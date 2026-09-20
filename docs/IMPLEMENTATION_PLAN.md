@@ -8,7 +8,7 @@ Status legend: ✅ done · 🚧 in progress · ⬜ not started
 
 ---
 
-## Phase 0 — Product source of truth + repo audit + bootstrap — 🚧 (this session)
+## Phase 0 — Product source of truth + repo audit + bootstrap — ✅ (complete, see `docs/PHASE_0_REPORT.md`)
 
 **Objective:** Establish project skeleton, documentation set, domain type scaffolding, dev-mode UI shell,
 and tooling — without implementing real discovery/outreach logic.
