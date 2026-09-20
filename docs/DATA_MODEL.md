@@ -122,3 +122,29 @@ a generic `info@` can be technically valid.
 `isContactPointAcceptable()` checks a `VerificationStatus` against a campaign-configurable
 `VerificationAcceptancePolicy` (default: only `valid`/`catch_all`). No provider-specific assumptions.
 
+## Phase 2 addendum — discovery engines, enrichment, autopilot services
+
+No schema/migration changes in Phase 2 (still unapplied to a real Postgres instance per the Phase 1
+known limitation) — this phase is entirely service/engine logic layered on the existing domain types.
+
+- **Shared candidate pipeline** (`src/services/discovery/candidate-processor.ts`): every engine's raw
+  output (`MapsRawPayload | SerpRawPayload | LinkedInRawPayload`) flows through one
+  `processRawCandidate()` function — Spain eligibility → account dedup → business-type classification →
+  contact-point discovery (crawl/fetch → extract → verify) → role inference → strategic priority → ready
+  evaluation. No engine reimplements this logic; engines only produce the raw payload shape.
+- **LinkedIn Owner never guesses a personal email.** A `LinkedInRawPayload` with no
+  `resolvedEmployerDomain` (i.e. no public evidence resolving the profile to a company website) produces
+  zero contact points — enforced structurally by the processor, not by convention.
+- **Provider usage → health**: `ProviderUsageStats` (`domain/providers/types.ts`) is accumulated per
+  engine (`accumulateUsage`) and evaluated by `evaluateProviderHealth()` (error-rate + quota thresholds)
+  into the existing `ProviderHealthStatus` vocabulary from Phase 0 — no new domain type needed.
+- **Job queue semantics** (`infrastructure/jobs/job-queue.ts`): pure functions over the existing
+  `JobRecord<TPayload>` type — atomic claim-or-skip with lease-based crash recovery, exponential backoff
+  for transient errors, immediate dead-letter for permanent errors. These functions are the exact contract
+  a real Supabase-backed repository (`SELECT ... FOR UPDATE SKIP LOCKED` or equivalent) must satisfy once
+  Phase 1's migrations are applied for real.
+- **Autopilot Target Engine services** (`src/services/autopilot/`): `PacingService`, `QuotaRebalancer`,
+  `QueueHealthService` compose (via `AutopilotScheduler`) into one `runAutopilotTick()` result, all
+  operating on the existing `GlobalAutopilotState`/`EngineTargetState`/`RebalanceDecision` types — no
+  domain-type changes were needed for Phase 2's target-engine logic.
+

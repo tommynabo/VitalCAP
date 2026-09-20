@@ -2,14 +2,21 @@
 
 Per Prompt 0 §0.8, no external provider is hard-coded into the domain layer. This document tracks the intended provider interfaces, their infrastructure homes, and current (Phase 0) status.
 
-## Intended interfaces (Phase 2/3, not yet implemented)
+## Implemented adapters (Phase 2 — mock only, no real API calls)
+
+| Interface | Mock adapter | Notes |
+|---|---|---|
+| `MapsDiscoveryProvider` | `src/infrastructure/providers/maps/mock-provider.ts` (`MockMapsDiscoveryProvider`) | Deterministic per query+geography+page (seeded via `deterministic-fixtures.ts`), paginates up to 3 pages, ~8 results/page, website present ~75% of the time. |
+| `SerpDiscoveryProvider` | `src/infrastructure/providers/serp/mock-provider.ts` (`MockSerpDiscoveryProvider`) | Detects role/LinkedIn-shaped queries via regex and emits `linkedin.com` profile results ~60% of the time for those; otherwise business-website-shaped results. |
+| `EmailVerificationProvider` | `src/infrastructure/providers/email-verification/mock-provider.ts` (`MockEmailVerificationProvider`) | Deterministic code assignment (`valid`/`catch_all`/`risky`/`invalid`) via a seeded roll, always batches per `verifyBatch`. |
+| `WebsiteFetcher` | `src/lib/security/safe-fetch.ts` (`safeFetchPage`) + `src/services/enrichment/website-crawler.ts` | Not a mock — a real SSRF-safe fetch implementation (manual bounded redirect loop, hostname/IP blocklist, content-type/length limits). Test/simulation code supplies inline fake `WebsiteFetcher` implementations instead of hitting the network. |
+
+All three domain-interface mocks share `src/infrastructure/providers/deterministic-fixtures.ts` (`hashString`, `seededRandom`) so synthetic output is stable across calls/tests while still varying meaningfully by input. **No real external API is called anywhere in Phase 2** — this is a standing safety decision (see ADR log); real adapters for these same interfaces are a Phase 3 concern once business input on vendor choice (see "Current status" below) is available.
+
+## Intended interfaces (Phase 3+, not yet implemented)
 
 | Interface | Consumed by | Infrastructure home |
 |---|---|---|
-| `MapsDiscoveryProvider` | `maps_fast`, `maps_deep` engines | `src/infrastructure/providers/maps/` |
-| `SerpDiscoveryProvider` | `google_serp`, `linkedin_owner` engines | `src/infrastructure/providers/serp/` |
-| `WebsiteFetcher` | `maps_deep` enrichment | `src/infrastructure/providers/` (to be added alongside maps/serp in Phase 2) |
-| `EmailVerificationProvider` | contact verification workers | `src/infrastructure/providers/email-verification/` |
 | `EmailDeliveryProvider` | outreach delivery workers | `src/infrastructure/providers/instantly/` (Instantly.ai per master doc's reference lessons) or equivalent |
 | `SmsDeliveryProvider` | outreach delivery workers | `src/infrastructure/providers/sms/` |
 | `CalendarProvider` (if needed) | meeting booking confirmation | not yet allocated a folder — add under `infrastructure/providers/` when Phase 4/5 needs it |
@@ -17,7 +24,7 @@ Per Prompt 0 §0.8, no external provider is hard-coded into the domain layer. Th
 
 Each folder currently contains only a `README.md` documenting its future ownership — no logic, no mock implementations yet, per the instruction not to fabricate placeholder architecture beyond what's needed to name the slot.
 
-## Rules for when these are implemented (Phase 2/3)
+## Rules for when these are implemented (Phase 3+)
 
 - Provider adapters live in `infrastructure/`, never called directly from `domain/` or `services/`. Services depend on the interface, not the concrete provider.
 - The app must keep working in dev/demo mode with mock providers + seed data (this is what Phase 0's dev seed mode already guarantees at the UI layer).

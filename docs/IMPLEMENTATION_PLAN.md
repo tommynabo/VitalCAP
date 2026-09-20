@@ -75,7 +75,7 @@ component code.
 
 ---
 
-## Phase 2 — Discovery engines, enrichment, autopilot target engine — ⬜
+## Phase 2 — Discovery engines, enrichment, autopilot target engine — ✅ (implemented, local/mocked only)
 
 **Objective:** Implement the 5 discovery engines behind a shared interface, geography planner, website
 enrichment + email extraction/verification adapters (mocked), and the Autopilot Target Engine
@@ -98,7 +98,8 @@ only.
 rebalancer math, Spain-boundary rejection, provider-outage handling.
 
 **Acceptance criteria:** Fully mocked local simulation of the 250/day target with soft-target rebalancing
-and hybrid fill, no real sends.
+and hybrid fill, no real sends. **Met** — see `src/services/autopilot/simulate-autopilot-day.ts` and
+`docs/PHASE_2_REPORT.md`.
 
 **Dependencies:** Phase 1.
 

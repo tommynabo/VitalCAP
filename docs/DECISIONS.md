@@ -156,3 +156,77 @@ most important negative-path completion criterion in §1.9 unverifiable through 
 that check belongs to `SpainEligibilityService` (`src/lib/geography/spain-eligibility.ts`), not type
 narrowing. `Campaign.countryCode` (a *target* configuration field, not an evaluated fact) is intentionally
 left as the literal `"ES"` in `src/domain/campaigns/types.ts` — it is not affected by this decision.
+
+---
+
+## ADR-009: Phase 2 discovery/enrichment providers are mock-only, no real external API calls
+
+**Decision:** Every provider interface touched in Phase 2 (`MapsDiscoveryProvider`, `SerpDiscoveryProvider`,
+`EmailVerificationProvider`) is backed exclusively by deterministic, seeded mock adapters in
+`src/infrastructure/providers/*`. No real Maps/SERP/email-verification API is called anywhere this phase.
+
+**Rationale:** Prompt 2's own scope never asked for real vendor selection or credentials, and a persistent
+user-memory note independently flags an unrelated production Supabase project to treat with extreme
+caution — the safest posture for an entire phase of new network-calling code is to make none of it touch
+a real network path at all. Determinism (seeded hashing) also makes every engine/pipeline test
+reproducible without flakiness from a live API.
+
+**Alternatives considered:** Wire at least one real provider (e.g. a free-tier SERP API) to prove
+end-to-end integration. Rejected — introduces credentials management, cost, and rate-limit flakiness for
+no benefit Prompt 2 requires; real vendor selection is explicitly a business decision deferred to Phase 3
+(see `docs/PROVIDERS.md` "Current status").
+
+**Consequences:** `simulate-autopilot-day.ts` (the §2.15 integration harness) and every engine/pipeline
+test run instantly and deterministically. Phase 3 must swap in real adapters behind the *same*
+`domain/providers/types.ts` interfaces — no service-layer code should need to change shape when that
+happens, only the concrete adapter passed in at the composition root.
+
+---
+
+## ADR-010: One shared `candidate-processor.ts` pipeline instead of per-engine duplication
+
+**Decision:** All five discovery engines (`MapsFastEngine`, `MapsDeepEngine`, `GoogleSerpEngine`,
+`LinkedInOwnerEngine`, `HybridFillEngine`) emit only a `RawCandidate` with an engine-specific
+`rawPayload` shape (`MapsRawPayload | SerpRawPayload | LinkedInRawPayload`, a discriminated union).
+A single `processRawCandidate()` function in `src/services/discovery/candidate-processor.ts` then
+performs Spain eligibility → dedup → business-type classification → contact-point discovery/verification
+→ ready evaluation identically for every engine.
+
+**Rationale:** Prompt 2 §2.3's step list applies to every engine's output with only minor differences
+(maps_deep reuses pre-crawled pages instead of one fresh fetch; LinkedIn never guesses a personal email).
+Duplicating the ~11-step pipeline five times would create five places for the Spain-eligibility or
+verification-acceptance logic to silently drift apart.
+
+**Alternatives considered:** Give each engine its own full pipeline for maximal independence. Rejected —
+directly risks the exact kind of "duplicated business logic slowly diverges" bug class this project's
+architecture doc's layering rule (`services/*` implement business logic against `domain/*` types) exists
+to prevent.
+
+**Consequences:** `executeDiscovery()` on every engine is intentionally "thin" (raw-candidate-only scope
+— it never itself decides readiness). `HybridFillEngine` additionally delegates to another engine's
+`executeDiscovery()` and only re-tags the resulting `RawCandidate.engineType` afterward, to preserve
+provenance that Hybrid Fill orchestrated that particular run without needing its own duplicate discovery
+logic.
+
+---
+
+## ADR-011: `HybridFillEngine` delegates to other engines rather than implementing its own discovery
+
+**Decision:** `HybridFillEngine` (`src/services/discovery/hybrid-fill-engine.ts`) holds a
+`Partial<Record<EngineType, DiscoveryEngine>>` of delegate engines. Its `executeDiscovery()` looks up the
+delegate matching the requested seed's `engineType`, calls that delegate's `executeDiscovery()` unchanged,
+and only re-tags the resulting candidates' `engineType` to `"hybrid_fill"` before returning them.
+
+**Rationale:** Per the master spec, Hybrid Fill's job is orchestration/fallback (broaden a category,
+expand regions, deepen incomplete accounts) — the *how* of getting more candidates is always one of the
+other four engines' existing logic, done under Hybrid Fill's discretion. Reimplementing Maps/SERP/LinkedIn
+search logic a second time inside Hybrid Fill would violate ADR-010's rationale for the exact same reason.
+
+**Alternatives considered:** Give `HybridFillEngine` its own provider calls. Rejected for the duplication
+reason above, and because it would make `HybridFillEngine`'s behavior diverge from whichever underlying
+engine it's "helping" in ways that are hard to reason about later.
+
+**Consequences:** `HybridFillEngine.planDiscoveryBatch()` currently only delegates to `maps_fast`'s
+planning (the primary hybrid-fill source per `hybrid-fill-decision.ts`'s action catalog); extending it to
+delegate planning to other engine types is a straightforward, backward-compatible follow-up if a later
+phase's decision logic calls for it.

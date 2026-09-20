@@ -23,11 +23,11 @@ src/
     dashboard/           # dashboard-specific presentational components
     shared/               # cross-page shared components (PhasePlaceholder)
   domain/                 # PURE TypeScript types. Zero framework/infra imports.
-    accounts/ contacts/ campaigns/ discovery/ autopilot/ outreach/ conversations/ compliance/
-  services/               # Phase-owned business logic (README stubs only in Phase 0)
-    deduplication/ enrichment/ verification/ routing/ setter/
-  infrastructure/         # Phase-owned adapters (README stubs only in Phase 0)
-    supabase/ providers/{maps,serp,email-verification,instantly,sms,llm}/ jobs/
+    accounts/ contacts/ campaigns/ discovery/ autopilot/ outreach/ conversations/ compliance/ providers/
+  services/               # Phase-owned business logic
+    deduplication/ enrichment/ verification/ routing/ setter/ discovery/ autopilot/   # discovery/ + autopilot/ added Phase 2
+  infrastructure/         # Phase-owned adapters
+    supabase/ providers/{maps,serp,email-verification,instantly,sms,llm}/ jobs/   # maps/serp/email-verification mocks + jobs implemented Phase 2
   lib/
     config/               # env validation
     utils/                # cn() etc.
@@ -64,5 +64,16 @@ Each module is pure vocabulary for a later phase's logic — no behavior, only s
 - **ESLint flat config**: `eslint-config-next@16` now ships a ready flat config array. Using `@eslint/eslintrc`'s `FlatCompat` to extend `"next/core-web-vitals"`/`"next/typescript"` string names (the pre-flat-config pattern) throws `TypeError: Converting circular structure to JSON` from `@eslint/eslintrc`'s config validator against this Next version's plugin objects. Fix: `import nextConfig from "eslint-config-next"` and spread the array directly in `eslint.config.mjs`. Do not reintroduce `FlatCompat` for this project.
 - **Next 16 `next.config.ts`**: the `eslint.ignoreDuringBuilds` option no longer exists on `NextConfig`'s type (lint is a separate, non-Next-owned step now: run `npm run lint` explicitly).
 - No git remote is created in Phase 0 per ADR-005; only a local `git init` + first commit.
+
+## 7. Phase 2 additions (Discovery Engines + Autopilot Target Engine)
+
+- **`domain/providers/types.ts`**: pure provider contracts (`MapsDiscoveryProvider`, `SerpDiscoveryProvider`, `EmailVerificationProvider`, `WebsiteFetcher`, `ProviderUsageStats`). Services depend only on these interfaces; concrete adapters live in `infrastructure/providers/*` and are never imported directly by a service — even service unit tests construct inline fake implementations of these interfaces rather than importing the infra mocks, to keep the dependency direction correct.
+- **`services/discovery/`**: `spain-search-catalog.ts` + `geography-planner.ts` (seed generation/selection), `business-type.ts`, `provider-health.ts`, `candidate-processor.ts` (the single shared pipeline every engine's raw candidates flow through — Spain eligibility → dedup → business-type → contact-point discovery/verification → ready evaluation), the five `DiscoveryEngine` implementations (`maps-fast-engine.ts`, `maps-deep-engine.ts`, `google-serp-engine.ts`, `linkedin-owner-engine.ts`, `hybrid-fill-engine.ts` + `hybrid-fill-decision.ts`), and `discovery-router.ts`.
+- **`services/enrichment/`**: `email-extraction.ts`, `website-crawler.ts`.
+- **`services/verification/email-verification-cache.ts`**: TTL cache in front of batch verification calls.
+- **`services/autopilot/`**: `pacing-service.ts`, `quota-rebalancer.ts`, `queue-health-service.ts`, `autopilot-scheduler.ts` (the orchestrator composing all three plus Hybrid Fill decisions into one tick), and `simulate-autopilot-day.ts` (the §2.15 integration harness).
+- **`infrastructure/jobs/job-queue.ts`**: pure atomic-claim/backoff/dead-letter primitives over `JobRecord[]` — the real DB-backed claim (e.g. `SELECT ... FOR UPDATE SKIP LOCKED`) is a Phase-1-schema/Phase-3-wiring concern; this module defines the exact semantics that implementation must match.
+- **`infrastructure/providers/{maps,serp,email-verification}/mock-provider.ts`** + `deterministic-fixtures.ts`: deterministic, seeded mock adapters — no real external API calls anywhere in Phase 2, per the standing mock-only decision (see ADR log).
+- **`lib/security/safe-fetch.ts`**: SSRF-safe fetch used by the website crawler — manual bounded redirect loop, hostname/IP blocklist re-checked per hop, injectable resolver/fetch for testability.
 
 See [`docs/DECISIONS.md`](./DECISIONS.md) for the full ADR log.

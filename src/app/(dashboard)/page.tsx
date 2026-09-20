@@ -1,5 +1,6 @@
 import { EngineCard } from "@/components/dashboard/engine-card";
 import { KpiStat } from "@/components/dashboard/kpi-stat";
+import { RebalanceActivity } from "@/components/dashboard/rebalance-activity";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
 import { globalProgressPct } from "@/lib/autopilot/targets";
@@ -44,20 +45,7 @@ export default function DashboardPage() {
           </CardContent>
         </Card>
 
-        <Card>
-          <CardHeader>
-            <CardTitle>Rebalancing activity</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <ul className="space-y-3">
-              {seedRebalanceDecisions.map((decision) => (
-                <li key={decision.id} className="text-xs text-text-muted">
-                  {decision.reason}
-                </li>
-              ))}
-            </ul>
-          </CardContent>
-        </Card>
+        <RebalanceActivity decisions={seedRebalanceDecisions} />
       </div>
 
       <div>
