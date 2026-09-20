@@ -39,15 +39,16 @@ sending, AI Setter, real provider calls, auth flows beyond stubs.
 
 ---
 
-## Phase 1 — Domain model, Supabase, deduplication, account/contact graph — ⬜
+## Phase 1 — Domain model, Supabase, deduplication, account/contact graph — ✅ (complete, see `docs/PHASE_1_REPORT.md`)
 
 **Objective:** Implement the normalized core schema (`accounts`, `account_sources`, `contacts`,
 `contact_points`, `offers`, `campaigns`, `campaign_memberships`, job/queue tables, outreach/conversation
 tables) in Supabase Postgres with RLS, plus `DeduplicationService`, `SpainEligibilityService`, contact
 priority scoring, and normalization utilities.
 
-**Prerequisites:** Phase 0 complete; Supabase project provisioned (URL + anon + service role keys
-available as env vars, never committed).
+**Prerequisites:** Phase 0 complete. Supabase project provisioning was **not** a hard prerequisite in
+practice — see `docs/PHASE_1_REPORT.md` and ADR-007: migrations/RLS/seed were written as unapplied SQL
+artifacts, no live project was provisioned or touched this phase.
 
 **Major modules:** `domain/accounts`, `domain/contacts`, `domain/campaigns`, `services/deduplication`,
 `lib/normalization`, `lib/geography`, `infrastructure/supabase` client factories (browser vs
@@ -59,7 +60,8 @@ indexes for strong dedup identities (place_id, normalized domain/phone/email).
 **External integrations:** Supabase only (Auth + Postgres). No discovery/outreach providers yet.
 
 **Tests:** Normalizers, strong/fuzzy dedup thresholds, Spain eligibility, contact priority, outreach
-concurrency lock, RLS sanity checks, seed data integrity.
+concurrency lock, suppression behavior. RLS sanity checks are **deferred** — they require a live Postgres
+instance, which does not exist yet (see `docs/PHASE_1_REPORT.md`).
 
 **Acceptance criteria:** Seeded synthetic Spanish accounts/contacts visible in UI tables with correct
 dedup/priority behavior; no real external calls.

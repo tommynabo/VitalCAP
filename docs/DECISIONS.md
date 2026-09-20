@@ -106,3 +106,53 @@ answer is "none found," so this log is a faithful audit trail.
 **Alternatives considered:** N/A.
 
 **Consequences:** None. This entry exists purely for audit completeness.
+
+---
+
+## ADR-007: Phase 1 Supabase schema written as unapplied SQL artifacts — no live project provisioned
+
+**Decision:** All Prompt 1 "Supabase" deliverables (`supabase/migrations/000{1..5}_*.sql`,
+`supabase/seed.sql`) are committed as version-controlled infrastructure-as-code but were **never
+executed** against any live database in this session. No `mcp_supabase_*` tool was called at any point.
+
+**Rationale:** This workspace has no Supabase project of its own (per ADR-002), so there is nothing to
+apply migrations to without provisioning one first — a decision reserved for the user. Separately, this
+session had working `mcp_supabase_*` tools available whose *target* project could not be verified, while
+this operator's own persistent notes document a real, unrelated production Supabase project (a "Medical
+CRM") with an explicit, emphatic warning after a past incident where an entire production database was
+wiped with no backup. Given that risk profile, calling any `mcp_supabase_*` tool this session — even a
+read-only one — was judged not worth it without first confirming which project it targets.
+
+**Alternatives considered:** (a) Spin up a local Postgres via `initdb`/`pg_ctl` to validate the SQL
+actually runs. Rejected on a time/scope tradeoff — `psql`/`initdb` are present locally but there is no
+`postgres` server binary or Docker installed, and provisioning one from source was deemed out of scope
+for this phase. (b) Use the available `mcp_supabase_*` tools to apply/verify the schema live. Rejected
+per the safety rationale above. The SQL was instead written carefully by hand, following standard
+Postgres/Supabase idioms (partial unique indexes for optional identity fields, `security definer` helper
+functions for RLS, explicit `check` constraints mirroring every domain-type union).
+
+**Consequences:** The schema is unverified against a real Postgres engine — a known limitation, called
+out explicitly in `docs/PHASE_1_REPORT.md`. Before Phase 2, a real Supabase project must be provisioned
+(or a local Postgres spun up) and these migrations applied and smoke-tested for the first time.
+
+---
+
+## ADR-008: `Account.countryCode` widened from the literal `"ES"` to `string`
+
+**Decision:** `Account.countryCode` (introduced in Phase 0 as the literal type `"ES"`) is widened to
+`string` in `src/domain/accounts/types.ts`, with an inline comment explaining why.
+
+**Rationale:** Prompt 1 §1.9's completion criteria explicitly requires seeding an "invalid non-Spain
+record," and Appendix B's `AccountStatus` state machine explicitly includes `rejected_country` as a
+reachable status — meaning a non-Spain `Account` row must be representable and storable (just never
+promoted past `rejected_country`) so `SpainEligibilityService`'s rejection path has real audit evidence
+to point at. A literal `"ES"` type would make that seed record a type error.
+
+**Alternatives considered:** Keep the literal `"ES"` type and represent the rejected non-Spain example
+as a bare, unstructured record outside the `Account` type. Rejected — it would leave the single
+most important negative-path completion criterion in §1.9 unverifiable through the actual domain model.
+
+**Consequences:** Application code must not assume `account.countryCode === "ES"` implies eligibility —
+that check belongs to `SpainEligibilityService` (`src/lib/geography/spain-eligibility.ts`), not type
+narrowing. `Campaign.countryCode` (a *target* configuration field, not an evaluated fact) is intentionally
+left as the literal `"ES"` in `src/domain/campaigns/types.ts` — it is not affected by this decision.

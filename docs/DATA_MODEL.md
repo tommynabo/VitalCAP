@@ -67,3 +67,58 @@ A single channel endpoint (email/phone/linkedin/other) belonging to either a nam
 ## Not yet implemented (by design, Phase 0)
 
 No database tables, no migrations, no RLS policies, no Supabase project. Phase 1 introduces the persisted schema (accounts/contacts/contact_points/account_sources tables + repository interfaces) behind these same domain types.
+
+---
+
+## Phase 1 addendum — SQL schema, RLS, dedup/eligibility/priority design
+
+The domain types above are now backed by real (but **unapplied** — see `docs/DECISIONS.md` ADR-007) SQL
+migrations under `supabase/migrations/`:
+
+- `0001_core_schema.sql` — `workspaces`, `workspace_members`, `accounts`, `account_sources`,
+  `account_merge_records`, `contacts`, `contact_points`. Strong dedup identities (`google_place_id`,
+  `normalized_domain`, `normalized_phone` on accounts; `normalized_value` on contact points) are enforced
+  with partial unique indexes (only when the value is present), plus supporting composite indexes for
+  the name+postal-code / name+address fuzzy signals.
+- `0002_campaigns_schema.sql` — `offers`, `campaigns`, `campaign_memberships`.
+- `0003_jobs_schema.sql` — `discovery_jobs`, `raw_candidates`, `processing_jobs`, `outreach_queue`,
+  `dead_letter_jobs`, each with the standard durable-job shape (`status`/`attempt_count`/`max_attempts`/
+  `locked_at`/`locked_by`/`next_attempt_at`/`last_error`).
+- `0004_outreach_conversations_schema.sql` — `outreach_events`, `conversations`,
+  `conversation_messages`, `setter_drafts`, `setter_feedback`, `meetings`, `suppression_entries`.
+- `0005_rls_policies.sql` — workspace-scoped RLS on every table (via an `is_workspace_member()`
+  `security definer` helper, joined through the nearest ancestor that carries `workspace_id` for tables
+  that don't have the column directly), plus an `audit_log` table + trigger on `account_merge_records`
+  and `suppression_entries` mutations (§1.7 "audit privileged mutations").
+
+### Deduplication (`src/services/deduplication/`)
+
+- `account-dedup.ts` — strong signals (Place ID / domain / phone) always merge; composite/fuzzy signals
+  (name+postal code / name+address / name+geo-proximity, haversine distance) only auto-merge at/above a
+  configurable confidence threshold (default `0.8`), otherwise `flag_for_review`. Every merge produces an
+  `AccountMergeRecord` (`merge-record.ts`).
+- `contact-dedup.ts` — strong (email/phone/LinkedIn) and composite (full name + same account) contact
+  matching. Distinct named contacts on the same account are never conflated.
+- `outreach-dedup.ts` — suppression check first, then per-endpoint cooldown
+  (`contact_point + campaign + channel`), then the account-level concurrency lock (never contact two
+  endpoints of the same account simultaneously unless explicitly configured).
+
+### Spain eligibility (`src/lib/geography/`)
+
+`spain-provinces.ts` holds the canonical 50-province + Ceuta/Melilla dataset with postal-code prefixes.
+`spain-eligibility.ts`'s `evaluateSpainEligibility()` verifies on any single strong signal (provider
+country code ES / valid ES postal code / in-bounds coordinates), rejects outright on an explicit
+non-Spain country code, and treats phone/domain/province-name matches as supporting-only evidence that
+never verifies alone — ambiguous cases stay `needs_review`.
+
+### Contact priority (`src/services/routing/contact-priority.ts`)
+
+`computeStrategicPriority()` implements the §1.5 scoring table exactly (100 down to 50) and is kept
+strictly separate from `verificationConfidence()` — a high-priority owner email can be technically risky,
+a generic `info@` can be technically valid.
+
+### Verification acceptance policy (`src/services/verification/acceptance-policy.ts`)
+
+`isContactPointAcceptable()` checks a `VerificationStatus` against a campaign-configurable
+`VerificationAcceptancePolicy` (default: only `valid`/`catch_all`). No provider-specific assumptions.
+

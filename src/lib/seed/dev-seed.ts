@@ -362,6 +362,35 @@ export const seedAccountBundles: SeedAccountBundle[] = [
     ],
     contactPoints: [],
   },
+  {
+    // Invalid non-Spain record (Prompt 1 §1.9 / §1.4): SpainEligibilityService
+    // rejects it outright on the provider country code — never silently
+    // accepted, never promoted past `rejected_country`.
+    account: account({
+      id: "acc_6",
+      canonicalName: "Farmacia Lisboa Centro",
+      businessType: "pharmacy",
+      countryCode: "PT",
+      city: "Lisboa",
+      status: "rejected_country",
+      fitTier: "unscored",
+      fitScore: null,
+    }),
+    sources: [
+      {
+        id: "src_6a",
+        accountId: "acc_6",
+        sourceType: "maps_fast",
+        sourceProvider: "mock_maps",
+        sourceExternalId: "place_6",
+        sourceUrl: null,
+        rawSnapshot: {},
+        discoveredAt: now(),
+      },
+    ],
+    contacts: [],
+    contactPoints: [],
+  },
 ];
 
 export const seedEngineTargets: EngineTargetState[] = [

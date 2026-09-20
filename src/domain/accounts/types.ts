@@ -37,7 +37,13 @@ export interface Account {
   canonicalName: string;
   normalizedName: string;
   businessType: BusinessType;
-  countryCode: "ES";
+  /**
+   * Raw ISO-3166 alpha-2 as evaluated by `SpainEligibilityService` (Prompt 1
+   * §1.4). Not narrowed to `"ES"` because a rejected non-Spain candidate must
+   * still be storable (`status: "rejected_country"`) as audit evidence that
+   * the boundary worked — it is simply never promoted to `outreach_ready`.
+   */
+  countryCode: string;
   region: string | null;
   province: string | null;
   city: string | null;
@@ -78,4 +84,28 @@ export interface AccountSource {
   sourceUrl: string | null;
   rawSnapshot: Record<string, unknown>;
   discoveredAt: string;
+}
+
+/**
+ * Audit trail for `DeduplicationService` merge decisions (Prompt 1 §1.2).
+ * Never write a merge without one of these — including fuzzy/composite
+ * merges, which must record the matched signal and confidence that
+ * justified the merge.
+ */
+export type AccountDedupSignal =
+  | "google_place_id"
+  | "normalized_domain"
+  | "normalized_phone"
+  | "name_postal_code"
+  | "name_address"
+  | "name_geo_proximity";
+
+export interface AccountMergeRecord {
+  id: string;
+  survivingAccountId: string;
+  mergedAccountId: string;
+  matchedSignal: AccountDedupSignal;
+  confidence: number;
+  decidedBy: "auto" | "human_review";
+  createdAt: string;
 }
