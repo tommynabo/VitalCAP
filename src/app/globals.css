@@ -1,0 +1,36 @@
+@import "tailwindcss";
+
+@theme {
+  --color-background: #f7f4ef;
+  --color-surface: #ffffff;
+  --color-surface-muted: #fbf9f6;
+  --color-border: #e8e3dc;
+  --color-text: #171717;
+  --color-text-muted: #6f6b66;
+  --color-primary: #f26a21;
+  --color-primary-hover: #dd5b17;
+  --color-primary-soft: #fff1e7;
+  --color-success: #3f7d53;
+  --color-success-soft: #eaf4ee;
+  --color-warning: #b7791f;
+  --color-warning-soft: #fbf1de;
+  --color-danger: #c0392b;
+  --color-danger-soft: #fbeae8;
+
+  --radius-card: 16px;
+  --radius-control: 10px;
+
+  --font-sans: var(--font-inter), ui-sans-serif, system-ui, sans-serif;
+}
+
+body {
+  background-color: var(--color-background);
+  color: var(--color-text);
+  font-family: var(--font-sans);
+}
+
+/* Visible keyboard focus states everywhere (Prompt 0 §0.10 accessibility). */
+:focus-visible {
+  outline: 2px solid var(--color-primary);
+  outline-offset: 2px;
+}
