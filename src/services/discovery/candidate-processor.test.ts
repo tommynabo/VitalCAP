@@ -167,3 +167,38 @@ describe("processRawCandidate — linkedin candidates", () => {
     expect(result.readyForOutreach).toBe(false);
   });
 });
+
+describe("processRawCandidate — verification provider outage (Prompt 6 §6.1 Flow F)", () => {
+  it("degrades to unverified/not-ready instead of throwing when the verification provider is down", async () => {
+    const outage: EmailVerificationProvider = {
+      providerName: "outage",
+      verifyBatch: async () => {
+        throw new Error("provider unavailable");
+      },
+    };
+    const payload: CandidateRawPayload = {
+      kind: "maps",
+      place: {
+        externalPlaceId: "p4",
+        name: "Farmacia Outage",
+        category: "farmacia",
+        address: null,
+        postalCode: "28001",
+        province: "Madrid",
+        city: "Madrid",
+        countryCode: "ES",
+        websiteUrl: "https://farmaciaoutage.es",
+        phone: null,
+        latitude: null,
+        longitude: null,
+        rating: null,
+        reviewCount: null,
+        sourceUrl: null,
+      },
+    };
+    const result = await processRawCandidate(payload, "maps_fast", baseContext({ verificationProvider: outage }));
+    expect(result.readyForOutreach).toBe(false);
+    expect(result.contactPoints.every((cp) => cp.verificationStatus === "unverified" && !cp.acceptable)).toBe(true);
+    expect(result.rejectionReason).toBe("No acceptable contact point found");
+  });
+});

@@ -394,3 +394,52 @@ conversation, which the spec forbids.
 **Consequences:** Any future feature that needs to know "is this account in cold outreach or warm
 follow-up" must check both modules' state independently; there is deliberately no single combined
 enum.
+
+## ADR-019: Phase 6 DB hardening fixes three CHECK-constraint/domain mismatches instead of a full conversations/setter_drafts schema rewrite
+
+**Decision:** `supabase/migrations/0006_phase6_hardening.sql` corrects three concrete bugs found while
+auditing 0001-0005 against the current TypeScript domain types (`src/domain/conversations/types.ts`):
+1. `conversations.state` had no CHECK constraint at all, and its `default 'active'` value is not even a
+   member of the 14-value `ConversationState` union — replaced with a CHECK against the real enum and the
+   default changed to `'reply_received'` (the actual initial state used everywhere in application code).
+2. `conversation_messages.direction` CHECK allowed `('inbound', 'outbound')`; the domain type is
+   `"incoming" | "outgoing"` — every real insert from application code would have failed. Corrected to
+   match.
+3. `setter_drafts.review_decision` CHECK allowed `('approved', 'rejected', 'corrected')`; the domain
+   `ReviewDecision` union is `approve | edit_and_send | reject | no_reply_needed | escalate | suppress` —
+   corrected to match.
+
+**Rationale:** These are genuine latent defects (schema/application drift), not new functionality — fixing
+them is squarely what Prompt 6 §6.4/§6.5 asks for ("Make the system reliable," DB constraints checklist).
+No live database has ever been migrated (every 0001-0005 file's header says so), so there is no data at
+risk and no destructive operation involved.
+
+**Known limitation deliberately NOT fixed in this migration:** `conversations` is still missing
+`offer_id`/`provider_thread_id`/`latest_intent` columns, and `setter_drafts` is still missing several
+fields the Phase 4 domain type carries (`language`, `intent_summary`, `confidence`, `needs_human`,
+`reason_for_human`, `detected_facts_requested`, `risk_flags`, `suggested_next_action`), and `setter_drafts`
+links to `conversation_id` rather than the domain's `conversationMessageId`. These were written in Phase 1
+(`0004_outreach_conversations_schema.sql`'s header: "reserved now so Phase 3/4 do not need a breaking
+schema change later") before the Phase 3/4 domain design existed, and now genuinely underfit it. Recorded
+here as a known limitation for the pre-go-live checklist (`docs/PRODUCTION_CHECKLIST.md`) rather than
+redesigned speculatively in this phase — a full reconciliation is itself a schema-design decision that
+deserves its own ADR and a test-backed migration once a real Supabase project is provisioned, not a
+guessed fix with no live database to validate it against.
+
+**Alternatives considered:** Rewrite `conversations`/`setter_drafts` to fully mirror the domain types in
+this same migration. Rejected for this phase — Prompt 6 explicitly says "do not add major new features,"
+and expanding a table's shape without a live database or any consumer reading those columns yet is
+speculative schema design, not a bug fix.
+
+**Consequences:** The three corrected constraints are safe to apply to a fresh project today. The
+documented remaining gap must be closed (a follow-up migration) before `conversations`/`setter_drafts` are
+ever wired to real Supabase reads/writes — flagged explicitly in `docs/PRODUCTION_CHECKLIST.md`.
+
+**Addendum (same migration, found during the §6.4 idempotency audit):** `outreach_events.provider_event_id`
+had no uniqueness constraint at the DB level, even though the application-level reducer
+(`ingestOutreachEvent`) already deduped on it — a real repository implementation that skipped that check
+could still insert a duplicate row for a replayed webhook delivery. Added
+`uq_outreach_events_provider_event_id on outreach_events (provider_event_id) where provider_event_id is
+not null` (partial, since internally generated events such as the dry-run orchestrator's initial
+`"scheduled"` event have no provider webhook to key off of). See `docs/IDEMPOTENCY_AUDIT.md` for the full
+scenario-by-scenario audit this was found under.

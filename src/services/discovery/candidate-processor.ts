@@ -221,12 +221,18 @@ export async function processRawCandidate(
   const extractedEmails = pages.flatMap((page) => extractCandidateEmails(page.body, page.url));
   const uniqueEmails = Array.from(new Map(extractedEmails.map((e) => [e.email, e])).values());
 
-  const { outcomes } = await verifyEmailsWithCache(
-    context.verificationProvider,
-    uniqueEmails.map((e) => e.email),
-    context.verificationCacheStore,
-    context.now,
-  );
+  // Prompt 6 §6.1 Flow F (provider outage): a verification-provider failure
+  // must never crash candidate processing or produce an invalid send — it
+  // degrades to `unverified` (unacceptable under the default policy) so the
+  // candidate is simply not marked ready, never lost and never guessed valid.
+  let outcomes: Awaited<ReturnType<typeof verifyEmailsWithCache>>["outcomes"] = [];
+  try {
+    outcomes = (
+      await verifyEmailsWithCache(context.verificationProvider, uniqueEmails.map((e) => e.email), context.verificationCacheStore, context.now)
+    ).outcomes;
+  } catch {
+    outcomes = [];
+  }
   const verificationByEmail = new Map(outcomes.map((o) => [o.email, o]));
 
   const contactPoints: ProcessedContactPoint[] = uniqueEmails.map((extracted) => {

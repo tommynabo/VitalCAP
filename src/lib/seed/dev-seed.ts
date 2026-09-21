@@ -689,6 +689,11 @@ export const seedQueueHealth = {
   healthy: true,
 };
 
+/** Prompt 6 §6.3 admin diagnostics view — cron/webhook freshness + DB reachability, not shown on any salesperson-facing screen. */
+export const seedCronLastRunAt = new Date(Date.now() - 45 * 60 * 1000).toISOString();
+export const seedWebhookLastEventAt = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+export const seedDbConnectivityOk = true;
+
 export interface DeadLetterSample {
   id: string;
   jobType: string;

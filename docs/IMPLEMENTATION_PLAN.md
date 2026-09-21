@@ -235,7 +235,7 @@ was added.
 
 ---
 
-## Phase 6 — QA, observability, failure modes, production hardening, release — ⬜
+## Phase 6 — QA, observability, failure modes, production hardening, release — ✅ (implemented, see `docs/PHASE_6_REPORT.md`)
 
 **Objective:** Harden the system: idempotency audits, DB constraints/indexes, security review (RLS,
 SSRF, webhook verification, secrets), performance pass, recovery runbooks, production checklist.
