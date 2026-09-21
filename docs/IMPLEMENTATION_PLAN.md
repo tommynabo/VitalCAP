@@ -110,31 +110,42 @@ planner from the start, not bolted on later.
 
 ---
 
-## Phase 3 — Outreach infrastructure, email/SMS, channel router, suppression — ⬜
+## Phase 3 — Outreach infrastructure, email/SMS, channel router, suppression — ✅ (implemented, local/mocked only, see `docs/PHASE_3_REPORT.md`)
 
 **Objective:** Turn outreach-ready prospects into safe, idempotent send jobs with a deterministic
 `ChannelRouter`, sender pool management, universal suppression, and `dry_run` delivery mode.
 
 **Prerequisites:** Phase 2 outreach-ready queue populated.
 
-**Major modules:** `services/routing`, `infrastructure/providers/{instantly,sms}`,
-`domain/compliance` (ComplianceGate/ChannelEligibilityService), `domain/outreach`.
+**Major modules:** `services/outreach` (ChannelRouter, sender pool, channel mix planner, sequence
+service, message renderer, event ingestion, dry-run orchestrator), `services/compliance` (suppression
+service, `ComplianceGate`), `infrastructure/providers/{instantly,sms}` (mock `EmailDeliveryProvider` /
+`SmsDeliveryProvider`), `domain/providers` (delivery provider interfaces), `lib/normalization`
+(`classifyPhoneTypeES`).
 
-**Database changes:** `sending_domains`, `mailboxes`, `suppression_entries`, `outreach_events` lifecycle
-columns, sequence tables.
+**Database changes:** None applied — `sending_domains`, `mailboxes`, `suppression_entries` and
+`outreach_events` lifecycle columns were already defined in Phase 1's unapplied SQL
+(`0003_jobs_schema.sql`, `0004_outreach_conversations_schema.sql`); Phase 3 only builds the pure-function
+services and in-memory seed data against those already-designed shapes.
 
-**External integrations:** Instantly (email) and an SMS provider adapter — interface + mock first; real
-adapters only against documented APIs, credentials never hard-coded.
+**External integrations:** Instantly (email) and an SMS provider — both mock-only adapters this phase,
+reusing Phase 2's deterministic-fixture pattern. No live credentials wired.
 
-**Tests:** Channel routing preference order, concurrency (no simultaneous owner+info@), suppression
-gate bypass attempts (must fail), dry-run end-to-end.
+**Tests:** Channel routing preference order (owner > purchasing > manager > named > role email >
+generic > info@), one-active-path concurrency + account cooldown, suppression gate bypass attempts
+(must fail), sender pool capacity/health, 125/125 mix planning with shortfall reporting, cold/warm
+sequence pause-on-reply and cancel-on-bounce, idempotent webhook ingestion (HMAC signature + dedup by
+`providerEventId`), and a `simulate-outreach-day.test.ts` integration test — 42 outreach-scoped tests
+(230 total repo-wide), all passing.
 
-**Acceptance criteria:** Dry-run send pipeline fully exercised with zero real provider calls by default.
+**Acceptance criteria:** Dry-run send pipeline fully exercised with zero real provider calls by default —
+**met**: `runOutreachDryRunCycle` never imports `MockInstantlyEmailDeliveryProvider` /
+`MockSmsDeliveryProvider`, only records planned `OutreachQueueItem`/`OutreachEvent` pairs.
 
 **Dependencies:** Phases 1–2.
 
-**Risks:** Accidental live sends — mitigated by `delivery_mode` defaulting to `dry_run` at the schema
-level (NOT NULL DEFAULT 'dry_run').
+**Risks:** Accidental live sends — mitigated by `deliveryMode` defaulting to `"dry_run"` in every queue
+item constructed by the orchestrator; flipping to live is out of this phase's scope entirely.
 
 **Must NOT implement now:** AI Setter, autonomous sending, real credential activation.
 

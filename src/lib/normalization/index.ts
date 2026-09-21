@@ -5,3 +5,4 @@ export { normalizePhoneES } from "./normalize-phone-es";
 export { normalizeLinkedInUrl } from "./normalize-linkedin-url";
 export { normalizeBusinessName } from "./normalize-business-name";
 export { normalizeAddress } from "./normalize-address";
+export { classifyPhoneTypeES, type PhoneType } from "./classify-phone-type-es";

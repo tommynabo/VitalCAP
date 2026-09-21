@@ -92,6 +92,80 @@ export interface EmailVerificationProvider {
   verifyBatch(emails: readonly string[]): Promise<{ outcomes: EmailVerificationOutcome[]; usage: ProviderUsageStats }>;
 }
 
+/**
+ * Email delivery provider contract (Prompt 3 §3.3). Primary production
+ * adapter may be Instantly if configured, but no Instantly campaign ID is
+ * ever hard-coded — the internal-campaign → provider-campaign-ID mapping is
+ * caller-supplied configuration, never baked into this interface or an
+ * adapter.
+ */
+export interface EmailLeadInput {
+  providerCampaignId: string;
+  email: string;
+  customVariables: Record<string, string>;
+  /** Ask the provider to no-op instead of duplicating a lead it already has. */
+  skipIfExisting: boolean;
+}
+
+export type EmailLeadAddStatus = "added" | "skipped_existing";
+
+export interface EmailLeadResult {
+  providerLeadId: string;
+  status: EmailLeadAddStatus;
+}
+
+export type EmailDeliveryStatusCode = "sent" | "delivered" | "bounced" | "replied" | "unsubscribed" | "failed";
+
+export interface EmailDeliveryStatusEvent {
+  providerLeadId: string;
+  providerEventId: string;
+  code: EmailDeliveryStatusCode;
+  occurredAt: string;
+  raw: Record<string, unknown>;
+}
+
+export interface EmailDeliveryProvider {
+  readonly providerName: string;
+  addLead(input: EmailLeadInput): Promise<{ result: EmailLeadResult; usage: ProviderUsageStats }>;
+  /** Polls (or, in a real adapter, is fed by a webhook) provider-side status changes since a point in time. */
+  syncStatus(providerCampaignId: string, since: Date): Promise<{ events: EmailDeliveryStatusEvent[]; usage: ProviderUsageStats }>;
+}
+
+/**
+ * SMS delivery provider contract (Prompt 3 §3.5). A concrete adapter for an
+ * undocumented vendor (e.g. Textvy) must never be built against a guessed
+ * API — until official docs are available, only this interface + a mock
+ * adapter exist (see `docs/PROVIDERS.md`).
+ */
+export interface SmsSendInput {
+  fromSenderId: string;
+  toE164: string;
+  body: string;
+}
+
+export interface SmsSendResult {
+  providerMessageId: string;
+  segments: number;
+  costUsd: number;
+}
+
+export type SmsDeliveryStatusCode = "sent" | "delivered" | "failed" | "replied" | "opted_out";
+
+export interface SmsDeliveryStatusEvent {
+  providerMessageId: string;
+  providerEventId: string;
+  code: SmsDeliveryStatusCode;
+  failureCode: string | null;
+  occurredAt: string;
+  raw: Record<string, unknown>;
+}
+
+export interface SmsDeliveryProvider {
+  readonly providerName: string;
+  send(input: SmsSendInput): Promise<{ result: SmsSendResult; usage: ProviderUsageStats }>;
+  syncStatus(since: Date): Promise<{ events: SmsDeliveryStatusEvent[]; usage: ProviderUsageStats }>;
+}
+
 export interface FetchedPage {
   url: string;
   status: number;

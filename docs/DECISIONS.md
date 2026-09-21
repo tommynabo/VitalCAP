@@ -230,3 +230,71 @@ engine it's "helping" in ways that are hard to reason about later.
 planning (the primary hybrid-fill source per `hybrid-fill-decision.ts`'s action catalog); extending it to
 delegate planning to other engine types is a straightforward, backward-compatible follow-up if a later
 phase's decision logic calls for it.
+
+---
+
+## ADR-012: Phase 3 outreach services are mock-provider-only; the dry-run orchestrator never imports a delivery provider
+
+**Decision:** `runOutreachDryRunCycle` (`src/services/outreach/outreach-orchestrator.ts`) composes the
+`ChannelRouter`, sender pool, channel mix planner, `ComplianceGate` and message renderer, but has no
+import of `EmailDeliveryProvider`/`SmsDeliveryProvider` at all — it only constructs
+`OutreachQueueItem`/`OutreachEvent` records with `deliveryMode: "dry_run"` and `state: "scheduled"`.
+`MockInstantlyEmailDeliveryProvider`/`MockSmsDeliveryProvider` exist as standalone, independently-tested
+adapters but are not wired into the orchestrator this phase.
+
+**Rationale:** Appendix C's non-negotiable ("real outbound disabled until go-live") is easiest to audit
+when it's a structural fact (an import that doesn't exist) rather than a runtime flag check that could be
+bypassed or misconfigured. A future "live" orchestrator variant is a deliberate, separate, reviewable
+addition — not a branch inside this one.
+
+**Alternatives considered:** One orchestrator with an `if (deliveryMode === "live") await provider.send()`
+branch. Rejected — a single accidental config flip (or a copy-pasted test with the wrong mode) would be
+enough to trigger a real send; keeping dry-run and live as structurally separate code paths raises the bar
+for that mistake significantly.
+
+**Consequences:** Enabling live sending in a later phase requires writing a new orchestrator function (or
+an explicit second branch reviewed on its own merits) rather than flipping a config value in the existing
+one.
+
+---
+
+## ADR-013: `ChannelRouter` endpoint ranking reuses Phase 1's `ContactPoint.priorityScore` instead of re-encoding the preference ladder
+
+**Decision:** `routeAccountToEndpoint` (`src/services/outreach/channel-router.ts`) selects the eligible,
+non-suppressed contact point with the highest `priorityScore` — it does not re-implement Prompt 3 §3.2's
+"owner/titular > purchasing manager > manager > other named > compras@/role email > pharmacy-specific
+generic > info@" ladder as a second, parallel ranking function.
+
+**Rationale:** Phase 1's `computeStrategicPriority()` (`src/services/routing/contact-priority.ts`) already
+assigns scores (100/95/90/85/80/75/65/60/50) that implement exactly this ladder. A second independent
+ranking would be redundant and could silently drift out of sync with the scoring service if either one
+were changed without the other.
+
+**Alternatives considered:** A dedicated endpoint-preference comparator inside the router. Rejected as
+unnecessary duplication once the existing `priorityScore` was confirmed to already encode the identical
+order.
+
+**Consequences:** Any future change to the endpoint preference order should be made once, in
+`contact-priority.ts` — the router will pick it up automatically via `priorityScore` with no code change
+of its own.
+
+---
+
+## ADR-014: One shared `ComplianceGate` implementation is consulted by both the `ChannelRouter` and the orchestrator (defense in depth)
+
+**Decision:** `SuppressionAwareComplianceGate` (`src/services/compliance/compliance-gate.ts`) is the single
+implementation of the `domain/compliance` `ComplianceGate` interface. The `ChannelRouter` independently
+filters out suppressed/ineligible contact points *before* ranking candidates, and the orchestrator calls
+the same gate again right before recording a queue item — so a contact can be rejected at either layer.
+
+**Rationale:** Belt-and-suspenders: if a future change ever lets an ineligible endpoint slip past the
+router's own filtering (e.g. a bug in candidate selection), the gate check immediately before "sending"
+(recording, in dry-run) still catches it. This mirrors the master spec's instruction that *no send may
+bypass compliance*, regardless of which upstream step selected the endpoint.
+
+**Alternatives considered:** Check compliance only once, either in the router or only in the orchestrator.
+Rejected — a single check point is a single point of failure for a rule the spec treats as non-negotiable.
+
+**Consequences:** A test observed this directly: a suppressed contact point is filtered out by the router
+itself (`no_eligible_endpoint`), so the orchestrator's own gate check never even gets the chance to reject
+it for that specific case — both layers agree, which is the intended redundancy.

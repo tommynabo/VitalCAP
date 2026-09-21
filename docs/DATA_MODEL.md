@@ -148,3 +148,43 @@ known limitation) — this phase is entirely service/engine logic layered on the
   operating on the existing `GlobalAutopilotState`/`EngineTargetState`/`RebalanceDecision` types — no
   domain-type changes were needed for Phase 2's target-engine logic.
 
+## Phase 3 addendum — outreach infrastructure, channel routing, suppression
+
+No schema/migration changes in Phase 3 either — `sending_domains`, `mailboxes`, `suppression_entries`
+and the `outreach_events` lifecycle were already defined in Phase 1's `0003_jobs_schema.sql` /
+`0004_outreach_conversations_schema.sql`; Phase 3 implements the pure-function services and seed data
+against those already-designed shapes, still unapplied to a real Postgres instance.
+
+- **`outreach-dedup.ts` was never created as a single file** — the two behaviors this doc originally
+  described under that name ("suppression check first, then per-endpoint cooldown") are implemented as
+  two separate, independently-tested modules instead: `services/compliance/suppression-service.ts`
+  (`checkSuppression`/`addSuppression`, workspace-wide, idempotent) and
+  `services/outreach/channel-router.ts` (`routeAccountToEndpoint`, which enforces the account-level
+  concurrency lock — one active outreach path per account — plus a configurable account cooldown window).
+  Splitting them keeps "is this contact/account suppressed at all" (a universal, channel-independent
+  question) separate from "is it this account's turn to be routed right now" (a routing-specific
+  question).
+- **`services/compliance/compliance-gate.ts`**: `SuppressionAwareComplianceGate` implements the
+  `domain/compliance` `ComplianceGate` interface from Phase 0/1 — suppression always wins over any
+  eligibility status, and channel eligibility is evaluated per-channel (`eligible_email` does not imply
+  `eligible_sms`, matching §0.9's "channel eligibility ≠ endpoint existence").
+- **`services/outreach/sender-pool-service.ts`**: capacity is always `dailyCapacity - sentToday`, never a
+  hardcoded number; a mailbox is only usable when both it and its parent `SendingDomain` are healthy
+  (configurable bounce-rate/health-score thresholds).
+- **`services/outreach/channel-mix-planner.ts`**: given a campaign's `desiredChannelMix` (e.g. 125
+  email / 125 SMS) plus what's already sent today and remaining sender capacity, computes an allocatable
+  count per channel and reports any capacity-driven shortfall — it never selects accounts itself, so a
+  mix target can never justify bypassing suppression/eligibility.
+- **`services/outreach/sequence-service.ts`**: a reply anywhere in an outreach path pauses every further
+  scheduled step (cold or warm); a bounce/unsubscribe cancels the path outright.
+- **`services/outreach/outreach-event-ingestion.ts`**: webhook signature verification (HMAC-SHA256,
+  timing-safe compare) plus dedup by `providerEventId` — replaying the same provider event twice never
+  creates a duplicate `OutreachEvent`.
+- **`services/outreach/outreach-orchestrator.ts`**: `runOutreachDryRunCycle` composes all of the above
+  plus `message-renderer.ts` (whitelisted `Offer`-backed placeholder substitution only, no fabricated
+  commercial facts) into one dry-run pass — see ADR-012 for why it structurally cannot call a real
+  delivery provider.
+- **Mock delivery providers** (`infrastructure/providers/{instantly,sms}/mock-provider.ts`): Instantly-
+  shaped `EmailDeliveryProvider` and a generic `SmsDeliveryProvider`, both reusing Phase 2's
+  `deterministic-fixtures.ts` pattern, not wired into the orchestrator (see ADR-012).
+

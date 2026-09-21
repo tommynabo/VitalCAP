@@ -13,12 +13,19 @@ Per Prompt 0 §0.8, no external provider is hard-coded into the domain layer. Th
 
 All three domain-interface mocks share `src/infrastructure/providers/deterministic-fixtures.ts` (`hashString`, `seededRandom`) so synthetic output is stable across calls/tests while still varying meaningfully by input. **No real external API is called anywhere in Phase 2** — this is a standing safety decision (see ADR log); real adapters for these same interfaces are a Phase 3 concern once business input on vendor choice (see "Current status" below) is available.
 
+## Implemented adapters (Phase 3 — mock only, no real API calls)
+
+| Interface | Mock adapter | Notes |
+|---|---|---|
+| `EmailDeliveryProvider` | `src/infrastructure/providers/instantly/mock-provider.ts` (`MockInstantlyEmailDeliveryProvider`) | Instantly-shaped `addLead`/`syncStatus`; deterministic `providerLeadId`/status-event rolls via the shared fixture pattern; no campaign ID is ever hard-coded — always supplied by the caller. |
+| `SmsDeliveryProvider` | `src/infrastructure/providers/sms/mock-provider.ts` (`MockSmsDeliveryProvider`) | Deterministic segment/cost calculation from body length; deterministic status-event rolls (delivered/replied/failed/opted_out). |
+
+`runOutreachDryRunCycle` (`src/services/outreach/outreach-orchestrator.ts`) never imports either mock provider — the dry-run orchestrator only ever records planned `OutreachQueueItem`/`OutreachEvent` rows, so a real send requires a separate, explicit live-mode code path that does not exist yet.
+
 ## Intended interfaces (Phase 3+, not yet implemented)
 
 | Interface | Consumed by | Infrastructure home |
 |---|---|---|
-| `EmailDeliveryProvider` | outreach delivery workers | `src/infrastructure/providers/instantly/` (Instantly.ai per master doc's reference lessons) or equivalent |
-| `SmsDeliveryProvider` | outreach delivery workers | `src/infrastructure/providers/sms/` |
 | `CalendarProvider` (if needed) | meeting booking confirmation | not yet allocated a folder — add under `infrastructure/providers/` when Phase 4/5 needs it |
 | `LLMProvider` | AI Setter drafting/classification | `src/infrastructure/providers/llm/` |
 

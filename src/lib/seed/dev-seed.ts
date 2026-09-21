@@ -2,6 +2,7 @@ import type { Account, AccountSource } from "@/domain/accounts/types";
 import type { Contact, ContactPoint } from "@/domain/contacts/types";
 import type { Campaign, Offer } from "@/domain/campaigns/types";
 import type { EngineTargetState, GlobalAutopilotState, RebalanceDecision } from "@/domain/autopilot/types";
+import type { Mailbox, OutreachEvent, OutreachQueueItem, SendingDomain, SuppressionEntry } from "@/domain/outreach/types";
 
 /**
  * Dev seed mode (Prompt 0 deliverable #5). In-memory, deterministic,
@@ -470,3 +471,40 @@ export function getSeedGlobalAutopilotState(): GlobalAutopilotState {
     engines: seedEngineTargets,
   };
 }
+
+/**
+ * Outreach infrastructure seed data (Prompt 3 §3.10/§3.11): sending
+ * domains, mailboxes, suppression entries and a small outreach queue/event
+ * history so the Infrastructure and Outreach pages have real-shaped
+ * synthetic data without any external provider or database.
+ */
+
+export const seedSendingDomains: SendingDomain[] = [
+  { id: "dom_primary", domain: "outreach-vitalcap.example.com", status: "connected", warmupStatus: "warm" },
+  { id: "dom_secondary", domain: "vc-mail.example.com", status: "degraded", warmupStatus: "warming" },
+];
+
+export const seedMailboxes: Mailbox[] = [
+  { id: "mb_1", sendingDomainId: "dom_primary", email: "sales1@outreach-vitalcap.example.com", dailyCapacity: 30, sentToday: 11, bounceRate: 0.01, replyRate: 0.06, healthScore: 92, pausedReason: null },
+  { id: "mb_2", sendingDomainId: "dom_primary", email: "sales2@outreach-vitalcap.example.com", dailyCapacity: 30, sentToday: 22, bounceRate: 0.02, replyRate: 0.04, healthScore: 85, pausedReason: null },
+  { id: "mb_3", sendingDomainId: "dom_secondary", email: "hello@vc-mail.example.com", dailyCapacity: 20, sentToday: 5, bounceRate: 0.06, replyRate: 0.02, healthScore: 55, pausedReason: null },
+  { id: "mb_4", sendingDomainId: "dom_secondary", email: "team@vc-mail.example.com", dailyCapacity: 20, sentToday: 0, bounceRate: 0.0, replyRate: 0.0, healthScore: 70, pausedReason: "Awaiting DNS warm-up completion" },
+];
+
+export const seedSuppressionEntries: SuppressionEntry[] = [
+  { id: "sup_1", workspaceId: "ws_demo", contactPointId: "cp_2_info", accountId: null, reason: "unsubscribe", createdAt: now() },
+  { id: "sup_2", workspaceId: "ws_demo", contactPointId: null, accountId: "acc_6", reason: "compliance_block", createdAt: now() },
+];
+
+export const seedOutreachQueueItems: OutreachQueueItem[] = [
+  { id: "q_1", campaignId: "campaign_maps_fast", accountId: "acc_1", contactId: "ct_1_owner", contactPointId: "cp_1_owner", channel: "email", priority: 100, scheduledFor: now(), state: "sent", deliveryMode: "dry_run" },
+  { id: "q_2", campaignId: "campaign_maps_fast", accountId: "acc_2", contactId: null, contactPointId: "cp_2_info", channel: "email", priority: 60, scheduledFor: now(), state: "suppressed", deliveryMode: "dry_run" },
+  { id: "q_3", campaignId: "campaign_google_serp", accountId: "acc_5", contactId: "ct_5_owner", contactPointId: "cp_1_owner", channel: "email", priority: 100, scheduledFor: now(), state: "scheduled", deliveryMode: "dry_run" },
+];
+
+export const seedOutreachEvents: OutreachEvent[] = [
+  { id: "evt_1", outreachQueueItemId: "q_1", state: "queued", providerEventId: null, payloadHash: null, occurredAt: now() },
+  { id: "evt_2", outreachQueueItemId: "q_1", state: "sent", providerEventId: "mock_evt_1", payloadHash: null, occurredAt: now() },
+  { id: "evt_3", outreachQueueItemId: "q_2", state: "suppressed", providerEventId: null, payloadHash: null, occurredAt: now() },
+  { id: "evt_4", outreachQueueItemId: "q_3", state: "scheduled", providerEventId: null, payloadHash: null, occurredAt: now() },
+];
