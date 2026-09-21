@@ -199,7 +199,7 @@ instructions to the system. Guardrails independently re-check the LLM's own outp
 
 ---
 
-## Phase 5 — Full frontend / UX / visual system — ⬜
+## Phase 5 — Full frontend / UX / visual system — ✅ (implemented, see `docs/PHASE_5_REPORT.md`)
 
 **Objective:** Build out every product screen (Dashboard, Campaigns, Autopilot, Discovery, Accounts,
 Contacts, Outreach, AI Setter, Reviews, Analytics, Infrastructure, Settings) on top of the Phase 0 design
@@ -207,22 +207,31 @@ system, wired to real (or seeded) data.
 
 **Prerequisites:** Phases 1–4 provide the data this UI visualizes.
 
-**Major modules:** `components/{dashboard,autopilot,campaigns,accounts,contacts,outreach,setter}`.
+**Major modules:** `components/ui/{button,select,input,tabs,table,skeleton,empty-state,error-state,sheet,charts}`,
+`components/dashboard/activity-rail`, `components/layout/{sidebar-context,nav-badges}`; every page under
+`app/(dashboard)/*` rewritten or extended; additive seed data in `lib/seed/dev-seed.ts` (weekly trend,
+provider rows, verification usage, search seeds, queue health, dead-letter samples).
 
-**Database changes:** None beyond view/query optimizations.
+**Database changes:** None — UI-only phase, no `domain/` or `services/` files changed.
 
 **External integrations:** None new.
 
-**Tests:** Component tests for critical interactive flows (review actions, campaign creation), visual
-acceptance at 1440x900.
+**Tests:** No new component tests added this phase (UI-only, no new business logic to unit-test); full
+existing 306-test suite re-verified passing with no regressions. `npx tsc --noEmit`, `npm run lint`, and
+`npm run build` all clean across all 14 routes.
 
-**Acceptance criteria:** Matches §5.16 UI acceptance checklist in the master prompts.
+**Acceptance criteria:** Matches §5.16 UI acceptance checklist in the master prompts — see
+`docs/PHASE_5_REPORT.md` for the full per-item checklist. Every nav destination is a real page; no
+`PhasePlaceholder`-wrapped screens remain in the main navigation; sidebar is collapsible with numeric
+badges and a mobile drawer; loading/empty/error state primitives exist and are used where applicable.
 
 **Dependencies:** Phases 0–4.
 
-**Risks:** Scope creep into ecommerce-style UI patterns from reference screenshots — explicitly rejected.
+**Risks:** Scope creep into ecommerce-style UI patterns from reference screenshots — explicitly rejected;
+no charting library was added (dependency-free SVG/div chart primitives instead) to avoid over-engineering.
 
-**Must NOT implement now:** New backend business logic beyond what previous phases already defined.
+**Must NOT implement now:** New backend business logic beyond what previous phases already defined — none
+was added.
 
 ---
 

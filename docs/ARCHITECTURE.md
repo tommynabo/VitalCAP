@@ -116,3 +116,34 @@ See [`docs/DECISIONS.md`](./DECISIONS.md) for the full ADR log.
 
 See [`docs/DECISIONS.md`](./DECISIONS.md) for the full ADR log (ADR-015 through ADR-018 cover this phase).
 
+## 9. Phase 5 additions (Full frontend / UX / visual system)
+
+UI-only phase — no `domain/` or `services/` files changed.
+
+- **`components/ui/`** grew to a full primitive set: `button.tsx`, `select.tsx`, `input.tsx`, `tabs.tsx`
+  (render-prop, controlled/uncontrolled), `table.tsx`, `skeleton.tsx` (+ `PageSkeleton`), `empty-state.tsx`,
+  `error-state.tsx` (expandable "technical details" instead of a raw dump), `sheet.tsx` (portal-based
+  right-side drawer for account/campaign detail), `charts.tsx` (dependency-free `MiniBarChart`/
+  `FunnelChart`/`MixBar` — no charting library was added).
+- **`components/layout/sidebar-context.tsx`**: `SidebarProvider`/`useSidebar()` — collapsed state
+  (persisted to `localStorage`) and mobile drawer open state, consumed by the rewritten `Sidebar`/`TopBar`.
+- **`components/layout/nav-badges.ts`**: `getNavBadgeCounts()` computes nav badge counts from seed data,
+  kept separate from the pure `nav-config.ts` by design.
+- **`components/dashboard/activity-rail.tsx`**: consolidated "needs your attention" feed (provider alerts,
+  rebalance activity, pending reviews, mailbox issues, verification quota warnings) replacing the narrower
+  Phase-0-era rebalance-only rail on the Dashboard.
+- **`lib/seed/dev-seed.ts`** (additive only): `seedWeeklyTrend`, `seedProviderRows`,
+  `seedEmailVerificationUsage`, `seedSearchSeeds`, `seedQueueHealth`, `seedDeadLetterSamples`.
+- **Every page under `app/(dashboard)/*`** rewritten or extended to a real screen: Dashboard (activity
+  rail + trend/mix/funnel/top-campaign sections), Campaigns (richer table + `Sheet` detail with 8 tabs +
+  guided creation form), Autopilot (flagship: pause/resume/emergency-stop banner, target allocation bars,
+  queue health, provider health/dead-letter), Discovery (search-seed coverage table, built from placeholder),
+  Accounts (`Sheet` detail drawer), Contacts (generic-vs-named visual distinction in one table), Outreach
+  (tab-based queue: Scheduled/Sent/Replies/Failed/Suppressed, mix chart, sender pool health), Reviews
+  (keyboard shortcuts A/E/R/S/N with same-key-twice confirmation), Analytics (full funnel + breakdowns,
+  built from placeholder, deliberately no single "best engine" score), Infrastructure (placeholder wrapper
+  removed), Settings (real workspace/offer/user page, built from placeholder).
+- **`PhasePlaceholder` retirement**: no page in the main navigation uses the Phase-0-era placeholder
+  wrapper anymore (§5.16 "no debug screens in main navigation"); the component file itself is kept but
+  unused.
+

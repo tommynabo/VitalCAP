@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import {
@@ -36,12 +36,12 @@ const STATE_VARIANT: Record<ConversationState, "success" | "warning" | "danger" 
   human_owned: "neutral",
 };
 
-const REVIEW_ACTIONS: Array<{ decision: ReviewDecision; label: string }> = [
-  { decision: "approve", label: "Approve" },
-  { decision: "edit_and_send", label: "Edit & Send" },
-  { decision: "reject", label: "Reject" },
-  { decision: "escalate", label: "Escalate" },
-  { decision: "suppress", label: "Suppress" },
+const REVIEW_ACTIONS: Array<{ decision: ReviewDecision; label: string; shortcut: string }> = [
+  { decision: "approve", label: "Approve", shortcut: "A" },
+  { decision: "edit_and_send", label: "Edit & Send", shortcut: "E" },
+  { decision: "reject", label: "Reject", shortcut: "R" },
+  { decision: "escalate", label: "Escalate", shortcut: "Esc" },
+  { decision: "suppress", label: "Suppress", shortcut: "S" },
 ];
 
 export default function ReviewsPage() {
@@ -60,6 +60,7 @@ export default function ReviewsPage() {
 
   const [selectedConversationId, setSelectedConversationId] = useState(seedConversations[0]?.id ?? null);
   const [lastAction, setLastAction] = useState<string | null>(null);
+  const [pendingDecision, setPendingDecision] = useState<ReviewDecision | null>(null);
 
   const selectedConversation = seedConversations.find((conversation) => conversation.id === selectedConversationId) ?? null;
   const thread = selectedConversation ? (messagesByConversationId.get(selectedConversation.id) ?? []) : [];
@@ -67,6 +68,52 @@ export default function ReviewsPage() {
   const draft = latestIncoming ? (draftsByMessageId.get(latestIncoming.id) ?? null) : null;
   const account = selectedConversation ? accountsById.get(selectedConversation.accountId) : null;
   const campaign = selectedConversation ? campaignsById.get(selectedConversation.campaignId) : null;
+
+  const applyDecision = useCallback(
+    (decision: ReviewDecision) => {
+      const action = REVIEW_ACTIONS.find((a) => a.decision === decision);
+      setLastAction(`${action?.label ?? decision} recorded for ${selectedConversation?.id ?? "conversation"} (dev-seed demo, not persisted).`);
+      setPendingDecision(null);
+    },
+    [selectedConversation],
+  );
+
+  const goToNext = useCallback(() => {
+    const index = seedConversations.findIndex((c) => c.id === selectedConversationId);
+    const next = seedConversations[(index + 1) % seedConversations.length];
+    if (next) setSelectedConversationId(next.id);
+  }, [selectedConversationId]);
+
+  // Keyboard shortcuts (Prompt 5 §5.11): A=approve, E=edit&send, R=reject,
+  // S=suppress, N=next conversation. Approve/edit/reject/suppress require a
+  // second keypress confirmation so an accidental key never triggers a send.
+  useEffect(() => {
+    function handleKeyDown(event: KeyboardEvent) {
+      const target = event.target as HTMLElement | null;
+      if (target && ["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName)) return;
+      if (event.metaKey || event.ctrlKey || event.altKey) return;
+
+      const key = event.key.toLowerCase();
+      if (key === "n") {
+        setPendingDecision(null);
+        goToNext();
+        return;
+      }
+      if (!draft) return;
+
+      const map: Record<string, ReviewDecision> = { a: "approve", e: "edit_and_send", r: "reject", s: "suppress" };
+      const decision = map[key];
+      if (!decision) return;
+
+      if (pendingDecision === decision) {
+        applyDecision(decision);
+      } else {
+        setPendingDecision(decision);
+      }
+    }
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [draft, pendingDecision, applyDecision, goToNext]);
 
   return (
     <div className="space-y-4">
@@ -78,9 +125,18 @@ export default function ReviewsPage() {
         <CardContent>
           <p className="text-sm text-text-muted">
             Every AI draft requires human review before sending (§4.7). Approve, edit, reject, escalate or suppress from the
-            right-hand panel.
+            right-hand panel, or use keyboard shortcuts: <span className="font-medium text-text">A</span> approve ·{" "}
+            <span className="font-medium text-text">E</span> edit & send · <span className="font-medium text-text">R</span> reject ·{" "}
+            <span className="font-medium text-text">S</span> suppress · <span className="font-medium text-text">N</span> next. Press the
+            same key twice to confirm — a single keypress never sends anything.
           </p>
           {lastAction ? <p className="mt-2 text-sm font-medium text-primary">{lastAction}</p> : null}
+          {pendingDecision ? (
+            <p className="mt-2 text-sm font-medium text-warning">
+              Press {REVIEW_ACTIONS.find((a) => a.decision === pendingDecision)?.shortcut} again to confirm{" "}
+              {REVIEW_ACTIONS.find((a) => a.decision === pendingDecision)?.label}.
+            </p>
+          ) : null}
         </CardContent>
       </Card>
 
@@ -96,7 +152,10 @@ export default function ReviewsPage() {
                 <button
                   key={conversation.id}
                   type="button"
-                  onClick={() => setSelectedConversationId(conversation.id)}
+                  onClick={() => {
+                    setSelectedConversationId(conversation.id);
+                    setPendingDecision(null);
+                  }}
                   className={`w-full rounded-md border px-3 py-2 text-left text-sm transition ${
                     conversation.id === selectedConversationId ? "border-primary bg-primary-soft" : "border-border bg-surface"
                   }`}
@@ -182,12 +241,14 @@ export default function ReviewsPage() {
                     <button
                       key={action.decision}
                       type="button"
-                      onClick={() =>
-                        setLastAction(`${action.label} recorded for ${selectedConversation?.id ?? "conversation"} (dev-seed demo, not persisted).`)
-                      }
-                      className="rounded-md border border-border bg-surface px-3 py-1.5 text-xs font-medium text-text transition hover:bg-surface-muted"
+                      onClick={() => applyDecision(action.decision)}
+                      className={`rounded-md border px-3 py-1.5 text-xs font-medium transition ${
+                        pendingDecision === action.decision
+                          ? "border-warning bg-warning-soft text-warning"
+                          : "border-border bg-surface text-text hover:bg-surface-muted"
+                      }`}
                     >
-                      {action.label}
+                      {action.label} <span className="text-text-muted">({action.shortcut})</span>
                     </button>
                   ))}
                 </div>

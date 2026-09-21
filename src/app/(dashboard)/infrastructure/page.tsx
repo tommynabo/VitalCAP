@@ -1,9 +1,14 @@
 import { KpiStat } from "@/components/dashboard/kpi-stat";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { PhasePlaceholder } from "@/components/shared/phase-placeholder";
 import { summarizeSenderPoolCapacity } from "@/services/outreach/sender-pool-service";
-import { seedMailboxes, seedSendingDomains } from "@/lib/seed/dev-seed";
+import {
+  seedEmailVerificationUsage,
+  seedMailboxes,
+  seedProviderRows,
+  seedSendingDomains,
+  type ProviderRowStatus,
+} from "@/lib/seed/dev-seed";
 import type { SendingDomain } from "@/domain/outreach/types";
 
 const DOMAIN_STATUS_VARIANT: Record<SendingDomain["status"], "success" | "warning" | "danger" | "neutral"> = {
@@ -13,29 +18,21 @@ const DOMAIN_STATUS_VARIANT: Record<SendingDomain["status"], "success" | "warnin
   missing_configuration: "neutral",
 };
 
-type ProviderRowStatus = "connected" | "degraded" | "paused" | "missing_configuration";
-
 const PROVIDER_STATUS_VARIANT: Record<ProviderRowStatus, "success" | "warning" | "danger" | "neutral"> = DOMAIN_STATUS_VARIANT;
-
-const providerRows: Array<{ name: string; status: ProviderRowStatus; detail: string }> = [
-  { name: "Email delivery (Instantly)", status: "connected", detail: "Mock adapter active — no live API key configured" },
-  { name: "SMS delivery", status: "connected", detail: "Mock adapter active — no live API key configured" },
-  { name: "Email verification", status: "connected", detail: "Mock adapter active" },
-  { name: "Maps discovery", status: "connected", detail: "Mock adapter active" },
-  { name: "Google SERP", status: "connected", detail: "Mock adapter active" },
-  { name: "LLM (setter drafts)", status: "missing_configuration", detail: "Owned by Phase 4" },
-  { name: "Outreach webhooks", status: "connected", detail: "Signature verification enforced (HMAC-SHA256)" },
-];
 
 export default function InfrastructurePage() {
   const capacity = summarizeSenderPoolCapacity({ mailboxes: seedMailboxes, sendingDomains: seedSendingDomains });
 
   return (
-    <PhasePlaceholder
-      title="Infrastructure"
-      phase="Prompt 3"
-      description="Domains, mailboxes, email/SMS/verification/search/LLM provider status and webhook health are implemented in Phase 3. No secret values are ever displayed after save."
-    >
+    <div className="space-y-6">
+      <div>
+        <h2 className="text-xl font-semibold tracking-tight text-text">Infrastructure</h2>
+        <p className="text-sm text-text-muted">
+          Sending domains, mailboxes and every external provider adapter this workspace depends on. No secret
+          values are ever displayed after save.
+        </p>
+      </div>
+
       <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-5">
         <KpiStat label="Remaining capacity" value={String(capacity.totalRemainingCapacity)} emphasize />
         <KpiStat label="Daily capacity" value={String(capacity.totalDailyCapacity)} />
@@ -44,7 +41,7 @@ export default function InfrastructurePage() {
         <KpiStat label="Paused / unhealthy" value={String(capacity.pausedOrUnhealthyMailboxCount)} />
       </div>
 
-      <div className="mt-6 grid gap-4 lg:grid-cols-2">
+      <div className="grid gap-4 lg:grid-cols-2">
         <Card>
           <CardHeader>
             <CardTitle>Sending domains</CardTitle>
@@ -82,24 +79,41 @@ export default function InfrastructurePage() {
         </Card>
       </div>
 
-      <div className="mt-6">
-        <Card>
-          <CardHeader>
-            <CardTitle>Provider status</CardTitle>
-          </CardHeader>
-          <CardContent className="space-y-3">
-            {providerRows.map((row) => (
-              <div key={row.name} className="flex items-center justify-between rounded-md border border-border px-3 py-2">
-                <div>
-                  <p className="text-sm font-medium text-text">{row.name}</p>
-                  <p className="text-xs text-text-muted">{row.detail}</p>
-                </div>
-                <Badge variant={PROVIDER_STATUS_VARIANT[row.status]}>{row.status.replace("_", " ")}</Badge>
+      <Card>
+        <CardHeader>
+          <CardTitle>Provider status</CardTitle>
+          <span className="text-xs text-text-muted">Last successful call: just now (mock mode)</span>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          {seedProviderRows.map((row) => (
+            <div key={row.name} className="flex items-center justify-between rounded-md border border-border px-3 py-2">
+              <div>
+                <p className="text-sm font-medium text-text">{row.name}</p>
+                <p className="text-xs text-text-muted">{row.detail}</p>
               </div>
-            ))}
-          </CardContent>
-        </Card>
-      </div>
-    </PhasePlaceholder>
+              <Badge variant={PROVIDER_STATUS_VARIANT[row.status]}>{row.status.replace("_", " ")}</Badge>
+            </div>
+          ))}
+          <div className="flex items-center justify-between rounded-md border border-border px-3 py-2">
+            <div>
+              <p className="text-sm font-medium text-text">Email verification quota</p>
+              <p className="text-xs text-text-muted">
+                {seedEmailVerificationUsage.items} verified this month · {seedEmailVerificationUsage.errors} errors
+              </p>
+            </div>
+            <Badge
+              variant={
+                seedEmailVerificationUsage.quotaRemaining !== null && seedEmailVerificationUsage.quotaRemaining < 150
+                  ? "warning"
+                  : "success"
+              }
+            >
+              {seedEmailVerificationUsage.quotaRemaining ?? "—"} remaining
+            </Badge>
+          </div>
+        </CardContent>
+      </Card>
+    </div>
   );
 }
+

@@ -4,6 +4,9 @@ import type { Campaign, Offer } from "@/domain/campaigns/types";
 import type { Conversation, ConversationMessage, Meeting, SetterDraft, SetterFeedback } from "@/domain/conversations/types";
 import type { EngineTargetState, GlobalAutopilotState, RebalanceDecision } from "@/domain/autopilot/types";
 import type { Mailbox, OutreachEvent, OutreachQueueItem, SendingDomain, SuppressionEntry } from "@/domain/outreach/types";
+import type { SearchSeed } from "@/domain/discovery/types";
+import type { ProviderUsageStats } from "@/domain/providers/types";
+import { hashString, seededRandom } from "@/infrastructure/providers/deterministic-fixtures";
 
 /**
  * Dev seed mode (Prompt 0 deliverable #5). In-memory, deterministic,
@@ -607,5 +610,94 @@ export const seedSetterFeedback: SetterFeedback[] = [
 
 export const seedMeetings: Meeting[] = [
   { id: "meeting_1", conversationId: "conv_2", scheduledFor: now(), bookingUrl: seedOffer.bookingUrl, createdAt: now() },
+];
+
+/**
+ * Dashboard weekly trend seed (Prompt 5 §5.3 "weekly reply/meeting trend").
+ * Deterministic via the shared `hashString`/`seededRandom` fixture pattern
+ * (Phase 2) so the trend is stable across renders/tests, not pure noise.
+ */
+export interface WeeklyTrendPoint {
+  label: string;
+  replies: number;
+  meetings: number;
+}
+
+export const seedWeeklyTrend: WeeklyTrendPoint[] = (
+  ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"] as const
+).map((label, index) => {
+  const rand = seededRandom(hashString(`weekly-trend-${label}-${index}`));
+  return {
+    label,
+    replies: 3 + Math.round(rand() * 9),
+    meetings: Math.round(rand() * 3),
+  };
+});
+
+/**
+ * Infrastructure/dashboard provider status rows (Prompt 3 §3.10, Prompt 5
+ * §5.13). Shared between `/infrastructure` and the dashboard activity rail
+ * so the two screens never disagree about provider health.
+ */
+export type ProviderRowStatus = "connected" | "degraded" | "paused" | "missing_configuration";
+
+export const seedProviderRows: Array<{ name: string; status: ProviderRowStatus; detail: string }> = [
+  { name: "Email delivery (Instantly)", status: "connected", detail: "Mock adapter active — no live API key configured" },
+  { name: "SMS delivery", status: "connected", detail: "Mock adapter active — no live API key configured" },
+  { name: "Email verification", status: "connected", detail: "Mock adapter active" },
+  { name: "Maps discovery", status: "connected", detail: "Mock adapter active" },
+  { name: "Google SERP", status: "connected", detail: "Mock adapter active" },
+  { name: "LLM (setter drafts)", status: "connected", detail: "Mock adapter active (MockLLMProvider) — no real LLM API key configured" },
+  { name: "Outreach webhooks", status: "connected", detail: "Signature verification enforced (HMAC-SHA256)" },
+];
+
+export const seedEmailVerificationUsage: ProviderUsageStats = {
+  calls: 182,
+  items: 640,
+  errors: 3,
+  totalLatencyMs: 91000,
+  costUsd: 6.4,
+  quotaRemaining: 120,
+};
+
+/**
+ * Discovery search-seed catalog (Prompt 2 §2.4 `SearchSeed`, Prompt 5 §5.6).
+ * A small, varied set of query/geography pairs per engine spanning
+ * high-yield, average and exhausted/low-yield seeds.
+ */
+export const seedSearchSeeds: SearchSeed[] = [
+  { id: "seed_1", campaignId: "campaign_maps_fast", engineType: "maps_fast", query: "farmacia", geography: "Sevilla", lastRunAt: now(), totalRaw: 210, totalUnique: 165, totalReady: 98, yieldRate: 0.59, exhaustionScore: 0.2, nextEligibleAt: null },
+  { id: "seed_2", campaignId: "campaign_maps_fast", engineType: "maps_fast", query: "farmacia", geography: "Madrid", lastRunAt: now(), totalRaw: 340, totalUnique: 240, totalReady: 121, yieldRate: 0.5, exhaustionScore: 0.35, nextEligibleAt: null },
+  { id: "seed_3", campaignId: "campaign_maps_deep", engineType: "maps_deep", query: "parafarmacia", geography: "Valencia", lastRunAt: now(), totalRaw: 95, totalUnique: 80, totalReady: 22, yieldRate: 0.28, exhaustionScore: 0.55, nextEligibleAt: null },
+  { id: "seed_4", campaignId: "campaign_google_serp", engineType: "google_serp", query: "tienda nutrición deportiva", geography: "Barcelona", lastRunAt: now(), totalRaw: 130, totalUnique: 110, totalReady: 57, yieldRate: 0.52, exhaustionScore: 0.15, nextEligibleAt: null },
+  { id: "seed_5", campaignId: "campaign_linkedin_owner", engineType: "linkedin_owner", query: "titular farmacia", geography: "Bizkaia", lastRunAt: now(), totalRaw: 40, totalUnique: 33, totalReady: 5, yieldRate: 0.14, exhaustionScore: 0.82, nextEligibleAt: null },
+  { id: "seed_6", campaignId: "campaign_maps_fast", engineType: "maps_fast", query: "herbolario", geography: "Málaga", lastRunAt: now(), totalRaw: 60, totalUnique: 48, totalReady: 4, yieldRate: 0.08, exhaustionScore: 0.94, nextEligibleAt: null },
+];
+
+/**
+ * Job queue health snapshot (Prompt 2 §2.12 `evaluateQueueHealth` shape,
+ * Prompt 5 §5.5 Autopilot bottom section) — a static, plausible snapshot
+ * rather than a full `JobRecord[]` fixture, since only the aggregate
+ * numbers are rendered on the Autopilot page.
+ */
+export const seedQueueHealth = {
+  pendingCount: 34,
+  processingCount: 6,
+  deadLetterCount: 2,
+  oldestPendingAgeMs: 12 * 60 * 1000,
+  stuckProcessingCount: 0,
+  healthy: true,
+};
+
+export interface DeadLetterSample {
+  id: string;
+  jobType: string;
+  reason: string;
+  failedAt: string;
+}
+
+export const seedDeadLetterSamples: DeadLetterSample[] = [
+  { id: "dlq_1", jobType: "verify_contact_point", reason: "unauthorized: provider quota exhausted", failedAt: now() },
+  { id: "dlq_2", jobType: "send_outreach_message", reason: "permanent bounce: mailbox does not exist", failedAt: now() },
 ];
 

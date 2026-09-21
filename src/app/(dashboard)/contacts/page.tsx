@@ -1,50 +1,76 @@
+import { User, AtSign } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Table, TableBody, TableCell, TableHead, TableHeadCell, TableRow } from "@/components/ui/table";
 import { seedAccountBundles } from "@/lib/seed/dev-seed";
 
 export default function ContactsPage() {
-  const contacts = seedAccountBundles.flatMap(({ account, contacts: accountContacts }) =>
-    accountContacts.map((contact) => ({ contact, accountName: account.canonicalName })),
+  const namedContacts = seedAccountBundles.flatMap(({ account, contacts: accountContacts }) =>
+    accountContacts.map((contact) => ({ kind: "named" as const, contact, accountName: account.canonicalName })),
+  );
+
+  const genericEndpoints = seedAccountBundles.flatMap(({ account, contactPoints }) =>
+    contactPoints
+      .filter((cp) => cp.isGeneric && !cp.contactId)
+      .map((cp) => ({ kind: "generic" as const, contactPoint: cp, accountName: account.canonicalName })),
   );
 
   return (
     <Card>
       <CardHeader>
         <CardTitle>Contacts</CardTitle>
-        <Badge variant="primary">Seed data · Prompt 1 finalizes schema</Badge>
       </CardHeader>
       <CardContent>
         <p className="mb-4 text-sm text-text-muted">
-          Named decision makers from dev seed mode. Generic account-level endpoints (e.g. info@) are not
-          listed here as people — see the Accounts page for the full contact-point graph once Phase 1 ships.
+          Named decision makers are shown with a person badge; generic account-level endpoints (e.g. info@,
+          switchboard numbers) are shown muted below with a mailbox badge — they are channel endpoints, not people.
         </p>
-        <div className="overflow-x-auto rounded-[10px] border border-border">
-          <table className="w-full text-left text-sm">
-            <thead className="bg-surface-muted text-xs uppercase tracking-wide text-text-muted">
-              <tr>
-                <th className="px-4 py-2">Person</th>
-                <th className="px-4 py-2">Account</th>
-                <th className="px-4 py-2">Role</th>
-                <th className="px-4 py-2">Decision maker</th>
-              </tr>
-            </thead>
-            <tbody>
-              {contacts.map(({ contact, accountName }) => (
-                <tr key={contact.id} className="border-t border-border">
-                  <td className="px-4 py-2 font-medium text-text">{contact.fullName}</td>
-                  <td className="px-4 py-2 text-text-muted">{accountName}</td>
-                  <td className="px-4 py-2 text-text-muted">{contact.roleType.replace(/_/g, " ")}</td>
-                  <td className="px-4 py-2">
-                    <Badge variant={contact.isDecisionMaker ? "success" : "neutral"}>
-                      {contact.isDecisionMaker ? "Yes" : "No"}
-                    </Badge>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
+        <Table>
+          <TableHead>
+            <TableRow>
+              <TableHeadCell>Contact</TableHeadCell>
+              <TableHeadCell>Account</TableHeadCell>
+              <TableHeadCell>Role</TableHeadCell>
+              <TableHeadCell>Decision maker</TableHeadCell>
+            </TableRow>
+          </TableHead>
+          <TableBody>
+            {namedContacts.map(({ contact, accountName }) => (
+              <TableRow key={contact.id}>
+                <TableCell className="font-medium text-text">
+                  <span className="inline-flex items-center gap-1.5">
+                    <User className="h-3.5 w-3.5 text-primary" aria-hidden="true" />
+                    {contact.fullName}
+                  </span>
+                </TableCell>
+                <TableCell className="text-text-muted">{accountName}</TableCell>
+                <TableCell className="text-text-muted">{contact.roleType.replace(/_/g, " ")}</TableCell>
+                <TableCell>
+                  <Badge variant={contact.isDecisionMaker ? "success" : "neutral"}>
+                    {contact.isDecisionMaker ? "Yes" : "No"}
+                  </Badge>
+                </TableCell>
+              </TableRow>
+            ))}
+            {genericEndpoints.map(({ contactPoint, accountName }) => (
+              <TableRow key={contactPoint.id} className="opacity-70">
+                <TableCell className="text-text-muted">
+                  <span className="inline-flex items-center gap-1.5">
+                    <AtSign className="h-3.5 w-3.5" aria-hidden="true" />
+                    {contactPoint.value}
+                  </span>
+                </TableCell>
+                <TableCell className="text-text-muted">{accountName}</TableCell>
+                <TableCell>
+                  <Badge variant="neutral">Generic endpoint</Badge>
+                </TableCell>
+                <TableCell className="text-text-muted">—</TableCell>
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
       </CardContent>
     </Card>
   );
 }
+

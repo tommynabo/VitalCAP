@@ -1,19 +1,66 @@
 import { EngineCard } from "@/components/dashboard/engine-card";
 import { KpiStat } from "@/components/dashboard/kpi-stat";
-import { RebalanceActivity } from "@/components/dashboard/rebalance-activity";
+import { ActivityRail } from "@/components/dashboard/activity-rail";
+import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
+import { FunnelChart, MiniBarChart, MixBar } from "@/components/ui/charts";
 import { globalProgressPct } from "@/lib/autopilot/targets";
-import { getSeedGlobalAutopilotState, seedRebalanceDecisions } from "@/lib/seed/dev-seed";
+import {
+  getSeedGlobalAutopilotState,
+  seedAccountBundles,
+  seedCampaigns,
+  seedConversations,
+  seedMeetings,
+  seedOutreachQueueItems,
+  seedWeeklyTrend,
+} from "@/lib/seed/dev-seed";
+
+function greeting(): string {
+  const hour = new Date().getHours();
+  if (hour < 12) return "Good morning";
+  if (hour < 19) return "Good afternoon";
+  return "Good evening";
+}
 
 export default function DashboardPage() {
   const state = getSeedGlobalAutopilotState();
   const progressPct = globalProgressPct(state.dailyTarget, state.engines);
 
+  const totalContactPoints = seedAccountBundles.reduce((sum, b) => sum + b.contactPoints.length, 0);
+  const verifiedContactPoints = seedAccountBundles.reduce(
+    (sum, b) => sum + b.contactPoints.filter((cp) => cp.verificationStatus === "valid").length,
+    0,
+  );
+  const readyAccounts = seedAccountBundles.filter((b) => b.account.status === "outreach_ready").length;
+  const sentOrBeyond = seedOutreachQueueItems.filter((q) => q.state === "sent" || q.state === "delivered").length;
+  const funnelStages = [
+    { label: "Accounts", value: seedAccountBundles.length },
+    { label: "Contact points", value: totalContactPoints },
+    { label: "Verified", value: verifiedContactPoints },
+    { label: "Outreach ready", value: readyAccounts },
+    { label: "Sent", value: sentOrBeyond },
+    { label: "Replied", value: seedConversations.length },
+    { label: "Meetings", value: seedMeetings.length },
+  ];
+
+  const emailCount = seedOutreachQueueItems.filter((q) => q.channel === "email").length;
+  const smsCount = seedOutreachQueueItems.filter((q) => q.channel === "phone").length;
+
+  const topCampaigns = seedCampaigns
+    .map((campaign) => {
+      const conversations = seedConversations.filter((c) => c.campaignId === campaign.id);
+      const conversationIds = new Set(conversations.map((c) => c.id));
+      const meetings = seedMeetings.filter((m) => conversationIds.has(m.conversationId)).length;
+      return { campaign, replies: conversations.length, meetings };
+    })
+    .filter((row) => row.replies > 0)
+    .sort((a, b) => b.meetings - a.meetings || b.replies - a.replies);
+
   return (
     <div className="space-y-6">
       <div>
-        <h2 className="text-xl font-semibold tracking-tight text-text">Good morning</h2>
+        <h2 className="text-xl font-semibold tracking-tight text-text">{greeting()}</h2>
         <p className="text-sm text-text-muted">
           {new Date().toLocaleDateString("es-ES", { weekday: "long", day: "numeric", month: "long" })} · Autopilot
           status overview
@@ -45,7 +92,7 @@ export default function DashboardPage() {
           </CardContent>
         </Card>
 
-        <RebalanceActivity decisions={seedRebalanceDecisions} />
+        <ActivityRail />
       </div>
 
       <div>
@@ -56,6 +103,69 @@ export default function DashboardPage() {
           ))}
         </div>
       </div>
+
+      <div className="grid gap-4 lg:grid-cols-2">
+        <Card>
+          <CardHeader>
+            <CardTitle>Weekly reply / meeting trend</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <MiniBarChart data={seedWeeklyTrend.map((p) => ({ label: p.label, value: p.replies }))} />
+            <p className="mt-3 text-xs text-text-muted">
+              {seedWeeklyTrend.reduce((sum, p) => sum + p.meetings, 0)} meetings booked this week
+            </p>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle>Channel mix</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <MixBar
+              segments={[
+                { label: "Email", value: emailCount, colorClassName: "bg-primary" },
+                { label: "SMS", value: smsCount, colorClassName: "bg-warning" },
+              ]}
+            />
+          </CardContent>
+        </Card>
+      </div>
+
+      <div className="grid gap-4 lg:grid-cols-2">
+        <Card>
+          <CardHeader>
+            <CardTitle>Discovery-to-meeting funnel</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <FunnelChart stages={funnelStages} />
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle>Top campaign performance</CardTitle>
+          </CardHeader>
+          <CardContent>
+            {topCampaigns.length === 0 ? (
+              <p className="text-xs text-text-muted">No campaign has generated replies yet.</p>
+            ) : (
+              <ul className="space-y-3">
+                {topCampaigns.map(({ campaign, replies, meetings }) => (
+                  <li key={campaign.id} className="flex items-center justify-between text-sm">
+                    <span className="text-text">{campaign.name}</span>
+                    <span className="flex items-center gap-2">
+                      <Badge variant="neutral">{replies} replies</Badge>
+                      <Badge variant="success">{meetings} meetings</Badge>
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </CardContent>
+        </Card>
+      </div>
     </div>
   );
 }
+
