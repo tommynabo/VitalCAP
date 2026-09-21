@@ -176,3 +176,51 @@ export interface FetchedPage {
 export interface WebsiteFetcher {
   fetchPage(url: string): Promise<FetchedPage>;
 }
+
+/**
+ * AI Setter LLM contract (Prompt 4 §4.4/§4.5). The provider receives only a
+ * pre-built, whitelisted context object (never a raw DB dump) and must
+ * return the exact structured shape below — the caller re-validates the
+ * response with Zod regardless of what the provider claims to guarantee.
+ */
+export interface SetterPromptContext {
+  language: string;
+  offer: {
+    company: string;
+    description: string;
+    primaryCta: string;
+    bookingUrl: string;
+    approvedCommercialFacts: Record<string, unknown>;
+    approvedProductFacts: Record<string, unknown>;
+    approvedClaims: string[];
+    forbiddenClaims: string[];
+    faq: Array<{ question: string; answer: string }>;
+    objectionGuidance: Record<string, string>;
+    toneConfig: Record<string, unknown>;
+  };
+  account: { name: string; businessType: string };
+  contact: { roleType: string; firstName: string | null } | null;
+  discoverySource: string | null;
+  recentMessages: Array<{ direction: "incoming" | "outgoing"; body: string }>;
+  recentFeedbackNotes: string[];
+  latestIncomingMessage: string;
+  isRepairAttempt: boolean;
+}
+
+export interface SetterClassificationOutput {
+  language: string;
+  branch: string;
+  intentSummary: string;
+  confidence: number;
+  draft: string;
+  needsHuman: boolean;
+  reasonForHuman: string | null;
+  detectedFactsRequested: string[];
+  riskFlags: string[];
+  suggestedNextAction: string;
+}
+
+export interface LLMProvider {
+  readonly providerName: string;
+  classifyAndDraft(context: SetterPromptContext): Promise<{ output: SetterClassificationOutput; usage: ProviderUsageStats }>;
+}

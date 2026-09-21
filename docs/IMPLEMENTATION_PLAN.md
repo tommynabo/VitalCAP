@@ -151,31 +151,49 @@ item constructed by the orchestrator; flipping to live is out of this phase's sc
 
 ---
 
-## Phase 4 — AI Setter, reply classification, human review, learning loop — ⬜
+## Phase 4 — AI Setter, reply classification, human review, learning loop — ✅ (implemented, mock LLM only, see `docs/PHASE_4_REPORT.md`)
 
 **Objective:** Reply ingestion → deterministic pre-router → LLM classification (Zod-validated) → human
 review UI → structured feedback loop. Autonomy policy engine built but disabled.
 
 **Prerequisites:** Phase 3 conversations/outreach events exist.
 
-**Major modules:** `domain/conversations`, `services/setter`, `infrastructure/providers/llm`.
+**Major modules:** `domain/conversations` (extended with `providerThreadId`, `detectedFactsRequested`,
+`suggestedNextAction`, `SetterFeedback.meetingOutcome`/`qualified`/`lostReason`), `domain/providers`
+(`LLMProvider`, `SetterPromptContext`, `SetterClassificationOutput`), `services/setter` (pre-router,
+context builder, Zod output schema, guardrails, classify-and-draft retry/fallback orchestration, reply
+ingestion, human review service, feedback analytics, autonomy policy engine, warm follow-up scheduler,
+setter orchestrator), `infrastructure/providers/llm` (`MockLLMProvider`).
 
-**Database changes:** `conversations`, `conversation_messages`, `setter_drafts`, `setter_feedback`,
-`meetings` finalized with branch catalog config table.
+**Database changes:** None applied — `conversations`, `conversation_messages`, `setter_drafts`,
+`setter_feedback`, `meetings` remain Phase 1's unapplied SQL shapes; Phase 4 only builds the pure-function
+services and in-memory seed data against those already-designed shapes (domain types extended additively,
+no breaking changes).
 
-**External integrations:** LLM provider (interface + mock by default), email/SMS reply webhooks
-(idempotent ingestion).
+**External integrations:** LLM provider — mock-only (`MockLLMProvider`) this phase, deterministic
+keyword classification + template drafting reusing Phase 2's `hashString`/`seededRandom` fixture
+pattern. No real LLM API is called.
 
-**Tests:** Idempotent webhook replays, deterministic pre-router overriding LLM on unsubscribe/bounce,
-guardrail tests (no invented claims), human-in-the-loop gating.
+**Tests:** Deterministic pre-router (unsubscribe/do-not-contact/hard-negative/OOO/bounce/meeting-booked/
+wrong-person/spam) always suppressing before any LLM call; guardrails rejecting invented forbidden
+claims and escalating non-approved commercial negotiation; Zod-validated structured output with a
+retry-once-then-`HUMAN_REQUIRED`-fallback path; idempotent reply webhook ingestion (dedup by
+`providerMessageId`); all six human review actions; feedback analytics (branch accuracy, approval/edit/
+rejection rate, confidence calibration); autonomy policy engine (built, never wired to an actual send);
+warm follow-up queue (pause on reply/meeting/unsubscribe/human ownership); a `simulate-setter-day.test.ts`
+integration test — 76 setter-scoped tests (306 total repo-wide), all passing.
 
-**Acceptance criteria:** `auto_send_enabled=false` globally; every reply requires human action before
-send.
+**Acceptance criteria:** `AUTO_SEND_ENABLED = false` globally (hardcoded constant, not read by any send
+path) — **met**; every reply requires human action before send — **met**: `processIncomingReply` only
+ever produces a `pending_review`/`suppressed`/`pre_routed` conversation state, never `sent`, and
+`applyReviewDecision` is the only function that can move a conversation to `sent`.
 
 **Dependencies:** Phases 1–3.
 
-**Risks:** Prompt injection via inbound replies — mitigated by treating reply text as untrusted data,
-never as instructions to the system.
+**Risks:** Prompt injection via inbound replies — mitigated by treating reply text as untrusted data
+passed through a whitelisted `SetterPromptContext` (never raw DB dumps, never instructions), never as
+instructions to the system. Guardrails independently re-check the LLM's own output rather than trusting
+`needsHuman`/`riskFlags` as reported.
 
 **Must NOT implement now:** Enabling autosend, medical/commercial claim generation beyond approved facts.
 

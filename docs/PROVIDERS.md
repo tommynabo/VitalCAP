@@ -22,14 +22,21 @@ All three domain-interface mocks share `src/infrastructure/providers/determinist
 
 `runOutreachDryRunCycle` (`src/services/outreach/outreach-orchestrator.ts`) never imports either mock provider — the dry-run orchestrator only ever records planned `OutreachQueueItem`/`OutreachEvent` rows, so a real send requires a separate, explicit live-mode code path that does not exist yet.
 
-## Intended interfaces (Phase 3+, not yet implemented)
+## Implemented adapters (Phase 4 — mock only, no real API calls)
+
+| Interface | Mock adapter | Notes |
+|---|---|---|
+| `LLMProvider` | `src/infrastructure/providers/llm/mock-provider.ts` (`MockLLMProvider`) | Deterministic keyword classifier + template drafting over the whitelisted `SetterPromptContext` (never a raw DB dump); confidence rolls reuse the shared `hashString`/`seededRandom` fixture pattern; `needsHuman` is forced for `COMMERCIAL_TERMS`/`NOT_DECISION_MAKER`/`UNKNOWN`. |
+
+Every `MockLLMProvider` response is still re-validated by `services/setter/setter-output-schema.ts` (Zod) and passed through `services/setter/guardrails.ts` before being trusted — the mock's own honesty is never assumed. `AUTO_SEND_ENABLED` (`services/setter/autonomy-policy.ts`) is a hardcoded `false` constant not read by any send path.
+
+## Intended interfaces (Phase 5+, not yet implemented)
 
 | Interface | Consumed by | Infrastructure home |
 |---|---|---|
-| `CalendarProvider` (if needed) | meeting booking confirmation | not yet allocated a folder — add under `infrastructure/providers/` when Phase 4/5 needs it |
-| `LLMProvider` | AI Setter drafting/classification | `src/infrastructure/providers/llm/` |
+| `CalendarProvider` (if needed) | meeting booking confirmation | not yet allocated a folder — add under `infrastructure/providers/` when a later phase needs it |
 
-Each folder currently contains only a `README.md` documenting its future ownership — no logic, no mock implementations yet, per the instruction not to fabricate placeholder architecture beyond what's needed to name the slot.
+That folder currently contains only a `README.md` documenting its future ownership — no logic, no mock implementations yet, per the instruction not to fabricate placeholder architecture beyond what's needed to name the slot.
 
 ## Rules for when these are implemented (Phase 3+)
 

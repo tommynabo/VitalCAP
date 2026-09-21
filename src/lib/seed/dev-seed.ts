@@ -1,6 +1,7 @@
 import type { Account, AccountSource } from "@/domain/accounts/types";
 import type { Contact, ContactPoint } from "@/domain/contacts/types";
 import type { Campaign, Offer } from "@/domain/campaigns/types";
+import type { Conversation, ConversationMessage, Meeting, SetterDraft, SetterFeedback } from "@/domain/conversations/types";
 import type { EngineTargetState, GlobalAutopilotState, RebalanceDecision } from "@/domain/autopilot/types";
 import type { Mailbox, OutreachEvent, OutreachQueueItem, SendingDomain, SuppressionEntry } from "@/domain/outreach/types";
 
@@ -508,3 +509,103 @@ export const seedOutreachEvents: OutreachEvent[] = [
   { id: "evt_3", outreachQueueItemId: "q_2", state: "suppressed", providerEventId: null, payloadHash: null, occurredAt: now() },
   { id: "evt_4", outreachQueueItemId: "q_3", state: "scheduled", providerEventId: null, payloadHash: null, occurredAt: now() },
 ];
+
+/**
+ * AI Setter seed data (Prompt 4 §4.1/§4.7/§4.8/§4.11): a small set of
+ * conversations at different points in the review pipeline so the Reviews
+ * inbox and Setter dashboard have real-shaped synthetic data.
+ */
+
+export const seedConversations: Conversation[] = [
+  {
+    id: "conv_1",
+    workspaceId: "ws_demo",
+    accountId: "acc_1",
+    contactId: "ct_1_owner",
+    campaignId: "campaign_maps_fast",
+    offerId: seedOffer.id,
+    channel: "email",
+    providerThreadId: "instantly_thread_1",
+    state: "pending_review",
+    latestIntent: "PRICE",
+    createdAt: now(),
+    updatedAt: now(),
+  },
+  {
+    id: "conv_2",
+    workspaceId: "ws_demo",
+    accountId: "acc_5",
+    contactId: "ct_5_owner",
+    campaignId: "campaign_google_serp",
+    offerId: seedOffer.id,
+    channel: "email",
+    providerThreadId: "instantly_thread_2",
+    state: "sent",
+    latestIntent: "MEETING_REQUEST",
+    createdAt: now(),
+    updatedAt: now(),
+  },
+  {
+    id: "conv_3",
+    workspaceId: "ws_demo",
+    accountId: "acc_2",
+    contactId: null,
+    campaignId: "campaign_maps_fast",
+    offerId: seedOffer.id,
+    channel: "email",
+    providerThreadId: "instantly_thread_3",
+    state: "suppressed",
+    latestIntent: "UNSUBSCRIBE",
+    createdAt: now(),
+    updatedAt: now(),
+  },
+];
+
+export const seedConversationMessages: ConversationMessage[] = [
+  { id: "cmsg_1", conversationId: "conv_1", direction: "incoming", body: "Hola, ¿qué precio tienen para pedidos de farmacia?", channel: "email", providerMessageId: "instantly_msg_1", metadata: {}, createdAt: now() },
+  { id: "cmsg_2", conversationId: "conv_2", direction: "incoming", body: "Nos interesa, ¿podemos agendar una llamada?", channel: "email", providerMessageId: "instantly_msg_2", metadata: {}, createdAt: now() },
+  { id: "cmsg_3", conversationId: "conv_2", direction: "outgoing", body: "Perfecto, encantados de coordinar. ¿Le viene bien que agendemos una breve llamada con nuestro director comercial?", channel: "email", providerMessageId: null, metadata: { reviewDecision: "approve" }, createdAt: now() },
+  { id: "cmsg_4", conversationId: "conv_3", direction: "incoming", body: "Por favor, dadme de baja de esta lista.", channel: "email", providerMessageId: "instantly_msg_3", metadata: {}, createdAt: now() },
+];
+
+export const seedSetterDrafts: SetterDraft[] = [
+  {
+    id: "draft_1",
+    conversationMessageId: "cmsg_1",
+    language: "es",
+    branch: "PRICE",
+    intentSummary: "Lead message classified as PRICE",
+    confidence: 0.82,
+    draft: "Gracias por su interés. Para compartir precios y condiciones concretas, lo mejor es una breve llamada. ¿Le viene bien que agendemos una breve llamada con nuestro director comercial? https://example.com/configure-booking-url",
+    needsHuman: false,
+    reasonForHuman: null,
+    detectedFactsRequested: ["price"],
+    riskFlags: [],
+    suggestedNextAction: "await_human_review",
+    createdAt: now(),
+  },
+];
+
+export const seedSetterFeedback: SetterFeedback[] = [
+  {
+    id: "fb_1",
+    conversationMessageId: "cmsg_2",
+    predictedBranch: "MEETING_REQUEST",
+    correctedBranch: null,
+    aiDraft: "Perfecto, encantados de coordinar. ¿Le viene bien que agendemos una breve llamada con nuestro director comercial?",
+    correctedText: null,
+    decision: "approve",
+    reasonCategory: null,
+    note: null,
+    meetingOutcome: "qualified",
+    qualified: true,
+    lostReason: null,
+    reviewedAt: now(),
+    reviewerId: "reviewer_demo",
+  },
+];
+
+export const seedMeetings: Meeting[] = [
+  { id: "meeting_1", conversationId: "conv_2", scheduledFor: now(), bookingUrl: seedOffer.bookingUrl, createdAt: now() },
+];
+

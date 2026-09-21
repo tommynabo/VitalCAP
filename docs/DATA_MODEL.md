@@ -58,7 +58,16 @@ A single channel endpoint (email/phone/linkedin/other) belonging to either a nam
 
 ## Conversations / AI Setter (`src/domain/conversations/types.ts`)
 
-`SetterBranch` catalog (INTEREST, SEND_INFO, MARGIN, PRICE, MINIMUM_ORDER, PRODUCT_DETAILS, EXISTING_SUPPLIER, SAMPLES, CREDIBILITY, NOT_DECISION_MAKER, FORWARD_TO_PURCHASING, CALL_ME_LATER, MEETING_REQUEST, LOGISTICS, COMMERCIAL_TERMS, NOT_INTERESTED, UNSUBSCRIBE, UNKNOWN, HUMAN_REQUIRED), `ConversationState` machine, `Conversation`/`ConversationMessage`/`SetterDraft`/`ReviewDecision`/`SetterFeedback`/`Meeting`. See [`docs/SETTER.md`](./SETTER.md).
+`SetterBranch` catalog (INTEREST, SEND_INFO, MARGIN, PRICE, MINIMUM_ORDER, PRODUCT_DETAILS, EXISTING_SUPPLIER, SAMPLES, CREDIBILITY, NOT_DECISION_MAKER, FORWARD_TO_PURCHASING, CALL_ME_LATER, MEETING_REQUEST, LOGISTICS, COMMERCIAL_TERMS, NOT_INTERESTED, UNSUBSCRIBE, UNKNOWN, HUMAN_REQUIRED), `ConversationState` machine, `Conversation`/`ConversationMessage`/`SetterDraft`/`ReviewDecision`/`SetterFeedback`/`Meeting`. `Conversation.providerThreadId` (nullable) supports idempotent thread matching for reply ingestion. `SetterDraft` additionally carries `detectedFactsRequested: string[]` and `suggestedNextAction: string` (full §4.5 output shape). `SetterFeedback` additionally carries `meetingOutcome`/`qualified`/`lostReason` (nullable) for the Phase 4 learning loop (`services/setter/feedback-analytics.ts`). See [`docs/SETTER.md`](./SETTER.md).
+
+## LLM provider contract (`src/domain/providers/types.ts`)
+
+`SetterPromptContext` (whitelisted: language, offer facts/claims/FAQ/objection guidance/tone config,
+account name/type, contact role/first name, discovery source, capped recent messages/feedback notes,
+latest incoming message, `isRepairAttempt` flag for the retry-once path), `SetterClassificationOutput`
+(loose `branch: string` — the domain layer cannot depend on Zod, so the strict enum narrowing happens in
+`services/setter/setter-output-schema.ts`), `LLMProvider` interface (`classifyAndDraft`). Implemented by
+`infrastructure/providers/llm/mock-provider.ts` (`MockLLMProvider`) only — no real LLM API is called.
 
 ## Compliance (`src/domain/compliance/types.ts`)
 

@@ -298,3 +298,99 @@ Rejected — a single check point is a single point of failure for a rule the sp
 **Consequences:** A test observed this directly: a suppressed contact point is filtered out by the router
 itself (`no_eligible_endpoint`), so the orchestrator's own gate check never even gets the chance to reject
 it for that specific case — both layers agree, which is the intended redundancy.
+
+---
+
+## ADR-015: The deterministic pre-router runs *before* any LLM call and its suppression result is unconditional
+
+**Decision:** `services/setter/pre-router.ts`'s `detectDeterministicCase` is called first in
+`setter-orchestrator.ts`, before the LLM/context builder is ever touched. When it matches an
+unsubscribe/do-not-contact case (`suppress: true`), the orchestrator calls `addSuppression` and sets the
+conversation to `"suppressed"` unconditionally — the LLM is never invoked for that reply at all, and an
+existing suppression entry is also checked (via `checkSuppression`) before any LLM call for every other
+reply too.
+
+**Rationale:** Prompt 4 §4.2 is explicit: "Do not let the LLM override a suppression event." The only way
+to guarantee that structurally (not just by convention) is to never give the LLM the opportunity — no
+suppression decision may depend on, or be reversed by, a model call.
+
+**Alternatives considered:** Let the LLM classify first, then check its `branch` output for `UNSUBSCRIBE`
+and suppress after the fact. Rejected — this would mean an LLM output bug, prompt injection from the
+reply body, or a low-confidence misclassification could result in a real unsubscribe request never being
+suppressed, which is a compliance failure, not just a quality one.
+
+**Consequences:** `simulate-setter-day.test.ts` verifies both that an unsubscribe reply never calls the
+LLM provider at all (a spy wrapper asserts zero invocations) and that a *pre-existing* suppression entry
+also blocks the LLM path for an otherwise-innocuous message.
+
+---
+
+## ADR-016: Guardrails re-validate the LLM's own output rather than trusting its self-reported `needsHuman`/`riskFlags`
+
+**Decision:** `services/setter/guardrails.ts`'s `applyGuardrails` independently pattern-matches the
+generated `draft` text against `Offer.forbiddenClaims` categories and against approved commercial/product
+fact keys, and independently pattern-matches the lead's `latestIncomingMessage` for non-approved
+commercial-negotiation asks — regardless of what the LLM/mock provider itself set `needsHuman`/`riskFlags`
+to. `classify-and-draft.ts` always runs guardrails on a Zod-valid output before it's treated as usable.
+
+**Rationale:** Prompt 4 §4.6 lists guardrails as hard constraints ("AI must never invent... unless
+explicitly present in approved campaign knowledge"), not as suggestions to the model. A model (mock today,
+real later) claiming `needsHuman: false` is not sufficient evidence that a forbidden claim wasn't made —
+the system must check the actual text.
+
+**Alternatives considered:** Trust the LLM's structured output as authoritative once it passes Zod
+validation (Zod only validates shape, not content/policy compliance). Rejected — Zod cannot express "this
+draft doesn't mention pricing unless the offer has approved pricing facts"; that requires a second,
+independent content check.
+
+**Consequences:** A guardrail violation always forces `needsHuman: true` and appends a risk flag, even if
+the underlying `needsHuman` was `false` — tested directly in `guardrails.test.ts` and
+`classify-and-draft.test.ts`.
+
+---
+
+## ADR-017: The autonomy policy engine is fully built and tested but has no import path to any send action
+
+**Decision:** `services/setter/autonomy-policy.ts` exports `canAutoSend()` (a pure evaluator over branch
+allowlist / confidence threshold / risk flags / contact type / campaign toggle) and the constant
+`AUTO_SEND_ENABLED = false`. Neither `review-service.ts` nor `setter-orchestrator.ts` imports
+`autonomy-policy.ts` — there is currently no code path in the repository that could call `canAutoSend()`
+and then actually send a message without a human review action in between.
+
+**Rationale:** Directly mirrors ADR-012's reasoning for the Phase 3 dry-run orchestrator: Prompt 4 §4.9's
+"Never silently activate autosend" is far more reliably enforced as a structural fact (the function is
+simply never called from a send path) than as a runtime flag that a future change could flip or bypass
+by accident.
+
+**Alternatives considered:** Wire `canAutoSend()` into `review-service.ts` behind an `if
+(AUTO_SEND_ENABLED)` runtime check. Rejected for the same reason as ADR-012 — a single accidental flip of
+one boolean constant, or a copy-pasted branch, would be enough to enable real autonomous sending; keeping
+the policy engine entirely unwired removes that risk class.
+
+**Consequences:** Enabling autonomy in a later phase requires writing new code that explicitly calls
+`canAutoSend()` from a real send path — a deliberate, separately-reviewable change, not a config flip.
+
+---
+
+## ADR-018: Warm follow-up is a distinct queue/service from Phase 3's cold-sequence service, not a branch inside it
+
+**Decision:** `services/setter/warm-followup-service.ts` (`enterWarmFollowupQueue`,
+`applyWarmFollowupTrigger`, `isDueForFollowup`) is a new, independent module. It does not extend or import
+`services/outreach/sequence-service.ts`'s `SequenceStepKind` (`"cold" | "warm_followup"`), even though that
+type already has a `"warm_followup"` label from Phase 3.
+
+**Rationale:** Prompt 4 §4.12 explicitly says "Do not mix this with cold follow-up state." Phase 3's
+`warm_followup` step kind describes a *pre-reply* cold-outreach cadence step (still part of the original
+cold sequence, just a later/softer step in it); Phase 4's warm follow-up queue is *post-reply*, for a lead
+who has already responded positively and not yet booked — a conceptually different state machine with
+different pause triggers (reply/meeting/unsubscribe/human-ownership vs. Phase 3's reply/bounce/unsubscribe
+pausing the *cold* cadence).
+
+**Alternatives considered:** Reuse `sequence-service.ts` and add the four Phase 4 pause triggers to its
+existing `decideNextSequenceAction`. Rejected — conflating the two would make it easy to accidentally
+resume cold-outreach cadence logic for a lead who has already replied and is now a Phase 4 setter
+conversation, which the spec forbids.
+
+**Consequences:** Any future feature that needs to know "is this account in cold outreach or warm
+follow-up" must check both modules' state independently; there is deliberately no single combined
+enum.

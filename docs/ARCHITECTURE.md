@@ -80,3 +80,39 @@ Each module is pure vocabulary for a later phase's logic — no behavior, only s
 - **`lib/security/safe-fetch.ts`**: SSRF-safe fetch used by the website crawler — manual bounded redirect loop, hostname/IP blocklist re-checked per hop, injectable resolver/fetch for testability.
 
 See [`docs/DECISIONS.md`](./DECISIONS.md) for the full ADR log.
+
+## 8. Phase 4 additions (AI Setter, reply classification, human review, learning loop)
+
+- **`domain/providers/types.ts`** (extended): `SetterPromptContext` (whitelisted context passed to any
+  `LLMProvider`), `SetterClassificationOutput` (loose `branch: string`, narrowed by a service-layer Zod
+  schema), `LLMProvider` interface (`classifyAndDraft`).
+- **`services/setter/` composition, applied in this order by `setter-orchestrator.ts`**:
+  1. `pre-router.ts` — deterministic regex-based branch/suppression detection, runs before any LLM call.
+  2. Suppression check (reused from Phase 3's `services/compliance/suppression-service.ts`) for
+     pre-existing suppression entries — also blocks the LLM path.
+  3. `context-builder.ts` — builds the whitelisted `SetterPromptContext`.
+  4. `classify-and-draft.ts` — calls the `LLMProvider`, Zod-validates via `setter-output-schema.ts`,
+     retries once with a repair flag, falls back to a `HUMAN_REQUIRED` draft on double failure.
+  5. `guardrails.ts` — independently re-checks the (now Zod-valid) draft against forbidden claims and
+     non-approved commercial negotiation, forcing `needsHuman: true` when triggered.
+- **`reply-ingestion.ts`**: idempotent reply webhook ingestion (dedup by `providerMessageId`), reuses
+  Phase 3's `verifyWebhookSignature` rather than duplicating HMAC logic.
+- **`review-service.ts`**: the only function that can move a conversation to `"sent"` — applies one of six
+  human review decisions, always records a `SetterFeedback` row.
+- **`feedback-analytics.ts`**: pure aggregation for the learning loop (branch accuracy, approval/edit/
+  rejection rate, confidence calibration, per-branch performance).
+- **`autonomy-policy.ts`**: `canAutoSend()` policy evaluator — built and tested, but not imported by
+  `review-service.ts` or `setter-orchestrator.ts`; `AUTO_SEND_ENABLED` is a hardcoded `false` constant
+  (see ADR-017, mirrors ADR-012's structural-safety pattern).
+- **`warm-followup-service.ts`**: a queue distinct from Phase 3's cold-sequence service, for
+  interested-but-not-yet-booked leads (see ADR-018).
+- **`infrastructure/providers/llm/mock-provider.ts`** (`MockLLMProvider`): deterministic keyword
+  classifier + template drafting, same `deterministic-fixtures.ts` pattern as Phase 2/3's mocks — no real
+  LLM API is called anywhere in Phase 4.
+- **`app/(dashboard)/reviews/page.tsx`**: three-column human review inbox (conversation list / thread /
+  AI analysis + draft + review actions), reading dev-seed data.
+- **`app/(dashboard)/setter/page.tsx`**: AI Setter dashboard (KPI row + branch performance table), backed
+  by `feedback-analytics.ts`.
+
+See [`docs/DECISIONS.md`](./DECISIONS.md) for the full ADR log (ADR-015 through ADR-018 cover this phase).
+

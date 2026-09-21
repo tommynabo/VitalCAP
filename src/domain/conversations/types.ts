@@ -51,6 +51,8 @@ export interface Conversation {
   campaignId: string;
   offerId: string;
   channel: ContactPointType;
+  /** Provider-side thread/conversation ID (Instantly thread ID, SMS conversation ID, ...), for idempotent reply matching. */
+  providerThreadId: string | null;
   state: ConversationState;
   latestIntent: SetterBranch | null;
   createdAt: string;
@@ -78,7 +80,9 @@ export interface SetterDraft {
   draft: string;
   needsHuman: boolean;
   reasonForHuman: string | null;
+  detectedFactsRequested: string[];
   riskFlags: string[];
+  suggestedNextAction: string;
   createdAt: string;
 }
 
@@ -100,6 +104,9 @@ export interface SetterFeedback {
   decision: ReviewDecision;
   reasonCategory: string | null;
   note: string | null;
+  meetingOutcome: string | null;
+  qualified: boolean | null;
+  lostReason: string | null;
   reviewedAt: string;
   reviewerId: string;
 }
