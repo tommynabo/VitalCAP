@@ -1,6 +1,16 @@
 # Providers — Vitalcap Outreach OS
 
-Per Prompt 0 §0.8, no external provider is hard-coded into the domain layer. This document tracks the intended provider interfaces, their infrastructure homes, and current (Phase 0) status.
+Per Prompt 0 §0.8, no external provider is hard-coded into the domain layer. This document tracks the intended provider interfaces, their infrastructure homes, and current status.
+
+## Implemented adapters (Gate D — real API calls)
+
+| Interface | Real adapter | Notes |
+|---|---|---|
+| `MapsDiscoveryProvider` | `src/infrastructure/providers/maps/apify-provider.ts` (`ApifyMapsDiscoveryProvider`) | Real Apify REST calls (`src/infrastructure/providers/maps/apify-client.ts`): documented async start-run → poll → dataset-fetch pattern (§15), `maxTotalChargeUsd` batch cost guard + injected daily-spend guard (§14), defensive multi-actor field mapping (`mapApifyItemToPlaceResult`). Actor choice is registry-driven (`actor-registry.ts`, §11/§13) and must be informed by `npm run benchmark:maps` (§12) — see `docs/APIFY_ACTOR_BENCHMARK.md`. |
+| `SerpDiscoveryProvider` | `src/infrastructure/providers/serp/serper-provider.ts` (`SerperDiscoveryProvider`) | Real Serper.dev `POST https://google.serper.dev/search` calls (§16), Spain country/language config, bounded timeout + retry, in-process response cache to avoid re-billing identical queries (§17). Used for both `google_serp` and `linkedin_owner` (public `site:linkedin.com/in` searches only, §18). |
+| `EmailVerificationProvider` | `src/infrastructure/providers/email-verification/millionverifier-provider.ts` (`MillionVerifierEmailVerificationProvider`) | Real MillionVerifier Single API calls, bounded concurrency fan-out (no true real-time batch endpoint exists), provider errors/outages always map to `unknown` — never `valid` (§20). |
+
+`src/infrastructure/providers/provider-factory.ts` is the composition root: reads `MAPS_PROVIDER`/`SERP_PROVIDER`/`EMAIL_VERIFICATION_PROVIDER` and returns the interface-typed mock or real adapter — engines/services never import a concrete adapter class directly.
 
 ## Implemented adapters (Phase 2 — mock only, no real API calls)
 
@@ -11,7 +21,7 @@ Per Prompt 0 §0.8, no external provider is hard-coded into the domain layer. Th
 | `EmailVerificationProvider` | `src/infrastructure/providers/email-verification/mock-provider.ts` (`MockEmailVerificationProvider`) | Deterministic code assignment (`valid`/`catch_all`/`risky`/`invalid`) via a seeded roll, always batches per `verifyBatch`. |
 | `WebsiteFetcher` | `src/lib/security/safe-fetch.ts` (`safeFetchPage`) + `src/services/enrichment/website-crawler.ts` | Not a mock — a real SSRF-safe fetch implementation (manual bounded redirect loop, hostname/IP blocklist, content-type/length limits). Test/simulation code supplies inline fake `WebsiteFetcher` implementations instead of hitting the network. |
 
-All three domain-interface mocks share `src/infrastructure/providers/deterministic-fixtures.ts` (`hashString`, `seededRandom`) so synthetic output is stable across calls/tests while still varying meaningfully by input. **No real external API is called anywhere in Phase 2** — this is a standing safety decision (see ADR log); real adapters for these same interfaces are a Phase 3 concern once business input on vendor choice (see "Current status" below) is available.
+All three domain-interface mocks share `src/infrastructure/providers/deterministic-fixtures.ts` (`hashString`, `seededRandom`) so synthetic output is stable across calls/tests while still varying meaningfully by input. These mocks remain the active path whenever `MAPS_PROVIDER=mock` / `SERP_PROVIDER=mock` / `EMAIL_VERIFICATION_PROVIDER=mock` (the default, and the only allowed setting outside production) — real adapters for the same interfaces shipped in Gate D (see above) and are selected via `provider-factory.ts` once the corresponding env var is switched to the real provider name and its API key is set.
 
 ## Implemented adapters (Phase 3 — mock only, no real API calls)
 
@@ -45,13 +55,13 @@ That folder currently contains only a `README.md` documenting its future ownersh
 - If a provider's API is undocumented or unavailable, build the interface + a safe mock/stub — never invent endpoints.
 - Consult each provider's official documentation before implementing a real integration (no guessed endpoints/URLs).
 
-## Current status (Phase 0)
+## Current status
 
-- No provider credentials are configured. `.env.example` lists variable **names only**, grouped by the phase that will consume them (Supabase → Phase 1; cron/discovery providers → Phase 2; enrichment/verification/outreach delivery → Phase 2/3; AI Setter LLM → Phase 4).
 - `DEFAULT_DELIVERY_MODE=dry_run` is the hardcoded-safe default in `src/lib/config/env.ts` — there is no code path today that can default to `live` sending, verified by `env.test.ts`.
-- Unresolved external provider decisions (deferred to Phase 2/3, need business input before implementation):
-  1. Which concrete Maps/Places-compatible provider and which SERP provider to use (cost/ToS tradeoffs).
-  2. Which email-verification vendor.
-  3. Whether Instantly.ai (referenced in FlowNex) or a different email delivery provider is preferred going forward.
-  4. Which SMS provider (Spain-specific deliverability/compliance considerations).
-  5. Which LLM provider/model for the AI Setter, and cost/latency budget per reply.
+- Real adapters now exist for Maps (Apify), SERP/LinkedIn Owner (Serper.dev), and email verification (MillionVerifier) — see the Gate D table above. None have been run against real credentials yet in this environment; `docs/PROVIDER_SMOKE_TESTS.md` and `docs/APIFY_ACTOR_BENCHMARK.md` track that as a pending operator action, not a completed verification.
+- Still unresolved / not yet implemented (deferred to later gates, need business input or further implementation):
+  1. Email delivery: real Instantly v2 adapter (Gate F) — only the mock exists today.
+  2. SMS: no real vendor will ever be wired per standing product policy; `SMS_PROVIDER` is a hardcoded `"disabled"` literal.
+  3. LLM: real OpenAI-backed `LLMProvider` (Gate F) — only the mock exists today.
+  4. `CalendarProvider` (if needed) — not yet allocated a folder.
+
