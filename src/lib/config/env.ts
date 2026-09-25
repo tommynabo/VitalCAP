@@ -20,11 +20,16 @@ import { z } from "zod";
 
 const NEON_VAR_PREFIXES = ["Vitalcap"];
 
+function optionalEnvValue(value: string | undefined): string | undefined {
+  const trimmed = value?.trim();
+  return trimmed ? trimmed : undefined;
+}
+
 function resolveNeonVar(standardName: string): string | undefined {
-  const direct = process.env[standardName];
+  const direct = optionalEnvValue(process.env[standardName]);
   if (direct) return direct;
   for (const prefix of NEON_VAR_PREFIXES) {
-    const prefixed = process.env[`${prefix}_${standardName}`];
+    const prefixed = optionalEnvValue(process.env[`${prefix}_${standardName}`]);
     if (prefixed) return prefixed;
   }
   return undefined;
@@ -129,12 +134,12 @@ let cached: ServerEnv | null = null;
 export function getServerEnv(): ServerEnv {
   if (cached) return cached;
   cached = serverEnvSchema.parse({
-    APP_ENV: process.env.APP_ENV,
-    DEV_SEED_MODE: process.env.DEV_SEED_MODE,
-    NEXT_PUBLIC_APP_URL: process.env.NEXT_PUBLIC_APP_URL,
-    DEFAULT_DELIVERY_MODE: process.env.DEFAULT_DELIVERY_MODE,
-    DEFAULT_BOOKING_URL: process.env.DEFAULT_BOOKING_URL,
-    CRON_SECRET: process.env.CRON_SECRET,
+    APP_ENV: optionalEnvValue(process.env.APP_ENV),
+    DEV_SEED_MODE: optionalEnvValue(process.env.DEV_SEED_MODE),
+    NEXT_PUBLIC_APP_URL: optionalEnvValue(process.env.NEXT_PUBLIC_APP_URL),
+    DEFAULT_DELIVERY_MODE: optionalEnvValue(process.env.DEFAULT_DELIVERY_MODE),
+    DEFAULT_BOOKING_URL: optionalEnvValue(process.env.DEFAULT_BOOKING_URL),
+    CRON_SECRET: optionalEnvValue(process.env.CRON_SECRET),
 
     DATABASE_URL: resolveNeonVar("DATABASE_URL"),
     DATABASE_URL_UNPOOLED: resolveNeonVar("DATABASE_URL_UNPOOLED"),
@@ -143,31 +148,31 @@ export function getServerEnv(): ServerEnv {
     NEON_AUTH_COOKIE_SECRET: process.env.NEON_AUTH_COOKIE_SECRET,
 
     MAPS_PROVIDER: process.env.MAPS_PROVIDER,
-    APIFY_API_TOKEN: process.env.APIFY_API_TOKEN,
-    APIFY_MAPS_FAST_ACTOR: process.env.APIFY_MAPS_FAST_ACTOR,
-    APIFY_MAPS_DEEP_ACTOR: process.env.APIFY_MAPS_DEEP_ACTOR,
-    APIFY_MAPS_FALLBACK_ACTOR: process.env.APIFY_MAPS_FALLBACK_ACTOR,
-    APIFY_MAPS_CONTACT_ENRICHMENT_ACTOR: process.env.APIFY_MAPS_CONTACT_ENRICHMENT_ACTOR,
-    APIFY_DAILY_COST_LIMIT_USD: process.env.APIFY_DAILY_COST_LIMIT_USD,
-    APIFY_BATCH_COST_LIMIT_USD: process.env.APIFY_BATCH_COST_LIMIT_USD,
+    APIFY_API_TOKEN: optionalEnvValue(process.env.APIFY_API_TOKEN),
+    APIFY_MAPS_FAST_ACTOR: optionalEnvValue(process.env.APIFY_MAPS_FAST_ACTOR),
+    APIFY_MAPS_DEEP_ACTOR: optionalEnvValue(process.env.APIFY_MAPS_DEEP_ACTOR),
+    APIFY_MAPS_FALLBACK_ACTOR: optionalEnvValue(process.env.APIFY_MAPS_FALLBACK_ACTOR),
+    APIFY_MAPS_CONTACT_ENRICHMENT_ACTOR: optionalEnvValue(process.env.APIFY_MAPS_CONTACT_ENRICHMENT_ACTOR),
+    APIFY_DAILY_COST_LIMIT_USD: optionalEnvValue(process.env.APIFY_DAILY_COST_LIMIT_USD),
+    APIFY_BATCH_COST_LIMIT_USD: optionalEnvValue(process.env.APIFY_BATCH_COST_LIMIT_USD),
 
     SERP_PROVIDER: process.env.SERP_PROVIDER,
-    SERPER_API_KEY: process.env.SERPER_API_KEY,
-    SERPER_COUNTRY: process.env.SERPER_COUNTRY,
-    SERPER_LANGUAGE: process.env.SERPER_LANGUAGE,
+    SERPER_API_KEY: optionalEnvValue(process.env.SERPER_API_KEY),
+    SERPER_COUNTRY: optionalEnvValue(process.env.SERPER_COUNTRY),
+    SERPER_LANGUAGE: optionalEnvValue(process.env.SERPER_LANGUAGE),
 
     EMAIL_VERIFICATION_PROVIDER: process.env.EMAIL_VERIFICATION_PROVIDER,
-    MILLIONVERIFIER_API_KEY: process.env.MILLIONVERIFIER_API_KEY,
+    MILLIONVERIFIER_API_KEY: optionalEnvValue(process.env.MILLIONVERIFIER_API_KEY),
 
     EMAIL_DELIVERY_PROVIDER: process.env.EMAIL_DELIVERY_PROVIDER,
-    INSTANTLY_API_KEY: process.env.INSTANTLY_API_KEY,
-    INSTANTLY_WEBHOOK_SECRET: process.env.INSTANTLY_WEBHOOK_SECRET,
+    INSTANTLY_API_KEY: optionalEnvValue(process.env.INSTANTLY_API_KEY),
+    INSTANTLY_WEBHOOK_SECRET: optionalEnvValue(process.env.INSTANTLY_WEBHOOK_SECRET),
 
     SMS_PROVIDER: process.env.SMS_PROVIDER,
 
     LLM_PROVIDER: process.env.LLM_PROVIDER,
-    LLM_PROVIDER_API_KEY: process.env.LLM_PROVIDER_API_KEY,
-    LLM_MODEL: process.env.LLM_MODEL,
+    LLM_PROVIDER_API_KEY: optionalEnvValue(process.env.LLM_PROVIDER_API_KEY),
+    LLM_MODEL: optionalEnvValue(process.env.LLM_MODEL),
   });
   return cached;
 }
