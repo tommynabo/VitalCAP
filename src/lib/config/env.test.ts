@@ -32,4 +32,20 @@ describe("getServerEnv", () => {
     else process.env.DEFAULT_DELIVERY_MODE = originalDeliveryMode;
     resetServerEnvCacheForTests();
   });
+
+  it("rejects production when development seed mode is enabled", () => {
+    const originalAppEnv = process.env.APP_ENV;
+    const originalSeedMode = process.env.DEV_SEED_MODE;
+    process.env.APP_ENV = "production";
+    process.env.DEV_SEED_MODE = "true";
+    resetServerEnvCacheForTests();
+
+    expect(() => getServerEnv()).toThrow(/DEV_SEED_MODE=true is forbidden/);
+
+    if (originalAppEnv === undefined) delete process.env.APP_ENV;
+    else process.env.APP_ENV = originalAppEnv;
+    if (originalSeedMode === undefined) delete process.env.DEV_SEED_MODE;
+    else process.env.DEV_SEED_MODE = originalSeedMode;
+    resetServerEnvCacheForTests();
+  });
 });
