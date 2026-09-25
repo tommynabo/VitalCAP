@@ -103,7 +103,7 @@ async function benchmarkActor(actorId: string, args: CliArgs, client: ApifyClien
     }
 
     const rawItems = (await client.getDatasetItems(run.defaultDatasetId, { limit: args.max })) as Record<string, unknown>[];
-    const mapped = rawItems.map(mapApifyItemToPlaceResult);
+    const mapped = rawItems.map(mapApifyItemToPlaceResult).filter((place) => place !== null);
 
     const uniqueIds = new Set(mapped.map((m) => m.externalPlaceId));
     const spainVerified = mapped.filter((m) => (m.countryCode ?? "").toUpperCase() === "ES").length;

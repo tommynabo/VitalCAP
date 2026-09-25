@@ -224,7 +224,7 @@ export interface InsertAccountInput {
   canonicalName: string;
   normalizedName: string;
   businessType: BusinessType;
-  countryCode: string;
+  countryCode: string | null;
   region: string | null;
   province: string | null;
   city: string | null;
@@ -263,7 +263,7 @@ export interface InsertAccountSourceInput {
 
 export async function insertAccountSource(input: InsertAccountSourceInput): Promise<void> {
   const db = getDb();
-  await db.insert(accountSources).values(input);
+  await db.insert(accountSources).values(input).onConflictDoNothing();
 }
 
 export async function updateAccountStatus(accountId: string, status: AccountStatus): Promise<void> {

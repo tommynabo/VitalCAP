@@ -43,7 +43,7 @@ export interface Account {
    * still be storable (`status: "rejected_country"`) as audit evidence that
    * the boundary worked — it is simply never promoted to `outreach_ready`.
    */
-  countryCode: string;
+  countryCode: string | null;
   region: string | null;
   province: string | null;
   city: string | null;

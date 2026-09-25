@@ -58,7 +58,7 @@ const serverEnvSchema = z
     // ── Discovery: Apify (Maps) ───────────────────────────────────────────
     MAPS_PROVIDER: z.enum(["apify", "mock"]).default("mock"),
     APIFY_API_TOKEN: z.string().optional(),
-    APIFY_MAPS_FAST_ACTOR: z.string().default("bovi/google-maps-scraper"),
+    APIFY_MAPS_FAST_ACTOR: z.string().default("compass/crawler-google-places"),
     APIFY_MAPS_DEEP_ACTOR: z.string().default("compass/crawler-google-places"),
     APIFY_MAPS_FALLBACK_ACTOR: z.string().default("compass/crawler-google-places"),
     APIFY_MAPS_CONTACT_ENRICHMENT_ACTOR: z.string().optional(),

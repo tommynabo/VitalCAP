@@ -39,10 +39,11 @@ export function createMapsDiscoveryProvider(workspaceId: string, role: MapsEngin
       recordProviderRun({
         workspaceId,
         provider: "apify",
-        operation: role,
+        operation: "maps_search",
         externalRunId: run.externalRunId,
         externalDatasetId: run.externalDatasetId,
         status: run.status,
+        itemsRequested: run.itemsRequested,
         itemsReturned: run.itemsReturned,
         costUsd: run.costUsd,
         metadata: { actorId: run.actorId, errorMessage: run.errorMessage ?? null },

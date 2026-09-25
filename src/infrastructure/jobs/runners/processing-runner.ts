@@ -17,12 +17,31 @@ import {
 } from "@/infrastructure/neon/repositories/accounts";
 import { createEmailVerificationProvider } from "@/infrastructure/providers/provider-factory";
 import { createInMemoryVerificationCacheStore } from "@/services/verification/email-verification-cache";
+import type { EmailVerificationProvider, WebsiteFetcher } from "@/domain/providers/types";
 import { processRawCandidate, deriveIncomingIdentitySignals, type CandidateRawPayload, type ProcessedCandidateResult } from "@/services/discovery/candidate-processor";
 import { realWebsiteFetcher, providerLabelForEngine } from "./engine-factory";
 
 interface ProcessingJobPayload {
   rawCandidateId: string;
 }
+
+export interface ProcessingRunnerOptions {
+  enrichContacts?: boolean;
+}
+
+const smokeWebsiteFetcher: WebsiteFetcher = {
+  fetchPage: async () => {
+    throw new Error("Website enrichment disabled for the Maps smoke test.");
+  },
+};
+
+const smokeVerificationProvider: EmailVerificationProvider = {
+  providerName: "disabled-smoke",
+  verifyBatch: async () => ({
+    outcomes: [],
+    usage: { calls: 0, items: 0, errors: 0, totalLatencyMs: 0, costUsd: 0, quotaRemaining: null },
+  }),
+};
 
 function resolveAccountStatus(processed: ProcessedCandidateResult): AccountStatus {
   if (processed.spainVerdict === "rejected") return "rejected_country";
@@ -109,7 +128,10 @@ function extractAccountFields(payload: CandidateRawPayload): {
   };
 }
 
-async function executeProcessingJob(job: { id: string; campaignId: string; payload: ProcessingJobPayload }): Promise<void> {
+async function executeProcessingJob(
+  job: { id: string; campaignId: string; payload: ProcessingJobPayload },
+  options: ProcessingRunnerOptions,
+): Promise<void> {
   const raw = await getRawCandidateById(job.payload.rawCandidateId);
   if (!raw || raw.rawPayload === undefined) throw new Error(`raw_candidate not found: ${job.payload.rawCandidateId}`);
 
@@ -122,8 +144,8 @@ async function executeProcessingJob(job: { id: string; campaignId: string; paylo
 
   const processed = await processRawCandidate(payload, raw.engineType, {
     existingAccounts,
-    websiteFetcher: realWebsiteFetcher,
-    verificationProvider: createEmailVerificationProvider(campaign.workspaceId),
+    websiteFetcher: options.enrichContacts === false ? smokeWebsiteFetcher : realWebsiteFetcher,
+    verificationProvider: options.enrichContacts === false ? smokeVerificationProvider : createEmailVerificationProvider(campaign.workspaceId),
     verificationCacheStore: createInMemoryVerificationCacheStore(),
     now: new Date(),
   });
@@ -148,7 +170,7 @@ async function executeProcessingJob(job: { id: string; campaignId: string; paylo
       canonicalName: accountFields.canonicalName,
       normalizedName: incoming.normalizedName,
       businessType: processed.businessType,
-      countryCode: accountFields.countryCode ?? "ES",
+      countryCode: accountFields.countryCode,
       region: null,
       province: accountFields.province,
       city: accountFields.city,
@@ -212,7 +234,11 @@ export interface ProcessingRunnerResult {
 }
 
 /** One bounded batch of processing work: claim+execute up to `maxJobsPerTick` `processing_jobs` (claims are global across every workspace's campaigns). Called once per `/api/cron/process` invocation. */
-export async function runProcessingCronTick(maxJobsPerTick: number, now: Date = new Date()): Promise<ProcessingRunnerResult> {
+export async function runProcessingCronTick(
+  maxJobsPerTick: number,
+  now: Date = new Date(),
+  options: ProcessingRunnerOptions = {},
+): Promise<ProcessingRunnerResult> {
   const workerId = `cron-process-${randomUUID()}`;
   let jobsClaimed = 0;
 
@@ -220,7 +246,7 @@ export async function runProcessingCronTick(maxJobsPerTick: number, now: Date = 
   for (const job of jobs) {
     jobsClaimed += 1;
     try {
-      await executeProcessingJob(job);
+      await executeProcessingJob(job, options);
       await completeProcessingJob({ jobId: job.id, workerId, now });
     } catch (error) {
       await failProcessingJob({ workerId, job, error, now });

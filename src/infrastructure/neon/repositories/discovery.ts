@@ -121,6 +121,7 @@ export async function insertRawCandidates(rows: readonly InsertRawCandidateInput
   const inserted = await db
     .insert(rawCandidates)
     .values(rows.map((row) => ({ ...row, processed: false })))
+    .onConflictDoNothing()
     .returning({ id: rawCandidates.id });
   return inserted.map((row) => row.id);
 }

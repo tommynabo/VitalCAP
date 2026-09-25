@@ -20,7 +20,7 @@ export function emptyProviderUsageStats(): ProviderUsageStats {
 }
 
 export interface MapsPlaceResult {
-  externalPlaceId: string;
+  externalPlaceId: string | null;
   name: string;
   category: string | null;
   address: string | null;

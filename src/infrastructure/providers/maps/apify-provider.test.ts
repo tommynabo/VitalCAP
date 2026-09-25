@@ -27,17 +27,16 @@ describe("mapApifyItemToPlaceResult", () => {
       url: "https://maps.google.com/p1",
       location: { lat: 40.1, lng: -3.5 },
     });
-    expect(result.externalPlaceId).toBe("p1");
-    expect(result.name).toBe("Farmacia Central");
-    expect(result.websiteUrl).toBe("https://example.es");
-    expect(result.latitude).toBe(40.1);
-    expect(result.longitude).toBe(-3.5);
+    expect(result?.externalPlaceId).toBe("p1");
+    expect(result?.name).toBe("Farmacia Central");
+    expect(result?.websiteUrl).toBe("https://example.es");
+    expect(result?.latitude).toBe(40.1);
+    expect(result?.longitude).toBe(-3.5);
   });
 
   it("falls back gracefully when fields are missing", () => {
     const result = mapApifyItemToPlaceResult({});
-    expect(result.name).toBe("Unknown");
-    expect(result.websiteUrl).toBeNull();
+    expect(result).toBeNull();
   });
 });
 
@@ -50,7 +49,7 @@ describe("ApifyMapsDiscoveryProvider", () => {
     const recordRun = vi.fn().mockResolvedValue(undefined);
     const provider = new ApifyMapsDiscoveryProvider({
       apiToken: "token",
-      actorId: "owner/actor",
+      actorId: "compass/crawler-google-places",
       dailyCostLimitUsd: 10,
       batchCostLimitUsd: 2,
       getTodaySpendUsd: vi.fn().mockResolvedValue(0),
@@ -63,7 +62,7 @@ describe("ApifyMapsDiscoveryProvider", () => {
   it("refuses to start a run once the daily cost limit is reached", async () => {
     const provider = new ApifyMapsDiscoveryProvider({
       apiToken: "token",
-      actorId: "owner/actor",
+      actorId: "compass/crawler-google-places",
       dailyCostLimitUsd: 10,
       batchCostLimitUsd: 2,
       getTodaySpendUsd: vi.fn().mockResolvedValue(10),
@@ -94,7 +93,7 @@ describe("ApifyMapsDiscoveryProvider", () => {
     const recordRun = vi.fn().mockResolvedValue(undefined);
     const provider = new ApifyMapsDiscoveryProvider({
       apiToken: "token",
-      actorId: "owner/actor",
+      actorId: "compass/crawler-google-places",
       dailyCostLimitUsd: 10,
       batchCostLimitUsd: 2,
       getTodaySpendUsd: vi.fn().mockResolvedValue(0),

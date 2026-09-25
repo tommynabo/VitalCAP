@@ -41,7 +41,7 @@ export class MapsFastEngine implements DiscoveryEngine {
     try {
       const output = await this.provider.search({ query: input.seed.query, geography: input.seed.geography, pageToken: null });
       const rawCandidates: RawCandidate[] = output.results.map((place) => ({
-        id: `raw_${input.seed.id}_${place.externalPlaceId}`,
+        id: `raw_${input.seed.id}_${place.externalPlaceId ?? place.name}`,
         campaignId: input.seed.campaignId,
         engineType: this.engineType,
         sourceExternalId: place.externalPlaceId,

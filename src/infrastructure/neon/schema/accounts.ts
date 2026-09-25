@@ -17,7 +17,7 @@ export const accounts = pgTable(
     canonicalName: text("canonical_name").notNull(),
     normalizedName: text("normalized_name").notNull(),
     businessType: text("business_type").notNull(),
-    countryCode: text("country_code").notNull(),
+    countryCode: text("country_code"),
     region: text("region"),
     province: text("province"),
     city: text("city"),
@@ -65,7 +65,10 @@ export const accountSources = pgTable(
     rawSnapshot: jsonb("raw_snapshot").notNull().default({}),
     discoveredAt: timestamp("discovered_at", { withTimezone: true }).notNull().defaultNow(),
   },
-  (table) => [index("idx_account_sources_account").on(table.accountId)],
+  (table) => [
+    index("idx_account_sources_account").on(table.accountId),
+    uniqueIndex("uq_account_sources_external").on(table.accountId, table.sourceProvider, table.sourceExternalId),
+  ],
 );
 
 export const accountMergeRecords = pgTable(

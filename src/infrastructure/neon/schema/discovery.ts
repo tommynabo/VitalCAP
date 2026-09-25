@@ -58,6 +58,9 @@ export const rawCandidates = pgTable(
   (table) => [
     index("idx_raw_candidates_job").on(table.discoveryJobId),
     index("idx_raw_candidates_campaign").on(table.campaignId),
+    uniqueIndex("uq_raw_candidates_campaign_engine_external")
+      .on(table.campaignId, table.engineType, table.sourceExternalId)
+      .where(sql`${table.sourceExternalId} is not null`),
   ],
 );
 

@@ -78,7 +78,7 @@ export class MapsDeepEngine implements DiscoveryEngine {
       }
 
       rawCandidates.push({
-        id: `raw_${input.seed.id}_${place.externalPlaceId}`,
+        id: `raw_${input.seed.id}_${place.externalPlaceId ?? place.name}`,
         campaignId: input.seed.campaignId,
         engineType: this.engineType,
         sourceExternalId: place.externalPlaceId,
