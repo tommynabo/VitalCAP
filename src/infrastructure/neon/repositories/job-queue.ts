@@ -1,24 +1,44 @@
-import { sql } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import { getDb } from "../db";
-import { deadLetterJobs } from "../schema/outreach";
 import { discoveryJobs, processingJobs } from "../schema/discovery";
+import { deadLetterJobs } from "../schema/outreach";
 import type { JobRecord, JobStatus } from "@/domain/discovery/types";
 import { computeBackoffMs, isPermanentError } from "@/infrastructure/jobs/job-queue";
 
-/**
- * Durable Neon-backed job queue (Prompt 7 §24). Implements the exact same
- * semantics `src/infrastructure/jobs/job-queue.ts`'s pure functions define
- * (crash-recoverable lease claim, exponential backoff, dead-letter after
- * `maxAttempts`) but as atomic SQL against `discovery_jobs` /
- * `processing_jobs` instead of an in-memory array. Claim is a single
- * `UPDATE ... FROM (SELECT ... FOR UPDATE SKIP LOCKED)` statement — atomic
- * even over the Neon HTTP driver, which only ever sends one statement per
- * round trip (no explicit multi-statement transaction needed for a single
- * UPDATE). Campaign `status != 'active'` never gets claimed (pause prevents
- * claims, per §24).
- */
+export const JOB_LEASE_MS = 5 * 60 * 1000;
+const MAX_CLAIM_BATCH_SIZE = 100;
 
-const DEFAULT_LEASE_MS = 5 * 60 * 1000;
+type QueueTable = "discovery_jobs" | "processing_jobs";
+
+export type JobFailureClassification = "transient" | "permanent";
+
+export class PermanentJobError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "PermanentJobError";
+  }
+}
+
+export class TransientJobError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "TransientJobError";
+  }
+}
+
+export class LostLeaseError extends Error {
+  readonly queue: QueueTable;
+  readonly jobId: string;
+  readonly workerId: string;
+
+  constructor(queue: QueueTable, jobId: string, workerId: string) {
+    super(`Lost lease for ${queue} job ${jobId} (worker ${workerId}).`);
+    this.name = "LostLeaseError";
+    this.queue = queue;
+    this.jobId = jobId;
+    this.workerId = workerId;
+  }
+}
 
 interface JobRow {
   id: string;
@@ -30,10 +50,20 @@ interface JobRow {
   max_attempts: number;
   locked_at: string | null;
   locked_by: string | null;
+  idempotency_key: string | null;
   next_attempt_at: string | null;
   last_error: string | null;
   created_at: string;
   updated_at: string;
+}
+
+interface FailableJob {
+  id: string;
+  campaignId: string;
+  type: string;
+  payload: unknown;
+  attemptCount: number;
+  maxAttempts: number;
 }
 
 function toJobRecord<T>(row: JobRow): JobRecord<T> {
@@ -47,6 +77,7 @@ function toJobRecord<T>(row: JobRow): JobRecord<T> {
     maxAttempts: row.max_attempts,
     lockedAt: row.locked_at,
     lockedBy: row.locked_by,
+    idempotencyKey: row.idempotency_key,
     nextAttemptAt: row.next_attempt_at,
     lastError: row.last_error,
     createdAt: row.created_at,
@@ -54,207 +85,373 @@ function toJobRecord<T>(row: JobRow): JobRecord<T> {
   };
 }
 
-async function claimNext<T>(table: "discovery_jobs" | "processing_jobs", workerId: string, now: Date, leaseMs: number): Promise<JobRecord<T> | null> {
+function normalizeBatchSize(batchSize: number): number {
+  if (!Number.isInteger(batchSize) || batchSize <= 0) return 1;
+  return Math.min(batchSize, MAX_CLAIM_BATCH_SIZE);
+}
+
+function classifyFailure(error: unknown, explicit?: JobFailureClassification): JobFailureClassification {
+  if (explicit) return explicit;
+  if (error instanceof PermanentJobError) return "permanent";
+  if (error instanceof TransientJobError) return "transient";
+  return isPermanentError(error) ? "permanent" : "transient";
+}
+
+async function claim<T>(
+  table: QueueTable,
+  workerId: string,
+  now: Date,
+  leaseMs: number,
+  batchSize: number,
+): Promise<JobRecord<T>[]> {
   const db = getDb();
   const nowIso = now.toISOString();
   const leaseSeconds = Math.max(1, Math.ceil(leaseMs / 1000));
+  const boundedBatchSize = normalizeBatchSize(batchSize);
 
   const result =
     table === "discovery_jobs"
       ? await db.execute(sql`
+          WITH claimable AS (
+            SELECT j.id
+            FROM discovery_jobs j
+            JOIN campaigns c ON c.id = j.campaign_id
+            WHERE c.status = 'active'
+              AND j.status IN ('pending', 'processing')
+              AND (j.next_attempt_at IS NULL OR j.next_attempt_at <= ${nowIso}::timestamptz)
+              AND (
+                j.status = 'pending'
+                OR j.locked_at IS NULL
+                OR j.locked_at + (${leaseSeconds} * interval '1 second') <= ${nowIso}::timestamptz
+              )
+            ORDER BY j.next_attempt_at ASC NULLS FIRST
+            FOR UPDATE OF j SKIP LOCKED
+            LIMIT ${boundedBatchSize}
+          )
           UPDATE discovery_jobs AS job
           SET status = 'processing',
               locked_at = ${nowIso}::timestamptz,
               locked_by = ${workerId},
               attempt_count = job.attempt_count + 1,
               updated_at = ${nowIso}::timestamptz
-          FROM (
-            SELECT j.id
-            FROM discovery_jobs j
-            JOIN campaigns c ON c.id = j.campaign_id
-            WHERE c.status = 'active'
-              AND j.status IN ('pending', 'processing')
-              AND j.next_attempt_at <= ${nowIso}::timestamptz
-              AND (j.status = 'pending' OR j.locked_at + (${leaseSeconds} * interval '1 second') <= ${nowIso}::timestamptz)
-            ORDER BY j.next_attempt_at ASC
-            FOR UPDATE OF j SKIP LOCKED
-            LIMIT 1
-          ) AS claimed
-          WHERE job.id = claimed.id
+          FROM claimable
+          WHERE job.id = claimable.id
           RETURNING job.*;
         `)
       : await db.execute(sql`
+          WITH claimable AS (
+            SELECT j.id
+            FROM processing_jobs j
+            JOIN campaigns c ON c.id = j.campaign_id
+            WHERE c.status = 'active'
+              AND j.status IN ('pending', 'processing')
+              AND (j.next_attempt_at IS NULL OR j.next_attempt_at <= ${nowIso}::timestamptz)
+              AND (
+                j.status = 'pending'
+                OR j.locked_at IS NULL
+                OR j.locked_at + (${leaseSeconds} * interval '1 second') <= ${nowIso}::timestamptz
+              )
+            ORDER BY j.next_attempt_at ASC NULLS FIRST
+            FOR UPDATE OF j SKIP LOCKED
+            LIMIT ${boundedBatchSize}
+          )
           UPDATE processing_jobs AS job
           SET status = 'processing',
               locked_at = ${nowIso}::timestamptz,
               locked_by = ${workerId},
               attempt_count = job.attempt_count + 1,
               updated_at = ${nowIso}::timestamptz
-          FROM (
-            SELECT j.id
-            FROM processing_jobs j
-            JOIN campaigns c ON c.id = j.campaign_id
-            WHERE c.status = 'active'
-              AND j.status IN ('pending', 'processing')
-              AND j.next_attempt_at <= ${nowIso}::timestamptz
-              AND (j.status = 'pending' OR j.locked_at + (${leaseSeconds} * interval '1 second') <= ${nowIso}::timestamptz)
-            ORDER BY j.next_attempt_at ASC
-            FOR UPDATE OF j SKIP LOCKED
-            LIMIT 1
-          ) AS claimed
-          WHERE job.id = claimed.id
+          FROM claimable
+          WHERE job.id = claimable.id
           RETURNING job.*;
         `);
 
-  const row = (result.rows[0] as JobRow | undefined) ?? undefined;
-  return row ? toJobRecord<T>(row) : null;
+  return (result.rows as unknown as JobRow[]).map((row) => toJobRecord<T>(row));
+}
+
+export interface ClaimJobsInput {
+  workerId: string;
+  batchSize: number;
+  now?: Date;
+  leaseMs?: number;
+}
+
+export async function claimDiscoveryJobs<T = Record<string, unknown>>(input: ClaimJobsInput): Promise<JobRecord<T>[]> {
+  return claim<T>("discovery_jobs", input.workerId, input.now ?? new Date(), input.leaseMs ?? JOB_LEASE_MS, input.batchSize);
+}
+
+export async function claimProcessingJobs<T = Record<string, unknown>>(input: ClaimJobsInput): Promise<JobRecord<T>[]> {
+  return claim<T>("processing_jobs", input.workerId, input.now ?? new Date(), input.leaseMs ?? JOB_LEASE_MS, input.batchSize);
 }
 
 export async function claimNextDiscoveryJob<T = Record<string, unknown>>(
   workerId: string,
   now: Date = new Date(),
-  leaseMs: number = DEFAULT_LEASE_MS,
+  leaseMs: number = JOB_LEASE_MS,
 ): Promise<JobRecord<T> | null> {
-  return claimNext<T>("discovery_jobs", workerId, now, leaseMs);
+  const jobs = await claimDiscoveryJobs<T>({ workerId, batchSize: 1, now, leaseMs });
+  return jobs[0] ?? null;
 }
 
 export async function claimNextProcessingJob<T = Record<string, unknown>>(
   workerId: string,
   now: Date = new Date(),
-  leaseMs: number = DEFAULT_LEASE_MS,
+  leaseMs: number = JOB_LEASE_MS,
 ): Promise<JobRecord<T> | null> {
-  return claimNext<T>("processing_jobs", workerId, now, leaseMs);
+  const jobs = await claimProcessingJobs<T>({ workerId, batchSize: 1, now, leaseMs });
+  return jobs[0] ?? null;
 }
 
-async function complete(table: "discovery_jobs" | "processing_jobs", jobId: string, now: Date): Promise<void> {
+export interface CompleteJobInput {
+  jobId: string;
+  workerId: string;
+  now?: Date;
+}
+
+async function complete(table: QueueTable, input: CompleteJobInput): Promise<void> {
   const db = getDb();
-  const nowIso = now.toISOString();
-  if (table === "discovery_jobs") {
-    await db.execute(sql`
-      UPDATE discovery_jobs
-      SET status = 'completed', locked_at = NULL, locked_by = NULL, next_attempt_at = NULL, last_error = NULL, updated_at = ${nowIso}::timestamptz
-      WHERE id = ${jobId}::uuid;
-    `);
-  } else {
-    await db.execute(sql`
-      UPDATE processing_jobs
-      SET status = 'completed', locked_at = NULL, locked_by = NULL, next_attempt_at = NULL, last_error = NULL, updated_at = ${nowIso}::timestamptz
-      WHERE id = ${jobId}::uuid;
-    `);
+  const nowIso = (input.now ?? new Date()).toISOString();
+
+  const result =
+    table === "discovery_jobs"
+      ? await db.execute(sql`
+          UPDATE discovery_jobs
+          SET status = 'completed',
+              locked_at = NULL,
+              locked_by = NULL,
+              next_attempt_at = NULL,
+              last_error = NULL,
+              updated_at = ${nowIso}::timestamptz
+          WHERE id = ${input.jobId}::uuid
+            AND status = 'processing'
+            AND locked_by = ${input.workerId}
+          RETURNING id;
+        `)
+      : await db.execute(sql`
+          UPDATE processing_jobs
+          SET status = 'completed',
+              locked_at = NULL,
+              locked_by = NULL,
+              next_attempt_at = NULL,
+              last_error = NULL,
+              updated_at = ${nowIso}::timestamptz
+          WHERE id = ${input.jobId}::uuid
+            AND status = 'processing'
+            AND locked_by = ${input.workerId}
+          RETURNING id;
+        `);
+
+  if (result.rows.length === 0) {
+    throw new LostLeaseError(table, input.jobId, input.workerId);
   }
 }
 
-export async function completeDiscoveryJob(jobId: string, now: Date = new Date()): Promise<void> {
-  return complete("discovery_jobs", jobId, now);
+export async function completeDiscoveryJob(input: CompleteJobInput): Promise<void> {
+  return complete("discovery_jobs", input);
 }
 
-export async function completeProcessingJob(jobId: string, now: Date = new Date()): Promise<void> {
-  return complete("processing_jobs", jobId, now);
+export async function completeProcessingJob(input: CompleteJobInput): Promise<void> {
+  return complete("processing_jobs", input);
 }
 
 export interface FailJobOptions {
   maxAttempts?: number;
 }
 
-interface FailableJob {
-  id: string;
-  campaignId: string;
-  type: string;
-  payload: unknown;
-  attemptCount: number;
-  maxAttempts: number;
+export interface FailJobInput {
+  workerId: string;
+  job: FailableJob;
+  error: unknown;
+  classification?: JobFailureClassification;
+  now?: Date;
+  options?: FailJobOptions;
 }
 
-async function fail(
-  table: "discovery_jobs" | "processing_jobs",
-  job: FailableJob,
-  error: unknown,
-  now: Date,
-  options: FailJobOptions,
-): Promise<void> {
+async function fail(table: QueueTable, input: FailJobInput): Promise<void> {
   const db = getDb();
+  const now = input.now ?? new Date();
   const nowIso = now.toISOString();
-  const maxAttempts = options.maxAttempts ?? job.maxAttempts;
-  const message = error instanceof Error ? error.message : String(error);
-  const permanent = isPermanentError(error);
-  const deadLetter = permanent || job.attemptCount >= maxAttempts;
+  const maxAttempts = input.options?.maxAttempts ?? input.job.maxAttempts;
+  const message = input.error instanceof Error ? input.error.message : String(input.error);
+  const classification = classifyFailure(input.error, input.classification);
+  const deadLetter = classification === "permanent" || input.job.attemptCount >= maxAttempts;
 
   if (deadLetter) {
-    if (table === "discovery_jobs") {
-      await db.execute(sql`
-        UPDATE discovery_jobs
-        SET status = 'dead_letter', locked_at = NULL, locked_by = NULL, next_attempt_at = NULL, last_error = ${message}, updated_at = ${nowIso}::timestamptz
-        WHERE id = ${job.id}::uuid;
-      `);
-    } else {
-      await db.execute(sql`
-        UPDATE processing_jobs
-        SET status = 'dead_letter', locked_at = NULL, locked_by = NULL, next_attempt_at = NULL, last_error = ${message}, updated_at = ${nowIso}::timestamptz
-        WHERE id = ${job.id}::uuid;
-      `);
-    }
-    await db.insert(deadLetterJobs).values({
-      sourceTable: table,
-      sourceJobId: job.id,
-      campaignId: job.campaignId,
-      payload: job.payload as Record<string, unknown>,
-      attemptCount: job.attemptCount,
-      lastError: message,
+    await db.transaction(async (tx) => {
+      const updated =
+        table === "discovery_jobs"
+          ? await tx.execute(sql`
+              UPDATE discovery_jobs
+              SET status = 'dead_letter',
+                  locked_at = NULL,
+                  locked_by = NULL,
+                  next_attempt_at = NULL,
+                  last_error = ${message},
+                  updated_at = ${nowIso}::timestamptz
+              WHERE id = ${input.job.id}::uuid
+                AND status = 'processing'
+                AND locked_by = ${input.workerId}
+              RETURNING id, campaign_id, payload, attempt_count;
+            `)
+          : await tx.execute(sql`
+              UPDATE processing_jobs
+              SET status = 'dead_letter',
+                  locked_at = NULL,
+                  locked_by = NULL,
+                  next_attempt_at = NULL,
+                  last_error = ${message},
+                  updated_at = ${nowIso}::timestamptz
+              WHERE id = ${input.job.id}::uuid
+                AND status = 'processing'
+                AND locked_by = ${input.workerId}
+              RETURNING id, campaign_id, payload, attempt_count;
+            `);
+
+      const row = updated.rows[0] as
+        | {
+            id: string;
+            campaign_id: string;
+            payload: Record<string, unknown>;
+            attempt_count: number;
+          }
+        | undefined;
+
+      if (!row) {
+        throw new LostLeaseError(table, input.job.id, input.workerId);
+      }
+
+      await tx
+        .insert(deadLetterJobs)
+        .values({
+          sourceTable: table,
+          sourceJobId: row.id,
+          campaignId: row.campaign_id,
+          payload: row.payload,
+          attemptCount: row.attempt_count,
+          lastError: message,
+        })
+        .onConflictDoNothing({
+          target: [deadLetterJobs.sourceTable, deadLetterJobs.sourceJobId],
+        });
     });
     return;
   }
 
-  const backoffMs = computeBackoffMs(job.attemptCount);
+  const backoffMs = computeBackoffMs(input.job.attemptCount);
   const nextAttemptAtIso = new Date(now.getTime() + backoffMs).toISOString();
-  if (table === "discovery_jobs") {
-    await db.execute(sql`
-      UPDATE discovery_jobs
-      SET status = 'pending', locked_at = NULL, locked_by = NULL, next_attempt_at = ${nextAttemptAtIso}::timestamptz, last_error = ${message}, updated_at = ${nowIso}::timestamptz
-      WHERE id = ${job.id}::uuid;
-    `);
-  } else {
-    await db.execute(sql`
-      UPDATE processing_jobs
-      SET status = 'pending', locked_at = NULL, locked_by = NULL, next_attempt_at = ${nextAttemptAtIso}::timestamptz, last_error = ${message}, updated_at = ${nowIso}::timestamptz
-      WHERE id = ${job.id}::uuid;
-    `);
+
+  const result =
+    table === "discovery_jobs"
+      ? await db.execute(sql`
+          UPDATE discovery_jobs
+          SET status = 'pending',
+              locked_at = NULL,
+              locked_by = NULL,
+              next_attempt_at = ${nextAttemptAtIso}::timestamptz,
+              last_error = ${message},
+              updated_at = ${nowIso}::timestamptz
+          WHERE id = ${input.job.id}::uuid
+            AND status = 'processing'
+            AND locked_by = ${input.workerId}
+          RETURNING id;
+        `)
+      : await db.execute(sql`
+          UPDATE processing_jobs
+          SET status = 'pending',
+              locked_at = NULL,
+              locked_by = NULL,
+              next_attempt_at = ${nextAttemptAtIso}::timestamptz,
+              last_error = ${message},
+              updated_at = ${nowIso}::timestamptz
+          WHERE id = ${input.job.id}::uuid
+            AND status = 'processing'
+            AND locked_by = ${input.workerId}
+          RETURNING id;
+        `);
+
+  if (result.rows.length === 0) {
+    throw new LostLeaseError(table, input.job.id, input.workerId);
   }
 }
 
-export async function failDiscoveryJob(
-  job: FailableJob,
-  error: unknown,
-  now: Date = new Date(),
-  options: FailJobOptions = {},
-): Promise<void> {
-  return fail("discovery_jobs", job, error, now, options);
+export async function failDiscoveryJob(input: FailJobInput): Promise<void> {
+  return fail("discovery_jobs", input);
 }
 
-export async function failProcessingJob(
-  job: FailableJob,
-  error: unknown,
-  now: Date = new Date(),
-  options: FailJobOptions = {},
-): Promise<void> {
-  return fail("processing_jobs", job, error, now, options);
+export async function failProcessingJob(input: FailJobInput): Promise<void> {
+  return fail("processing_jobs", input);
 }
 
 export interface EnqueueJobInput {
   campaignId: string;
   type: string;
   payload: Record<string, unknown>;
+  maxAttempts?: number;
+  idempotencyKey?: string | null;
+}
+
+async function enqueueDiscovery(input: EnqueueJobInput): Promise<string> {
+  const db = getDb();
+  const values = {
+    campaignId: input.campaignId,
+    type: input.type,
+    payload: input.payload,
+    maxAttempts: input.maxAttempts ?? 5,
+    idempotencyKey: input.idempotencyKey ?? null,
+  };
+
+  if (!input.idempotencyKey) {
+    const [row] = await db.insert(discoveryJobs).values(values).returning({ id: discoveryJobs.id });
+    if (!row) throw new Error("Failed to enqueue discovery job.");
+    return row.id;
+  }
+
+  const [inserted] = await db.insert(discoveryJobs).values(values).onConflictDoNothing().returning({ id: discoveryJobs.id });
+  if (inserted) return inserted.id;
+
+  const [existing] = await db
+    .select({ id: discoveryJobs.id })
+    .from(discoveryJobs)
+    .where(and(eq(discoveryJobs.idempotencyKey, input.idempotencyKey), inArray(discoveryJobs.status, ["pending", "processing"])))
+    .limit(1);
+
+  if (!existing) throw new Error(`Failed to resolve idempotent discovery enqueue for key ${input.idempotencyKey}.`);
+  return existing.id;
+}
+
+async function enqueueProcessing(input: EnqueueJobInput): Promise<string> {
+  const db = getDb();
+  const values = {
+    campaignId: input.campaignId,
+    type: input.type,
+    payload: input.payload,
+    maxAttempts: input.maxAttempts ?? 5,
+    idempotencyKey: input.idempotencyKey ?? null,
+  };
+
+  if (!input.idempotencyKey) {
+    const [row] = await db.insert(processingJobs).values(values).returning({ id: processingJobs.id });
+    if (!row) throw new Error("Failed to enqueue processing job.");
+    return row.id;
+  }
+
+  const [inserted] = await db.insert(processingJobs).values(values).onConflictDoNothing().returning({ id: processingJobs.id });
+  if (inserted) return inserted.id;
+
+  const [existing] = await db
+    .select({ id: processingJobs.id })
+    .from(processingJobs)
+    .where(and(eq(processingJobs.idempotencyKey, input.idempotencyKey), inArray(processingJobs.status, ["pending", "processing"])))
+    .limit(1);
+
+  if (!existing) throw new Error(`Failed to resolve idempotent processing enqueue for key ${input.idempotencyKey}.`);
+  return existing.id;
 }
 
 export async function enqueueDiscoveryJob(input: EnqueueJobInput): Promise<string> {
-  const db = getDb();
-  const [row] = await db.insert(discoveryJobs).values({ campaignId: input.campaignId, type: input.type, payload: input.payload }).returning({ id: discoveryJobs.id });
-  if (!row) throw new Error("Failed to enqueue discovery job.");
-  return row.id;
+  return enqueueDiscovery(input);
 }
 
 export async function enqueueProcessingJob(input: EnqueueJobInput): Promise<string> {
-  const db = getDb();
-  const [row] = await db.insert(processingJobs).values({ campaignId: input.campaignId, type: input.type, payload: input.payload }).returning({ id: processingJobs.id });
-  if (!row) throw new Error("Failed to enqueue processing job.");
-  return row.id;
+  return enqueueProcessing(input);
 }

@@ -1,3 +1,4 @@
+import { sql } from "drizzle-orm";
 import { pgTable, text, timestamp, uuid, integer, numeric, jsonb, uniqueIndex, index } from "drizzle-orm/pg-core";
 import { campaigns } from "./campaigns";
 import { accounts } from "./accounts";
@@ -23,7 +24,8 @@ export const outreachQueue = pgTable(
     maxAttempts: integer("max_attempts").notNull().default(5),
     lockedAt: timestamp("locked_at", { withTimezone: true }),
     lockedBy: text("locked_by"),
-    nextAttemptAt: timestamp("next_attempt_at", { withTimezone: true }).notNull().defaultNow(),
+    idempotencyKey: text("idempotency_key"),
+    nextAttemptAt: timestamp("next_attempt_at", { withTimezone: true }).defaultNow(),
     lastError: text("last_error"),
     accountId: uuid("account_id")
       .notNull()
@@ -45,6 +47,9 @@ export const outreachQueue = pgTable(
     index("idx_outreach_queue_dispatch").on(table.status, table.nextAttemptAt),
     index("idx_outreach_queue_account").on(table.accountId),
     index("idx_outreach_queue_dedup_key").on(table.contactPointId, table.campaignId, table.channel),
+    uniqueIndex("uq_outreach_queue_idempotency_inflight")
+      .on(table.idempotencyKey)
+      .where(sql`${table.idempotencyKey} is not null and ${table.status} in ('pending', 'processing')`),
   ],
 );
 
@@ -82,6 +87,7 @@ export const deadLetterJobs = pgTable(
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [
+    uniqueIndex("uq_dead_letter_jobs_source_job").on(table.sourceTable, table.sourceJobId),
     index("idx_dead_letter_jobs_source").on(table.sourceTable, table.sourceJobId),
     index("idx_dead_letter_jobs_created_at").on(table.createdAt),
   ],

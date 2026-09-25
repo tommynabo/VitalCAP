@@ -3,7 +3,7 @@ import type { EngineType } from "@/domain/campaigns/types";
 import { getCampaignById, listActiveCampaigns } from "@/infrastructure/neon/repositories/campaigns";
 import { listWorkspaceIds } from "@/infrastructure/neon/repositories/workspace";
 import {
-  claimNextDiscoveryJob,
+  claimDiscoveryJobs,
   completeDiscoveryJob,
   failDiscoveryJob,
   enqueueDiscoveryJob,
@@ -46,7 +46,12 @@ export async function ensureDiscoveryJobsQueued(workspaceId: string): Promise<nu
     if (campaign.engineType === "hybrid_fill") continue; // hybrid_fill is driven by the autopilot rebalancer, not a standing per-tick job (§2.10)
     if (await hasInFlightDiscoveryJob(campaign.id)) continue;
     await bootstrapSearchSeeds(campaign.id, campaign.engineType, catalogForEngine(campaign.id, campaign.engineType));
-    await enqueueDiscoveryJob({ campaignId: campaign.id, type: DISCOVERY_JOB_TYPE, payload: { engineType: campaign.engineType } });
+    await enqueueDiscoveryJob({
+      campaignId: campaign.id,
+      type: DISCOVERY_JOB_TYPE,
+      payload: { engineType: campaign.engineType },
+      idempotencyKey: `discovery:${campaign.id}:${DISCOVERY_JOB_TYPE}`,
+    });
     enqueued += 1;
   }
   return enqueued;
@@ -89,7 +94,12 @@ async function executeDiscoveryJob(job: { id: string; campaignId: string; payloa
         : [];
 
     for (const rawCandidateId of insertedIds) {
-      await enqueueProcessingJob({ campaignId: campaign.id, type: "process_raw_candidate", payload: { rawCandidateId } });
+      await enqueueProcessingJob({
+        campaignId: campaign.id,
+        type: "process_raw_candidate",
+        payload: { rawCandidateId },
+        idempotencyKey: `raw_candidate:${rawCandidateId}`,
+      });
     }
 
     await insertSearchSeedRun({
@@ -132,15 +142,14 @@ export async function runDiscoveryCronTick(maxJobsPerTick: number, now: Date = n
   let jobsClaimed = 0;
   let rawCandidatesProduced = 0;
 
-  for (let i = 0; i < maxJobsPerTick; i++) {
-    const job = await claimNextDiscoveryJob<DiscoveryJobPayload>(workerId, now);
-    if (!job) break;
+  const jobs = await claimDiscoveryJobs<DiscoveryJobPayload>({ workerId, batchSize: maxJobsPerTick, now });
+  for (const job of jobs) {
     jobsClaimed += 1;
     try {
       rawCandidatesProduced += await executeDiscoveryJob(job);
-      await completeDiscoveryJob(job.id, now);
+      await completeDiscoveryJob({ jobId: job.id, workerId, now });
     } catch (error) {
-      await failDiscoveryJob(job, error, now);
+      await failDiscoveryJob({ workerId, job, error, now });
     }
   }
 

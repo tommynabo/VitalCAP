@@ -24,6 +24,7 @@ export interface JobRecord<TPayload = Record<string, unknown>> {
   maxAttempts: number;
   lockedAt: string | null;
   lockedBy: string | null;
+  idempotencyKey?: string | null;
   nextAttemptAt: string | null;
   lastError: string | null;
   createdAt: string;

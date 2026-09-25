@@ -1,4 +1,5 @@
-import { pgTable, text, timestamp, uuid, integer, numeric, jsonb, boolean, index } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
+import { pgTable, text, timestamp, uuid, integer, numeric, jsonb, boolean, index, uniqueIndex } from "drizzle-orm/pg-core";
 import { campaigns } from "./campaigns";
 
 /**
@@ -22,7 +23,8 @@ export const discoveryJobs = pgTable(
     maxAttempts: integer("max_attempts").notNull().default(5),
     lockedAt: timestamp("locked_at", { withTimezone: true }),
     lockedBy: text("locked_by"),
-    nextAttemptAt: timestamp("next_attempt_at", { withTimezone: true }).notNull().defaultNow(),
+    idempotencyKey: text("idempotency_key"),
+    nextAttemptAt: timestamp("next_attempt_at", { withTimezone: true }).defaultNow(),
     lastError: text("last_error"),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
@@ -30,6 +32,9 @@ export const discoveryJobs = pgTable(
   (table) => [
     index("idx_discovery_jobs_campaign").on(table.campaignId),
     index("idx_discovery_jobs_dispatch").on(table.status, table.nextAttemptAt),
+    uniqueIndex("uq_discovery_jobs_idempotency_inflight")
+      .on(table.idempotencyKey)
+      .where(sql`${table.idempotencyKey} is not null and ${table.status} in ('pending', 'processing')`),
   ],
 );
 
@@ -70,7 +75,8 @@ export const processingJobs = pgTable(
     maxAttempts: integer("max_attempts").notNull().default(5),
     lockedAt: timestamp("locked_at", { withTimezone: true }),
     lockedBy: text("locked_by"),
-    nextAttemptAt: timestamp("next_attempt_at", { withTimezone: true }).notNull().defaultNow(),
+    idempotencyKey: text("idempotency_key"),
+    nextAttemptAt: timestamp("next_attempt_at", { withTimezone: true }).defaultNow(),
     lastError: text("last_error"),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
@@ -78,6 +84,9 @@ export const processingJobs = pgTable(
   (table) => [
     index("idx_processing_jobs_campaign").on(table.campaignId),
     index("idx_processing_jobs_dispatch").on(table.status, table.nextAttemptAt),
+    uniqueIndex("uq_processing_jobs_idempotency_inflight")
+      .on(table.idempotencyKey)
+      .where(sql`${table.idempotencyKey} is not null and ${table.status} in ('pending', 'processing')`),
   ],
 );
 

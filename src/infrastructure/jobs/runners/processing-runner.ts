@@ -4,7 +4,7 @@ import type { CampaignMembershipStage } from "@/domain/campaigns/types";
 import { getCampaignById } from "@/infrastructure/neon/repositories/campaigns";
 import { upsertCampaignMembership } from "@/infrastructure/neon/repositories/campaigns";
 import {
-  claimNextProcessingJob,
+  claimProcessingJobs,
   completeProcessingJob,
   failProcessingJob,
 } from "@/infrastructure/neon/repositories/job-queue";
@@ -216,15 +216,14 @@ export async function runProcessingCronTick(maxJobsPerTick: number, now: Date = 
   const workerId = `cron-process-${randomUUID()}`;
   let jobsClaimed = 0;
 
-  for (let i = 0; i < maxJobsPerTick; i++) {
-    const job = await claimNextProcessingJob<ProcessingJobPayload>(workerId, now);
-    if (!job) break;
+  const jobs = await claimProcessingJobs<ProcessingJobPayload>({ workerId, batchSize: maxJobsPerTick, now });
+  for (const job of jobs) {
     jobsClaimed += 1;
     try {
       await executeProcessingJob(job);
-      await completeProcessingJob(job.id, now);
+      await completeProcessingJob({ jobId: job.id, workerId, now });
     } catch (error) {
-      await failProcessingJob(job, error, now);
+      await failProcessingJob({ workerId, job, error, now });
     }
   }
 
