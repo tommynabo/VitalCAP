@@ -1,9 +1,10 @@
 "use client";
 
 import { usePathname } from "next/navigation";
-import { Bell, Menu, Search } from "lucide-react";
+import { Bell, LogOut, Menu, Search } from "lucide-react";
 import { NAV_ITEMS } from "./nav-config";
 import { useSidebar } from "./sidebar-context";
+import { signOutAction } from "@/lib/auth/actions";
 
 export function TopBar() {
   const pathname = usePathname();
@@ -44,6 +45,15 @@ export function TopBar() {
         >
           V
         </div>
+        <form action={signOutAction}>
+          <button
+            type="submit"
+            aria-label="Sign out"
+            className="flex h-9 w-9 items-center justify-center rounded-[10px] border border-border text-text-muted hover:bg-surface-muted hover:text-text"
+          >
+            <LogOut className="h-4 w-4" aria-hidden="true" />
+          </button>
+        </form>
       </div>
     </header>
   );
