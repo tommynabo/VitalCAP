@@ -68,7 +68,7 @@ export async function getGlobalAutopilotState(workspaceId: string): Promise<Glob
     .innerJoin(conversations, eq(meetings.conversationId, conversations.id))
     .where(and(eq(conversations.workspaceId, workspaceId), gte(meetings.createdAt, today)));
 
-  const engines = await Promise.all(ENGINE_TYPES.map((engineType) => getEngineTargetState(workspaceId, engineType)));
+  const engines = await listEngineTargets(workspaceId);
 
   return {
     dailyTarget: dailyTargetRow?.total ?? 0,
@@ -80,6 +80,10 @@ export async function getGlobalAutopilotState(workspaceId: string): Promise<Glob
     systemHealth: "unknown",
     engines,
   };
+}
+
+export async function listEngineTargets(workspaceId: string): Promise<EngineTargetState[]> {
+  return Promise.all(ENGINE_TYPES.map((engineType) => getEngineTargetState(workspaceId, engineType)));
 }
 
 async function getEngineTargetState(workspaceId: string, engineType: EngineType): Promise<EngineTargetState> {
