@@ -25,7 +25,7 @@ export async function getWeeklyTrend(workspaceId: string): Promise<WeeklyTrendPo
     .where(
       and(
         eq(conversations.workspaceId, workspaceId),
-        eq(conversationMessages.direction, "inbound"),
+        eq(conversationMessages.direction, "incoming"),
         gte(conversationMessages.createdAt, since),
       ),
     )

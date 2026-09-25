@@ -2,7 +2,7 @@ import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Table, TableBody, TableCell, TableHead, TableHeadCell, TableRow } from "@/components/ui/table";
 import { KpiStat } from "@/components/dashboard/kpi-stat";
-import { seedSearchSeeds } from "@/lib/seed/dev-seed";
+import { getSearchSeeds } from "@/lib/data/repository";
 
 const ENGINE_LABELS: Record<string, string> = {
   maps_fast: "Maps Fast",
@@ -18,7 +18,8 @@ function yieldVariant(yieldRate: number): "success" | "warning" | "danger" {
   return "danger";
 }
 
-export default function DiscoveryPage() {
+export default async function DiscoveryPage() {
+  const seedSearchSeeds = await getSearchSeeds();
   const totalRaw = seedSearchSeeds.reduce((sum, s) => sum + s.totalRaw, 0);
   const totalReady = seedSearchSeeds.reduce((sum, s) => sum + s.totalReady, 0);
   const exhausted = seedSearchSeeds.filter((s) => s.exhaustionScore >= 0.8).length;

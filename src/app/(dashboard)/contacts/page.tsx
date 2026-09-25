@@ -2,14 +2,15 @@ import { User, AtSign } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Table, TableBody, TableCell, TableHead, TableHeadCell, TableRow } from "@/components/ui/table";
-import { seedAccountBundles } from "@/lib/seed/dev-seed";
+import { getAccountBundles } from "@/lib/data/repository";
 
-export default function ContactsPage() {
-  const namedContacts = seedAccountBundles.flatMap(({ account, contacts: accountContacts }) =>
+export default async function ContactsPage() {
+  const accountBundles = await getAccountBundles();
+  const namedContacts = accountBundles.flatMap(({ account, contacts: accountContacts }) =>
     accountContacts.map((contact) => ({ kind: "named" as const, contact, accountName: account.canonicalName })),
   );
 
-  const genericEndpoints = seedAccountBundles.flatMap(({ account, contactPoints }) =>
+  const genericEndpoints = accountBundles.flatMap(({ account, contactPoints }) =>
     contactPoints
       .filter((cp) => cp.isGeneric && !cp.contactId)
       .map((cp) => ({ kind: "generic" as const, contactPoint: cp, accountName: account.canonicalName })),

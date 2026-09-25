@@ -3,12 +3,12 @@ import type { LucideIcon } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import {
-  seedEmailVerificationUsage,
-  seedMailboxes,
-  seedProviderRows,
-  seedConversations,
-  seedRebalanceDecisions,
-} from "@/lib/seed/dev-seed";
+  getEmailVerificationUsageData,
+  getMailboxes,
+  getProviderRowsData,
+  getConversations,
+  getRebalanceDecisions,
+} from "@/lib/data/repository";
 
 interface ActivityItem {
   id: string;
@@ -23,7 +23,15 @@ interface ActivityItem {
  * issues, verification quota warnings — one operator-facing stream rather
  * than several small unrelated cards.
  */
-export function ActivityRail() {
+export async function ActivityRail() {
+  const [seedRebalanceDecisions, seedConversations, seedMailboxes, seedProviderRows, seedEmailVerificationUsage] =
+    await Promise.all([
+      getRebalanceDecisions(),
+      getConversations(),
+      getMailboxes(),
+      getProviderRowsData(),
+      getEmailVerificationUsageData(),
+    ]);
   const items: ActivityItem[] = [];
 
   for (const decision of seedRebalanceDecisions) {

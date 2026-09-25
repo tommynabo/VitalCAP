@@ -5,18 +5,18 @@ import { usePathname } from "next/navigation";
 import { ChevronsLeft, ChevronsRight, X } from "lucide-react";
 import { cn } from "@/lib/utils/cn";
 import { NAV_ITEMS } from "./nav-config";
-import { getNavBadgeCounts } from "./nav-badges";
 import { useSidebar } from "./sidebar-context";
 
 function SidebarContent({
   collapsed,
   onNavigate,
+  badgeCounts,
 }: {
   collapsed: boolean;
   onNavigate?: () => void;
+  badgeCounts: Record<string, number>;
 }) {
   const pathname = usePathname();
-  const badgeCounts = getNavBadgeCounts();
 
   return (
     <>
@@ -63,7 +63,7 @@ function SidebarContent({
   );
 }
 
-export function Sidebar() {
+export function Sidebar({ badgeCounts }: { badgeCounts: Record<string, number> }) {
   const { collapsed, toggleCollapsed, mobileOpen, setMobileOpen } = useSidebar();
 
   return (
@@ -81,7 +81,7 @@ export function Sidebar() {
           {!collapsed && <span className="text-sm font-semibold tracking-tight text-text">Vitalcap Outreach OS</span>}
         </div>
 
-        <SidebarContent collapsed={collapsed} />
+        <SidebarContent collapsed={collapsed} badgeCounts={badgeCounts} />
 
         <div className="border-t border-border p-3">
           <button
@@ -111,7 +111,7 @@ export function Sidebar() {
                 <X className="h-4 w-4" aria-hidden="true" />
               </button>
             </div>
-            <SidebarContent collapsed={false} onNavigate={() => setMobileOpen(false)} />
+            <SidebarContent collapsed={false} onNavigate={() => setMobileOpen(false)} badgeCounts={badgeCounts} />
           </div>
         </div>
       ) : null}

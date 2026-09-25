@@ -7,14 +7,14 @@ import { Progress } from "@/components/ui/progress";
 import { FunnelChart, MiniBarChart, MixBar } from "@/components/ui/charts";
 import { globalProgressPct } from "@/lib/autopilot/targets";
 import {
-  getSeedGlobalAutopilotState,
-  seedAccountBundles,
-  seedCampaigns,
-  seedConversations,
-  seedMeetings,
-  seedOutreachQueueItems,
-  seedWeeklyTrend,
-} from "@/lib/seed/dev-seed";
+  getGlobalAutopilotStateData,
+  getAccountBundles,
+  getCampaigns,
+  getConversations,
+  getMeetings,
+  getOutreachQueueItems,
+  getWeeklyTrendData,
+} from "@/lib/data/repository";
 
 function greeting(): string {
   const hour = new Date().getHours();
@@ -23,8 +23,17 @@ function greeting(): string {
   return "Good evening";
 }
 
-export default function DashboardPage() {
-  const state = getSeedGlobalAutopilotState();
+export default async function DashboardPage() {
+  const [state, seedAccountBundles, seedCampaigns, seedConversations, seedMeetings, seedOutreachQueueItems, seedWeeklyTrend] =
+    await Promise.all([
+      getGlobalAutopilotStateData(),
+      getAccountBundles(),
+      getCampaigns(),
+      getConversations(),
+      getMeetings(),
+      getOutreachQueueItems(),
+      getWeeklyTrendData(),
+    ]);
   const progressPct = globalProgressPct(state.dailyTarget, state.engines);
 
   const totalContactPoints = seedAccountBundles.reduce((sum, b) => sum + b.contactPoints.length, 0);

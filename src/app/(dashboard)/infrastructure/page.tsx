@@ -3,12 +3,12 @@ import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { summarizeSenderPoolCapacity } from "@/services/outreach/sender-pool-service";
 import {
-  seedEmailVerificationUsage,
-  seedMailboxes,
-  seedProviderRows,
-  seedSendingDomains,
-  type ProviderRowStatus,
-} from "@/lib/seed/dev-seed";
+  getEmailVerificationUsageData,
+  getMailboxes,
+  getProviderRowsData,
+  getSendingDomains,
+} from "@/lib/data/repository";
+import type { ProviderRowStatus } from "@/lib/data/repository";
 import type { SendingDomain } from "@/domain/outreach/types";
 
 const DOMAIN_STATUS_VARIANT: Record<SendingDomain["status"], "success" | "warning" | "danger" | "neutral"> = {
@@ -18,9 +18,18 @@ const DOMAIN_STATUS_VARIANT: Record<SendingDomain["status"], "success" | "warnin
   missing_configuration: "neutral",
 };
 
-const PROVIDER_STATUS_VARIANT: Record<ProviderRowStatus, "success" | "warning" | "danger" | "neutral"> = DOMAIN_STATUS_VARIANT;
+const PROVIDER_STATUS_VARIANT: Record<ProviderRowStatus, "success" | "warning" | "danger" | "neutral"> = {
+  ...DOMAIN_STATUS_VARIANT,
+  unknown: "neutral",
+};
 
-export default function InfrastructurePage() {
+export default async function InfrastructurePage() {
+  const [seedMailboxes, seedSendingDomains, seedProviderRows, seedEmailVerificationUsage] = await Promise.all([
+    getMailboxes(),
+    getSendingDomains(),
+    getProviderRowsData(),
+    getEmailVerificationUsageData(),
+  ]);
   const capacity = summarizeSenderPoolCapacity({ mailboxes: seedMailboxes, sendingDomains: seedSendingDomains });
 
   return (

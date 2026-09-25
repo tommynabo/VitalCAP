@@ -2,12 +2,12 @@ import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { FunnelChart } from "@/components/ui/charts";
 import {
-  seedAccountBundles,
-  seedCampaigns,
-  seedConversations,
-  seedMeetings,
-  seedOutreachQueueItems,
-} from "@/lib/seed/dev-seed";
+  getAccountBundles,
+  getCampaigns,
+  getConversations,
+  getMeetings,
+  getOutreachQueueItems,
+} from "@/lib/data/repository";
 
 const ENGINE_LABELS: Record<string, string> = {
   maps_fast: "Maps Fast",
@@ -58,7 +58,15 @@ function BreakdownTable({ title, rows }: { title: string; rows: Array<{ label: s
   );
 }
 
-export default function AnalyticsPage() {
+export default async function AnalyticsPage() {
+  const [seedAccountBundles, seedCampaigns, seedConversations, seedMeetings, seedOutreachQueueItems] = await Promise.all([
+    getAccountBundles(),
+    getCampaigns(),
+    getConversations(),
+    getMeetings(),
+    getOutreachQueueItems(),
+  ]);
+
   const accounts = seedAccountBundles.map((b) => b.account);
   const allContactPoints = seedAccountBundles.flatMap((b) => b.contactPoints);
   const allContacts = seedAccountBundles.flatMap((b) => b.contacts);

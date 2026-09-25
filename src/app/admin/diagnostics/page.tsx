@@ -1,14 +1,14 @@
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import {
-  seedCronLastRunAt,
-  seedDbConnectivityOk,
-  seedDeadLetterSamples,
-  seedProviderRows,
-  seedQueueHealth,
-  seedWebhookLastEventAt,
-  getSeedGlobalAutopilotState,
-} from "@/lib/seed/dev-seed";
+  getCronLastRunAtData,
+  getDbConnectivityOkData,
+  getDeadLetterSamplesData,
+  getProviderRowsData,
+  getQueueHealthData,
+  getWebhookLastEventAtData,
+  getGlobalAutopilotStateData,
+} from "@/lib/data/repository";
 import { buildAdminDiagnostics } from "@/lib/observability/admin-diagnostics";
 
 /**
@@ -18,8 +18,24 @@ import { buildAdminDiagnostics } from "@/lib/observability/admin-diagnostics";
  * salesperson-facing navigation. Intended for whoever operates the system,
  * not for day-to-day sales use.
  */
-export default function AdminDiagnosticsPage() {
-  const autopilotState = getSeedGlobalAutopilotState();
+export default async function AdminDiagnosticsPage() {
+  const [
+    autopilotState,
+    seedQueueHealth,
+    seedProviderRows,
+    seedCronLastRunAt,
+    seedWebhookLastEventAt,
+    seedDbConnectivityOk,
+    seedDeadLetterSamples,
+  ] = await Promise.all([
+    getGlobalAutopilotStateData(),
+    getQueueHealthData(),
+    getProviderRowsData(),
+    getCronLastRunAtData(),
+    getWebhookLastEventAtData(),
+    getDbConnectivityOkData(),
+    getDeadLetterSamplesData(),
+  ]);
   const snapshot = buildAdminDiagnostics({
     queueHealth: seedQueueHealth,
     now: new Date(),
