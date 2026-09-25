@@ -8,3 +8,4 @@ export * from "./conversations";
 export * from "./providers";
 export * from "./audit";
 export * from "./autopilot";
+export * from "./jobs-meta";

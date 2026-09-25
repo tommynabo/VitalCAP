@@ -59,3 +59,15 @@ export function isDueForFollowup(item: WarmFollowupQueueItem, now: Date): boolea
   if (item.status !== "active" || !item.nextFollowupAt) return false;
   return now.getTime() >= new Date(item.nextFollowupAt).getTime();
 }
+
+/**
+ * Records that a follow-up was just dispatched and re-arms the item for the
+ * next one — there's no "max follow-up count" concept in this schema (only
+ * a single re-armable `nextFollowupAt`), so the item stays `active`
+ * indefinitely until an actual pause/complete trigger fires via
+ * `applyWarmFollowupTrigger`. Reuses the exact same delay constant/formula
+ * `enterWarmFollowupQueue` already uses.
+ */
+export function recordFollowupDispatch(item: WarmFollowupQueueItem, now: Date): WarmFollowupQueueItem {
+  return { ...item, nextFollowupAt: new Date(now.getTime() + WARM_FOLLOWUP_DELAY_MS).toISOString() };
+}

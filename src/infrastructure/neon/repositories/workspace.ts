@@ -31,3 +31,10 @@ export async function getOrCreateWorkspaceIdForUser(userId: string, fallbackName
   if (existing) return existing;
   return createWorkspaceForUser(userId, fallbackName);
 }
+
+/** Every workspace id (Gate E cron routes tick across all workspaces, not just the caller's). Bounded — see docs/PERFORMANCE_REVIEW.md if this ever needs pagination. */
+export async function listWorkspaceIds(): Promise<string[]> {
+  const db = getDb();
+  const rows = await db.select({ id: workspaces.id }).from(workspaces);
+  return rows.map((row) => row.id);
+}

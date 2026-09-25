@@ -165,6 +165,19 @@ function identitySignalsFor(payload: CandidateRawPayload): {
   };
 }
 
+/**
+ * Exposes `identitySignalsFor`'s `incoming` half only — needed by the Neon
+ * repository layer (Gate E) to run its bounded, indexed
+ * `findCandidateAccountMatches` query *before* calling `processRawCandidate`
+ * itself (which needs that query's result as its `existingAccounts` input).
+ * Deliberately not exposing the rest of `identitySignalsFor`'s return value
+ * — the Spain-eligibility/business-name/website-url fields are only ever
+ * needed inside this module's own pipeline.
+ */
+export function deriveIncomingIdentitySignals(payload: CandidateRawPayload): Omit<AccountIdentitySignals, "accountId"> {
+  return identitySignalsFor(payload).incoming;
+}
+
 function accountKeyFor(incoming: Omit<AccountIdentitySignals, "accountId">, businessNameGuess: string, geography: string): string {
   if (incoming.googlePlaceId) return `place:${incoming.googlePlaceId}`;
   if (incoming.normalizedDomain) return `domain:${incoming.normalizedDomain}`;

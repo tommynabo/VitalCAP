@@ -156,3 +156,15 @@ export async function listRebalanceDecisions(workspaceId: string): Promise<Rebal
     .limit(50);
   return rows.map(toRebalanceDecision);
 }
+
+/** Persists one `QuotaRebalancer` decision (Gate E autopilot cron). */
+export async function insertRebalanceDecision(workspaceId: string, decision: Omit<RebalanceDecision, "id" | "createdAt">): Promise<void> {
+  const db = getDb();
+  await db.insert(rebalanceDecisions).values({
+    workspaceId,
+    fromEngine: decision.fromEngine,
+    toEngine: decision.toEngine,
+    amount: decision.amount,
+    reason: decision.reason,
+  });
+}

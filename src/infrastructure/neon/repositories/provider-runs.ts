@@ -1,6 +1,7 @@
 import { and, eq, gte, sql } from "drizzle-orm";
 import { getDb } from "../db";
 import { providerRuns } from "../schema/providers";
+import type { ProviderUsageStats } from "@/domain/providers/types";
 
 export interface RecordProviderRunInput {
   workspaceId: string;
@@ -57,4 +58,24 @@ export async function getTodaySpendUsd(workspaceId: string, provider: string): P
     .where(and(eq(providerRuns.workspaceId, workspaceId), eq(providerRuns.provider, provider), gte(providerRuns.startedAt, startOfDayUtc)));
 
   return row?.total ?? 0;
+}
+
+/** Real `provider_runs` rows from the last `sinceHours`, folded into `evaluateProviderHealth`'s `ProviderUsageStats` shape (Gate E autopilot cron — feeds real per-engine provider health into `runAutopilotTick`, replacing the previously-hardcoded `"unknown"`). */
+export async function getRecentProviderUsage(workspaceId: string, provider: string, sinceHours = 24): Promise<ProviderUsageStats> {
+  const db = getDb();
+  const since = new Date(Date.now() - sinceHours * 60 * 60 * 1000);
+  const rows = await db
+    .select({ status: providerRuns.status, itemsReturned: providerRuns.itemsReturned, costUsd: providerRuns.costUsd })
+    .from(providerRuns)
+    .where(and(eq(providerRuns.workspaceId, workspaceId), eq(providerRuns.provider, provider), gte(providerRuns.startedAt, since)));
+
+  let items = 0;
+  let errors = 0;
+  let costUsd = 0;
+  for (const row of rows) {
+    items += row.itemsReturned;
+    costUsd += row.costUsd;
+    if (row.status === "failed") errors += 1;
+  }
+  return { calls: rows.length, items, errors, totalLatencyMs: 0, costUsd, quotaRemaining: null };
 }

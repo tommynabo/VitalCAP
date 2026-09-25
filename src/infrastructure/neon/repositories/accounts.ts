@@ -1,9 +1,10 @@
-import { eq } from "drizzle-orm";
+import { and, eq, gte, lte, or } from "drizzle-orm";
 import { getDb } from "../db";
 import { accounts, accountSources } from "../schema/accounts";
 import { contacts, contactPoints } from "../schema/contacts";
-import type { Account, AccountSource } from "@/domain/accounts/types";
-import type { Contact, ContactPoint } from "@/domain/contacts/types";
+import type { Account, AccountSource, AccountStatus, BusinessType } from "@/domain/accounts/types";
+import type { Contact, ContactPoint, ContactPointType, VerificationStatus } from "@/domain/contacts/types";
+import type { AccountIdentitySignals } from "@/services/deduplication/account-dedup";
 
 export interface AccountBundle {
   account: Account;
@@ -77,7 +78,7 @@ function toContact(row: typeof contacts.$inferSelect): Contact {
   };
 }
 
-function toContactPoint(row: typeof contactPoints.$inferSelect): ContactPoint {
+export function toContactPoint(row: typeof contactPoints.$inferSelect): ContactPoint {
   return {
     id: row.id,
     workspaceId: row.workspaceId,
@@ -155,4 +156,189 @@ export async function listAccountBundles(workspaceId: string): Promise<AccountBu
       contactPoints: contactPointsByAccount.get(account.id) ?? [],
     };
   });
+}
+
+/**
+ * Bounded, indexed lookup of accounts that could plausibly match `incoming`
+ * (Gate E processing cron) — feeds `evaluateAccountDedup` the same way the
+ * simulation harness feeds it an in-memory `existingAccounts` array, but
+ * without ever loading the whole workspace's account table. Every clause
+ * mirrors one of `evaluateAccountDedup`'s own signals (strong: place id /
+ * domain / phone; fuzzy: name+postal, name+address, name+geo-box) — the
+ * geo clause is intentionally a slightly wider bounding box than the 150m
+ * fuzzy threshold, since the exact haversine distance is still computed by
+ * `evaluateAccountDedup` itself; this is only a candidate prefilter.
+ */
+export async function findCandidateAccountMatches(
+  workspaceId: string,
+  incoming: Omit<AccountIdentitySignals, "accountId">,
+): Promise<AccountIdentitySignals[]> {
+  const db = getDb();
+  const clauses = [];
+
+  if (incoming.googlePlaceId) clauses.push(eq(accounts.googlePlaceId, incoming.googlePlaceId));
+  if (incoming.normalizedDomain) clauses.push(eq(accounts.normalizedDomain, incoming.normalizedDomain));
+  if (incoming.normalizedPhone) clauses.push(eq(accounts.normalizedPhone, incoming.normalizedPhone));
+  if (incoming.normalizedName && incoming.postalCode) {
+    clauses.push(and(eq(accounts.normalizedName, incoming.normalizedName), eq(accounts.postalCode, incoming.postalCode)));
+  }
+  if (incoming.normalizedName && incoming.normalizedAddress) {
+    clauses.push(and(eq(accounts.normalizedName, incoming.normalizedName), eq(accounts.normalizedAddress, incoming.normalizedAddress)));
+  }
+  if (incoming.normalizedName && typeof incoming.latitude === "number" && typeof incoming.longitude === "number") {
+    const boxDeg = 0.002; // ~200m, deliberately wider than the 150m fuzzy threshold — a prefilter, not the final distance check
+    clauses.push(
+      and(
+        eq(accounts.normalizedName, incoming.normalizedName),
+        gte(accounts.latitude, incoming.latitude - boxDeg),
+        lte(accounts.latitude, incoming.latitude + boxDeg),
+        gte(accounts.longitude, incoming.longitude - boxDeg),
+        lte(accounts.longitude, incoming.longitude + boxDeg),
+      ),
+    );
+  }
+
+  if (clauses.length === 0) return [];
+
+  const rows = await db
+    .select()
+    .from(accounts)
+    .where(and(eq(accounts.workspaceId, workspaceId), or(...clauses)))
+    .limit(20);
+
+  return rows.map((row) => ({
+    accountId: row.id,
+    normalizedName: row.normalizedName,
+    googlePlaceId: row.googlePlaceId,
+    normalizedDomain: row.normalizedDomain,
+    normalizedPhone: row.normalizedPhone,
+    postalCode: row.postalCode,
+    normalizedAddress: row.normalizedAddress,
+    latitude: row.latitude,
+    longitude: row.longitude,
+  }));
+}
+
+export interface InsertAccountInput {
+  workspaceId: string;
+  canonicalName: string;
+  normalizedName: string;
+  businessType: BusinessType;
+  countryCode: string;
+  region: string | null;
+  province: string | null;
+  city: string | null;
+  postalCode: string | null;
+  addressLine: string | null;
+  normalizedAddress: string | null;
+  latitude: number | null;
+  longitude: number | null;
+  phone: string | null;
+  normalizedPhone: string | null;
+  websiteUrl: string | null;
+  normalizedDomain: string | null;
+  googlePlaceId: string | null;
+  mapsUrl: string | null;
+  rating: number | null;
+  reviewCount: number | null;
+  status: AccountStatus;
+}
+
+/** Inserts a brand-new account row. Callers must have already confirmed via `findCandidateAccountMatches` + `evaluateAccountDedup` that no existing account matches. */
+export async function insertAccount(input: InsertAccountInput): Promise<string> {
+  const db = getDb();
+  const [row] = await db.insert(accounts).values(input).returning({ id: accounts.id });
+  if (!row) throw new Error("Failed to insert account.");
+  return row.id;
+}
+
+export interface InsertAccountSourceInput {
+  accountId: string;
+  sourceType: AccountSource["sourceType"];
+  sourceProvider: string;
+  sourceExternalId: string | null;
+  sourceUrl: string | null;
+  rawSnapshot: Record<string, unknown>;
+}
+
+export async function insertAccountSource(input: InsertAccountSourceInput): Promise<void> {
+  const db = getDb();
+  await db.insert(accountSources).values(input);
+}
+
+export async function updateAccountStatus(accountId: string, status: AccountStatus): Promise<void> {
+  const db = getDb();
+  await db.update(accounts).set({ status, updatedAt: new Date() }).where(eq(accounts.id, accountId));
+}
+
+export interface InsertContactPointInput {
+  workspaceId: string;
+  accountId: string;
+  type: ContactPointType;
+  value: string;
+  normalizedValue: string;
+  label: string | null;
+  isGeneric: boolean;
+  isPersonalOrNamed: boolean;
+  priorityScore: number;
+  verificationStatus: VerificationStatus;
+  verificationProvider: string | null;
+  sourceUrl: string | null;
+  sourceType: string | null;
+}
+
+/** `ContactPointStatus` and `VerificationStatus` overlap but are not identical enums — `unknown`/`disposable`/`bounced` have no direct status equivalent, so they fall back to `"discovered"` (endpoint exists, verification outcome inconclusive). */
+function verificationToContactPointStatus(verificationStatus: VerificationStatus): ContactPoint["status"] {
+  switch (verificationStatus) {
+    case "valid":
+    case "catch_all":
+    case "risky":
+    case "invalid":
+      return verificationStatus;
+    case "unverified":
+    case "unknown":
+    case "disposable":
+    case "bounced":
+    default:
+      return "discovered";
+  }
+}
+
+/**
+ * Inserts one discovered contact point. `contactId` is deliberately left
+ * null — the candidate processor (`processRawCandidate`) only ever produces
+ * role-labeled email evidence, never a named person, so there is no
+ * `Contact` identity to attach yet (see `ContactPoint.contactId`'s own
+ * nullability for exactly this case). `channelEligibility` stays `"unknown"`
+ * — no compliance-classification rule for newly-discovered public business
+ * emails is specified anywhere in the spec yet (a real, pre-existing gap,
+ * not something Gate E invents an answer for); `status` mirrors the
+ * verification outcome directly, which is the one fact actually known.
+ */
+export async function insertContactPoint(input: InsertContactPointInput): Promise<string> {
+  const db = getDb();
+  const [row] = await db
+    .insert(contactPoints)
+    .values({
+      workspaceId: input.workspaceId,
+      accountId: input.accountId,
+      contactId: null,
+      type: input.type,
+      value: input.value,
+      normalizedValue: input.normalizedValue,
+      label: input.label,
+      isGeneric: input.isGeneric,
+      isPersonalOrNamed: input.isPersonalOrNamed,
+      priorityScore: input.priorityScore,
+      verificationStatus: input.verificationStatus,
+      verificationProvider: input.verificationProvider,
+      verificationCheckedAt: new Date(),
+      channelEligibility: "unknown",
+      sourceUrl: input.sourceUrl,
+      sourceType: input.sourceType,
+      status: verificationToContactPointStatus(input.verificationStatus),
+    })
+    .onConflictDoNothing({ target: [contactPoints.workspaceId, contactPoints.type, contactPoints.normalizedValue] })
+    .returning({ id: contactPoints.id });
+  return row?.id ?? "";
 }

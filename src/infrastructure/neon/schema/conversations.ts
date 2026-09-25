@@ -119,3 +119,29 @@ export const meetings = pgTable(
   },
   (table) => [index("idx_meetings_conversation").on(table.conversationId)],
 );
+
+/**
+ * Neon replacement for `src/services/setter/warm-followup-service.ts`'s
+ * `WarmFollowupQueueItem` (Prompt 4 §4.12, wired up for real by the Gate E
+ * `/api/cron/warm-followup` route). A positive/interested lead that replied
+ * but has not booked enters this queue instead of the cold sequence.
+ */
+export const warmFollowupQueue = pgTable(
+  "warm_followup_queue",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    conversationId: uuid("conversation_id")
+      .notNull()
+      .references(() => conversations.id, { onDelete: "cascade" }),
+    enteredAt: timestamp("entered_at", { withTimezone: true }).notNull().defaultNow(),
+    status: text("status").notNull().default("active"),
+    pauseReason: text("pause_reason"),
+    nextFollowupAt: timestamp("next_followup_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    index("idx_warm_followup_queue_conversation").on(table.conversationId),
+    index("idx_warm_followup_queue_dispatch").on(table.status, table.nextFollowupAt),
+  ],
+);
