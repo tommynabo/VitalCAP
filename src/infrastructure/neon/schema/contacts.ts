@@ -55,6 +55,7 @@ export const contactPoints = pgTable(
     verificationProvider: text("verification_provider"),
     verificationCheckedAt: timestamp("verification_checked_at", { withTimezone: true }),
     channelEligibility: text("channel_eligibility").notNull().default("unknown"),
+    status: text("status").notNull().default("discovered"),
     sourceUrl: text("source_url"),
     sourceType: text("source_type"),
     lastContactedAt: timestamp("last_contacted_at", { withTimezone: true }),
