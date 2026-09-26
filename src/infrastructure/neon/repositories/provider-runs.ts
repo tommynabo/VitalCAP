@@ -1,4 +1,4 @@
-import { and, eq, gte, sql } from "drizzle-orm";
+import { and, eq, gte, inArray, sql } from "drizzle-orm";
 import { getDb } from "../db";
 import { providerRuns } from "../schema/providers";
 import type { ProviderUsageStats } from "@/domain/providers/types";
@@ -10,12 +10,19 @@ export interface RecordProviderRunInput {
   operation: string;
   externalRunId?: string | null;
   externalDatasetId?: string | null;
-  status: "completed" | "failed";
+  status: ProviderRunStatus;
+  requestKey?: string | null;
+  actorId?: string | null;
+  seedId?: string | null;
+  ingestedAt?: Date | null;
+  error?: string | null;
   itemsRequested?: number;
   itemsReturned: number;
   costUsd: number;
   metadata?: Record<string, unknown>;
 }
+
+export type ProviderRunStatus = "queued" | "running" | "succeeded" | "failed" | "aborted" | "timed_out" | "ingested" | "completed";
 
 /**
  * Persists one provider-run event (Prompt 7 §14 cost-guard audit trail —
@@ -31,6 +38,9 @@ export async function recordProviderRun(input: RecordProviderRunInput): Promise<
     campaignId: input.campaignId ?? null,
     provider: input.provider,
     operation: input.operation,
+    requestKey: input.requestKey ?? null,
+    actorId: input.actorId ?? null,
+    seedId: input.seedId ?? null,
     externalRunId: input.externalRunId ?? null,
     externalDatasetId: input.externalDatasetId ?? null,
     status: input.status,
@@ -38,8 +48,72 @@ export async function recordProviderRun(input: RecordProviderRunInput): Promise<
     itemsReturned: input.itemsReturned,
     costUsd: input.costUsd,
     metadata: input.metadata ?? {},
-    finishedAt: new Date(),
+    ingestedAt: input.ingestedAt ?? null,
+    error: input.error ?? null,
+    startedAt: new Date(),
+    finishedAt: input.status === "queued" || input.status === "running" ? null : new Date(),
   });
+}
+
+export interface CreateProviderRunInput {
+  workspaceId: string;
+  campaignId: string;
+  provider: string;
+  operation: string;
+  requestKey: string;
+  actorId: string;
+  seedId: string;
+  externalRunId: string;
+  externalDatasetId: string | null;
+  status: "queued" | "running";
+  itemsRequested: number;
+  costUsd?: number;
+  metadata?: Record<string, unknown>;
+}
+
+export async function createProviderRun(input: CreateProviderRunInput): Promise<string> {
+  const db = getDb();
+  const [inserted] = await db
+    .insert(providerRuns)
+    .values({ ...input, costUsd: input.costUsd ?? 0, metadata: input.metadata ?? {}, itemsReturned: 0 })
+    .onConflictDoNothing({ target: providerRuns.requestKey })
+    .returning({ id: providerRuns.id });
+  if (inserted) return inserted.id;
+  const existing = await getProviderRunByRequestKey(input.requestKey);
+  if (!existing) throw new Error(`Unable to resolve provider run request key ${input.requestKey}.`);
+  return existing.id;
+}
+
+export async function getProviderRunByRequestKey(requestKey: string) {
+  const db = getDb();
+  const [row] = await db.select().from(providerRuns).where(eq(providerRuns.requestKey, requestKey)).limit(1);
+  return row ?? null;
+}
+
+export async function listApifyRunsForPolling(limit: number) {
+  const db = getDb();
+  return db
+    .select()
+    .from(providerRuns)
+    .where(and(eq(providerRuns.provider, "apify"), inArray(providerRuns.status, ["queued", "running", "succeeded"])))
+    .limit(limit);
+}
+
+export async function updateProviderRun(
+  id: string,
+  patch: Partial<{
+    status: ProviderRunStatus;
+    externalDatasetId: string | null;
+    itemsReturned: number;
+    costUsd: number;
+    finishedAt: Date | null;
+    ingestedAt: Date | null;
+    error: string | null;
+    metadata: Record<string, unknown>;
+  }>,
+): Promise<void> {
+  const db = getDb();
+  await db.update(providerRuns).set(patch).where(eq(providerRuns.id, id));
 }
 
 /**

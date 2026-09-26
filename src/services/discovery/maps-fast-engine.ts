@@ -29,17 +29,23 @@ export class MapsFastEngine implements DiscoveryEngine {
   /** Seed catalog is caller-managed (persisted `search_seeds` rows in a real deployment); injected here so tests/simulations control it directly. */
   seeds: SearchSeed[] = [];
 
-  async executeDiscovery(input: { seed: SearchSeed; dryRun: boolean }): Promise<{
+  async executeDiscovery(input: { seed: SearchSeed; dryRun: boolean; requestKey?: string }): Promise<{
     rawCandidates: RawCandidate[];
     providerCalls: number;
     providerErrors: number;
     latencyMs: number;
+    providerRun?: import("@/domain/providers/types").AsyncMapsRun;
   }> {
     const start = Date.now();
     let providerErrors = 0;
 
     try {
-      const output = await this.provider.search({ query: input.seed.query, geography: input.seed.geography, pageToken: null });
+      const searchInput = { query: input.seed.query, geography: input.seed.geography, pageToken: null, requestKey: input.requestKey };
+      if (this.provider.startAsync) {
+        const providerRun = await this.provider.startAsync(searchInput);
+        return { rawCandidates: [], providerCalls: 1, providerErrors: 0, latencyMs: Date.now() - start, providerRun };
+      }
+      const output = await this.provider.search(searchInput);
       const rawCandidates: RawCandidate[] = output.results.map((place) => ({
         id: `raw_${input.seed.id}_${place.externalPlaceId ?? place.name}`,
         campaignId: input.seed.campaignId,

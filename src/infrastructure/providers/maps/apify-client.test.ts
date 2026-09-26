@@ -22,6 +22,19 @@ describe("ApifyClient", () => {
     expect(init.headers.Authorization).toBe("Bearer token123");
   });
 
+  it("exposes explicit run status and dataset pagination endpoints", async () => {
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse({ data: { id: "run1", actId: "act1", status: "RUNNING", defaultDatasetId: "ds1", usageTotalUsd: null, startedAt: "t", finishedAt: null } }))
+      .mockResolvedValueOnce(jsonResponse([{ title: "A" }]));
+    const client = new ApifyClient({ apiToken: "token123", fetchImpl });
+    await client.getActorRun("run1");
+    await client.getDatasetItems("ds1", { offset: 100, limit: 25 });
+    expect(String(fetchImpl.mock.calls[0]?.[0])).toContain("/actor-runs/run1");
+    expect(String(fetchImpl.mock.calls[1]?.[0])).toContain("offset=100");
+    expect(String(fetchImpl.mock.calls[1]?.[0])).toContain("limit=25");
+  });
+
   it("throws ApifyRequestError on a non-ok response", async () => {
     const fetchImpl = vi.fn().mockResolvedValue(new Response("nope", { status: 401 }));
     const client = new ApifyClient({ apiToken: "t", fetchImpl });

@@ -94,9 +94,9 @@ export async function updateSearchSeedAfterRun(seed: SearchSeed): Promise<void> 
     .where(eq(searchSeeds.id, seed.id));
 }
 
-export async function insertSearchSeedRun(run: Omit<SearchSeedRun, "id">): Promise<void> {
+export async function insertSearchSeedRun(run: Omit<SearchSeedRun, "id">): Promise<string> {
   const db = getDb();
-  await db.insert(searchSeedRuns).values({
+  const [row] = await db.insert(searchSeedRuns).values({
     seedId: run.seedId,
     startedAt: new Date(run.startedAt),
     finishedAt: run.finishedAt ? new Date(run.finishedAt) : null,
@@ -104,7 +104,21 @@ export async function insertSearchSeedRun(run: Omit<SearchSeedRun, "id">): Promi
     uniqueCount: run.uniqueCount,
     readyCount: run.readyCount,
     error: run.error,
-  });
+  }).returning({ id: searchSeedRuns.id });
+  if (!row) throw new Error("Failed to insert search seed run.");
+  return row.id;
+}
+
+export async function updateSearchSeedRun(
+  id: string,
+  patch: Partial<Pick<SearchSeedRun, "finishedAt" | "rawCount" | "uniqueCount" | "readyCount" | "error">>,
+): Promise<void> {
+  const db = getDb();
+  const { finishedAt, ...rest } = patch;
+  await db.update(searchSeedRuns).set({
+    ...rest,
+    finishedAt: finishedAt === undefined ? undefined : finishedAt ? new Date(finishedAt) : null,
+  }).where(eq(searchSeedRuns.id, id));
 }
 
 export interface InsertRawCandidateInput {

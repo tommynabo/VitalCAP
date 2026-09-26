@@ -30,7 +30,7 @@ export interface ApifyRun {
   id: string;
   actId: string;
   status: ApifyRunStatus;
-  defaultDatasetId: string;
+  defaultDatasetId: string | null;
   usageTotalUsd: number | null;
   startedAt: string;
   finishedAt: string | null;
@@ -81,7 +81,7 @@ export class ApifyClient {
    * §15 "do not keep a Vercel function open waiting for large actor runs").
    * `maxTotalChargeUsd` is Apify's own documented cost-guard query param.
    */
-  async startRun(actorId: string, input: Record<string, unknown>, options: { maxTotalChargeUsd?: number; timeoutSecs?: number } = {}): Promise<ApifyRun> {
+  async startActorRun(actorId: string, input: Record<string, unknown>, options: { maxTotalChargeUsd?: number; timeoutSecs?: number } = {}): Promise<ApifyRun> {
     const params = new URLSearchParams();
     if (options.maxTotalChargeUsd !== undefined) params.set("maxTotalChargeUsd", String(options.maxTotalChargeUsd));
     if (options.timeoutSecs !== undefined) params.set("timeout", String(options.timeoutSecs));
@@ -96,7 +96,7 @@ export class ApifyClient {
     return body.data;
   }
 
-  async getRun(runId: string): Promise<ApifyRun> {
+  async getActorRun(runId: string): Promise<ApifyRun> {
     const response = await this.fetchImpl(`${this.baseUrl}/actor-runs/${encodeURIComponent(runId)}`, {
       method: "GET",
       headers: this.authHeaders(),
@@ -105,8 +105,17 @@ export class ApifyClient {
     return body.data;
   }
 
-  async getDatasetItems(datasetId: string, options: { limit?: number } = {}): Promise<unknown[]> {
+  async startRun(actorId: string, input: Record<string, unknown>, options: { maxTotalChargeUsd?: number; timeoutSecs?: number } = {}): Promise<ApifyRun> {
+    return this.startActorRun(actorId, input, options);
+  }
+
+  async getRun(runId: string): Promise<ApifyRun> {
+    return this.getActorRun(runId);
+  }
+
+  async getDatasetItems(datasetId: string, options: { offset?: number; limit?: number } = {}): Promise<unknown[]> {
     const params = new URLSearchParams({ clean: "true" });
+    if (options.offset !== undefined) params.set("offset", String(options.offset));
     if (options.limit !== undefined) params.set("limit", String(options.limit));
 
     const response = await this.fetchImpl(`${this.baseUrl}/datasets/${encodeURIComponent(datasetId)}/items?${params.toString()}`, {
@@ -134,12 +143,12 @@ export class ApifyClient {
     const maxWaitMs = options.maxWaitMs ?? 55_000;
     const pollIntervalMs = options.pollIntervalMs ?? 2_000;
 
-    let run = await this.startRun(actorId, input, { maxTotalChargeUsd: options.maxTotalChargeUsd });
+    let run = await this.startActorRun(actorId, input, { maxTotalChargeUsd: options.maxTotalChargeUsd });
     const deadline = Date.now() + maxWaitMs;
 
     while (!ApifyClient.TERMINAL_STATUSES.includes(run.status) && Date.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
-      run = await this.getRun(run.id);
+      run = await this.getActorRun(run.id);
     }
     return run;
   }

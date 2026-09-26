@@ -102,6 +102,7 @@ async function benchmarkActor(actorId: string, args: CliArgs, client: ApifyClien
       };
     }
 
+    if (!run.defaultDatasetId) throw new Error(`Apify run ${run.id} completed without a dataset ID.`);
     const rawItems = (await client.getDatasetItems(run.defaultDatasetId, { limit: args.max })) as Record<string, unknown>[];
     const mapped = rawItems.map(mapApifyItemToPlaceResult).filter((place) => place !== null);
 

@@ -18,6 +18,8 @@ import {
   updateSearchSeedAfterRun,
   getRemainingDiscoveryTarget,
 } from "@/infrastructure/neon/repositories/discovery";
+import { createProviderRun, getProviderRunByRequestKey } from "@/infrastructure/neon/repositories/provider-runs";
+import { getDayBounds } from "@/lib/time/day-bounds";
 import { recordSeedRun } from "@/services/discovery/geography-planner";
 import { buildMapsSeedCatalog, buildSerpSeedCatalog, LINKEDIN_OWNER_ROLE_QUERIES, ICP_CATEGORY_TERMS } from "@/services/discovery/spain-search-catalog";
 import { createDiscoveryEngine } from "./engine-factory";
@@ -81,8 +83,40 @@ async function executeDiscoveryJob(job: { id: string; campaignId: string; payloa
   let totalRawCandidates = 0;
   for (const seed of boundedSeeds) {
     const startedAt = new Date();
-    const result = await engine.executeDiscovery({ seed, dryRun: false });
+    const requestKey = `apify:${campaign.id}:${seed.id}:${getDayBounds(campaign.timeZone, startedAt).start.toISOString()}`;
+    const existingProviderRun = await getProviderRunByRequestKey(requestKey);
+    if (existingProviderRun) continue;
+
+    const result = await engine.executeDiscovery({ seed, dryRun: false, requestKey });
     const finishedAt = new Date();
+
+    if (result.providerRun) {
+      const seedRunId = await insertSearchSeedRun({
+        seedId: seed.id,
+        startedAt: startedAt.toISOString(),
+        finishedAt: null,
+        rawCount: 0,
+        uniqueCount: 0,
+        readyCount: 0,
+        error: null,
+      });
+      await createProviderRun({
+        workspaceId: campaign.workspaceId,
+        campaignId: campaign.id,
+        provider: "apify",
+        operation: "maps_search",
+        requestKey,
+        actorId: result.providerRun.actorId,
+        seedId: seed.id,
+        externalRunId: result.providerRun.externalRunId,
+        externalDatasetId: result.providerRun.externalDatasetId,
+        status: result.providerRun.status,
+        itemsRequested: result.providerRun.itemsRequested,
+        costUsd: result.providerRun.costUsd,
+        metadata: { ...result.providerRun.metadata, seedId: seed.id, seedRunId, discoveryJobId: job.id, query: seed.query, geography: seed.geography },
+      });
+      continue;
+    }
 
     const insertedIds =
       result.rawCandidates.length > 0

@@ -41,6 +41,17 @@ export interface MapsSearchInput {
   query: string;
   geography: string;
   pageToken: string | null;
+  requestKey?: string;
+}
+
+export interface AsyncMapsRun {
+  actorId: string;
+  externalRunId: string;
+  externalDatasetId: string | null;
+  status: "queued" | "running";
+  itemsRequested: number;
+  costUsd: number;
+  metadata: Record<string, unknown>;
 }
 
 export interface MapsSearchOutput {
@@ -52,6 +63,7 @@ export interface MapsSearchOutput {
 export interface MapsDiscoveryProvider {
   readonly providerName: string;
   search(input: MapsSearchInput): Promise<MapsSearchOutput>;
+  startAsync?(input: MapsSearchInput): Promise<AsyncMapsRun>;
 }
 
 export interface SerpResult {

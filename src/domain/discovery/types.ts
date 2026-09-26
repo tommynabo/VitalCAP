@@ -6,6 +6,7 @@
  */
 
 import type { EngineType } from "@/domain/campaigns/types";
+import type { AsyncMapsRun } from "@/domain/providers/types";
 
 export type JobStatus =
   | "pending"
@@ -82,10 +83,11 @@ export interface DiscoveryEngine {
     campaignId: string;
     remainingTarget: number;
   }): Promise<{ seeds: SearchSeed[] }>;
-  executeDiscovery(input: { seed: SearchSeed; dryRun: boolean }): Promise<{
+  executeDiscovery(input: { seed: SearchSeed; dryRun: boolean; requestKey?: string }): Promise<{
     rawCandidates: RawCandidate[];
     providerCalls: number;
     providerErrors: number;
     latencyMs: number;
+    providerRun?: AsyncMapsRun;
   }>;
 }

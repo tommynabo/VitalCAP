@@ -1,11 +1,13 @@
-import type { MapsDiscoveryProvider, MapsPlaceResult, MapsSearchInput, MapsSearchOutput } from "@/domain/providers/types";
+import type { AsyncMapsRun, MapsDiscoveryProvider, MapsPlaceResult, MapsSearchInput, MapsSearchOutput } from "@/domain/providers/types";
 import { ApifyClient, type ApifyRun } from "./apify-client";
 import { buildCompassActorInput, COMPASS_ACTOR_ID, mapCompassItemToPlaceResult } from "./apify-actors/compass-adapter";
 
 /** Narrowed to just the two methods this provider calls, so tests can inject a plain fake instead of a real `ApifyClient`. */
 export interface ApifyMapsClient {
   runAndWait(actorId: string, input: Record<string, unknown>, options?: { maxTotalChargeUsd?: number }): Promise<ApifyRun>;
-  getDatasetItems(datasetId: string, options?: { limit?: number }): Promise<unknown[]>;
+  startActorRun?(actorId: string, input: Record<string, unknown>, options?: { maxTotalChargeUsd?: number }): Promise<ApifyRun>;
+  getActorRun?(runId: string): Promise<ApifyRun>;
+  getDatasetItems(datasetId: string, options?: { offset?: number; limit?: number }): Promise<unknown[]>;
 }
 
 export class ApifyCostLimitExceededError extends Error {
@@ -60,6 +62,31 @@ export class ApifyMapsDiscoveryProvider implements MapsDiscoveryProvider {
     this.client = config.client ?? new ApifyClient({ apiToken: config.apiToken });
   }
 
+  async startAsync(input: MapsSearchInput): Promise<AsyncMapsRun> {
+    const todaySpend = await this.config.getTodaySpendUsd();
+    if (todaySpend >= this.config.dailyCostLimitUsd) {
+      throw new ApifyCostLimitExceededError(
+        `Apify daily cost limit reached ($${todaySpend.toFixed(2)} >= $${this.config.dailyCostLimitUsd.toFixed(2)}); refusing to start a new run.`,
+      );
+    }
+    if (this.config.actorId !== COMPASS_ACTOR_ID) {
+      throw new Error(`No verified input adapter exists for Apify actor ${this.config.actorId}.`);
+    }
+    const startActorRun = this.client.startActorRun;
+    if (!startActorRun) throw new Error("Async Apify client support is not configured.");
+    const actorInput = buildCompassActorInput(input, this.config.maxCrawledPlacesPerSearch ?? 20);
+    const run = await startActorRun.call(this.client, this.config.actorId, actorInput, { maxTotalChargeUsd: this.config.batchCostLimitUsd });
+    return {
+      actorId: this.config.actorId,
+      externalRunId: run.id,
+      externalDatasetId: run.defaultDatasetId,
+      status: run.status === "READY" ? "queued" : "running",
+      itemsRequested: this.config.maxCrawledPlacesPerSearch ?? 20,
+      costUsd: run.usageTotalUsd ?? 0,
+      metadata: { requestKey: input.requestKey ?? null },
+    };
+  }
+
   async search(input: MapsSearchInput): Promise<MapsSearchOutput> {
     const start = Date.now();
 
@@ -107,6 +134,7 @@ export class ApifyMapsDiscoveryProvider implements MapsDiscoveryProvider {
       throw new Error(`Apify actor run ${run.id} for ${this.config.actorId} did not succeed (status: ${run.status})`);
     }
 
+    if (!run.defaultDatasetId) throw new Error(`Apify run ${run.id} completed without a dataset ID.`);
     let items: Record<string, unknown>[];
     try {
       items = (await this.client.getDatasetItems(run.defaultDatasetId, {

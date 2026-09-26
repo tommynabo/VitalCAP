@@ -1,4 +1,4 @@
-import { pgTable, text, timestamp, uuid, numeric, integer, jsonb, index } from "drizzle-orm/pg-core";
+import { pgTable, text, timestamp, uuid, numeric, integer, jsonb, index, uniqueIndex } from "drizzle-orm/pg-core";
 import { workspaces } from "./workspaces";
 import { campaigns } from "./campaigns";
 
@@ -18,6 +18,9 @@ export const providerRuns = pgTable(
     campaignId: uuid("campaign_id").references(() => campaigns.id, { onDelete: "set null" }),
     provider: text("provider").notNull(),
     operation: text("operation").notNull(),
+    requestKey: text("request_key"),
+    actorId: text("actor_id"),
+    seedId: uuid("seed_id"),
     externalRunId: text("external_run_id"),
     externalDatasetId: text("external_dataset_id"),
     status: text("status").notNull().default("completed"),
@@ -27,10 +30,13 @@ export const providerRuns = pgTable(
     metadata: jsonb("metadata").notNull().default({}),
     startedAt: timestamp("started_at", { withTimezone: true }).notNull().defaultNow(),
     finishedAt: timestamp("finished_at", { withTimezone: true }),
+    ingestedAt: timestamp("ingested_at", { withTimezone: true }),
+    error: text("error"),
   },
   (table) => [
     index("idx_provider_runs_workspace").on(table.workspaceId),
     index("idx_provider_runs_campaign").on(table.campaignId),
     index("idx_provider_runs_provider").on(table.provider, table.startedAt),
+    uniqueIndex("uq_provider_runs_request_key").on(table.requestKey),
   ],
 );
