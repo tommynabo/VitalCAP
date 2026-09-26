@@ -5,6 +5,7 @@ import { campaigns } from "../schema/campaigns";
 import type { EngineType } from "@/domain/campaigns/types";
 import type { RawCandidate, SearchSeed, SearchSeedRun } from "@/domain/discovery/types";
 import { getDayBounds } from "@/lib/time/day-bounds";
+import { recordSeedRun } from "@/services/discovery/geography-planner";
 
 function toSearchSeed(row: typeof searchSeeds.$inferSelect): SearchSeed {
   return {
@@ -121,6 +122,77 @@ export async function updateSearchSeedRun(
   }).where(eq(searchSeedRuns.id, id));
 }
 
+/** Finalizes the seed run and folds its metrics exactly once in one DB transaction. */
+export async function finalizeSearchSeedRun(input: {
+  seedRunId: string;
+  rawCount: number;
+  uniqueCount: number;
+  readyCount: number;
+  finishedAt: Date;
+  error: string | null;
+}): Promise<boolean> {
+  const db = getDb();
+  return db.transaction(async (tx) => {
+    const runResult = await tx.execute(sql`
+      SELECT id, seed_id, finished_at
+      FROM search_seed_runs
+      WHERE id = ${input.seedRunId}::uuid
+      FOR UPDATE
+    `);
+    const run = runResult.rows[0] as { id: string; seed_id: string; finished_at: string | null } | undefined;
+    if (!run) throw new Error(`Search seed run ${input.seedRunId} was not found.`);
+    if (run.finished_at) return false;
+
+    const seedResult = await tx.execute(sql`
+      SELECT id, campaign_id, engine_type, query, geography, last_run_at,
+             total_raw, total_unique, total_ready, yield_rate,
+             exhaustion_score, next_eligible_at
+      FROM search_seeds
+      WHERE id = ${run.seed_id}::uuid
+      FOR UPDATE
+    `);
+    const seedRow = seedResult.rows[0] as Record<string, unknown> | undefined;
+    if (!seedRow) throw new Error(`Search seed ${run.seed_id} was not found.`);
+    const seed: SearchSeed = {
+      id: String(seedRow.id),
+      campaignId: String(seedRow.campaign_id),
+      engineType: seedRow.engine_type as SearchSeed["engineType"],
+      query: String(seedRow.query),
+      geography: String(seedRow.geography),
+      lastRunAt: seedRow.last_run_at ? new Date(String(seedRow.last_run_at)).toISOString() : null,
+      totalRaw: Number(seedRow.total_raw),
+      totalUnique: Number(seedRow.total_unique),
+      totalReady: Number(seedRow.total_ready),
+      yieldRate: Number(seedRow.yield_rate),
+      exhaustionScore: Number(seedRow.exhaustion_score),
+      nextEligibleAt: seedRow.next_eligible_at ? new Date(String(seedRow.next_eligible_at)).toISOString() : null,
+    };
+    const updated = recordSeedRun(seed, {
+      rawCount: input.rawCount,
+      uniqueCount: input.uniqueCount,
+      readyCount: input.readyCount,
+      finishedAt: input.finishedAt.toISOString(),
+    });
+    await tx.execute(sql`
+      UPDATE search_seed_runs
+      SET finished_at = ${input.finishedAt.toISOString()}::timestamptz,
+          raw_count = ${input.rawCount}, unique_count = ${input.uniqueCount},
+          ready_count = ${input.readyCount}, error = ${input.error}
+      WHERE id = ${input.seedRunId}::uuid
+    `);
+    await tx.execute(sql`
+      UPDATE search_seeds
+      SET last_run_at = ${updated.lastRunAt}::timestamptz,
+          total_raw = ${updated.totalRaw}, total_unique = ${updated.totalUnique},
+          total_ready = ${updated.totalReady}, yield_rate = ${updated.yieldRate},
+          exhaustion_score = ${updated.exhaustionScore},
+          next_eligible_at = ${updated.nextEligibleAt}::timestamptz
+      WHERE id = ${updated.id}::uuid
+    `);
+    return true;
+  });
+}
+
 export interface InsertRawCandidateInput {
   discoveryJobId: string;
   campaignId: string;
@@ -187,16 +259,15 @@ export async function getRemainingDiscoveryTarget(
          AND rc.discovered_at >= ${dayStart.toISOString()}::timestamptz
          AND rc.discovered_at < ${dayEnd.toISOString()}::timestamptz
       ) AS generated_today,
-      (SELECT COUNT(*)::int
-       FROM processing_jobs pj
-       WHERE pj.campaign_id = ${campaignId}::uuid
-         AND pj.status IN ('pending', 'processing')
-         AND NOT EXISTS (
-           SELECT 1
-           FROM raw_candidates rc
-           WHERE rc.id::text = pj.payload ->> 'rawCandidateId'
-         )) AS in_flight;
+      (SELECT COALESCE(SUM(pr.items_requested), 0)::int
+       FROM provider_runs pr
+       WHERE pr.campaign_id = ${campaignId}::uuid
+         AND pr.provider = 'apify'
+         AND pr.status IN ('starting', 'queued', 'running')
+         AND pr.started_at >= ${dayStart.toISOString()}::timestamptz
+         AND pr.started_at < ${dayEnd.toISOString()}::timestamptz
+      ) AS in_flight_provider_items;
   `);
-  const row = progressResult.rows[0] as unknown as { generated_today: number; in_flight: number };
-  return Math.max(0, dailySoftTarget - Number(row.generated_today ?? 0) - Number(row.in_flight ?? 0));
+  const row = progressResult.rows[0] as unknown as { generated_today: number; in_flight_provider_items: number };
+  return Math.max(0, dailySoftTarget - Number(row.generated_today ?? 0) - Number(row.in_flight_provider_items ?? 0));
 }

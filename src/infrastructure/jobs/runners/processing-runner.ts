@@ -55,7 +55,6 @@ function resolveAccountStatus(processed: ProcessedCandidateResult): AccountStatu
 }
 
 function resolveMembershipStage(processed: ProcessedCandidateResult): { stage: CampaignMembershipStage; rejectionReason: string | null } {
-  if (processed.isDuplicate) return { stage: "rejected", rejectionReason: processed.rejectionReason };
   if (processed.readyForOutreach) return { stage: "ready", rejectionReason: null };
   if (processed.spainVerdict === "rejected") return { stage: "rejected", rejectionReason: processed.rejectionReason };
   if (processed.spainVerdict === "needs_review") return { stage: "discovered", rejectionReason: processed.rejectionReason };

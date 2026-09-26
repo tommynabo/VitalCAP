@@ -18,7 +18,7 @@ import {
   updateSearchSeedAfterRun,
   getRemainingDiscoveryTarget,
 } from "@/infrastructure/neon/repositories/discovery";
-import { createProviderRun, getProviderRunByRequestKey } from "@/infrastructure/neon/repositories/provider-runs";
+import { getProviderRunByRequestKey, reserveApifyProviderRun, updateProviderRun } from "@/infrastructure/neon/repositories/provider-runs";
 import { getAutopilotSettings } from "@/infrastructure/neon/repositories/autopilot";
 import { getEffectiveAutopilotState } from "@/domain/autopilot/types";
 import { getDayBounds } from "@/lib/time/day-bounds";
@@ -90,14 +90,21 @@ async function executeDiscoveryJob(job: { id: string; campaignId: string; payloa
   for (const seed of boundedSeeds) {
     const startedAt = new Date();
     const requestKey = `apify:${campaign.id}:${seed.id}:${getDayBounds(campaign.timeZone, startedAt).start.toISOString()}`;
-    const existingProviderRun = await getProviderRunByRequestKey(requestKey);
-    if (existingProviderRun) continue;
-
-    const result = await engine.executeDiscovery({ seed, dryRun: false, requestKey });
-    const finishedAt = new Date();
-
-    if (result.providerRun) {
-      const seedRunId = await insertSearchSeedRun({
+    let seedRunId: string | null = null;
+    let reservationId: string | null = null;
+    if (engine.usesAsyncProvider) {
+      const reservation = await reserveApifyProviderRun({
+        workspaceId: campaign.workspaceId,
+        campaignId: campaign.id,
+        operation: "maps_search",
+        requestKey,
+        seedId: seed.id,
+        itemsRequested: Math.max(1, Math.min(campaign.dailySoftTarget, 1000)),
+        metadata: { seedId: seed.id, discoveryJobId: job.id, query: seed.query, geography: seed.geography },
+      });
+      if (!reservation.created) continue;
+      reservationId = reservation.providerRun.id;
+      seedRunId = await insertSearchSeedRun({
         seedId: seed.id,
         startedAt: startedAt.toISOString(),
         finishedAt: null,
@@ -106,23 +113,41 @@ async function executeDiscoveryJob(job: { id: string; campaignId: string; payloa
         readyCount: 0,
         error: null,
       });
-      await createProviderRun({
-        workspaceId: campaign.workspaceId,
-        campaignId: campaign.id,
-        provider: "apify",
-        operation: "maps_search",
-        requestKey,
+      await updateProviderRun(reservationId, { metadata: { seedId: seed.id, seedRunId, discoveryJobId: job.id, query: seed.query, geography: seed.geography } });
+    } else if (await getProviderRunByRequestKey(requestKey)) {
+      continue;
+    }
+
+    const result = await engine.executeDiscovery({ seed, dryRun: false, requestKey });
+    const finishedAt = new Date();
+
+    if (result.providerRun) {
+      if (!reservationId || !seedRunId) throw new Error(`Async provider run ${requestKey} had no local reservation.`);
+      await updateProviderRun(reservationId, {
         actorId: result.providerRun.actorId,
-        seedId: seed.id,
         externalRunId: result.providerRun.externalRunId,
         externalDatasetId: result.providerRun.externalDatasetId,
         status: result.providerRun.status,
-        itemsRequested: result.providerRun.itemsRequested,
         costUsd: result.providerRun.costUsd,
         metadata: { ...result.providerRun.metadata, seedId: seed.id, seedRunId, discoveryJobId: job.id, query: seed.query, geography: seed.geography },
       });
       continue;
     }
+
+    if (reservationId) {
+      await updateProviderRun(reservationId, { error: "Async provider did not return a run; operator reconciliation required." });
+      continue;
+    }
+
+    await insertSearchSeedRun({
+      seedId: seed.id,
+      startedAt: startedAt.toISOString(),
+      finishedAt: finishedAt.toISOString(),
+      rawCount: result.rawCandidates.length,
+      uniqueCount: result.rawCandidates.length,
+      readyCount: 0,
+      error: result.providerErrors > 0 ? `${result.providerErrors} provider error(s)` : null,
+    });
 
     const insertedIds =
       result.rawCandidates.length > 0
@@ -146,16 +171,6 @@ async function executeDiscoveryJob(job: { id: string; campaignId: string; payloa
         idempotencyKey: `raw_candidate:${rawCandidateId}`,
       });
     }
-
-    await insertSearchSeedRun({
-      seedId: seed.id,
-      startedAt: startedAt.toISOString(),
-      finishedAt: finishedAt.toISOString(),
-      rawCount: result.rawCandidates.length,
-      uniqueCount: result.rawCandidates.length,
-      readyCount: 0, // readiness is only known after the processing cron runs `processRawCandidate` — this seed-run row only tracks raw yield
-      error: result.providerErrors > 0 ? `${result.providerErrors} provider error(s)` : null,
-    });
 
     const updatedSeed = recordSeedRun(seed, {
       rawCount: result.rawCandidates.length,

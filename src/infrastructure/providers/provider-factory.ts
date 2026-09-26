@@ -51,7 +51,10 @@ export function createMapsDiscoveryProvider(workspaceId: string, role: MapsEngin
     actorId,
     dailyCostLimitUsd: env.APIFY_DAILY_COST_LIMIT_USD,
     batchCostLimitUsd: env.APIFY_BATCH_COST_LIMIT_USD,
-    getTodaySpendUsd: () => getTodaySpendUsd(workspaceId, "apify"),
+    getTodaySpendUsd: async () => {
+      const settings = await getAutopilotSettings(workspaceId);
+      return getTodaySpendUsd(workspaceId, "apify", settings.timezone);
+    },
     getAutopilotState: async () => getEffectiveAutopilotState(await getAutopilotSettings(workspaceId)),
     recordRun: (run) =>
       recordProviderRun({

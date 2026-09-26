@@ -6,13 +6,16 @@ import { discoveryJobs, processingJobs, searchSeeds } from "../schema/discovery"
 import { outreachQueue, outreachEvents } from "../schema/outreach";
 import { conversations, meetings } from "../schema/conversations";
 import { autopilotSettings, rebalanceDecisions } from "../schema/autopilot";
+import { auditLog } from "../schema/audit";
 import type { EngineType } from "@/domain/campaigns/types";
 import type { AutopilotSettings, EngineTargetState, GlobalAutopilotState, RebalanceDecision } from "@/domain/autopilot/types";
+import { getDayBounds } from "@/lib/time/day-bounds";
 
 const DEFAULT_AUTOPILOT_SETTINGS = {
   enabled: false,
   emergencyStopped: false,
   globalDailyTarget: 25,
+  targetMetric: "qualified",
   timezone: "Europe/Madrid",
   operatingStartHour: null,
   operatingEndHour: null,
@@ -25,6 +28,7 @@ function toAutopilotSettings(row: typeof autopilotSettings.$inferSelect): Autopi
     enabled: row.enabled,
     emergencyStopped: row.emergencyStopped,
     globalDailyTarget: row.globalDailyTarget,
+    targetMetric: row.targetMetric as AutopilotSettings["targetMetric"],
     timezone: row.timezone,
     operatingStartHour: row.operatingStartHour,
     operatingEndHour: row.operatingEndHour,
@@ -37,11 +41,32 @@ function toAutopilotSettings(row: typeof autopilotSettings.$inferSelect): Autopi
 /** Lazily bootstraps a workspace in the safe PAUSED state. */
 export async function getAutopilotSettings(workspaceId: string): Promise<AutopilotSettings> {
   const db = getDb();
-  const [existing] = await db.select().from(autopilotSettings).where(eq(autopilotSettings.workspaceId, workspaceId));
-  if (existing) return toAutopilotSettings(existing);
-  const [created] = await db.insert(autopilotSettings).values({ workspaceId, ...DEFAULT_AUTOPILOT_SETTINGS }).returning();
-  if (!created) throw new Error("Failed to initialize Autopilot settings.");
-  return toAutopilotSettings(created);
+  await db.insert(autopilotSettings).values({ workspaceId, ...DEFAULT_AUTOPILOT_SETTINGS }).onConflictDoNothing({ target: autopilotSettings.workspaceId });
+  const [row] = await db.select().from(autopilotSettings).where(eq(autopilotSettings.workspaceId, workspaceId));
+  if (!row) throw new Error("Failed to initialize Autopilot settings.");
+  return toAutopilotSettings(row);
+}
+
+export async function updateAutopilotSettingsWithAudit(input: {
+  workspaceId: string;
+  patch: Partial<Pick<AutopilotSettings, "enabled" | "emergencyStopped" | "globalDailyTarget">>;
+  audit: { actorUserId: string | null; action: string; metadata: Record<string, unknown> };
+}): Promise<AutopilotSettings> {
+  const db = getDb();
+  return db.transaction(async (tx) => {
+    await tx.insert(autopilotSettings).values({ workspaceId: input.workspaceId, ...DEFAULT_AUTOPILOT_SETTINGS }).onConflictDoNothing({ target: autopilotSettings.workspaceId });
+    const [updated] = await tx.update(autopilotSettings).set({ ...input.patch, updatedAt: new Date() }).where(eq(autopilotSettings.workspaceId, input.workspaceId)).returning();
+    if (!updated) throw new Error("Failed to update Autopilot settings.");
+    await tx.insert(auditLog).values({
+      workspaceId: input.workspaceId,
+      actorUserId: input.audit.actorUserId,
+      action: input.audit.action,
+      entityType: "autopilot_settings",
+      entityId: input.workspaceId,
+      metadata: input.audit.metadata,
+    });
+    return toAutopilotSettings(updated);
+  });
 }
 
 export async function updateAutopilotSettings(
@@ -57,9 +82,8 @@ export async function updateAutopilotSettings(
 
 const ENGINE_TYPES: EngineType[] = ["maps_fast", "maps_deep", "google_serp", "linkedin_owner", "hybrid_fill"];
 
-function startOfToday(): Date {
-  const now = new Date();
-  return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+function startOfToday(timeZone: string): Date {
+  return getDayBounds(timeZone).start;
 }
 
 /**
@@ -72,14 +96,15 @@ function startOfToday(): Date {
  */
 export async function getGlobalAutopilotState(workspaceId: string): Promise<GlobalAutopilotState> {
   const db = getDb();
-  const today = startOfToday();
   const settings = await getAutopilotSettings(workspaceId);
+  const today = startOfToday(settings.timezone);
 
-  const [readyRow] = await db
+  const [qualifiedRow] = await db
     .select({ total: count() })
-    .from(accounts)
+    .from(campaignMemberships)
+    .innerJoin(campaigns, eq(campaignMemberships.campaignId, campaigns.id))
     .where(
-      and(eq(accounts.workspaceId, workspaceId), eq(accounts.status, "outreach_ready"), gte(accounts.updatedAt, today)),
+      and(eq(campaigns.workspaceId, workspaceId), eq(campaignMemberships.stage, "qualified"), gte(campaignMemberships.updatedAt, today)),
     );
 
   const [sentRow] = await db
@@ -114,7 +139,9 @@ export async function getGlobalAutopilotState(workspaceId: string): Promise<Glob
 
   return {
     dailyTarget: settings.globalDailyTarget,
-    readyToday: readyRow?.total ?? 0,
+    readyToday: qualifiedRow?.total ?? 0,
+    targetAchievedToday: qualifiedRow?.total ?? 0,
+    targetMetric: settings.targetMetric,
     sentToday: sentRow?.total ?? 0,
     repliesToday: repliesRow?.total ?? 0,
     meetingsToday: meetingsRow?.total ?? 0,
@@ -166,8 +193,8 @@ async function getEngineTargetState(workspaceId: string, engineType: EngineType)
       and(
         eq(campaigns.workspaceId, workspaceId),
         eq(campaigns.engineType, engineType),
-        eq(campaignMemberships.stage, "ready"),
-        gte(campaignMemberships.updatedAt, startOfToday()),
+        eq(campaignMemberships.stage, "qualified"),
+        gte(campaignMemberships.updatedAt, startOfToday((await getAutopilotSettings(workspaceId)).timezone)),
       ),
     );
 
@@ -181,6 +208,7 @@ async function getEngineTargetState(workspaceId: string, engineType: EngineType)
     engineType,
     softTarget: targetRow?.total ?? 0,
     readyToday: readyRow?.total ?? 0,
+    qualifiedToday: readyRow?.total ?? 0,
     rawQueueDepth: rawDepthRow?.total ?? 0,
     processingQueueDepth: processingDepthRow?.total ?? 0,
     currentYield: yieldRow?.avgYield ?? 0,

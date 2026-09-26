@@ -1,4 +1,5 @@
-import { and, eq, gte, inArray, sql } from "drizzle-orm";
+import { and, asc, eq, gte, inArray, sql } from "drizzle-orm";
+import { getDayBounds } from "@/lib/time/day-bounds";
 import { getDb } from "../db";
 import { providerRuns } from "../schema/providers";
 import type { ProviderUsageStats } from "@/domain/providers/types";
@@ -22,7 +23,7 @@ export interface RecordProviderRunInput {
   metadata?: Record<string, unknown>;
 }
 
-export type ProviderRunStatus = "queued" | "running" | "succeeded" | "failed" | "aborted" | "timed_out" | "ingested" | "completed";
+export type ProviderRunStatus = "starting" | "queued" | "running" | "succeeded" | "failed" | "aborted" | "timed_out" | "ingested" | "completed";
 
 /**
  * Persists one provider-run event (Prompt 7 §14 cost-guard audit trail —
@@ -71,6 +72,43 @@ export interface CreateProviderRunInput {
   metadata?: Record<string, unknown>;
 }
 
+export interface ReserveApifyProviderRunInput {
+  workspaceId: string;
+  campaignId: string;
+  operation: string;
+  requestKey: string;
+  actorId?: string | null;
+  seedId: string;
+  itemsRequested: number;
+  metadata?: Record<string, unknown>;
+}
+
+export async function reserveApifyProviderRun(input: ReserveApifyProviderRunInput): Promise<{ providerRun: typeof providerRuns.$inferSelect; created: boolean }> {
+  const db = getDb();
+  const [inserted] = await db
+    .insert(providerRuns)
+    .values({
+      workspaceId: input.workspaceId,
+      campaignId: input.campaignId,
+      provider: "apify",
+      operation: input.operation,
+      requestKey: input.requestKey,
+      actorId: input.actorId ?? null,
+      seedId: input.seedId,
+      status: "starting",
+      itemsRequested: input.itemsRequested,
+      itemsReturned: 0,
+      costUsd: 0,
+      metadata: input.metadata ?? {},
+    })
+    .onConflictDoNothing({ target: providerRuns.requestKey })
+    .returning();
+  if (inserted) return { providerRun: inserted, created: true };
+  const existing = await getProviderRunByRequestKey(input.requestKey);
+  if (!existing) throw new Error(`Unable to resolve provider run request key ${input.requestKey}.`);
+  return { providerRun: existing, created: false };
+}
+
 export async function createProviderRun(input: CreateProviderRunInput): Promise<string> {
   const db = getDb();
   const [inserted] = await db
@@ -95,7 +133,8 @@ export async function listApifyRunsForPolling(limit: number) {
   return db
     .select()
     .from(providerRuns)
-    .where(and(eq(providerRuns.provider, "apify"), inArray(providerRuns.status, ["queued", "running", "succeeded"])))
+    .where(and(eq(providerRuns.provider, "apify"), inArray(providerRuns.status, ["starting", "queued", "running", "succeeded"])))
+    .orderBy(asc(providerRuns.startedAt), asc(providerRuns.id))
     .limit(limit);
 }
 
@@ -103,6 +142,8 @@ export async function updateProviderRun(
   id: string,
   patch: Partial<{
     status: ProviderRunStatus;
+    externalRunId: string | null;
+    actorId: string | null;
     externalDatasetId: string | null;
     itemsReturned: number;
     costUsd: number;
@@ -121,15 +162,14 @@ export async function updateProviderRun(
  * backs the pre-run daily cost-limit check (§14) without the provider
  * adapter itself needing a DB import.
  */
-export async function getTodaySpendUsd(workspaceId: string, provider: string): Promise<number> {
+export async function getTodaySpendUsd(workspaceId: string, provider: string, timeZone = "Europe/Madrid", now = new Date()): Promise<number> {
   const db = getDb();
-  const startOfDayUtc = new Date();
-  startOfDayUtc.setUTCHours(0, 0, 0, 0);
+  const { start, end } = getDayBounds(timeZone, now);
 
   const [row] = await db
     .select({ total: sql<number>`coalesce(sum(${providerRuns.costUsd}), 0)` })
     .from(providerRuns)
-    .where(and(eq(providerRuns.workspaceId, workspaceId), eq(providerRuns.provider, provider), gte(providerRuns.startedAt, startOfDayUtc)));
+    .where(and(eq(providerRuns.workspaceId, workspaceId), eq(providerRuns.provider, provider), gte(providerRuns.startedAt, start), sql`${providerRuns.startedAt} < ${end}`));
 
   return row?.total ?? 0;
 }

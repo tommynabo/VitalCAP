@@ -78,6 +78,7 @@ export interface SearchSeedRun {
  */
 export interface DiscoveryEngine {
   readonly engineType: EngineType;
+  readonly usesAsyncProvider?: boolean;
   validateConfig(config: Record<string, unknown>): { valid: boolean; errors: string[] };
   planDiscoveryBatch(input: {
     campaignId: string;

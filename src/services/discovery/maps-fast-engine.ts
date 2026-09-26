@@ -12,8 +12,11 @@ import type { MapsRawPayload } from "./candidate-processor";
  */
 export class MapsFastEngine implements DiscoveryEngine {
   readonly engineType = "maps_fast" as const;
+  readonly usesAsyncProvider: boolean;
 
-  constructor(private readonly provider: MapsDiscoveryProvider) {}
+  constructor(private readonly provider: MapsDiscoveryProvider) {
+    this.usesAsyncProvider = Boolean(provider.startAsync);
+  }
 
   validateConfig(config: Record<string, unknown>): { valid: boolean; errors: string[] } {
     const errors: string[] = [];

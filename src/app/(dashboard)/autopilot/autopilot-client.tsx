@@ -71,7 +71,7 @@ export function AutopilotClient({
               Autopilot is {effectiveState === "running" ? "running" : effectiveState === "paused" ? "paused" : "emergency stopped"}
             </p>
             <p className="text-xs text-text-muted">
-              {effectiveState === "running" ? `Targeting ${settings.globalDailyTarget} ready leads/day across ${state.engines.length} engines · system health ${state.systemHealth}` : effectiveState === "paused" ? "New discovery is paused; existing processing jobs may drain safely." : "Emergency stop blocks new discovery, processing claims, and outreach scheduling."}
+              {effectiveState === "running" ? `Targeting ${settings.globalDailyTarget} qualified prospects/day across ${state.engines.length} engines · metric ${settings.targetMetric}` : effectiveState === "paused" ? "New discovery is paused; existing processing jobs may drain safely." : "Emergency stop blocks new discovery, processing claims, and outreach scheduling."}
             </p>
           </div>
           <div className="flex gap-2">
@@ -101,7 +101,7 @@ export function AutopilotClient({
       <Card>
         <CardHeader><CardTitle>Global daily target</CardTitle></CardHeader>
         <CardContent className="flex flex-wrap items-end gap-3">
-          <label className="text-sm text-text-muted">Ready leads/day<input className="mt-1 block w-28 rounded border border-border bg-surface px-2 py-1 text-text" type="number" min="1" max="250" value={targetInput} onChange={(event) => setTargetInput(event.target.value)} /></label>
+          <label className="text-sm text-text-muted">Qualified prospects/day<input className="mt-1 block w-28 rounded border border-border bg-surface px-2 py-1 text-text" type="number" min="1" max="250" value={targetInput} onChange={(event) => setTargetInput(event.target.value)} /></label>
           <Button size="sm" disabled={pendingAction !== null} onClick={() => void control({ action: "target_change", globalDailyTarget: Number(targetInput) })}>Save target</Button>
           <span className="text-xs text-text-muted">Recommended 25 · timezone {settings.timezone}</span>
           {softTargetTotal !== settings.globalDailyTarget && <span className="text-xs text-warning">Campaign soft targets total {softTargetTotal}; allocation is not changed automatically.</span>}
@@ -109,7 +109,7 @@ export function AutopilotClient({
       </Card>
 
       <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-6">
-        <KpiStat label="Ready" value={`${state.readyToday}/${state.dailyTarget}`} emphasize />
+            <KpiStat label="Qualified" value={`${state.targetAchievedToday ?? state.readyToday}/${state.dailyTarget}`} emphasize />
         <KpiStat label="Progress" value={`${progressPct}%`} />
         <KpiStat label="Soft target total" value={String(softTargetTotal)} />
         <KpiStat label="Sent today" value={String(state.sentToday)} />

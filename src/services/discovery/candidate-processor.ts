@@ -273,11 +273,11 @@ export async function processRawCandidate(
   });
 
   const hasAcceptableContact = contactPoints.some((cp) => cp.acceptable);
-  const readyForOutreach = spainResult.verdict === "verified" && hasAcceptableContact && !isDuplicate;
+  const verificationEnabled = context.verificationProvider.providerName !== "disabled" && context.verificationProvider.providerName !== "disabled-smoke";
+  const readyForOutreach = verificationEnabled && spainResult.verdict === "verified" && hasAcceptableContact;
 
   let rejectionReason: string | null = null;
-  if (isDuplicate) rejectionReason = `Duplicate of existing account ${matchedAccountKey}`;
-  else if (spainResult.verdict === "needs_review") rejectionReason = "Awaiting Spain eligibility review";
+  if (spainResult.verdict === "needs_review") rejectionReason = "Awaiting Spain eligibility review";
   else if (!hasAcceptableContact) rejectionReason = "No acceptable contact point found";
 
   return {

@@ -83,7 +83,7 @@ describe("processRawCandidate — maps candidates", () => {
     expect(result.readyForOutreach).toBe(true);
   });
 
-  it("marks a global duplicate (matching google place id) and does not mark it ready", async () => {
+  it("marks a global duplicate as reusable campaign identity", async () => {
     const payload: CandidateRawPayload = {
       kind: "maps",
       place: {
@@ -110,8 +110,8 @@ describe("processRawCandidate — maps candidates", () => {
       baseContext({ existingAccounts: [{ accountId: "acc_1", normalizedName: "farmacia delgado", googlePlaceId: "existing_place" }] }),
     );
     expect(result.isDuplicate).toBe(true);
-    expect(result.readyForOutreach).toBe(false);
-    expect(result.rejectionReason).toContain("Duplicate");
+    expect(result.readyForOutreach).toBe(true);
+    expect(result.rejectionReason).toBeNull();
   });
 
   it("uses already-crawled pages for a maps_deep candidate instead of re-fetching", async () => {

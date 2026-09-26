@@ -9,6 +9,7 @@
 import type { EngineType } from "@/domain/campaigns/types";
 
 export type ProviderHealthStatus = "healthy" | "degraded" | "paused" | "unknown";
+export type AutopilotTargetMetric = "qualified" | "analyzed_qualified" | "outreach_ready";
 
 export type AutopilotEffectiveState = "running" | "paused" | "emergency_stopped";
 
@@ -17,6 +18,7 @@ export interface AutopilotSettings {
   enabled: boolean;
   emergencyStopped: boolean;
   globalDailyTarget: number;
+  targetMetric: AutopilotTargetMetric;
   timezone: string;
   operatingStartHour: number | null;
   operatingEndHour: number | null;
@@ -34,6 +36,7 @@ export interface EngineTargetState {
   engineType: EngineType;
   softTarget: number;
   readyToday: number;
+  qualifiedToday?: number;
   rawQueueDepth: number;
   processingQueueDepth: number;
   currentYield: number;
@@ -45,6 +48,8 @@ export interface EngineTargetState {
 export interface GlobalAutopilotState {
   dailyTarget: number;
   readyToday: number;
+  targetAchievedToday?: number;
+  targetMetric?: AutopilotTargetMetric;
   sentToday: number;
   repliesToday: number;
   meetingsToday: number;

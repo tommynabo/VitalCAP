@@ -29,6 +29,7 @@ export const autopilotSettings = pgTable("autopilot_settings", {
   enabled: boolean("enabled").notNull().default(false),
   emergencyStopped: boolean("emergency_stopped").notNull().default(false),
   globalDailyTarget: integer("global_daily_target").notNull().default(25),
+  targetMetric: text("target_metric").notNull().default("qualified"),
   timezone: text("timezone").notNull().default("Europe/Madrid"),
   operatingStartHour: integer("operating_start_hour"),
   operatingEndHour: integer("operating_end_hour"),
