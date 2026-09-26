@@ -11,14 +11,17 @@ import {
 import { getRawCandidateById, markRawCandidateProcessed } from "@/infrastructure/neon/repositories/discovery";
 import {
   findCandidateAccountMatches,
+  getAccountById,
   insertAccount,
   insertAccountSource,
   insertContactPoint,
+  updateAccountFields,
 } from "@/infrastructure/neon/repositories/accounts";
 import { createEmailVerificationProvider } from "@/infrastructure/providers/provider-factory";
 import { createInMemoryVerificationCacheStore } from "@/services/verification/email-verification-cache";
 import type { EmailVerificationProvider, WebsiteFetcher } from "@/domain/providers/types";
 import { processRawCandidate, deriveIncomingIdentitySignals, type CandidateRawPayload, type ProcessedCandidateResult } from "@/services/discovery/candidate-processor";
+import { mergeMissingAccountFields, type IncomingAccountFields } from "@/services/accounts/account-enrichment-merge";
 import { realWebsiteFetcher, providerLabelForEngine } from "./engine-factory";
 
 interface ProcessingJobPayload {
@@ -55,6 +58,7 @@ function resolveMembershipStage(processed: ProcessedCandidateResult): { stage: C
   if (processed.isDuplicate) return { stage: "rejected", rejectionReason: processed.rejectionReason };
   if (processed.readyForOutreach) return { stage: "ready", rejectionReason: null };
   if (processed.spainVerdict === "rejected") return { stage: "rejected", rejectionReason: processed.rejectionReason };
+  if (processed.spainVerdict === "needs_review") return { stage: "discovered", rejectionReason: processed.rejectionReason };
   return { stage: "qualified", rejectionReason: processed.rejectionReason };
 }
 
@@ -152,11 +156,34 @@ async function executeProcessingJob(
   });
 
   const accountFields = extractAccountFields(payload);
+  const incomingAccountFields: IncomingAccountFields = {
+    phone: accountFields.phone,
+    normalizedPhone: incoming.normalizedPhone ?? null,
+    websiteUrl: accountFields.websiteUrl,
+    normalizedDomain: incoming.normalizedDomain ?? null,
+    googlePlaceId: accountFields.googlePlaceId,
+    mapsUrl: accountFields.mapsUrl,
+    addressLine: accountFields.addressLine,
+    normalizedAddress: incoming.normalizedAddress ?? null,
+    city: accountFields.city,
+    province: accountFields.province,
+    postalCode: accountFields.postalCode,
+    latitude: accountFields.latitude,
+    longitude: accountFields.longitude,
+    rating: accountFields.rating,
+    reviewCount: accountFields.reviewCount,
+    countryCode: accountFields.countryCode,
+  };
   const providerLabel = providerLabelForEngine(raw.engineType);
 
   let accountId: string;
   if (processed.isDuplicate && processed.matchedAccountKey) {
     accountId = processed.matchedAccountKey;
+    const existingAccount = await getAccountById(accountId);
+    if (existingAccount) {
+      const missingFields = mergeMissingAccountFields(existingAccount, incomingAccountFields);
+      await updateAccountFields(accountId, missingFields);
+    }
     await insertAccountSource({
       accountId,
       sourceType: raw.engineType,
@@ -198,24 +225,24 @@ async function executeProcessingJob(
       sourceUrl: raw.sourceUrl,
       rawSnapshot: raw.rawPayload,
     });
+  }
 
-    for (const contactPoint of processed.contactPoints) {
-      await insertContactPoint({
-        workspaceId: campaign.workspaceId,
-        accountId,
-        type: "email",
-        value: contactPoint.email,
-        normalizedValue: contactPoint.email.toLowerCase(),
-        label: contactPoint.label,
-        isGeneric: contactPoint.isGeneric,
-        isPersonalOrNamed: !contactPoint.isGeneric,
-        priorityScore: contactPoint.priorityScore,
-        verificationStatus: contactPoint.verificationStatus,
-        verificationProvider: "email_verification",
-        sourceUrl: contactPoint.sourceUrl,
-        sourceType: raw.engineType,
-      });
-    }
+  for (const contactPoint of processed.contactPoints) {
+    await insertContactPoint({
+      workspaceId: campaign.workspaceId,
+      accountId,
+      type: "email",
+      value: contactPoint.email,
+      normalizedValue: contactPoint.email.toLowerCase(),
+      label: contactPoint.label,
+      isGeneric: contactPoint.isGeneric,
+      isPersonalOrNamed: !contactPoint.isGeneric,
+      priorityScore: contactPoint.priorityScore,
+      verificationStatus: contactPoint.verificationStatus,
+      verificationProvider: contactPoint.verificationProvider,
+      sourceUrl: contactPoint.sourceUrl,
+      sourceType: raw.engineType,
+    });
   }
 
   const membership = resolveMembershipStage(processed);

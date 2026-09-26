@@ -17,6 +17,14 @@ export class ProviderDisabledError extends Error {
   }
 }
 
+const disabledEmailVerificationProvider: EmailVerificationProvider = {
+  providerName: "disabled",
+  verifyBatch: async () => ({
+    outcomes: [],
+    usage: { calls: 0, items: 0, errors: 0, totalLatencyMs: 0, costUsd: 0, quotaRemaining: null },
+  }),
+};
+
 /**
  * Composition root for the discovery-provider interfaces (Prompt 7 §11–§20,
  * ADR-009). Reads `MAPS_PROVIDER` / `SERP_PROVIDER` /
@@ -97,7 +105,7 @@ export function createSerpDiscoveryProvider(workspaceId: string): SerpDiscoveryP
 
 export function createEmailVerificationProvider(workspaceId: string): EmailVerificationProvider {
   const env = getServerEnv();
-  if (env.EMAIL_VERIFICATION_PROVIDER === "disabled") throw new ProviderDisabledError("EMAIL_VERIFICATION_PROVIDER");
+  if (env.EMAIL_VERIFICATION_PROVIDER === "disabled") return disabledEmailVerificationProvider;
   if (env.EMAIL_VERIFICATION_PROVIDER === "mock") return new MockEmailVerificationProvider();
 
   if (!env.MILLIONVERIFIER_API_KEY) {

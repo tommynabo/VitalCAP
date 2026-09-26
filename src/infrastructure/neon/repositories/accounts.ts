@@ -1,4 +1,4 @@
-import { and, eq, gte, lte, or } from "drizzle-orm";
+import { and, eq, gte, isNull, lte, or } from "drizzle-orm";
 import { getDb } from "../db";
 import { accounts, accountSources } from "../schema/accounts";
 import { contacts, contactPoints } from "../schema/contacts";
@@ -252,6 +252,18 @@ export async function insertAccount(input: InsertAccountInput): Promise<string> 
   return row.id;
 }
 
+export async function getAccountById(accountId: string): Promise<Account | null> {
+  const db = getDb();
+  const [row] = await db.select().from(accounts).where(eq(accounts.id, accountId));
+  return row ? toAccount(row) : null;
+}
+
+export async function updateAccountFields(accountId: string, fields: Partial<InsertAccountInput>): Promise<void> {
+  if (Object.keys(fields).length === 0) return;
+  const db = getDb();
+  await db.update(accounts).set({ ...fields, updatedAt: new Date() }).where(eq(accounts.id, accountId));
+}
+
 export interface InsertAccountSourceInput {
   accountId: string;
   sourceType: AccountSource["sourceType"];
@@ -263,6 +275,18 @@ export interface InsertAccountSourceInput {
 
 export async function insertAccountSource(input: InsertAccountSourceInput): Promise<void> {
   const db = getDb();
+  const sourceIdentity = input.sourceExternalId
+    ? and(eq(accountSources.sourceProvider, input.sourceProvider), eq(accountSources.sourceExternalId, input.sourceExternalId))
+    : and(
+        eq(accountSources.sourceProvider, input.sourceProvider),
+        input.sourceUrl ? eq(accountSources.sourceUrl, input.sourceUrl) : isNull(accountSources.sourceUrl),
+      );
+  const [existing] = await db
+    .select({ id: accountSources.id })
+    .from(accountSources)
+    .where(and(eq(accountSources.accountId, input.accountId), sourceIdentity))
+    .limit(1);
+  if (existing) return;
   await db.insert(accountSources).values(input).onConflictDoNothing();
 }
 

@@ -73,7 +73,7 @@ async function executeDiscoveryJob(job: { id: string; campaignId: string; payloa
   const persistedSeeds = await listSearchSeedsForCampaignEngine(campaign.id, job.payload.engineType);
   if ("seeds" in engine) (engine as { seeds: SearchSeed[] }).seeds = persistedSeeds;
 
-  const remainingTarget = await getRemainingDiscoveryTarget(campaign.id, campaign.dailySoftTarget);
+  const remainingTarget = await getRemainingDiscoveryTarget(campaign.id, campaign.dailySoftTarget, campaign.timeZone);
   if (remainingTarget <= 0) return 0;
   const { seeds } = await engine.planDiscoveryBatch({ campaignId: campaign.id, remainingTarget });
   const boundedSeeds = seeds.slice(0, MAX_SEEDS_PER_JOB);

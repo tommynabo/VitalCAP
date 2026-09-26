@@ -4,6 +4,7 @@ import { searchSeeds, searchSeedRuns, discoveryJobs, rawCandidates } from "../sc
 import { campaigns } from "../schema/campaigns";
 import type { EngineType } from "@/domain/campaigns/types";
 import type { RawCandidate, SearchSeed, SearchSeedRun } from "@/domain/discovery/types";
+import { getDayBounds } from "@/lib/time/day-bounds";
 
 function toSearchSeed(row: typeof searchSeeds.$inferSelect): SearchSeed {
   return {
@@ -156,24 +157,31 @@ export async function hasInFlightDiscoveryJob(campaignId: string): Promise<boole
 }
 
 /** Temporary discovery-level budget until qualified Autopilot metrics replace it. */
-export async function getRemainingDiscoveryTarget(campaignId: string, dailySoftTarget: number, now = new Date()): Promise<number> {
+export async function getRemainingDiscoveryTarget(
+  campaignId: string,
+  dailySoftTarget: number,
+  timeZone = "Europe/Madrid",
+  now = new Date(),
+): Promise<number> {
   const db = getDb();
-  const dayStart = new Date(now);
-  dayStart.setUTCHours(0, 0, 0, 0);
-  const dayEnd = new Date(dayStart);
-  dayEnd.setUTCDate(dayEnd.getUTCDate() + 1);
+  const { start: dayStart, end: dayEnd } = getDayBounds(timeZone, now);
   const progressResult = await db.execute(sql`
     SELECT
-      (SELECT COUNT(DISTINCT rc.source_external_id)::int
+      (SELECT COUNT(DISTINCT rc.id)::int
        FROM raw_candidates rc
        WHERE rc.campaign_id = ${campaignId}::uuid
          AND rc.discovered_at >= ${dayStart.toISOString()}::timestamptz
          AND rc.discovered_at < ${dayEnd.toISOString()}::timestamptz
-         AND rc.source_external_id IS NOT NULL) AS generated_today,
+      ) AS generated_today,
       (SELECT COUNT(*)::int
        FROM processing_jobs pj
        WHERE pj.campaign_id = ${campaignId}::uuid
-         AND pj.status IN ('pending', 'processing')) AS in_flight;
+         AND pj.status IN ('pending', 'processing')
+         AND NOT EXISTS (
+           SELECT 1
+           FROM raw_candidates rc
+           WHERE rc.id::text = pj.payload ->> 'rawCandidateId'
+         )) AS in_flight;
   `);
   const row = progressResult.rows[0] as unknown as { generated_today: number; in_flight: number };
   return Math.max(0, dailySoftTarget - Number(row.generated_today ?? 0) - Number(row.in_flight ?? 0));

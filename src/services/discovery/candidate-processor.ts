@@ -55,6 +55,7 @@ export interface ProcessedContactPoint {
   verificationStatus: VerificationStatus;
   acceptable: boolean;
   sourceUrl: string;
+  verificationProvider: string | null;
 }
 
 export interface ProcessedCandidateResult {
@@ -267,6 +268,7 @@ export async function processRawCandidate(
       verificationStatus,
       acceptable: isContactPointAcceptable(verificationStatus, policy),
       sourceUrl: extracted.sourceUrl,
+      verificationProvider: verification ? context.verificationProvider.providerName : null,
     };
   });
 

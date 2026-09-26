@@ -169,6 +169,45 @@ describe("processRawCandidate — linkedin candidates", () => {
 });
 
 describe("processRawCandidate — verification provider outage (Prompt 6 §6.1 Flow F)", () => {
+  it("accepts a disabled verifier as a no-op and keeps discovered email unverified", async () => {
+    const result = await processRawCandidate(
+      {
+        kind: "maps",
+        place: {
+          externalPlaceId: "disabled-1",
+          name: "Farmacia Disabled",
+          category: "farmacia",
+          address: "Calle Mayor 1",
+          postalCode: "28001",
+          province: "Madrid",
+          city: "Madrid",
+          countryCode: "ES",
+          websiteUrl: "https://farmacia-disabled.es",
+          phone: null,
+          latitude: null,
+          longitude: null,
+          rating: null,
+          reviewCount: null,
+          sourceUrl: "https://maps.example.com/place/disabled-1",
+        },
+      },
+      "maps_fast",
+      baseContext({
+        verificationProvider: {
+          providerName: "disabled",
+          verifyBatch: async () => ({
+            outcomes: [],
+            usage: { calls: 0, items: 0, errors: 0, totalLatencyMs: 0, costUsd: 0, quotaRemaining: null },
+          }),
+        },
+      }),
+    );
+    expect(result.contactPoints[0]?.verificationStatus).toBe("unverified");
+    expect(result.contactPoints[0]?.verificationProvider).toBeNull();
+    expect(result.contactPoints[0]?.acceptable).toBe(false);
+    expect(result.readyForOutreach).toBe(false);
+  });
+
   it("degrades to unverified/not-ready instead of throwing when the verification provider is down", async () => {
     const outage: EmailVerificationProvider = {
       providerName: "outage",
