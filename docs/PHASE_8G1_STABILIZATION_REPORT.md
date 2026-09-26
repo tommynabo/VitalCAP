@@ -27,7 +27,7 @@
 
 No production migration is claimed as applied or verified in this phase. Vercel sealed Neon variables were previously unavailable through the CLI. The new migration is additive only, but deployment readiness remains blocked until the real production schema is confirmed.
 
-The code was pushed to GitHub and deployed to `https://vitalcap.vercel.app`. A non-destructive health check returned `status: ok`, but also reported `env: development` and `devSeedMode: true`; production configuration must be corrected before treating the deployment as production-ready.
+The code was pushed to GitHub and deployed to `https://vitalcap.vercel.app`. An initial non-destructive health check returned `status: ok`, but also reported `env: development` and `devSeedMode: true`. After the final redeploy, the alias returned Vercel `DEPLOYMENT_NOT_FOUND` for `/api/health`; production configuration and alias health must be corrected before treating the deployment as production-ready.
 
 ## Final readiness
 
