@@ -38,6 +38,7 @@ function resolveNeonVar(standardName: string): string | undefined {
 const serverEnvSchema = z
   .object({
     APP_ENV: z.enum(["development", "test", "production"]).default("development"),
+    VERCEL_ENV: z.enum(["development", "preview", "production"]).optional(),
     DEV_SEED_MODE: z
       .string()
       .optional()
@@ -89,6 +90,12 @@ const serverEnvSchema = z
     LLM_MODEL: z.string().default("gpt-4.1-mini"),
   })
   .superRefine((env, ctx) => {
+    if (env.VERCEL_ENV === "production" && optionalEnvValue(process.env.APP_ENV) !== "production") {
+      ctx.addIssue({ code: "custom", message: "VERCEL_ENV=production requires APP_ENV=production.", path: ["APP_ENV"] });
+    }
+    if (env.VERCEL_ENV === "production" && optionalEnvValue(process.env.DEV_SEED_MODE) !== "false") {
+      ctx.addIssue({ code: "custom", message: "VERCEL_ENV=production requires DEV_SEED_MODE=false.", path: ["DEV_SEED_MODE"] });
+    }
     if (env.APP_ENV === "production" && env.DEV_SEED_MODE) {
       ctx.addIssue({
         code: "custom",
@@ -123,6 +130,7 @@ export function getServerEnv(): ServerEnv {
   if (cached) return cached;
   cached = serverEnvSchema.parse({
     APP_ENV: optionalEnvValue(process.env.APP_ENV),
+    VERCEL_ENV: optionalEnvValue(process.env.VERCEL_ENV),
     DEV_SEED_MODE: optionalEnvValue(process.env.DEV_SEED_MODE),
     NEXT_PUBLIC_APP_URL: optionalEnvValue(process.env.NEXT_PUBLIC_APP_URL),
     DEFAULT_DELIVERY_MODE: optionalEnvValue(process.env.DEFAULT_DELIVERY_MODE),

@@ -32,7 +32,7 @@ export class MapsFastEngine implements DiscoveryEngine {
   /** Seed catalog is caller-managed (persisted `search_seeds` rows in a real deployment); injected here so tests/simulations control it directly. */
   seeds: SearchSeed[] = [];
 
-  async executeDiscovery(input: { seed: SearchSeed; dryRun: boolean; requestKey?: string }): Promise<{
+  async executeDiscovery(input: { seed: SearchSeed; dryRun: boolean; requestKey?: string; maxResults?: number }): Promise<{
     rawCandidates: RawCandidate[];
     providerCalls: number;
     providerErrors: number;
@@ -43,7 +43,7 @@ export class MapsFastEngine implements DiscoveryEngine {
     let providerErrors = 0;
 
     try {
-      const searchInput = { query: input.seed.query, geography: input.seed.geography, pageToken: null, requestKey: input.requestKey };
+      const searchInput = { query: input.seed.query, geography: input.seed.geography, pageToken: null, requestKey: input.requestKey, maxResults: input.maxResults };
       if (this.provider.startAsync) {
         const providerRun = await this.provider.startAsync(searchInput);
         return { rawCandidates: [], providerCalls: 1, providerErrors: 0, latencyMs: Date.now() - start, providerRun };

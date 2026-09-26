@@ -43,6 +43,7 @@ export function AutopilotClient({
   const [pendingAction, setPendingAction] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const effectiveState = settings.emergencyStopped ? "emergency_stopped" : settings.enabled ? "running" : "paused";
+  const pacing = state.pacing;
   const [targetInput, setTargetInput] = useState(String(settings.globalDailyTarget));
 
   async function control(action: Record<string, unknown>) {
@@ -109,13 +110,46 @@ export function AutopilotClient({
       </Card>
 
       <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-6">
-            <KpiStat label="Qualified" value={`${state.targetAchievedToday ?? state.readyToday}/${state.dailyTarget}`} emphasize />
+            <KpiStat label="Qualified today" value={`${state.targetAchievedToday ?? state.readyToday}/${state.dailyTarget}`} emphasize />
         <KpiStat label="Progress" value={`${progressPct}%`} />
         <KpiStat label="Soft target total" value={String(softTargetTotal)} />
         <KpiStat label="Sent today" value={String(state.sentToday)} />
-        <KpiStat label="Ready buffer" value={state.readyBufferDays === null ? "N/A" : state.readyBufferDays.toFixed(1)} suffix={state.readyBufferDays === null ? undefined : "days"} />
+        <KpiStat label="Raw candidates" value={pacing ? String(pacing.rawCandidatesToday) : "Unavailable"} />
+        <KpiStat label="Processing jobs" value={pacing ? String(pacing.processingInFlight) : "Unavailable"} />
         <KpiStat label="System health" value={state.systemHealth} />
       </div>
+
+      <Card>
+        <CardHeader><CardTitle>Autopilot pacing</CardTitle></CardHeader>
+        <CardContent className="space-y-3">
+          {pacing ? (
+            <>
+              <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+                <KpiStat label="Expected by now" value={pacing.expectedAchievedByNow.toFixed(1)} />
+                <KpiStat label="Remaining" value={String(pacing.remainingTarget)} />
+                <KpiStat label="Expected in-flight" value={pacing.expectedQualifiedFromInFlight.toFixed(1)} />
+                <KpiStat label="Pace deficit" value={pacing.paceDeficit.toFixed(1)} />
+                <KpiStat label="Hours remaining" value={pacing.hoursRemaining.toFixed(1)} />
+                <KpiStat label="Apify spend" value={`$${pacing.apifySpendToday.toFixed(2)}`} />
+                <KpiStat label="Budget remaining" value={`$${pacing.apifyDailyBudgetRemaining.toFixed(2)}`} />
+                <KpiStat label="Active provider runs" value={String(pacing.providerRunsInFlight)} />
+              </div>
+              <div className="flex flex-wrap items-center gap-2 text-xs text-text-muted">
+                <Badge variant={pacing.status === "behind_pace" ? "warning" : pacing.status === "on_pace" ? "success" : "neutral"}>{pacing.status.replace("_", " ")}</Badge>
+                <span>{pacing.operatingStart}-{pacing.operatingEnd} {pacing.timeZone}</span>
+                <span>Yield {Math.round(pacing.estimatedYield * 100)}% ({pacing.yieldSampleSize} raw)</span>
+              </div>
+              <p className="text-xs text-text-muted">{pacing.explanation}</p>
+              <div className="flex flex-wrap items-center gap-2 text-xs text-text-muted">
+                <span>Target risk: {state.targetRisk?.replaceAll("_", " ") ?? "Unavailable"}</span>
+                <span>Hybrid Fill: {state.targetRisk === "target_at_risk_time" ? "eligible" : "inactive"}</span>
+              </div>
+            </>
+          ) : (
+            <p className="text-sm text-text-muted">Pacing metrics are unavailable in seed mode.</p>
+          )}
+        </CardContent>
+      </Card>
 
       <Card>
         <CardHeader>
@@ -123,13 +157,14 @@ export function AutopilotClient({
         </CardHeader>
         <CardContent className="space-y-3">
           {state.engines.map((engine) => {
-            const pct = engine.softTarget > 0 ? Math.min(100, Math.round((engine.readyToday / engine.softTarget) * 100)) : 0;
+            const achieved = engine.targetAchievedToday ?? engine.readyToday;
+            const pct = engine.softTarget > 0 ? Math.min(100, Math.round((achieved / engine.softTarget) * 100)) : 0;
             return (
               <div key={engine.engineType}>
                 <div className="mb-1 flex items-center justify-between text-xs">
                   <span className="font-medium text-text">{engine.engineType.replace("_", " ")}</span>
                   <span className="text-text-muted">
-                    {engine.readyToday}/{engine.softTarget} ready · {pct}%
+                    {achieved}/{engine.softTarget} qualified · {pct}%
                   </span>
                 </div>
                 <Progress value={pct} />

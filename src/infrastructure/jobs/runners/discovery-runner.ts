@@ -49,23 +49,20 @@ export async function ensureDiscoveryJobsQueued(workspaceId: string): Promise<nu
   if (getEffectiveAutopilotState(settings) !== "running") return 0;
   const campaigns = await listActiveCampaigns(workspaceId);
   let enqueued = 0;
-  for (const campaign of campaigns) {
-    if (campaign.engineType !== "maps_fast") continue; // deferred engines remain paused until their providers are enabled
-    if (await hasInFlightDiscoveryJob(campaign.id)) continue;
-    await bootstrapSearchSeeds(campaign.id, campaign.engineType, catalogForEngine(campaign.id, campaign.engineType));
-    await enqueueDiscoveryJob({
-      campaignId: campaign.id,
-      type: DISCOVERY_JOB_TYPE,
-      payload: { engineType: campaign.engineType },
-      idempotencyKey: `discovery:${campaign.id}:${DISCOVERY_JOB_TYPE}`,
-    });
-    enqueued += 1;
-  }
+  // Discovery work is now issued by the Autopilot pacing order. This function
+  // only remains as a compatibility hook for the discovery cron.
+  void campaigns;
   return enqueued;
 }
 
 interface DiscoveryJobPayload {
   engineType: EngineType;
+  desiredRawCount: number;
+  planningWindow?: string;
+  reason?: string;
+  origin?: "normal" | "rebalance" | "hybrid_fill";
+  seedQuery?: string;
+  seedGeography?: string;
 }
 
 async function executeDiscoveryJob(job: { id: string; campaignId: string; payload: DiscoveryJobPayload }): Promise<number> {
@@ -81,13 +78,20 @@ async function executeDiscoveryJob(job: { id: string; campaignId: string; payloa
   const persistedSeeds = await listSearchSeedsForCampaignEngine(campaign.id, job.payload.engineType);
   if ("seeds" in engine) (engine as { seeds: SearchSeed[] }).seeds = persistedSeeds;
 
-  const remainingTarget = await getRemainingDiscoveryTarget(campaign.id, campaign.dailySoftTarget, campaign.timeZone);
-  if (remainingTarget <= 0) return 0;
-  const { seeds } = await engine.planDiscoveryBatch({ campaignId: campaign.id, remainingTarget });
-  const boundedSeeds = seeds.slice(0, MAX_SEEDS_PER_JOB);
+  const desiredRawCount = Math.min(100, Math.max(0, Math.floor(job.payload.desiredRawCount)));
+  if (desiredRawCount <= 0) return 0;
+  const maxSeeds = Math.min(MAX_SEEDS_PER_JOB, Math.max(1, Math.ceil(desiredRawCount / 10)));
+  const { seeds } = await engine.planDiscoveryBatch({ campaignId: campaign.id, remainingTarget: desiredRawCount });
+  const requestedSeed = job.payload.seedQuery && job.payload.seedGeography
+    ? seeds.find((seed) => seed.query === job.payload.seedQuery && seed.geography === job.payload.seedGeography)
+    : undefined;
+  const boundedSeeds = requestedSeed ? [requestedSeed] : seeds.slice(0, maxSeeds);
+  if (boundedSeeds.length === 0) return 0;
+  let remainingRaw = desiredRawCount;
 
   let totalRawCandidates = 0;
-  for (const seed of boundedSeeds) {
+  for (const [seedIndex, seed] of boundedSeeds.entries()) {
+    const requestedItems = Math.min(100, Math.max(1, Math.ceil(remainingRaw / (boundedSeeds.length - seedIndex))));
     const startedAt = new Date();
     const requestKey = `apify:${campaign.id}:${seed.id}:${getDayBounds(campaign.timeZone, startedAt).start.toISOString()}`;
     let seedRunId: string | null = null;
@@ -99,7 +103,7 @@ async function executeDiscoveryJob(job: { id: string; campaignId: string; payloa
         operation: "maps_search",
         requestKey,
         seedId: seed.id,
-        itemsRequested: Math.max(1, Math.min(campaign.dailySoftTarget, 1000)),
+        itemsRequested: requestedItems,
         metadata: { seedId: seed.id, discoveryJobId: job.id, query: seed.query, geography: seed.geography },
       });
       if (!reservation.created) continue;
@@ -118,7 +122,7 @@ async function executeDiscoveryJob(job: { id: string; campaignId: string; payloa
       continue;
     }
 
-    const result = await engine.executeDiscovery({ seed, dryRun: false, requestKey });
+    const result = await engine.executeDiscovery({ seed, dryRun: false, requestKey, maxResults: requestedItems });
     const finishedAt = new Date();
 
     if (result.providerRun) {
@@ -181,6 +185,8 @@ async function executeDiscoveryJob(job: { id: string; campaignId: string; payloa
     await updateSearchSeedAfterRun(updatedSeed);
 
     totalRawCandidates += result.rawCandidates.length;
+    remainingRaw = Math.max(0, remainingRaw - result.rawCandidates.length);
+    if (remainingRaw === 0) break;
   }
 
   return totalRawCandidates;

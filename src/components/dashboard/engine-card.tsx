@@ -19,7 +19,8 @@ const HEALTH_VARIANT: Record<EngineTargetState["providerHealth"], "success" | "w
 };
 
 export function EngineCard({ engine }: { engine: EngineTargetState }) {
-  const progressPct = Math.min(100, Math.round((engine.readyToday / engine.softTarget) * 100));
+  const achieved = engine.targetAchievedToday ?? engine.readyToday;
+  const progressPct = Math.min(100, Math.round((achieved / engine.softTarget) * 100));
 
   return (
     <Card>
@@ -29,7 +30,7 @@ export function EngineCard({ engine }: { engine: EngineTargetState }) {
       </CardHeader>
       <CardContent>
         <p className="text-xl font-semibold text-text">
-          {engine.readyToday} <span className="text-sm font-normal text-text-muted">/ {engine.softTarget}</span>
+          {achieved} <span className="text-sm font-normal text-text-muted">/ {engine.softTarget} qualified</span>
         </p>
         <Progress value={progressPct} className="mt-2" />
         <dl className="mt-4 grid grid-cols-2 gap-2 text-xs">

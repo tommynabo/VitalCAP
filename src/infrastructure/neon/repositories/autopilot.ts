@@ -10,6 +10,11 @@ import { auditLog } from "../schema/audit";
 import type { EngineType } from "@/domain/campaigns/types";
 import type { AutopilotSettings, EngineTargetState, GlobalAutopilotState, RebalanceDecision } from "@/domain/autopilot/types";
 import { getDayBounds } from "@/lib/time/day-bounds";
+import { getAutopilotPacingMetrics } from "./autopilot-pacing";
+import { getRecentProviderUsage } from "./provider-runs";
+import { getServerEnv } from "@/lib/config/env";
+import { evaluateProviderHealth } from "@/services/discovery/provider-health";
+import { computeAutopilotPacing } from "@/services/autopilot/pacing-service";
 
 const DEFAULT_AUTOPILOT_SETTINGS = {
   enabled: false,
@@ -82,6 +87,35 @@ export async function updateAutopilotSettings(
 
 const ENGINE_TYPES: EngineType[] = ["maps_fast", "maps_deep", "google_serp", "linkedin_owner", "hybrid_fill"];
 
+export async function getAutopilotPacingState(workspaceId: string, now = new Date()) {
+  const settings = await getAutopilotSettings(workspaceId);
+  const metrics = await getAutopilotPacingMetrics(workspaceId, settings.timezone, now);
+  const providerHealth = evaluateProviderHealth(await getRecentProviderUsage(workspaceId, "apify"));
+  const estimatedYield = metrics.historicalRawSampleSize >= 20
+    ? Math.min(1, Math.max(0.1, metrics.historicalQualifiedCount / metrics.historicalRawSampleSize))
+    : 0.25;
+  const env = getServerEnv();
+  const effectiveBudget = Math.min(env.APIFY_DAILY_COST_LIMIT_USD, settings.maxDailyApifySpendUsd ?? Number.POSITIVE_INFINITY);
+  return computeAutopilotPacing({
+    workspaceId,
+    timeZone: settings.timezone,
+    dailyTarget: settings.globalDailyTarget,
+    targetAchievedToday: metrics.qualifiedToday,
+    rawCandidatesToday: metrics.rawCandidatesToday,
+    processingInFlight: metrics.processingInFlight,
+    providerRunsInFlight: metrics.providerRunsInFlight,
+    expectedQualifiedFromInFlight: (metrics.providerRawItemsInFlight + metrics.processingInFlight) * estimatedYield,
+    apifySpendToday: metrics.apifySpendToday,
+    apifyDailyBudgetRemaining: Math.max(0, effectiveBudget - metrics.apifySpendToday),
+    providerHealth,
+    estimatedYield,
+    yieldSampleSize: metrics.historicalRawSampleSize,
+    now,
+    operatingStartHour: settings.operatingStartHour,
+    operatingEndHour: settings.operatingEndHour,
+  });
+}
+
 function startOfToday(timeZone: string): Date {
   return getDayBounds(timeZone).start;
 }
@@ -100,7 +134,7 @@ export async function getGlobalAutopilotState(workspaceId: string): Promise<Glob
   const today = startOfToday(settings.timezone);
 
   const [qualifiedRow] = await db
-    .select({ total: count() })
+    .select({ total: sql<number>`count(distinct ${campaignMemberships.accountId})` })
     .from(campaignMemberships)
     .innerJoin(campaigns, eq(campaignMemberships.campaignId, campaigns.id))
     .where(
@@ -136,6 +170,16 @@ export async function getGlobalAutopilotState(workspaceId: string): Promise<Glob
     .where(and(eq(conversations.workspaceId, workspaceId), gte(meetings.createdAt, today)));
 
   const engines = await listEngineTargets(workspaceId);
+  const pacing = await getAutopilotPacingState(workspaceId);
+  const targetRisk = pacing.status === "on_pace" || pacing.status === "before_window"
+    ? "on_track"
+    : pacing.apifyDailyBudgetRemaining <= 0
+      ? "target_at_risk_budget"
+      : pacing.providerHealth === "paused"
+        ? "target_at_risk_provider"
+        : pacing.hoursRemaining <= 2 && pacing.remainingTarget > 0
+          ? "target_at_risk_time"
+          : "recoverable";
 
   return {
     dailyTarget: settings.globalDailyTarget,
@@ -148,6 +192,8 @@ export async function getGlobalAutopilotState(workspaceId: string): Promise<Glob
     readyBufferDays: null,
     systemHealth: "unknown",
     engines,
+    pacing,
+    targetRisk,
   };
 }
 
@@ -208,6 +254,7 @@ async function getEngineTargetState(workspaceId: string, engineType: EngineType)
     engineType,
     softTarget: targetRow?.total ?? 0,
     readyToday: readyRow?.total ?? 0,
+    targetAchievedToday: readyRow?.total ?? 0,
     qualifiedToday: readyRow?.total ?? 0,
     rawQueueDepth: rawDepthRow?.total ?? 0,
     processingQueueDepth: processingDepthRow?.total ?? 0,
@@ -226,6 +273,10 @@ function toRebalanceDecision(row: typeof rebalanceDecisions.$inferSelect): Rebal
     toEngine: row.toEngine as RebalanceDecision["toEngine"],
     amount: row.amount,
     reason: row.reason,
+    fromCampaignId: row.fromCampaignId,
+    toCampaignId: row.toCampaignId,
+    metricSnapshot: row.metricSnapshot as Record<string, unknown>,
+    idempotencyKey: row.idempotencyKey ?? undefined,
   };
 }
 
@@ -249,5 +300,9 @@ export async function insertRebalanceDecision(workspaceId: string, decision: Omi
     toEngine: decision.toEngine,
     amount: decision.amount,
     reason: decision.reason,
-  });
+    fromCampaignId: decision.fromCampaignId ?? null,
+    toCampaignId: decision.toCampaignId ?? null,
+    metricSnapshot: decision.metricSnapshot ?? {},
+    idempotencyKey: decision.idempotencyKey ?? null,
+  }).onConflictDoNothing({ target: rebalanceDecisions.idempotencyKey });
 }

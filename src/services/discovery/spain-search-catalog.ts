@@ -18,6 +18,11 @@ export const ICP_CATEGORY_TERMS = [
   "complementos alimenticios",
 ] as const;
 
+export const HYBRID_GEOGRAPHIES = [
+  "Madrid", "Barcelona", "Valencia", "Sevilla", "Zaragoza", "Málaga", "Bilbao", "Alicante", "Murcia", "Palma",
+  "Galicia", "Asturias", "Castilla y León", "Castilla-La Mancha", "Extremadura", "Andalucía", "Cataluña", "Comunidad Valenciana",
+] as const;
+
 export const ICP_INTENT_TERMS = ["suplementos", "complementos", "nutrición", "vitaminas", "bienestar"] as const;
 
 function seedId(engineType: EngineType, query: string, geography: string): string {
@@ -50,6 +55,10 @@ function emptySeed(campaignId: string, engineType: EngineType, query: string, ge
  */
 export function buildMapsSeedCatalog(campaignId: string, engineType: "maps_fast" | "maps_deep"): SearchSeed[] {
   return SPAIN_PROVINCES.map((province) => emptySeed(campaignId, engineType, "farmacia", province.name));
+}
+
+export function buildHybridMapsSeedCatalog(campaignId: string): SearchSeed[] {
+  return HYBRID_GEOGRAPHIES.flatMap((geography) => ICP_CATEGORY_TERMS.slice(0, 6).map((query) => emptySeed(campaignId, "maps_fast", query, geography)));
 }
 
 /**

@@ -1,4 +1,4 @@
-import { pgTable, text, timestamp, uuid, numeric, index, boolean, integer } from "drizzle-orm/pg-core";
+import { pgTable, text, timestamp, uuid, numeric, index, boolean, integer, jsonb, uniqueIndex } from "drizzle-orm/pg-core";
 import { workspaces } from "./workspaces";
 
 /**
@@ -17,9 +17,16 @@ export const rebalanceDecisions = pgTable(
     toEngine: text("to_engine").notNull(),
     amount: numeric("amount", { mode: "number" }).notNull(),
     reason: text("reason").notNull(),
+    fromCampaignId: uuid("from_campaign_id"),
+    toCampaignId: uuid("to_campaign_id"),
+    metricSnapshot: jsonb("metric_snapshot").notNull().default({}),
+    idempotencyKey: text("idempotency_key"),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
-  (table) => [index("idx_rebalance_decisions_workspace").on(table.workspaceId, table.createdAt)],
+  (table) => [
+    index("idx_rebalance_decisions_workspace").on(table.workspaceId, table.createdAt),
+    uniqueIndex("uq_rebalance_decisions_idempotency").on(table.idempotencyKey),
+  ],
 );
 
 export const autopilotSettings = pgTable("autopilot_settings", {

@@ -62,6 +62,21 @@ const migrationColumnNames = new Set(migrationRows.map((row) => (row as { column
 if (!migrationColumnNames.has("filename") || !migrationColumnNames.has("hash") || !migrationColumnNames.has("applied_at")) {
   throw new Error("Migration tracking: FAIL");
 }
+const requiredMigrationFiles = [
+  "0000_base_schema.sql",
+  "0001_phase8a_job_queue_hardening.sql",
+  "0002_phase8c_maps_idempotency.sql",
+  "0003_phase8f_apify_async.sql",
+  "0004_phase8g_autopilot_control.sql",
+  "0005_phase8g1_stabilization.sql",
+];
+const appliedMigrationRows = await db`
+  SELECT filename FROM vitalcap_migrations WHERE filename = ANY(${requiredMigrationFiles})
+`;
+const appliedMigrationFiles = new Set(appliedMigrationRows.map((row) => String((row as { filename: string }).filename)));
+if (requiredMigrationFiles.some((filename) => !appliedMigrationFiles.has(filename))) {
+  throw new Error(`Migration versions: FAIL (missing ${requiredMigrationFiles.filter((filename) => !appliedMigrationFiles.has(filename)).join(", ")})`);
+}
 
 const rawAndSourceIndexes = await db`
   SELECT indexname
@@ -118,6 +133,37 @@ const expectedIndexes = [
   "uq_dead_letter_jobs_source_job",
 ];
 
+const providerRunColumns = await db`
+  SELECT column_name
+  FROM information_schema.columns
+  WHERE table_schema = 'public' AND table_name = 'provider_runs'
+    AND column_name = ANY(${["request_key", "actor_id", "seed_id", "ingested_at", "error"]})
+`;
+const providerRunColumnNames = new Set(providerRunColumns.map((row) => String((row as { column_name: string }).column_name)));
+const requiredProviderRunColumns = ["request_key", "actor_id", "seed_id", "ingested_at", "error"];
+
+const autopilotColumns = await db`
+  SELECT column_name
+  FROM information_schema.columns
+  WHERE table_schema = 'public' AND table_name = 'autopilot_settings'
+    AND column_name = ANY(${["workspace_id", "enabled", "emergency_stopped", "global_daily_target", "target_metric", "timezone"]})
+`;
+const autopilotColumnNames = new Set(autopilotColumns.map((row) => String((row as { column_name: string }).column_name)));
+const requiredAutopilotColumns = ["workspace_id", "enabled", "emergency_stopped", "global_daily_target", "target_metric", "timezone"];
+const targetMetricConstraint = await db`
+  SELECT 1
+  FROM pg_constraint
+  WHERE conrelid = 'autopilot_settings'::regclass
+    AND pg_get_constraintdef(oid) LIKE '%target_metric%'
+    AND pg_get_constraintdef(oid) LIKE '%qualified%'
+    AND pg_get_constraintdef(oid) LIKE '%analyzed_qualified%'
+    AND pg_get_constraintdef(oid) LIKE '%outreach_ready%'
+`;
+const providerRunIndexes = await db`
+  SELECT indexname FROM pg_indexes
+  WHERE schemaname = 'public' AND indexname = 'uq_provider_runs_request_key'
+`;
+
 await db.transaction([db`SELECT 1`]);
 
 if (missingTables.length > 0) {
@@ -129,6 +175,13 @@ if (expectedQueueColumns.some((column) => !queueColumnKeys.has(column))) {
 if (expectedIndexes.some((index) => !indexNames.has(index))) {
   throw new Error("Idempotency indexes: FAIL");
 }
+if (requiredProviderRunColumns.some((column) => !providerRunColumnNames.has(column))) {
+  throw new Error("Provider-run async columns: FAIL (Phase 8F migration missing)");
+}
+if (!providerRunIndexes.length) throw new Error("Provider-run request-key index: FAIL (Phase 8F migration missing)");
+if (requiredAutopilotColumns.some((column) => !autopilotColumnNames.has(column)) || !targetMetricConstraint.length) {
+  throw new Error("Autopilot control columns/constraint: FAIL (Phase 8G/8G.1 migration missing)");
+}
 
 console.log("Neon connection: PASS");
 console.log("Core tables: PASS");
@@ -136,5 +189,8 @@ console.log("Queue tables: PASS");
 console.log("Queue lease columns: PASS");
 console.log("Idempotency indexes: PASS");
 console.log("Replay idempotency indexes: PASS");
+console.log("Provider-run async columns and request-key index: PASS");
+console.log("Autopilot settings and target metric constraint: PASS");
 console.log("Migration tracking: PASS");
+console.log("Migrations 0000-0005: PASS");
 console.log("Transaction round-trip: PASS");

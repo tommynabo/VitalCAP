@@ -4,8 +4,7 @@ import { getServerEnv } from "@/lib/config/env";
 import { getAutopilotSettings } from "@/infrastructure/neon/repositories/autopilot";
 import { ApifyClient } from "@/infrastructure/providers/maps/apify-client";
 import { mapCompassItemToPlaceResult } from "@/infrastructure/providers/maps/apify-actors/compass-adapter";
-import { finalizeSearchSeedRun, insertRawCandidates } from "@/infrastructure/neon/repositories/discovery";
-import { enqueueProcessingJob } from "@/infrastructure/neon/repositories/job-queue";
+import { ingestApifyProviderRun } from "@/infrastructure/neon/repositories/provider-run-ingestion";
 
 const MONITORED_PROVIDERS = ["apify", "serper", "email_verification"] as const;
 const MAX_RUNS_PER_TICK = 20;
@@ -77,22 +76,19 @@ export async function runProviderRunsCronTick(maxRuns = MAX_RUNS_PER_TICK): Prom
 
       const datasetId = run.defaultDatasetId ?? providerRun.externalDatasetId;
       if (!datasetId) throw new Error(`Apify run ${run.id} succeeded without a dataset ID.`);
-      await updateProviderRun(providerRun.id, {
-        status: "succeeded",
-        externalDatasetId: datasetId,
-        costUsd: usageCost,
-        finishedAt: run.finishedAt ? new Date(run.finishedAt) : new Date(),
-        error: null,
-      });
-
       const metadata = (providerRun.metadata ?? {}) as Record<string, unknown>;
       const discoveryJobId = typeof metadata.discoveryJobId === "string" ? metadata.discoveryJobId : null;
       if (!discoveryJobId) throw new Error(`Provider run ${providerRun.id} has no discovery job metadata.`);
       const rawItems = await fetchBoundedDatasetItems(client, datasetId, providerRun.itemsRequested || 1);
 
       const places = rawItems.map(mapCompassItemToPlaceResult).filter((place): place is NonNullable<ReturnType<typeof mapCompassItemToPlaceResult>> => place !== null);
-      const insertedIds = await insertRawCandidates(
-        places.map((place) => ({
+      const ingestion = await ingestApifyProviderRun({
+        providerRunId: providerRun.id,
+        campaignId: providerRun.campaignId!,
+        discoveryJobId,
+        seedRunId: typeof metadata.seedRunId === "string" ? metadata.seedRunId : null,
+        externalDatasetId: datasetId,
+        candidates: places.map((place) => ({
           discoveryJobId,
           campaignId: providerRun.campaignId!,
           engineType: "maps_fast" as const,
@@ -100,18 +96,14 @@ export async function runProviderRunsCronTick(maxRuns = MAX_RUNS_PER_TICK): Prom
           sourceUrl: place.sourceUrl,
           rawPayload: { kind: "maps", place },
         })),
-      );
-      for (const rawCandidateId of insertedIds) {
-        await enqueueProcessingJob({ campaignId: providerRun.campaignId!, type: "process_raw_candidate", payload: { rawCandidateId }, idempotencyKey: `raw_candidate:${rawCandidateId}` });
+        finishedAt: run.finishedAt ? new Date(run.finishedAt) : new Date(),
+        costUsd: usageCost,
+        itemsReturned: places.length,
+      });
+      if (!ingestion.alreadyIngested) {
+        runsIngested += 1;
+        candidatesInserted += ingestion.rawCandidatesInserted;
       }
-
-      const seedRunId = typeof metadata.seedRunId === "string" ? metadata.seedRunId : null;
-      if (seedRunId) {
-        await finalizeSearchSeedRun({ seedRunId, finishedAt: new Date(), rawCount: places.length, uniqueCount: insertedIds.length, readyCount: 0, error: null });
-      }
-      await updateProviderRun(providerRun.id, { status: "ingested", itemsReturned: places.length, costUsd: usageCost, ingestedAt: new Date(), error: null });
-      runsIngested += 1;
-      candidatesInserted += insertedIds.length;
     } catch (error) {
       warnings.push(`provider_run ${providerRun.id}: ${error instanceof Error ? error.message : String(error)}`);
     }

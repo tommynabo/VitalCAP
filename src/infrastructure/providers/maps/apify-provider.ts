@@ -80,14 +80,15 @@ export class ApifyMapsDiscoveryProvider implements MapsDiscoveryProvider {
     }
     const startActorRun = this.client.startActorRun;
     if (!startActorRun) throw new Error("Async Apify client support is not configured.");
-    const actorInput = buildCompassActorInput(input, this.config.maxCrawledPlacesPerSearch ?? 20);
+    const maxResults = Math.min(this.config.maxCrawledPlacesPerSearch ?? 20, Math.max(1, Math.floor(input.maxResults ?? this.config.maxCrawledPlacesPerSearch ?? 20)));
+    const actorInput = buildCompassActorInput(input, maxResults);
     const run = await startActorRun.call(this.client, this.config.actorId, actorInput, { maxTotalChargeUsd: this.config.batchCostLimitUsd });
     return {
       actorId: this.config.actorId,
       externalRunId: run.id,
       externalDatasetId: run.defaultDatasetId,
       status: run.status === "READY" ? "queued" : "running",
-      itemsRequested: this.config.maxCrawledPlacesPerSearch ?? 20,
+      itemsRequested: maxResults,
       costUsd: run.usageTotalUsd ?? 0,
       metadata: { requestKey: input.requestKey ?? null },
     };
@@ -106,7 +107,8 @@ export class ApifyMapsDiscoveryProvider implements MapsDiscoveryProvider {
     if (this.config.actorId !== COMPASS_ACTOR_ID) {
       throw new Error(`No verified input adapter exists for Apify actor ${this.config.actorId}.`);
     }
-    const actorInput = buildCompassActorInput(input, this.config.maxCrawledPlacesPerSearch ?? 20);
+    const maxResults = Math.min(this.config.maxCrawledPlacesPerSearch ?? 20, Math.max(1, Math.floor(input.maxResults ?? this.config.maxCrawledPlacesPerSearch ?? 20)));
+    const actorInput = buildCompassActorInput(input, maxResults);
     let run;
     try {
       run = await this.client.runAndWait(this.config.actorId, actorInput, {

@@ -7,9 +7,11 @@
  */
 
 import type { EngineType } from "@/domain/campaigns/types";
+import type { AutopilotPacingState } from "@/services/autopilot/pacing-service";
 
 export type ProviderHealthStatus = "healthy" | "degraded" | "paused" | "unknown";
 export type AutopilotTargetMetric = "qualified" | "analyzed_qualified" | "outreach_ready";
+export type AutopilotTargetRisk = "on_track" | "recoverable" | "target_at_risk_budget" | "target_at_risk_provider" | "target_at_risk_exhaustion" | "target_at_risk_time";
 
 export type AutopilotEffectiveState = "running" | "paused" | "emergency_stopped";
 
@@ -36,6 +38,7 @@ export interface EngineTargetState {
   engineType: EngineType;
   softTarget: number;
   readyToday: number;
+  targetAchievedToday?: number;
   qualifiedToday?: number;
   rawQueueDepth: number;
   processingQueueDepth: number;
@@ -56,6 +59,8 @@ export interface GlobalAutopilotState {
   readyBufferDays: number | null;
   systemHealth: ProviderHealthStatus;
   engines: EngineTargetState[];
+  pacing?: AutopilotPacingState;
+  targetRisk?: AutopilotTargetRisk;
 }
 
 export interface RebalanceDecision {
@@ -65,4 +70,8 @@ export interface RebalanceDecision {
   toEngine: EngineType;
   amount: number;
   reason: string;
+  fromCampaignId?: string | null;
+  toCampaignId?: string | null;
+  metricSnapshot?: Record<string, unknown>;
+  idempotencyKey?: string;
 }

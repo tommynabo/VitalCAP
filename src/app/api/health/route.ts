@@ -7,7 +7,11 @@ export function GET() {
   return NextResponse.json({
     status: "ok",
     timestamp: new Date().toISOString(),
-    env: env.APP_ENV,
+    appEnv: env.APP_ENV,
+    vercelEnv: env.VERCEL_ENV ?? null,
     devSeedMode: env.DEV_SEED_MODE,
+    databaseConfigured: Boolean(env.DATABASE_URL),
+    mapsProvider: env.MAPS_PROVIDER,
+    deliveryMode: env.DEFAULT_DELIVERY_MODE,
   });
 }

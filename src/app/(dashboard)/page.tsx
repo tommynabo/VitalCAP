@@ -78,7 +78,7 @@ export default async function DashboardPage() {
 
       <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-5">
         <KpiStat label="Daily target" value={String(state.dailyTarget)} />
-        <KpiStat label="Ready today" value={String(state.readyToday)} emphasize />
+        <KpiStat label="Qualified today" value={String(state.targetAchievedToday ?? state.readyToday)} emphasize />
         <KpiStat label="Sent today" value={String(state.sentToday)} />
         <KpiStat label="Replies" value={String(state.repliesToday)} />
         <KpiStat label="Meetings" value={String(state.meetingsToday)} />
@@ -91,11 +91,11 @@ export default async function DashboardPage() {
           </CardHeader>
           <CardContent>
             <p className="text-3xl font-semibold text-text">
-              {state.readyToday} <span className="text-base font-normal text-text-muted">/ {state.dailyTarget}</span>
+              {state.targetAchievedToday ?? state.readyToday} <span className="text-base font-normal text-text-muted">/ {state.dailyTarget}</span>
             </p>
             <Progress value={progressPct} className="mt-3" />
             <p className="mt-3 text-xs text-text-muted">
-              Ready buffer: {state.readyBufferDays === null ? "N/A" : `${state.readyBufferDays.toFixed(1)} days`} · System health:{" "}
+              Qualified target progress · System health:{" "}
               <span className="font-medium text-text">{state.systemHealth}</span>
             </p>
           </CardContent>

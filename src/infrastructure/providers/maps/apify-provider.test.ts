@@ -90,12 +90,13 @@ describe("ApifyMapsDiscoveryProvider", () => {
 
   it("maps a successful run into MapsSearchOutput and records the run", async () => {
     const { provider, recordRun } = makeProvider();
-    const output = await provider.search({ query: "farmacia", geography: "Madrid", pageToken: null });
+    const output = await provider.search({ query: "farmacia", geography: "Madrid", pageToken: null, maxResults: 7 });
 
     expect(output.results).toHaveLength(1);
     expect(output.results[0]?.name).toBe("Farmacia A");
     expect(output.usage.costUsd).toBe(0.12);
     expect(output.nextPageToken).toBeNull();
+    expect((vi.mocked((provider as unknown as { client: ApifyMapsClient }).client.runAndWait).mock.calls[0]?.[1] as Record<string, unknown>).maxCrawledPlacesPerSearch).toBe(7);
     expect(recordRun).toHaveBeenCalledWith(
       expect.objectContaining({ status: "completed", externalRunId: "run1", externalDatasetId: "ds1", itemsReturned: 1 }),
     );
