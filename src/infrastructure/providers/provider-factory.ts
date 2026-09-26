@@ -10,6 +10,13 @@ import { getTodaySpendUsd, recordProviderRun } from "@/infrastructure/neon/repos
 
 export type MapsEngineRole = "maps_fast" | "maps_deep" | "hybrid_fill";
 
+export class ProviderDisabledError extends Error {
+  constructor(provider: string) {
+    super(`Provider ${provider} is disabled and cannot be invoked.`);
+    this.name = "ProviderDisabledError";
+  }
+}
+
 /**
  * Composition root for the discovery-provider interfaces (Prompt 7 §11–§20,
  * ADR-009). Reads `MAPS_PROVIDER` / `SERP_PROVIDER` /
@@ -53,6 +60,7 @@ export function createMapsDiscoveryProvider(workspaceId: string, role: MapsEngin
 
 export function createSerpDiscoveryProvider(workspaceId: string): SerpDiscoveryProvider {
   const env = getServerEnv();
+  if (env.SERP_PROVIDER === "disabled") throw new ProviderDisabledError("SERP_PROVIDER");
   if (env.SERP_PROVIDER === "mock") return new MockSerpDiscoveryProvider();
 
   if (!env.SERPER_API_KEY) {
@@ -89,6 +97,7 @@ export function createSerpDiscoveryProvider(workspaceId: string): SerpDiscoveryP
 
 export function createEmailVerificationProvider(workspaceId: string): EmailVerificationProvider {
   const env = getServerEnv();
+  if (env.EMAIL_VERIFICATION_PROVIDER === "disabled") throw new ProviderDisabledError("EMAIL_VERIFICATION_PROVIDER");
   if (env.EMAIL_VERIFICATION_PROVIDER === "mock") return new MockEmailVerificationProvider();
 
   if (!env.MILLIONVERIFIER_API_KEY) {

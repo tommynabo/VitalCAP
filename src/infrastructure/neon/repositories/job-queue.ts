@@ -103,9 +103,12 @@ async function claim<T>(
   now: Date,
   leaseMs: number,
   batchSize: number,
+  campaignId?: string,
+  requireAutopilot = true,
 ): Promise<JobRecord<T>[]> {
   const db = getDb();
   const nowIso = now.toISOString();
+  const inputCampaignId = campaignId ?? null;
   const leaseSeconds = Math.max(1, Math.ceil(leaseMs / 1000));
   const boundedBatchSize = normalizeBatchSize(batchSize);
 
@@ -117,6 +120,8 @@ async function claim<T>(
             FROM discovery_jobs j
             JOIN campaigns c ON c.id = j.campaign_id
             WHERE c.status = 'active'
+              AND (${requireAutopilot} = false OR c.autopilot_enabled = true)
+              AND (${inputCampaignId}::uuid IS NULL OR j.campaign_id = ${inputCampaignId}::uuid)
               AND j.status IN ('pending', 'processing')
               AND (j.next_attempt_at IS NULL OR j.next_attempt_at <= ${nowIso}::timestamptz)
               AND (
@@ -144,6 +149,8 @@ async function claim<T>(
             FROM processing_jobs j
             JOIN campaigns c ON c.id = j.campaign_id
             WHERE c.status = 'active'
+              AND (${requireAutopilot} = false OR c.autopilot_enabled = true)
+              AND (${inputCampaignId}::uuid IS NULL OR j.campaign_id = ${inputCampaignId}::uuid)
               AND j.status IN ('pending', 'processing')
               AND (j.next_attempt_at IS NULL OR j.next_attempt_at <= ${nowIso}::timestamptz)
               AND (
@@ -172,16 +179,18 @@ async function claim<T>(
 export interface ClaimJobsInput {
   workerId: string;
   batchSize: number;
+  campaignId?: string;
+  requireAutopilot?: boolean;
   now?: Date;
   leaseMs?: number;
 }
 
 export async function claimDiscoveryJobs<T = Record<string, unknown>>(input: ClaimJobsInput): Promise<JobRecord<T>[]> {
-  return claim<T>("discovery_jobs", input.workerId, input.now ?? new Date(), input.leaseMs ?? JOB_LEASE_MS, input.batchSize);
+  return claim<T>("discovery_jobs", input.workerId, input.now ?? new Date(), input.leaseMs ?? JOB_LEASE_MS, input.batchSize, input.campaignId, input.requireAutopilot ?? true);
 }
 
 export async function claimProcessingJobs<T = Record<string, unknown>>(input: ClaimJobsInput): Promise<JobRecord<T>[]> {
-  return claim<T>("processing_jobs", input.workerId, input.now ?? new Date(), input.leaseMs ?? JOB_LEASE_MS, input.batchSize);
+  return claim<T>("processing_jobs", input.workerId, input.now ?? new Date(), input.leaseMs ?? JOB_LEASE_MS, input.batchSize, input.campaignId, input.requireAutopilot ?? true);
 }
 
 export async function claimNextDiscoveryJob<T = Record<string, unknown>>(

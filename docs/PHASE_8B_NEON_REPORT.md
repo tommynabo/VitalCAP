@@ -60,3 +60,9 @@ Branch: `neon-production-wiring`
 **PHASE 8B = FAIL / BLOCKED** because real Neon connectivity and queue integration were not proven.
 
 **READY FOR PHASE 8C: NO**
+
+## Phase 8D follow-up verification
+
+- Added a current-schema base migration at `drizzle/0000_base_schema.sql` and order-safe filename/hash migration tracking.
+- Local typecheck, lint, tests, and build pass.
+- Fresh Neon migration, `smoke:db`, production baseline, and real queue integration remain NOT RUN because no safe Neon database was provided.

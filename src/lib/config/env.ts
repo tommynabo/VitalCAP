@@ -66,17 +66,17 @@ const serverEnvSchema = z
     APIFY_BATCH_COST_LIMIT_USD: z.coerce.number().default(2),
 
     // ── Discovery: Serper (SERP + LinkedIn owner) ─────────────────────────
-    SERP_PROVIDER: z.enum(["serper", "mock"]).default("mock"),
+    SERP_PROVIDER: z.enum(["serper", "disabled", "mock"]).default("disabled"),
     SERPER_API_KEY: z.string().optional(),
     SERPER_COUNTRY: z.string().default("es"),
     SERPER_LANGUAGE: z.string().default("es"),
 
     // ── Email verification ────────────────────────────────────────────────
-    EMAIL_VERIFICATION_PROVIDER: z.enum(["millionverifier", "mock"]).default("mock"),
+    EMAIL_VERIFICATION_PROVIDER: z.enum(["millionverifier", "disabled", "mock"]).default("disabled"),
     MILLIONVERIFIER_API_KEY: z.string().optional(),
 
     // ── Email delivery: Instantly v2 ──────────────────────────────────────
-    EMAIL_DELIVERY_PROVIDER: z.enum(["instantly", "mock"]).default("mock"),
+    EMAIL_DELIVERY_PROVIDER: z.enum(["instantly", "disabled", "mock"]).default("disabled"),
     INSTANTLY_API_KEY: z.string().optional(),
     INSTANTLY_WEBHOOK_SECRET: z.string().optional(),
 
@@ -84,7 +84,7 @@ const serverEnvSchema = z
     SMS_PROVIDER: z.literal("disabled").default("disabled"),
 
     // ── LLM (AI Setter) ────────────────────────────────────────────────────
-    LLM_PROVIDER: z.enum(["openai", "mock"]).default("mock"),
+    LLM_PROVIDER: z.enum(["openai", "disabled", "mock"]).default("disabled"),
     LLM_PROVIDER_API_KEY: z.string().optional(),
     LLM_MODEL: z.string().default("gpt-4.1-mini"),
   })
@@ -100,18 +100,6 @@ const serverEnvSchema = z
     }
     if (env.APP_ENV === "production" && env.MAPS_PROVIDER === "mock") {
       ctx.addIssue({ code: "custom", message: "MAPS_PROVIDER=mock is forbidden in production.", path: ["MAPS_PROVIDER"] });
-    }
-    if (env.APP_ENV === "production" && env.SERP_PROVIDER === "mock") {
-      ctx.addIssue({ code: "custom", message: "SERP_PROVIDER=mock is forbidden in production.", path: ["SERP_PROVIDER"] });
-    }
-    if (env.APP_ENV === "production" && env.EMAIL_VERIFICATION_PROVIDER === "mock") {
-      ctx.addIssue({ code: "custom", message: "EMAIL_VERIFICATION_PROVIDER=mock is forbidden in production.", path: ["EMAIL_VERIFICATION_PROVIDER"] });
-    }
-    if (env.APP_ENV === "production" && env.EMAIL_DELIVERY_PROVIDER === "mock") {
-      ctx.addIssue({ code: "custom", message: "EMAIL_DELIVERY_PROVIDER=mock is forbidden in production.", path: ["EMAIL_DELIVERY_PROVIDER"] });
-    }
-    if (env.APP_ENV === "production" && env.LLM_PROVIDER === "mock") {
-      ctx.addIssue({ code: "custom", message: "LLM_PROVIDER=mock is forbidden in production.", path: ["LLM_PROVIDER"] });
     }
     if (env.APP_ENV === "production" && !env.CRON_SECRET) {
       ctx.addIssue({ code: "custom", message: "CRON_SECRET is required in production.", path: ["CRON_SECRET"] });

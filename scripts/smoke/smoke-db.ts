@@ -16,6 +16,21 @@ const requiredTables = [
   "dead_letter_jobs",
   "provider_runs",
   "conversations",
+  "account_merge_records",
+  "offers",
+  "raw_candidates",
+  "search_seeds",
+  "search_seed_runs",
+  "outreach_events",
+  "setter_drafts",
+  "setter_feedback",
+  "meetings",
+  "suppression_entries",
+  "sending_domains",
+  "mailboxes",
+  "warm_followup_queue",
+  "rebalance_decisions",
+  "audit_log",
   "conversation_messages",
   "cron_runs",
 ];
@@ -33,6 +48,31 @@ if (!databaseUrl) {
 }
 
 const db = neon(databaseUrl);
+const one = await db`SELECT 1 AS value`;
+if (Number((one[0] as { value: number } | undefined)?.value) !== 1) {
+  throw new Error("SELECT 1: FAIL");
+}
+
+const migrationRows = await db`
+  SELECT column_name
+  FROM information_schema.columns
+  WHERE table_schema = 'public' AND table_name = 'vitalcap_migrations'
+`;
+const migrationColumnNames = new Set(migrationRows.map((row) => (row as { column_name: string }).column_name));
+if (!migrationColumnNames.has("filename") || !migrationColumnNames.has("hash") || !migrationColumnNames.has("applied_at")) {
+  throw new Error("Migration tracking: FAIL");
+}
+
+const rawAndSourceIndexes = await db`
+  SELECT indexname
+  FROM pg_indexes
+  WHERE schemaname = 'public'
+    AND indexname IN ('uq_raw_candidates_campaign_engine_external', 'uq_account_sources_external')
+`;
+const expectedReplayIndexes = new Set(rawAndSourceIndexes.map((row) => (row as { indexname: string }).indexname));
+if (!expectedReplayIndexes.has("uq_raw_candidates_campaign_engine_external") || !expectedReplayIndexes.has("uq_account_sources_external")) {
+  throw new Error("Replay idempotency indexes: FAIL");
+}
 const tables = await db`
   SELECT table_name
   FROM information_schema.tables
@@ -95,4 +135,6 @@ console.log("Core tables: PASS");
 console.log("Queue tables: PASS");
 console.log("Queue lease columns: PASS");
 console.log("Idempotency indexes: PASS");
+console.log("Replay idempotency indexes: PASS");
+console.log("Migration tracking: PASS");
 console.log("Transaction round-trip: PASS");

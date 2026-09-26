@@ -63,3 +63,10 @@ The operator-only command `npm run smoke:maps` writes the real values here after
 ## Remaining Concerns
 
 Phase 8B remains operationally blocked until a safe Neon URL is available and the Neon migration/queue integration suite runs against that database. Phase 8C must remain `FAIL / NOT READY` until the explicit smoke proves the real Apify-to-Neon path.
+
+## Phase 8D follow-up verification
+
+- Smoke workspace selection now requires `SMOKE_WORKSPACE_ID`; no implicit first workspace is used.
+- Smoke processing claims are campaign-scoped and the smoke campaign remains `autopilotEnabled=false`.
+- Deferred providers are explicitly disabled in the environment contract.
+- Real Compass request remains NOT RUN because secure `APIFY_API_TOKEN` and a real Neon database were not provided.

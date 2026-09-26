@@ -14,13 +14,10 @@
     "db:generate": "drizzle-kit generate",
     "db:migrate": "tsx scripts/migrate.ts",
     "smoke:db": "tsx scripts/smoke/smoke-db.ts",
-    "smoke:auth": "tsx scripts/smoke/smoke-auth.ts",
     "smoke:maps": "tsx scripts/smoke/smoke-maps.ts",
     "benchmark:maps": "tsx scripts/benchmark-maps.ts",
     "smoke:serper": "tsx scripts/smoke/smoke-serper.ts",
-    "smoke:email-verification": "tsx scripts/smoke/smoke-email-verification.ts",
-    "smoke:instantly": "tsx scripts/smoke/smoke-instantly.ts",
-    "smoke:llm": "tsx scripts/smoke/smoke-llm.ts"
+    "smoke:email-verification": "tsx scripts/smoke/smoke-email-verification.ts"
   },
   "dependencies": {
     "@neondatabase/auth": "^0.5.0-beta",

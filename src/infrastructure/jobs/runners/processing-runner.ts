@@ -27,6 +27,7 @@ interface ProcessingJobPayload {
 
 export interface ProcessingRunnerOptions {
   enrichContacts?: boolean;
+  campaignId?: string;
 }
 
 const smokeWebsiteFetcher: WebsiteFetcher = {
@@ -242,7 +243,13 @@ export async function runProcessingCronTick(
   const workerId = `cron-process-${randomUUID()}`;
   let jobsClaimed = 0;
 
-  const jobs = await claimProcessingJobs<ProcessingJobPayload>({ workerId, batchSize: maxJobsPerTick, now });
+  const jobs = await claimProcessingJobs<ProcessingJobPayload>({
+    workerId,
+    batchSize: maxJobsPerTick,
+    now,
+    campaignId: options.campaignId,
+    requireAutopilot: options.campaignId === undefined,
+  });
   for (const job of jobs) {
     jobsClaimed += 1;
     try {

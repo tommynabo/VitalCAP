@@ -123,11 +123,8 @@ export class ApifyClient {
   static readonly TERMINAL_STATUSES: readonly ApifyRunStatus[] = ["SUCCEEDED", "FAILED", "TIMED-OUT", "ABORTED"];
 
   /**
-   * Starts a run and polls until a terminal status or `maxWaitMs` elapses.
-   * This keeps the async start/poll/fetch pattern from §15 while still
-   * returning a single Promise the `MapsDiscoveryProvider.search()`
-   * interface expects — the polling itself happens inside a cron-triggered
-   * background job (Gate E), never inside a user-facing request.
+  * Corrective-phase bounded smoke helper. Production discovery must move to
+  * persisted async lifecycle state before using this method for normal work.
    */
   async runAndWait(
     actorId: string,

@@ -53,10 +53,13 @@ export async function getCampaignById(campaignId: string): Promise<Campaign | nu
   return row ? toCampaign(row) : null;
 }
 
-/** Every `status = 'active'` campaign, workspace-wide — the cron routes' outer loop (`listWorkspaceIds` × `listActiveCampaigns`). "Campaign pause prevents claims" (§24) applies identically here: a paused/draft/archived campaign is invisible to every cron. */
+/** Scheduled discovery only sees campaigns that are both active and explicitly autopilot-enabled. */
 export async function listActiveCampaigns(workspaceId: string): Promise<Campaign[]> {
   const db = getDb();
-  const rows = await db.select().from(campaigns).where(and(eq(campaigns.workspaceId, workspaceId), eq(campaigns.status, "active")));
+  const rows = await db
+    .select()
+    .from(campaigns)
+    .where(and(eq(campaigns.workspaceId, workspaceId), eq(campaigns.status, "active"), eq(campaigns.autopilotEnabled, true)));
   return rows.map(toCampaign);
 }
 

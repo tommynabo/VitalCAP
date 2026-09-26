@@ -3,7 +3,7 @@ import { readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { neon } from "@neondatabase/serverless";
 
-const migrationDirectory = join(process.cwd(), "supabase", "migrations-neon");
+const migrationDirectory = join(process.cwd(), "drizzle");
 const migrationTable = "vitalcap_migrations";
 const neonPrefixes = ["Vitalcap"];
 
@@ -23,18 +23,34 @@ const db = neon(databaseUrl);
 
 await db.unsafe(`
   CREATE TABLE IF NOT EXISTS ${migrationTable} (
-    id integer PRIMARY KEY,
     filename text NOT NULL UNIQUE,
     hash text NOT NULL,
     applied_at timestamptz NOT NULL DEFAULT now()
   )
 `);
 
+await db.unsafe(`
+  ALTER TABLE ${migrationTable}
+  ADD COLUMN IF NOT EXISTS filename text;
+`);
+
+await db.unsafe(`
+  ALTER TABLE ${migrationTable}
+  DROP CONSTRAINT IF EXISTS ${migrationTable}_pkey;
+`);
+
+const migrationColumns = await db`
+  SELECT column_name
+  FROM information_schema.columns
+  WHERE table_schema = 'public' AND table_name = ${migrationTable}
+`;
+const hasLegacyId = migrationColumns.some((row) => (row as { column_name: string }).column_name === "id");
+
 const files = (await readdir(migrationDirectory))
   .filter((filename) => filename.endsWith(".sql"))
   .sort();
 
-for (const [index, filename] of files.entries()) {
+for (const filename of files) {
   const contents = await readFile(join(migrationDirectory, filename), "utf8");
   const hash = createHash("sha256").update(contents).digest("hex");
   const existing = await db`
@@ -53,9 +69,12 @@ for (const [index, filename] of files.entries()) {
   }
 
   console.log(`Applying migration ${filename}`);
+  const insertMigration = hasLegacyId
+    ? db`INSERT INTO ${db.unsafe(migrationTable)} (id, filename, hash) SELECT COALESCE(MAX(id), 0) + 1, ${filename}, ${hash} FROM ${db.unsafe(migrationTable)}`
+    : db`INSERT INTO ${db.unsafe(migrationTable)} (filename, hash) VALUES (${filename}, ${hash})`;
   await db.transaction([
     db`${db.unsafe(contents)}`,
-    db`INSERT INTO ${db.unsafe(migrationTable)} (id, filename, hash) VALUES (${index + 1}, ${filename}, ${hash})`,
+    insertMigration,
   ]);
   console.log(`Migration ${filename}: applied`);
 }

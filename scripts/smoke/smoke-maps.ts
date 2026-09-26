@@ -13,7 +13,6 @@ import { getDb, schema } from "../../src/infrastructure/neon/db";
 import { getTodaySpendUsd, recordProviderRun } from "../../src/infrastructure/neon/repositories/provider-runs";
 import { insertRawCandidates } from "../../src/infrastructure/neon/repositories/discovery";
 import { enqueueProcessingJob } from "../../src/infrastructure/neon/repositories/job-queue";
-import { listWorkspaceIds } from "../../src/infrastructure/neon/repositories/workspace";
 import { runProcessingCronTick } from "../../src/infrastructure/jobs/runners/processing-runner";
 import { ApifyMapsDiscoveryProvider } from "../../src/infrastructure/providers/maps/apify-provider";
 import { COMPASS_ACTOR_ID } from "../../src/infrastructure/providers/maps/apify-actors/compass-adapter";
@@ -22,7 +21,7 @@ import { evaluateProviderHealth } from "../../src/services/discovery/provider-he
 const QUERY = "farmacia";
 const LOCATION = "Barcelona, Spain";
 const MAX_RESULTS = 5;
-const CAMPAIGN_NAME = "Vitalcap - Phase 8C Maps Smoke";
+const CAMPAIGN_NAME = "Vitalcap - Phase 8D Maps Smoke";
 
 async function getOrCreateSmokeCampaign(workspaceId: string): Promise<string> {
   const db = getDb();
@@ -140,10 +139,12 @@ async function main(): Promise<void> {
     throw new Error("APIFY_DAILY_COST_LIMIT_USD must be greater than 0 and no more than 1 for Phase 8C.");
   }
 
-  const workspaceId = (await listWorkspaceIds())[0];
-  if (!workspaceId) throw new Error("No Neon workspace exists for the Phase 8C smoke campaign.");
-  const campaignId = await getOrCreateSmokeCampaign(workspaceId);
+  const workspaceId = process.env.SMOKE_WORKSPACE_ID?.trim();
+  if (!workspaceId) throw new Error("SMOKE_WORKSPACE_ID is required; refusing to select a workspace implicitly.");
   const db = getDb();
+  const workspace = await db.select({ id: schema.workspaces.id }).from(schema.workspaces).where(eq(schema.workspaces.id, workspaceId)).limit(1);
+  if (!workspace[0]) throw new Error(`SMOKE_WORKSPACE_ID does not exist: ${workspaceId}`);
+  const campaignId = await getOrCreateSmokeCampaign(workspaceId);
   const beforeMemberships = await db
     .select({ accountId: schema.campaignMemberships.accountId })
     .from(schema.campaignMemberships)
@@ -197,7 +198,7 @@ async function main(): Promise<void> {
       await enqueueProcessingJob({ campaignId, type: "process_raw_candidate", payload: { rawCandidateId }, idempotencyKey: `raw_candidate:${rawCandidateId}` });
     }
 
-    const processingResult = await runProcessingCronTick(MAX_RESULTS, new Date(), { enrichContacts: false });
+    const processingResult = await runProcessingCronTick(MAX_RESULTS, new Date(), { enrichContacts: false, campaignId });
     const replayIds = await insertRawCandidates(candidates);
     if (replayIds.length > 0) throw new Error(`Idempotency replay inserted ${replayIds.length} duplicate raw candidates.`);
 

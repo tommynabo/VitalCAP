@@ -168,3 +168,9 @@ Note:
 - Idempotent enqueue: PASS (implementation) / NOT VERIFIED HERE against real DB runtime
 - Paused campaign protection: PASS
 - Schema consistency: PASS
+
+## Phase 8D follow-up verification
+
+- Migration chain normalized to `drizzle/0000_base_schema.sql`, `0001_phase8a_job_queue_hardening.sql`, and `0002_phase8c_maps_idempotency.sql`.
+- Scheduled discovery now requires active status and `autopilotEnabled=true`.
+- Real Neon queue integration remains NOT RUN because no safe test database was provided.

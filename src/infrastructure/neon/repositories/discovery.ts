@@ -1,4 +1,4 @@
-import { and, eq, inArray } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import { getDb } from "../db";
 import { searchSeeds, searchSeedRuns, discoveryJobs, rawCandidates } from "../schema/discovery";
 import { campaigns } from "../schema/campaigns";
@@ -153,4 +153,28 @@ export async function hasInFlightDiscoveryJob(campaignId: string): Promise<boole
     .where(and(eq(discoveryJobs.campaignId, campaignId), inArray(discoveryJobs.status, ["pending", "processing"])))
     .limit(1);
   return Boolean(row);
+}
+
+/** Temporary discovery-level budget until qualified Autopilot metrics replace it. */
+export async function getRemainingDiscoveryTarget(campaignId: string, dailySoftTarget: number, now = new Date()): Promise<number> {
+  const db = getDb();
+  const dayStart = new Date(now);
+  dayStart.setUTCHours(0, 0, 0, 0);
+  const dayEnd = new Date(dayStart);
+  dayEnd.setUTCDate(dayEnd.getUTCDate() + 1);
+  const progressResult = await db.execute(sql`
+    SELECT
+      (SELECT COUNT(DISTINCT rc.source_external_id)::int
+       FROM raw_candidates rc
+       WHERE rc.campaign_id = ${campaignId}::uuid
+         AND rc.discovered_at >= ${dayStart.toISOString()}::timestamptz
+         AND rc.discovered_at < ${dayEnd.toISOString()}::timestamptz
+         AND rc.source_external_id IS NOT NULL) AS generated_today,
+      (SELECT COUNT(*)::int
+       FROM processing_jobs pj
+       WHERE pj.campaign_id = ${campaignId}::uuid
+         AND pj.status IN ('pending', 'processing')) AS in_flight;
+  `);
+  const row = progressResult.rows[0] as unknown as { generated_today: number; in_flight: number };
+  return Math.max(0, dailySoftTarget - Number(row.generated_today ?? 0) - Number(row.in_flight ?? 0));
 }

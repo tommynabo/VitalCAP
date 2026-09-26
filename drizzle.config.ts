@@ -26,21 +26,11 @@ function resolveNeonVar(standardName: string): string | undefined {
 
 const migrationUrl = resolveNeonVar("DATABASE_URL_UNPOOLED") ?? resolveNeonVar("DATABASE_URL");
 
-if (!migrationUrl) {
-  throw new Error(
-    "DATABASE_URL_UNPOOLED (or DATABASE_URL) must be set to run drizzle-kit " +
-      "commands. Pull real values from Vercel (`vercel env pull`) or set them " +
-      "in your local .env file.",
-  );
-}
-
 export default defineConfig({
   dialect: "postgresql",
   schema: "./src/infrastructure/neon/schema/index.ts",
-  out: "./supabase/migrations-neon",
-  dbCredentials: {
-    url: migrationUrl,
-  },
+  out: "./drizzle",
+  ...(migrationUrl ? { dbCredentials: { url: migrationUrl } } : {}),
   strict: true,
   verbose: true,
 });

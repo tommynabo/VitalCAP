@@ -16,6 +16,7 @@ import {
   insertSearchSeedRun,
   listSearchSeedsForCampaignEngine,
   updateSearchSeedAfterRun,
+  getRemainingDiscoveryTarget,
 } from "@/infrastructure/neon/repositories/discovery";
 import { recordSeedRun } from "@/services/discovery/geography-planner";
 import { buildMapsSeedCatalog, buildSerpSeedCatalog, LINKEDIN_OWNER_ROLE_QUERIES, ICP_CATEGORY_TERMS } from "@/services/discovery/spain-search-catalog";
@@ -43,7 +44,7 @@ export async function ensureDiscoveryJobsQueued(workspaceId: string): Promise<nu
   const campaigns = await listActiveCampaigns(workspaceId);
   let enqueued = 0;
   for (const campaign of campaigns) {
-    if (campaign.engineType === "hybrid_fill") continue; // hybrid_fill is driven by the autopilot rebalancer, not a standing per-tick job (§2.10)
+    if (campaign.engineType !== "maps_fast") continue; // deferred engines remain paused until their providers are enabled
     if (await hasInFlightDiscoveryJob(campaign.id)) continue;
     await bootstrapSearchSeeds(campaign.id, campaign.engineType, catalogForEngine(campaign.id, campaign.engineType));
     await enqueueDiscoveryJob({
@@ -64,12 +65,16 @@ interface DiscoveryJobPayload {
 async function executeDiscoveryJob(job: { id: string; campaignId: string; payload: DiscoveryJobPayload }): Promise<number> {
   const campaign = await getCampaignById(job.campaignId);
   if (!campaign) throw new Error(`Campaign not found: ${job.campaignId}`);
+  if (campaign.status !== "active" || !campaign.autopilotEnabled) {
+    throw new Error(`Scheduled discovery is disabled for campaign ${job.campaignId}.`);
+  }
 
   const engine = createDiscoveryEngine(campaign.workspaceId, job.payload.engineType);
   const persistedSeeds = await listSearchSeedsForCampaignEngine(campaign.id, job.payload.engineType);
   if ("seeds" in engine) (engine as { seeds: SearchSeed[] }).seeds = persistedSeeds;
 
-  const remainingTarget = Math.max(1, campaign.dailySoftTarget);
+  const remainingTarget = await getRemainingDiscoveryTarget(campaign.id, campaign.dailySoftTarget);
+  if (remainingTarget <= 0) return 0;
   const { seeds } = await engine.planDiscoveryBatch({ campaignId: campaign.id, remainingTarget });
   const boundedSeeds = seeds.slice(0, MAX_SEEDS_PER_JOB);
 

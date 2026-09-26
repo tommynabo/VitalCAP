@@ -41,7 +41,11 @@ export const mapApifyItemToPlaceResult = mapCompassItemToPlaceResult;
 
 /**
  * Real Apify-backed `MapsDiscoveryProvider` (Prompt 7 §11–§15). Uses the
- * documented async run → poll → dataset-fetch pattern (`ApifyClient`), a
+ * documented start → poll → dataset-fetch pattern (`ApifyClient`), a
+ * batch cost cap enforced via Apify's own `maxTotalChargeUsd` run param, and a
+ * bounded `runAndWait()` only for the explicit five-result corrective smoke;
+ * normal production execution still needs the future async lifecycle,
+ * and a
  * batch cost cap enforced via Apify's own `maxTotalChargeUsd` run param, and
  * a daily cost cap checked before starting any run (via an injected spend
  * lookup so this class stays DB-free). Every run is persisted (actor ID,
