@@ -11,6 +11,8 @@ import {
 } from "@/lib/data/repository";
 import { buildAdminDiagnostics } from "@/lib/observability/admin-diagnostics";
 
+export const dynamic = "force-dynamic";
+
 /**
  * Prompt 6 §6.3 — internal operations diagnostics. Deliberately lives
  * outside the `(dashboard)` route group (no `AppShell`, no sidebar) and is
