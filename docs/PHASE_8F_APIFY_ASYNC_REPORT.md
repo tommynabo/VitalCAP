@@ -47,4 +47,7 @@ Mocked tests cover async start without polling, explicit run-status and dataset 
 - `Typecheck:` PASS.
 - `Lint:` PASS.
 - `Build:` PASS.
-- `READY FOR PHASE 8G: YES` after migration deployment and production rollout verification.
+- `Production deploy:` PASS (`vitalcapproject.vercel.app` aliased to the Phase 8F deployment).
+- `Migration deployment:` BLOCKED: Vercel's pulled `Vitalcap_DATABASE_URL` and `Vitalcap_DATABASE_URL_UNPOOLED` variables are sealed and empty in the local CLI output, so the additive migration was not applied from this environment.
+- `Production HTTP verification:` BLOCKED locally by `LibreSSL SSL_ERROR_SYSCALL` while connecting to the Vercel alias.
+- `READY FOR PHASE 8G: NO` until migration deployment and HTTP verification complete.
