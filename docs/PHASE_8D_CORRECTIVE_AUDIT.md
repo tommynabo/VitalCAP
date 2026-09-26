@@ -25,7 +25,9 @@ Branch: `neon-production-wiring`
 - Real Neon queue integration: NOT RUN; no safe `JOB_QUEUE_INTEGRATION_DATABASE_URL` was provided.
 - Real Neon migration/smoke: NOT RUN; no operator-provided Neon URL was available in this execution.
 - Real Apify smoke: NOT RUN; `APIFY_API_TOKEN` and explicit `SMOKE_WORKSPACE_ID` were not provided.
-- Vercel environment verification/deploy: PENDING permission and project checks.
+- Vercel deployment: PASS; production alias was created for the verified `vitalcapproject` project.
+- Vercel environment names: NOT VERIFIED; the CLI JSON response was not parseable without exposing values.
+- Deployed health URL: NOT VERIFIED; this machine's TLS request failed before receiving an HTTP response.
 
 ## Risks still open
 

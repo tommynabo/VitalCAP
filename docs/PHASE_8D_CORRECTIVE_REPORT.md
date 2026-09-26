@@ -5,7 +5,7 @@ Branch: `neon-production-wiring`
 
 ## Git HEAD
 
-Recorded after local validation and before any publish attempt.
+`2bdec2a17fc1767ada71d96dce72d25938f10281` (`feat: consolidate phase 8d neon safety gates`), followed by the report-only publication update.
 
 ## MIGRATIONS
 
@@ -47,7 +47,7 @@ Recorded after local validation and before any publish attempt.
 - Legacy vars removed from `.env.example`: PASS.
 - Deferred providers can be explicitly disabled: PASS.
 - Broken npm scripts removed: PASS.
-- Vercel names verified: NOT RUN; CLI/project permission not yet verified.
+- Vercel names verified: NOT VERIFIED; the CLI JSON response was not parseable without exposing values.
 
 ## SECURITY
 
@@ -61,7 +61,7 @@ Recorded after local validation and before any publish attempt.
 - Typecheck: PASS.
 - Lint: PASS.
 - Build: PASS.
-- Vercel: NOT DEPLOYED in this execution.
+- Vercel: PASS for deployment; production alias is `https://vitalcapproject.vercel.app`. HTTP health verification was blocked by a local TLS failure.
 
 ## CRITICAL REMAINING ISSUES
 
