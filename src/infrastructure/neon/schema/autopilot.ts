@@ -1,4 +1,4 @@
-import { pgTable, text, timestamp, uuid, numeric, index } from "drizzle-orm/pg-core";
+import { pgTable, text, timestamp, uuid, numeric, index, boolean, integer } from "drizzle-orm/pg-core";
 import { workspaces } from "./workspaces";
 
 /**
@@ -21,3 +21,18 @@ export const rebalanceDecisions = pgTable(
   },
   (table) => [index("idx_rebalance_decisions_workspace").on(table.workspaceId, table.createdAt)],
 );
+
+export const autopilotSettings = pgTable("autopilot_settings", {
+  workspaceId: uuid("workspace_id")
+    .primaryKey()
+    .references(() => workspaces.id, { onDelete: "cascade" }),
+  enabled: boolean("enabled").notNull().default(false),
+  emergencyStopped: boolean("emergency_stopped").notNull().default(false),
+  globalDailyTarget: integer("global_daily_target").notNull().default(25),
+  timezone: text("timezone").notNull().default("Europe/Madrid"),
+  operatingStartHour: integer("operating_start_hour"),
+  operatingEndHour: integer("operating_end_hour"),
+  maxDailyApifySpendUsd: numeric("max_daily_apify_spend_usd", { mode: "number" }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+});

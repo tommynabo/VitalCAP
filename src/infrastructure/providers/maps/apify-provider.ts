@@ -1,6 +1,7 @@
 import type { AsyncMapsRun, MapsDiscoveryProvider, MapsPlaceResult, MapsSearchInput, MapsSearchOutput } from "@/domain/providers/types";
 import { ApifyClient, type ApifyRun } from "./apify-client";
 import { buildCompassActorInput, COMPASS_ACTOR_ID, mapCompassItemToPlaceResult } from "./apify-actors/compass-adapter";
+import { allowsNewApifyRun } from "@/domain/autopilot/gates";
 
 /** Narrowed to just the two methods this provider calls, so tests can inject a plain fake instead of a real `ApifyClient`. */
 export interface ApifyMapsClient {
@@ -25,6 +26,7 @@ export interface ApifyMapsProviderConfig {
   maxCrawledPlacesPerSearch?: number;
   /** Injected so this provider never imports the Neon repository layer directly (keeps it DB-free and unit-testable). */
   getTodaySpendUsd: () => Promise<number>;
+  getAutopilotState?: () => Promise<"running" | "paused" | "emergency_stopped">;
   recordRun?: (run: {
     actorId: string;
     externalRunId: string | null;
@@ -63,6 +65,10 @@ export class ApifyMapsDiscoveryProvider implements MapsDiscoveryProvider {
   }
 
   async startAsync(input: MapsSearchInput): Promise<AsyncMapsRun> {
+    const autopilotState = await this.config.getAutopilotState?.();
+    if (autopilotState && !allowsNewApifyRun(autopilotState)) {
+      throw new Error(`Autopilot is ${autopilotState}; refusing to start a new Apify run.`);
+    }
     const todaySpend = await this.config.getTodaySpendUsd();
     if (todaySpend >= this.config.dailyCostLimitUsd) {
       throw new ApifyCostLimitExceededError(

@@ -10,6 +10,26 @@ import type { EngineType } from "@/domain/campaigns/types";
 
 export type ProviderHealthStatus = "healthy" | "degraded" | "paused" | "unknown";
 
+export type AutopilotEffectiveState = "running" | "paused" | "emergency_stopped";
+
+export interface AutopilotSettings {
+  workspaceId: string;
+  enabled: boolean;
+  emergencyStopped: boolean;
+  globalDailyTarget: number;
+  timezone: string;
+  operatingStartHour: number | null;
+  operatingEndHour: number | null;
+  maxDailyApifySpendUsd: number | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export function getEffectiveAutopilotState(settings: Pick<AutopilotSettings, "enabled" | "emergencyStopped">): AutopilotEffectiveState {
+  if (settings.emergencyStopped) return "emergency_stopped";
+  return settings.enabled ? "running" : "paused";
+}
+
 export interface EngineTargetState {
   engineType: EngineType;
   softTarget: number;
@@ -28,7 +48,7 @@ export interface GlobalAutopilotState {
   sentToday: number;
   repliesToday: number;
   meetingsToday: number;
-  readyBufferDays: number;
+  readyBufferDays: number | null;
   systemHealth: ProviderHealthStatus;
   engines: EngineTargetState[];
 }

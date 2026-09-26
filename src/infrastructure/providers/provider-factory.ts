@@ -7,6 +7,8 @@ import { SerperDiscoveryProvider } from "./serp/serper-provider";
 import { MockEmailVerificationProvider } from "./email-verification/mock-provider";
 import { MillionVerifierEmailVerificationProvider } from "./email-verification/millionverifier-provider";
 import { getTodaySpendUsd, recordProviderRun } from "@/infrastructure/neon/repositories/provider-runs";
+import { getAutopilotSettings } from "@/infrastructure/neon/repositories/autopilot";
+import { getEffectiveAutopilotState } from "@/domain/autopilot/types";
 
 export type MapsEngineRole = "maps_fast" | "maps_deep" | "hybrid_fill";
 
@@ -50,6 +52,7 @@ export function createMapsDiscoveryProvider(workspaceId: string, role: MapsEngin
     dailyCostLimitUsd: env.APIFY_DAILY_COST_LIMIT_USD,
     batchCostLimitUsd: env.APIFY_BATCH_COST_LIMIT_USD,
     getTodaySpendUsd: () => getTodaySpendUsd(workspaceId, "apify"),
+    getAutopilotState: async () => getEffectiveAutopilotState(await getAutopilotSettings(workspaceId)),
     recordRun: (run) =>
       recordProviderRun({
         workspaceId,

@@ -13,6 +13,7 @@ import {
   listSuppressionEntries,
 } from "@/infrastructure/neon/repositories/outreach";
 import { runOutreachDryRunCycle } from "@/services/outreach/outreach-orchestrator";
+import { getAutopilotSettings } from "@/infrastructure/neon/repositories/autopilot";
 
 /**
  * No per-campaign/per-offer message template editor exists yet in this
@@ -48,6 +49,8 @@ export async function runOutreachDryRunCronTick(now: Date = new Date()): Promise
   let skipped = 0;
 
   for (const workspaceId of workspaceIds) {
+    const autopilotSettings = await getAutopilotSettings(workspaceId);
+    if (autopilotSettings.emergencyStopped) continue;
     const campaigns = await listActiveCampaigns(workspaceId);
     if (campaigns.length === 0) continue;
 

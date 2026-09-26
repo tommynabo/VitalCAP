@@ -15,6 +15,13 @@
       "when": 1790415800000,
       "tag": "0003_phase8f_apify_async",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1790417000000,
+      "tag": "0004_phase8g_autopilot_control",
+      "breakpoints": true
     }
   ]
 }

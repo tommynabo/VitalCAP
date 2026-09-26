@@ -1,6 +1,7 @@
 import { listAutopilotEnabledCampaigns } from "@/infrastructure/neon/repositories/campaigns";
 import { listWorkspaceIds } from "@/infrastructure/neon/repositories/workspace";
-import { getGlobalAutopilotState } from "@/infrastructure/neon/repositories/autopilot";
+import { getAutopilotSettings, getGlobalAutopilotState } from "@/infrastructure/neon/repositories/autopilot";
+import { getEffectiveAutopilotState } from "@/domain/autopilot/types";
 import { insertRebalanceDecision } from "@/infrastructure/neon/repositories/autopilot";
 import { getRecentProviderUsage } from "@/infrastructure/neon/repositories/provider-runs";
 import { evaluateProviderHealth } from "@/services/discovery/provider-health";
@@ -31,6 +32,8 @@ async function withRealProviderHealth(workspaceId: string, state: GlobalAutopilo
 export interface AutopilotRunnerResult {
   campaignsTicked: number;
   rebalanceDecisionsRecorded: number;
+  pausedWorkspaces: number;
+  emergencyStoppedWorkspaces: number;
 }
 
 /**
@@ -46,8 +49,20 @@ export async function runAutopilotCronTick(now: Date = new Date()): Promise<Auto
   const workspaceIds = await listWorkspaceIds();
   let campaignsTicked = 0;
   let rebalanceDecisionsRecorded = 0;
+  let pausedWorkspaces = 0;
+  let emergencyStoppedWorkspaces = 0;
 
   for (const workspaceId of workspaceIds) {
+    const settings = await getAutopilotSettings(workspaceId);
+    const effectiveState = getEffectiveAutopilotState(settings);
+    if (effectiveState === "paused") {
+      pausedWorkspaces += 1;
+      continue;
+    }
+    if (effectiveState === "emergency_stopped") {
+      emergencyStoppedWorkspaces += 1;
+      continue;
+    }
     const campaigns = await listAutopilotEnabledCampaigns(workspaceId);
     if (campaigns.length === 0) continue;
 
@@ -73,5 +88,5 @@ export async function runAutopilotCronTick(now: Date = new Date()): Promise<Auto
     campaignsTicked += campaigns.length;
   }
 
-  return { campaignsTicked, rebalanceDecisionsRecorded };
+  return { campaignsTicked, rebalanceDecisionsRecorded, pausedWorkspaces, emergencyStoppedWorkspaces };
 }

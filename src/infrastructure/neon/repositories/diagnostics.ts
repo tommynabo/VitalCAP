@@ -1,9 +1,10 @@
-import { and, eq, sql, isNotNull } from "drizzle-orm";
+import { and, desc, eq, sql, isNotNull } from "drizzle-orm";
 import { getDb } from "../db";
 import { discoveryJobs, processingJobs } from "../schema/discovery";
 import { outreachQueue, outreachEvents, deadLetterJobs } from "../schema/outreach";
 import { campaigns } from "../schema/campaigns";
 import { providerRuns } from "../schema/providers";
+import { cronRuns } from "../schema/jobs-meta";
 import { getServerEnv } from "@/lib/config/env";
 import type { ProviderUsageStats } from "@/domain/providers/types";
 
@@ -185,6 +186,17 @@ export async function getCronLastRunAt(workspaceId: string): Promise<string | nu
     .from(providerRuns)
     .where(eq(providerRuns.workspaceId, workspaceId));
   return row?.latest ? new Date(row.latest).toISOString() : null;
+}
+
+export async function getLastCronRouteRunAt(route: string): Promise<string | null> {
+  const db = getDb();
+  const [row] = await db
+    .select({ finishedAt: cronRuns.finishedAt })
+    .from(cronRuns)
+    .where(and(eq(cronRuns.route, route), eq(cronRuns.status, "completed")))
+    .orderBy(desc(cronRuns.finishedAt))
+    .limit(1);
+  return row?.finishedAt?.toISOString() ?? null;
 }
 
 export async function getWebhookLastEventAt(workspaceId: string): Promise<string | null> {

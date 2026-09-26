@@ -1,13 +1,59 @@
 import { and, eq, gte, count, sql } from "drizzle-orm";
 import { getDb } from "../db";
-import { campaigns } from "../schema/campaigns";
+import { campaigns, campaignMemberships } from "../schema/campaigns";
 import { accounts } from "../schema/accounts";
 import { discoveryJobs, processingJobs, searchSeeds } from "../schema/discovery";
 import { outreachQueue, outreachEvents } from "../schema/outreach";
 import { conversations, meetings } from "../schema/conversations";
-import { rebalanceDecisions } from "../schema/autopilot";
+import { autopilotSettings, rebalanceDecisions } from "../schema/autopilot";
 import type { EngineType } from "@/domain/campaigns/types";
-import type { EngineTargetState, GlobalAutopilotState, RebalanceDecision } from "@/domain/autopilot/types";
+import type { AutopilotSettings, EngineTargetState, GlobalAutopilotState, RebalanceDecision } from "@/domain/autopilot/types";
+
+const DEFAULT_AUTOPILOT_SETTINGS = {
+  enabled: false,
+  emergencyStopped: false,
+  globalDailyTarget: 25,
+  timezone: "Europe/Madrid",
+  operatingStartHour: null,
+  operatingEndHour: null,
+  maxDailyApifySpendUsd: null,
+} as const;
+
+function toAutopilotSettings(row: typeof autopilotSettings.$inferSelect): AutopilotSettings {
+  return {
+    workspaceId: row.workspaceId,
+    enabled: row.enabled,
+    emergencyStopped: row.emergencyStopped,
+    globalDailyTarget: row.globalDailyTarget,
+    timezone: row.timezone,
+    operatingStartHour: row.operatingStartHour,
+    operatingEndHour: row.operatingEndHour,
+    maxDailyApifySpendUsd: row.maxDailyApifySpendUsd,
+    createdAt: row.createdAt.toISOString(),
+    updatedAt: row.updatedAt.toISOString(),
+  };
+}
+
+/** Lazily bootstraps a workspace in the safe PAUSED state. */
+export async function getAutopilotSettings(workspaceId: string): Promise<AutopilotSettings> {
+  const db = getDb();
+  const [existing] = await db.select().from(autopilotSettings).where(eq(autopilotSettings.workspaceId, workspaceId));
+  if (existing) return toAutopilotSettings(existing);
+  const [created] = await db.insert(autopilotSettings).values({ workspaceId, ...DEFAULT_AUTOPILOT_SETTINGS }).returning();
+  if (!created) throw new Error("Failed to initialize Autopilot settings.");
+  return toAutopilotSettings(created);
+}
+
+export async function updateAutopilotSettings(
+  workspaceId: string,
+  patch: Partial<Pick<AutopilotSettings, "enabled" | "emergencyStopped" | "globalDailyTarget">>,
+): Promise<AutopilotSettings> {
+  const db = getDb();
+  await getAutopilotSettings(workspaceId);
+  const [updated] = await db.update(autopilotSettings).set({ ...patch, updatedAt: new Date() }).where(eq(autopilotSettings.workspaceId, workspaceId)).returning();
+  if (!updated) throw new Error("Failed to update Autopilot settings.");
+  return toAutopilotSettings(updated);
+}
 
 const ENGINE_TYPES: EngineType[] = ["maps_fast", "maps_deep", "google_serp", "linkedin_owner", "hybrid_fill"];
 
@@ -27,11 +73,7 @@ function startOfToday(): Date {
 export async function getGlobalAutopilotState(workspaceId: string): Promise<GlobalAutopilotState> {
   const db = getDb();
   const today = startOfToday();
-
-  const [dailyTargetRow] = await db
-    .select({ total: sql<number>`coalesce(sum(${campaigns.dailySoftTarget}), 0)` })
-    .from(campaigns)
-    .where(and(eq(campaigns.workspaceId, workspaceId), eq(campaigns.autopilotEnabled, true)));
+  const settings = await getAutopilotSettings(workspaceId);
 
   const [readyRow] = await db
     .select({ total: count() })
@@ -71,12 +113,12 @@ export async function getGlobalAutopilotState(workspaceId: string): Promise<Glob
   const engines = await listEngineTargets(workspaceId);
 
   return {
-    dailyTarget: dailyTargetRow?.total ?? 0,
+    dailyTarget: settings.globalDailyTarget,
     readyToday: readyRow?.total ?? 0,
     sentToday: sentRow?.total ?? 0,
     repliesToday: repliesRow?.total ?? 0,
     meetingsToday: meetingsRow?.total ?? 0,
-    readyBufferDays: 0,
+    readyBufferDays: null,
     systemHealth: "unknown",
     engines,
   };
@@ -116,6 +158,19 @@ async function getEngineTargetState(workspaceId: string, engineType: EngineType)
       ),
     );
 
+  const [readyRow] = await db
+    .select({ total: count() })
+    .from(campaignMemberships)
+    .innerJoin(campaigns, eq(campaignMemberships.campaignId, campaigns.id))
+    .where(
+      and(
+        eq(campaigns.workspaceId, workspaceId),
+        eq(campaigns.engineType, engineType),
+        eq(campaignMemberships.stage, "ready"),
+        gte(campaignMemberships.updatedAt, startOfToday()),
+      ),
+    );
+
   const [yieldRow] = await db
     .select({ avgYield: sql<number>`coalesce(avg(${searchSeeds.yieldRate}), 0)`, lastRunAt: sql<Date | null>`max(${searchSeeds.lastRunAt})` })
     .from(searchSeeds)
@@ -125,7 +180,7 @@ async function getEngineTargetState(workspaceId: string, engineType: EngineType)
   return {
     engineType,
     softTarget: targetRow?.total ?? 0,
-    readyToday: 0,
+    readyToday: readyRow?.total ?? 0,
     rawQueueDepth: rawDepthRow?.total ?? 0,
     processingQueueDepth: processingDepthRow?.total ?? 0,
     currentYield: yieldRow?.avgYield ?? 0,

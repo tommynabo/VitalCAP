@@ -11,7 +11,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
 import { globalProgressPct, sumSoftTargets } from "@/lib/autopilot/targets";
 import type { DeadLetterSample, ProviderRowStatus, QueueHealthSnapshot } from "@/lib/data/repository";
-import type { GlobalAutopilotState, RebalanceDecision } from "@/domain/autopilot/types";
+import type { AutopilotSettings, GlobalAutopilotState, RebalanceDecision } from "@/domain/autopilot/types";
 
 interface ProviderRow {
   name: string;
@@ -21,12 +21,18 @@ interface ProviderRow {
 
 export function AutopilotClient({
   state,
+  settings,
+  lastAutopilotCron,
+  lastDiscoveryCron,
   deadLetterSamples,
   providerRows,
   queueHealth,
   rebalanceDecisions,
 }: {
   state: GlobalAutopilotState;
+  settings: AutopilotSettings;
+  lastAutopilotCron: string | null;
+  lastDiscoveryCron: string | null;
   deadLetterSamples: DeadLetterSample[];
   providerRows: ProviderRow[];
   queueHealth: QueueHealthSnapshot;
@@ -34,41 +40,71 @@ export function AutopilotClient({
 }) {
   const progressPct = globalProgressPct(state.dailyTarget, state.engines);
   const softTargetTotal = sumSoftTargets(state.engines);
-  const [running, setRunning] = useState(true);
+  const [pendingAction, setPendingAction] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const effectiveState = settings.emergencyStopped ? "emergency_stopped" : settings.enabled ? "running" : "paused";
+  const [targetInput, setTargetInput] = useState(String(settings.globalDailyTarget));
+
+  async function control(action: Record<string, unknown>) {
+    setPendingAction(String(action.action));
+    setError(null);
+    try {
+      const response = await fetch("/api/autopilot/control", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(action) });
+      const body = (await response.json()) as { error?: string };
+      if (!response.ok) throw new Error(body.error ?? "Autopilot control failed.");
+      window.location.reload();
+    } catch (controlError) {
+      setError(controlError instanceof Error ? controlError.message : "Autopilot control failed.");
+    } finally {
+      setPendingAction(null);
+    }
+  }
 
   const degradedProviders = providerRows.filter((p) => p.status === "degraded" || p.status === "paused");
 
   return (
     <div className="space-y-6">
-      <Card className={!running ? "border-warning" : undefined}>
+      <Card className={effectiveState !== "running" ? "border-warning" : undefined}>
         <CardContent className="flex flex-wrap items-center justify-between gap-4 py-4">
           <div>
             <p className="text-sm font-semibold text-text">
-              Autopilot is {running ? "running" : "paused"}
+              Autopilot is {effectiveState === "running" ? "running" : effectiveState === "paused" ? "paused" : "emergency stopped"}
             </p>
             <p className="text-xs text-text-muted">
-              {running
-                ? `Targeting ${state.dailyTarget} ready leads/day across ${state.engines.length} engines · system health ${state.systemHealth}`
-                : "No new discovery, verification or outreach jobs will be scheduled until resumed."}
+              {effectiveState === "running" ? `Targeting ${settings.globalDailyTarget} ready leads/day across ${state.engines.length} engines · system health ${state.systemHealth}` : effectiveState === "paused" ? "New discovery is paused; existing processing jobs may drain safely." : "Emergency stop blocks new discovery, processing claims, and outreach scheduling."}
             </p>
           </div>
           <div className="flex gap-2">
-            {running ? (
-              <Button variant="secondary" size="sm" onClick={() => setRunning(false)}>
+            {effectiveState === "running" ? (
+              <Button variant="secondary" size="sm" disabled={pendingAction !== null} onClick={() => control({ action: "pause" })}>
                 <Pause className="h-4 w-4" aria-hidden="true" />
                 Pause
               </Button>
             ) : (
-              <Button size="sm" onClick={() => setRunning(true)}>
+              <Button size="sm" disabled={pendingAction !== null || effectiveState === "emergency_stopped"} onClick={() => control({ action: "resume" })}>
                 <Play className="h-4 w-4" aria-hidden="true" />
                 Resume
               </Button>
             )}
-            <Button variant="danger" size="sm" onClick={() => setRunning(false)}>
+            <Button variant="danger" size="sm" disabled={pendingAction !== null || effectiveState === "emergency_stopped"} onClick={() => { if (window.confirm("Emergency stop will prevent all new discovery and processing activity. Existing data is preserved.")) void control({ action: "emergency_stop" }); }}>
               <AlertTriangle className="h-4 w-4" aria-hidden="true" />
               Emergency stop
             </Button>
           </div>
+          {effectiveState === "emergency_stopped" && <Button size="sm" disabled={pendingAction !== null} onClick={() => void control({ action: "clear_emergency_stop" })}>Clear emergency stop</Button>}
+          {error && <p className="w-full text-xs text-danger">{error}</p>}
+        </CardContent>
+      </Card>
+
+      <p className="text-xs text-text-muted">Last Autopilot cron: {lastAutopilotCron ? new Date(lastAutopilotCron).toLocaleString() : "N/A"} · Last discovery cron: {lastDiscoveryCron ? new Date(lastDiscoveryCron).toLocaleString() : "N/A"}</p>
+
+      <Card>
+        <CardHeader><CardTitle>Global daily target</CardTitle></CardHeader>
+        <CardContent className="flex flex-wrap items-end gap-3">
+          <label className="text-sm text-text-muted">Ready leads/day<input className="mt-1 block w-28 rounded border border-border bg-surface px-2 py-1 text-text" type="number" min="1" max="250" value={targetInput} onChange={(event) => setTargetInput(event.target.value)} /></label>
+          <Button size="sm" disabled={pendingAction !== null} onClick={() => void control({ action: "target_change", globalDailyTarget: Number(targetInput) })}>Save target</Button>
+          <span className="text-xs text-text-muted">Recommended 25 · timezone {settings.timezone}</span>
+          {softTargetTotal !== settings.globalDailyTarget && <span className="text-xs text-warning">Campaign soft targets total {softTargetTotal}; allocation is not changed automatically.</span>}
         </CardContent>
       </Card>
 
@@ -77,7 +113,7 @@ export function AutopilotClient({
         <KpiStat label="Progress" value={`${progressPct}%`} />
         <KpiStat label="Soft target total" value={String(softTargetTotal)} />
         <KpiStat label="Sent today" value={String(state.sentToday)} />
-        <KpiStat label="Ready buffer" value={state.readyBufferDays.toFixed(1)} suffix="days" />
+        <KpiStat label="Ready buffer" value={state.readyBufferDays === null ? "N/A" : state.readyBufferDays.toFixed(1)} suffix={state.readyBufferDays === null ? undefined : "days"} />
         <KpiStat label="System health" value={state.systemHealth} />
       </div>
 

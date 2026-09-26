@@ -95,7 +95,7 @@ export default async function DashboardPage() {
             </p>
             <Progress value={progressPct} className="mt-3" />
             <p className="mt-3 text-xs text-text-muted">
-              Ready buffer: {state.readyBufferDays.toFixed(1)} days · System health:{" "}
+              Ready buffer: {state.readyBufferDays === null ? "N/A" : `${state.readyBufferDays.toFixed(1)} days`} · System health:{" "}
               <span className="font-medium text-text">{state.systemHealth}</span>
             </p>
           </CardContent>

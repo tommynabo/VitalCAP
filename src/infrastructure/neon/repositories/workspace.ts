@@ -1,4 +1,4 @@
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { getDb } from "../db";
 import { workspaces, workspaceMembers } from "../schema/workspaces";
 
@@ -16,6 +16,16 @@ export async function findWorkspaceIdForUser(userId: string): Promise<string | n
     .where(eq(workspaceMembers.userId, userId))
     .limit(1);
   return membership?.workspaceId ?? null;
+}
+
+export async function getWorkspaceRole(workspaceId: string, userId: string): Promise<string | null> {
+  const db = getDb();
+  const [membership] = await db
+    .select({ role: workspaceMembers.role })
+    .from(workspaceMembers)
+    .where(and(eq(workspaceMembers.workspaceId, workspaceId), eq(workspaceMembers.userId, userId)))
+    .limit(1);
+  return membership?.role ?? null;
 }
 
 export async function createWorkspaceForUser(userId: string, workspaceName: string): Promise<string> {

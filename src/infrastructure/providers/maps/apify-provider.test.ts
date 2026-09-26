@@ -72,6 +72,22 @@ describe("ApifyMapsDiscoveryProvider", () => {
     await expect(provider.search({ query: "farmacia", geography: "Madrid", pageToken: null })).rejects.toThrow(ApifyCostLimitExceededError);
   });
 
+  it("does not start a new run while the workspace is paused", async () => {
+    const startActorRun = vi.fn();
+    const provider = new ApifyMapsDiscoveryProvider({
+      apiToken: "token",
+      actorId: "compass/crawler-google-places",
+      dailyCostLimitUsd: 10,
+      batchCostLimitUsd: 2,
+      getTodaySpendUsd: vi.fn().mockResolvedValue(0),
+      getAutopilotState: vi.fn().mockResolvedValue("paused"),
+      client: { runAndWait: vi.fn(), startActorRun, getDatasetItems: vi.fn() },
+    });
+
+    await expect(provider.startAsync({ query: "farmacia", geography: "Madrid", pageToken: null })).rejects.toThrow(/paused/);
+    expect(startActorRun).not.toHaveBeenCalled();
+  });
+
   it("maps a successful run into MapsSearchOutput and records the run", async () => {
     const { provider, recordRun } = makeProvider();
     const output = await provider.search({ query: "farmacia", geography: "Madrid", pageToken: null });

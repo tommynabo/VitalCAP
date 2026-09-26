@@ -9,6 +9,7 @@ import {
   updateWarmFollowupQueueItem,
 } from "@/infrastructure/neon/repositories/warm-followup";
 import { applyWarmFollowupTrigger, enterWarmFollowupQueue, recordFollowupDispatch } from "@/services/setter/warm-followup-service";
+import { getAutopilotSettings } from "@/infrastructure/neon/repositories/autopilot";
 
 const MAX_PER_WORKSPACE = 200;
 
@@ -46,6 +47,8 @@ export async function runWarmFollowupCronTick(now: Date = new Date()): Promise<W
   let dispatched = 0;
 
   for (const workspaceId of workspaceIds) {
+    const autopilotSettings = await getAutopilotSettings(workspaceId);
+    if (autopilotSettings.emergencyStopped) continue;
     const entryCandidates = await listWarmFollowupEntryCandidates(workspaceId, MAX_PER_WORKSPACE);
     for (const candidate of entryCandidates) {
       const item = enterWarmFollowupQueue(candidate.conversationId, candidate.branch, false, now.toISOString(), randomUUID);

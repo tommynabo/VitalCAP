@@ -119,8 +119,9 @@ async function claim<T>(
             SELECT j.id
             FROM discovery_jobs j
             JOIN campaigns c ON c.id = j.campaign_id
+            LEFT JOIN autopilot_settings aps ON aps.workspace_id = c.workspace_id
             WHERE c.status = 'active'
-              AND (${requireAutopilot} = false OR c.autopilot_enabled = true)
+              AND (${requireAutopilot} = false OR (c.autopilot_enabled = true AND aps.enabled = true AND aps.emergency_stopped = false))
               AND (${inputCampaignId}::uuid IS NULL OR j.campaign_id = ${inputCampaignId}::uuid)
               AND j.status IN ('pending', 'processing')
               AND (j.next_attempt_at IS NULL OR j.next_attempt_at <= ${nowIso}::timestamptz)
@@ -148,8 +149,9 @@ async function claim<T>(
             SELECT j.id
             FROM processing_jobs j
             JOIN campaigns c ON c.id = j.campaign_id
+            LEFT JOIN autopilot_settings aps ON aps.workspace_id = c.workspace_id
             WHERE c.status = 'active'
-              AND (${requireAutopilot} = false OR c.autopilot_enabled = true)
+              AND (${requireAutopilot} = false OR (c.autopilot_enabled = true AND aps.emergency_stopped = false))
               AND (${inputCampaignId}::uuid IS NULL OR j.campaign_id = ${inputCampaignId}::uuid)
               AND j.status IN ('pending', 'processing')
               AND (j.next_attempt_at IS NULL OR j.next_attempt_at <= ${nowIso}::timestamptz)

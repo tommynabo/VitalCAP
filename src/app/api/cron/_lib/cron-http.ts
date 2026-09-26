@@ -29,6 +29,7 @@ export function unauthorizedCronResponse(): NextResponse {
 export interface CronWorkResult {
   itemsProcessed: number;
   warnings?: string[];
+  metadata?: Record<string, unknown>;
 }
 
 /** Runs `work`, persisting a `cron_runs` row and structured log line for every outcome (success, warnings, or thrown error). */
@@ -48,7 +49,7 @@ export async function runCronRoute(route: string, work: () => Promise<CronWorkRe
       durationMs: Date.now() - startedAt,
       itemsProcessed: result.itemsProcessed,
     });
-    return NextResponse.json({ status, itemsProcessed: result.itemsProcessed, warnings: result.warnings ?? [] });
+    return NextResponse.json({ status, itemsProcessed: result.itemsProcessed, warnings: result.warnings ?? [], ...(result.metadata ?? {}) });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     await finishCronRun(cronRunId, { status: "failed", itemsProcessed: 0, error: message });

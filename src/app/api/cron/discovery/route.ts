@@ -10,6 +10,13 @@ export async function GET(request: NextRequest) {
   if (!isAuthorizedCronRequest(request)) return unauthorizedCronResponse();
   return runCronRoute("discovery", async () => {
     const result = await runDiscoveryCronTick(MAX_JOBS_PER_TICK);
-    return { itemsProcessed: result.jobsClaimed };
+    return {
+      itemsProcessed: result.jobsClaimed,
+      metadata: {
+        state: result.emergencyStoppedWorkspaces > 0 ? "emergency_stopped" : result.pausedWorkspaces > 0 ? "paused" : "running",
+        pausedWorkspaces: result.pausedWorkspaces,
+        emergencyStoppedWorkspaces: result.emergencyStoppedWorkspaces,
+      },
+    };
   });
 }

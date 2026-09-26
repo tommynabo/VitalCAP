@@ -33,6 +33,7 @@ import {
 } from "@/infrastructure/neon/repositories/conversations";
 import { listSearchSeeds } from "@/infrastructure/neon/repositories/discovery";
 import {
+  getAutopilotSettings,
   getGlobalAutopilotState,
   listEngineTargets,
   listRebalanceDecisions,
@@ -43,6 +44,7 @@ import {
   getQueueHealth,
   getDeadLetterSamples,
   getCronLastRunAt,
+  getLastCronRouteRunAt,
   getWebhookLastEventAt,
   getDbConnectivityOk,
   type ProviderRowStatus,
@@ -52,7 +54,7 @@ import {
 import { getWeeklyTrend, type WeeklyTrendPoint } from "@/infrastructure/neon/repositories/analytics";
 
 import type { Offer, Campaign } from "@/domain/campaigns/types";
-import type { GlobalAutopilotState, EngineTargetState, RebalanceDecision } from "@/domain/autopilot/types";
+import type { AutopilotSettings, GlobalAutopilotState, EngineTargetState, RebalanceDecision } from "@/domain/autopilot/types";
 import type {
   OutreachQueueItem,
   OutreachEvent,
@@ -88,6 +90,24 @@ export async function getGlobalAutopilotStateData(): Promise<GlobalAutopilotStat
   if (isDevSeedMode()) return seed.getSeedGlobalAutopilotState();
   const workspaceId = await getCurrentWorkspaceId();
   return getGlobalAutopilotState(workspaceId);
+}
+
+export async function getAutopilotSettingsData(): Promise<AutopilotSettings> {
+  if (isDevSeedMode()) {
+    return {
+      workspaceId: "ws_demo",
+      enabled: false,
+      emergencyStopped: false,
+      globalDailyTarget: 25,
+      timezone: "Europe/Madrid",
+      operatingStartHour: null,
+      operatingEndHour: null,
+      maxDailyApifySpendUsd: null,
+      createdAt: new Date(0).toISOString(),
+      updatedAt: new Date(0).toISOString(),
+    };
+  }
+  return getAutopilotSettings(await getCurrentWorkspaceId());
 }
 
 export async function getEngineTargets(): Promise<EngineTargetState[]> {
@@ -195,6 +215,11 @@ export async function getCronLastRunAtData(): Promise<string | null> {
   if (isDevSeedMode()) return seed.seedCronLastRunAt;
   const workspaceId = await getCurrentWorkspaceId();
   return getCronLastRunAt(workspaceId);
+}
+
+export async function getLastCronRouteRunAtData(route: "autopilot" | "discovery"): Promise<string | null> {
+  if (isDevSeedMode()) return seed.seedCronLastRunAt;
+  return getLastCronRouteRunAt(route);
 }
 
 export async function getWebhookLastEventAtData(): Promise<string | null> {

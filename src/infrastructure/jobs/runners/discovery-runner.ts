@@ -19,6 +19,8 @@ import {
   getRemainingDiscoveryTarget,
 } from "@/infrastructure/neon/repositories/discovery";
 import { createProviderRun, getProviderRunByRequestKey } from "@/infrastructure/neon/repositories/provider-runs";
+import { getAutopilotSettings } from "@/infrastructure/neon/repositories/autopilot";
+import { getEffectiveAutopilotState } from "@/domain/autopilot/types";
 import { getDayBounds } from "@/lib/time/day-bounds";
 import { recordSeedRun } from "@/services/discovery/geography-planner";
 import { buildMapsSeedCatalog, buildSerpSeedCatalog, LINKEDIN_OWNER_ROLE_QUERIES, ICP_CATEGORY_TERMS } from "@/services/discovery/spain-search-catalog";
@@ -43,6 +45,8 @@ function catalogForEngine(campaignId: string, engineType: EngineType): SearchSee
  * faster than they can be claimed and drained.
  */
 export async function ensureDiscoveryJobsQueued(workspaceId: string): Promise<number> {
+  const settings = await getAutopilotSettings(workspaceId);
+  if (getEffectiveAutopilotState(settings) !== "running") return 0;
   const campaigns = await listActiveCampaigns(workspaceId);
   let enqueued = 0;
   for (const campaign of campaigns) {
@@ -70,6 +74,8 @@ async function executeDiscoveryJob(job: { id: string; campaignId: string; payloa
   if (campaign.status !== "active" || !campaign.autopilotEnabled) {
     throw new Error(`Scheduled discovery is disabled for campaign ${job.campaignId}.`);
   }
+  const settings = await getAutopilotSettings(campaign.workspaceId);
+  if (getEffectiveAutopilotState(settings) !== "running") return 0;
 
   const engine = createDiscoveryEngine(campaign.workspaceId, job.payload.engineType);
   const persistedSeeds = await listSearchSeedsForCampaignEngine(campaign.id, job.payload.engineType);
@@ -168,6 +174,8 @@ async function executeDiscoveryJob(job: { id: string; campaignId: string; payloa
 export interface DiscoveryRunnerResult {
   jobsClaimed: number;
   rawCandidatesProduced: number;
+  pausedWorkspaces: number;
+  emergencyStoppedWorkspaces: number;
 }
 
 /** One bounded batch of discovery work across every workspace: enqueue-if-missing per workspace, then a single global claim+execute loop of up to `maxJobsPerTick` jobs (claims are global — not workspace-scoped — so this must not be called once per workspace). Called once per `/api/cron/discovery` invocation. */
@@ -180,6 +188,8 @@ export async function runDiscoveryCronTick(maxJobsPerTick: number, now: Date = n
   const workerId = `cron-discovery-${randomUUID()}`;
   let jobsClaimed = 0;
   let rawCandidatesProduced = 0;
+  let pausedWorkspaces = 0;
+  let emergencyStoppedWorkspaces = 0;
 
   const jobs = await claimDiscoveryJobs<DiscoveryJobPayload>({ workerId, batchSize: maxJobsPerTick, now });
   for (const job of jobs) {
@@ -192,5 +202,10 @@ export async function runDiscoveryCronTick(maxJobsPerTick: number, now: Date = n
     }
   }
 
-  return { jobsClaimed, rawCandidatesProduced };
+  for (const workspaceId of workspaceIds) {
+    const state = getEffectiveAutopilotState(await getAutopilotSettings(workspaceId));
+    if (state === "paused") pausedWorkspaces += 1;
+    if (state === "emergency_stopped") emergencyStoppedWorkspaces += 1;
+  }
+  return { jobsClaimed, rawCandidatesProduced, pausedWorkspaces, emergencyStoppedWorkspaces };
 }
