@@ -63,7 +63,8 @@ export async function runAutopilotCronTick(now: Date = new Date()): Promise<Auto
       campaignCounts: { maps_fast: campaigns.filter((campaign) => campaign.engineType === "maps_fast").length },
     });
     const mapsFast = capabilities.find((capability) => capability.engineType === "maps_fast");
-    if (mapsFast?.available && pacing.qualifiedNeededToPlan > 0 && pacing.rawNeededToPlan > 0) {
+    const maySchedulePaidWork = pacing.status === "behind_pace";
+    if (mapsFast?.available && maySchedulePaidWork && pacing.qualifiedNeededToPlan > 0 && pacing.rawNeededToPlan > 0) {
       const seedSets = await Promise.all(campaigns.filter((campaign) => campaign.engineType === "maps_fast").map((campaign) => listSearchSeedsForCampaignEngine(campaign.id, "maps_fast")));
       const performances: CampaignPerformance[] = campaigns.filter((campaign) => campaign.engineType === "maps_fast").map((campaign, index) => {
         const seeds = seedSets[index] ?? [];
@@ -82,7 +83,12 @@ export async function runAutopilotCronTick(now: Date = new Date()): Promise<Auto
         };
       });
       const previous = await listRebalanceDecisions(workspaceId);
-      const rebalanceActions = planRebalancing({ performances, uncoveredRaw: pacing.rawNeededToPlan, now, lastRebalanceAt: previous[0] ? new Date(previous[0].createdAt) : null });
+      const rebalanceActions = planRebalancing({ performances, uncoveredRaw: pacing.rawNeededToPlan, now }).filter((action) => {
+        const cooldownStart = now.getTime() - 30 * 60_000;
+        return !previous.some((decision) => decision.toCampaignId === action.toCampaignId
+          && decision.fromCampaignId === action.fromCampaignId
+          && new Date(decision.createdAt).getTime() > cooldownStart);
+      });
       const mapsSeeds = seedSets.flat();
       const seedInventoryExhausted = mapsSeeds.length > 0 && mapsSeeds.every((seed) => seed.exhaustionScore >= 0.8);
       const rescueSignal = pacing.hoursRemaining <= 2 || pacing.estimatedYield < 0.1 || seedInventoryExhausted || mapsSeeds.length === 0;

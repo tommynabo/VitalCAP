@@ -23,12 +23,9 @@ that explains *why* each step matters.
       real deployment.
 - [ ] **Cron secret** — `CRON_SECRET` set and the real cron route (once built) validates it before doing
       any work, so an unauthenticated request cannot trigger a dispatch cycle.
-- [ ] **Provider keys** — `MAPS_PROVIDER_API_KEY`, `SERP_PROVIDER_API_KEY`,
-      `EMAIL_VERIFICATION_PROVIDER_API_KEY`, `INSTANTLY_API_KEY`, `SMS_PROVIDER_API_KEY`,
-      `LLM_PROVIDER_API_KEY` all set with real, tested credentials — per §6.11's rule, do not mark any
-      provider "connected" until it has actually been called successfully against the real API (every
-      provider in this codebase is currently a mock — see the Provider Matrix in
-      `docs/PHASE_6_REPORT.md`).
+- [ ] **Provider keys** — `APIFY_API_TOKEN` set for `MAPS_PROVIDER=apify`; deferred providers remain
+      explicitly disabled (`SERP_PROVIDER=disabled`, `EMAIL_VERIFICATION_PROVIDER=disabled`,
+      `EMAIL_DELIVERY_PROVIDER=disabled`, `LLM_PROVIDER=disabled`, `SMS_PROVIDER=disabled`).
 - [ ] **Webhooks** — real webhook endpoint(s) built and registered with each provider that supports
       delivery/reply webhooks, using `verifyWebhookSignature`
       (`src/services/outreach/outreach-event-ingestion.ts`) with each provider's real shared secret (not
@@ -41,10 +38,11 @@ that explains *why* each step matters.
 - [ ] **Warmup/capacity entered** — each mailbox's realistic daily send capacity and warmup schedule
       entered accurately (`sender-pool-service.ts` capacity math is only as good as the numbers fed
       into it).
-- [ ] **Email verifier** — `EMAIL_VERIFICATION_PROVIDER_API_KEY` set and tested; confirm
+- [ ] **Email verifier** — leave `EMAIL_VERIFICATION_PROVIDER=disabled` until a documented provider is
+      intentionally activated; confirm
       `verifyEmailsWithCache`'s cache TTL is appropriate for the real provider's rate limits/pricing.
-- [ ] **Maps/SERP provider** — `MAPS_PROVIDER_API_KEY`/`SERP_PROVIDER_API_KEY` set and tested against a
-      real query before enabling Maps Fast/Maps Deep/Google SERP engines for a live campaign.
+- [ ] **Maps provider** — `APIFY_API_TOKEN` set and tested against a real query before enabling Maps Fast
+      for a live campaign; SERP remains disabled.
 - [ ] **SMS adapter configured or explicitly disabled** — either `SMS_PROVIDER_API_KEY` is set and
       tested, or the SMS channel is explicitly disabled in every campaign's `desiredChannelMix` (never
       left half-configured and silently attempted).

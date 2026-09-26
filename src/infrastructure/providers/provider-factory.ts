@@ -56,6 +56,7 @@ export function createMapsDiscoveryProvider(workspaceId: string, role: MapsEngin
       return getTodaySpendUsd(workspaceId, "apify", settings.timezone);
     },
     getAutopilotState: async () => getEffectiveAutopilotState(await getAutopilotSettings(workspaceId)),
+    getWorkspaceDailyCostLimitUsd: async () => (await getAutopilotSettings(workspaceId)).maxDailyApifySpendUsd,
     recordRun: (run) =>
       recordProviderRun({
         workspaceId,

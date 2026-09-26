@@ -114,6 +114,15 @@ const serverEnvSchema = z
     if (env.APP_ENV === "production" && !env.DATABASE_URL) {
       ctx.addIssue({ code: "custom", message: "DATABASE_URL is required in production.", path: ["DATABASE_URL"] });
     }
+    if (env.APP_ENV === "production" && !env.NEON_AUTH_BASE_URL) {
+      ctx.addIssue({ code: "custom", message: "NEON_AUTH_BASE_URL is required in production.", path: ["NEON_AUTH_BASE_URL"] });
+    }
+    if (env.APP_ENV === "production" && (!env.NEON_AUTH_COOKIE_SECRET || env.NEON_AUTH_COOKIE_SECRET.length < 32)) {
+      ctx.addIssue({ code: "custom", message: "NEON_AUTH_COOKIE_SECRET must be at least 32 characters in production.", path: ["NEON_AUTH_COOKIE_SECRET"] });
+    }
+    if (env.APP_ENV === "production" && env.MAPS_PROVIDER === "apify" && !env.APIFY_API_TOKEN) {
+      ctx.addIssue({ code: "custom", message: "APIFY_API_TOKEN is required when MAPS_PROVIDER=apify.", path: ["APIFY_API_TOKEN"] });
+    }
   });
 
 export type ServerEnv = z.infer<typeof serverEnvSchema>;
@@ -141,7 +150,7 @@ export function getServerEnv(): ServerEnv {
     DATABASE_URL_UNPOOLED: resolveNeonVar("DATABASE_URL_UNPOOLED"),
 
     NEON_AUTH_BASE_URL: resolveNeonVar("NEON_AUTH_BASE_URL"),
-    NEON_AUTH_COOKIE_SECRET: process.env.NEON_AUTH_COOKIE_SECRET,
+    NEON_AUTH_COOKIE_SECRET: optionalEnvValue(process.env.NEON_AUTH_COOKIE_SECRET),
 
     MAPS_PROVIDER: process.env.MAPS_PROVIDER,
     APIFY_API_TOKEN: optionalEnvValue(process.env.APIFY_API_TOKEN),

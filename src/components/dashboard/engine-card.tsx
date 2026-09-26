@@ -12,6 +12,7 @@ const ENGINE_LABELS: Record<EngineTargetState["engineType"], string> = {
 };
 
 const HEALTH_VARIANT: Record<EngineTargetState["providerHealth"], "success" | "warning" | "danger" | "neutral"> = {
+  untested: "neutral",
   healthy: "success",
   degraded: "warning",
   paused: "danger",

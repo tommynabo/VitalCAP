@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { planHybridFill } from "./hybrid-fill-planner";
 import type { SearchSeed } from "@/domain/discovery/types";
+import { ICP_CATEGORY_TERMS, HYBRID_GEOGRAPHIES } from "@/services/discovery/spain-search-catalog";
 
 const seed: SearchSeed = {
   id: "seed-1",
@@ -46,6 +47,13 @@ describe("Maps-only Hybrid Fill", () => {
   it("stops on budget/provider risk and avoids exhausted seeds", () => {
     expect(planHybridFill({ ...base, budgetRemaining: 0 }).targetRisk).toBe("target_at_risk_budget");
     expect(planHybridFill({ ...base, providerHealthy: false }).targetRisk).toBe("target_at_risk_provider");
-      expect(planHybridFill({ ...base, seedInventoryExhausted: true, seeds: [{ ...seed, exhaustionScore: 1 }] }).targetRisk).toBe("target_at_risk_exhaustion");
+      expect(planHybridFill({ ...base, seedInventoryExhausted: true, seeds: [{ ...seed, exhaustionScore: 1 }] }).active).toBe(true);
+  });
+
+  it("expands only through the approved Spanish hybrid catalog", () => {
+    const plan = planHybridFill({ ...base, seedInventoryExhausted: true, seeds: [] });
+    expect(plan.active).toBe(true);
+    expect(HYBRID_GEOGRAPHIES.some((geography) => plan.seed?.geography === geography)).toBe(true);
+    expect(ICP_CATEGORY_TERMS.some((term) => plan.seed?.query === term)).toBe(true);
   });
 });

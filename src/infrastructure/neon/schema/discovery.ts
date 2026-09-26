@@ -1,6 +1,8 @@
 import { sql } from "drizzle-orm";
 import { pgTable, text, timestamp, uuid, integer, numeric, jsonb, boolean, index, uniqueIndex } from "drizzle-orm/pg-core";
 import { campaigns } from "./campaigns";
+import { accounts } from "./accounts";
+import { providerRuns } from "./providers";
 
 /**
  * Neon replacement for `discovery_jobs` / `processing_jobs` / `raw_candidates`
@@ -52,6 +54,9 @@ export const rawCandidates = pgTable(
     sourceExternalId: text("source_external_id"),
     sourceUrl: text("source_url"),
     rawPayload: jsonb("raw_payload").notNull().default({}),
+    searchSeedRunId: uuid("search_seed_run_id").references(() => searchSeedRuns.id, { onDelete: "set null" }),
+    providerRunId: uuid("provider_run_id").references(() => providerRuns.id, { onDelete: "set null" }),
+    accountId: uuid("account_id").references(() => accounts.id, { onDelete: "set null" }),
     processed: boolean("processed").notNull().default(false),
     discoveredAt: timestamp("discovered_at", { withTimezone: true }).notNull().defaultNow(),
   },
@@ -127,6 +132,7 @@ export const searchSeedRuns = pgTable(
     uniqueCount: integer("unique_count").notNull().default(0),
     readyCount: integer("ready_count").notNull().default(0),
     error: text("error"),
+    qualificationFinalizedAt: timestamp("qualification_finalized_at", { withTimezone: true }),
   },
   (table) => [index("idx_search_seed_runs_seed").on(table.seedId)],
 );

@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { GET } from "./route";
 import { resetServerEnvCacheForTests } from "@/lib/config/env";
 
-const environmentNames = ["APP_ENV", "VERCEL_ENV", "DEV_SEED_MODE", "DATABASE_URL", "MAPS_PROVIDER", "DEFAULT_DELIVERY_MODE"];
+const environmentNames = ["APP_ENV", "VERCEL_ENV", "DEV_SEED_MODE", "DATABASE_URL", "MAPS_PROVIDER", "DEFAULT_DELIVERY_MODE", "NEON_AUTH_BASE_URL", "NEON_AUTH_COOKIE_SECRET", "APIFY_API_TOKEN"];
 
 describe("GET /api/health", () => {
   afterEach(() => {
@@ -19,7 +19,7 @@ describe("GET /api/health", () => {
 
     const body = await GET().json();
 
-    expect(body).toMatchObject({ status: "ok", appEnv: "development", devSeedMode: true, databaseConfigured: false, mapsProvider: "mock", deliveryMode: "dry_run" });
+    expect(body).toMatchObject({ status: "ok", appEnv: "development", devSeedMode: true, databaseConfigured: false, authConfigured: false, mapsProvider: "mock", apifyConfigured: false, deliveryMode: "dry_run" });
     expect(body).not.toHaveProperty("DATABASE_URL");
     expect(body).not.toHaveProperty("APIFY_API_TOKEN");
     expect(body).not.toHaveProperty("NEON_AUTH_COOKIE_SECRET");

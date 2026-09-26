@@ -8,7 +8,7 @@ import {
   completeProcessingJob,
   failProcessingJob,
 } from "@/infrastructure/neon/repositories/job-queue";
-import { getRawCandidateById, markRawCandidateProcessed } from "@/infrastructure/neon/repositories/discovery";
+import { getRawCandidateById, markRawCandidateProcessed, refreshSearchSeedQualification, updateRawCandidateAccountId } from "@/infrastructure/neon/repositories/discovery";
 import {
   findCandidateAccountMatches,
   getAccountById,
@@ -253,7 +253,9 @@ async function executeProcessingJob(
     readyAt: membership.stage === "ready" ? new Date() : null,
   });
 
+  await updateRawCandidateAccountId(raw.id, accountId);
   await markRawCandidateProcessed(raw.id);
+  if (raw.searchSeedRunId) await refreshSearchSeedQualification(raw.searchSeedRunId);
 }
 
 export interface ProcessingRunnerResult {

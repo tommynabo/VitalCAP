@@ -25,4 +25,15 @@ describe("engine capabilities", () => {
     });
     expect(capabilities.find((item) => item.engineType === "maps_fast")?.available).toBe(false);
   });
+
+  it("allows a configured untested provider to bootstrap paid work", () => {
+    const maps = buildEngineCapabilities({
+      mapsProvider: "apify",
+      serpProvider: "disabled",
+      mapsFastHealth: "untested",
+      costAllowed: true,
+      campaignCounts: { maps_fast: 1 },
+    }).find((item) => item.engineType === "maps_fast");
+    expect(maps).toMatchObject({ available: true, providerUntested: true });
+  });
 });

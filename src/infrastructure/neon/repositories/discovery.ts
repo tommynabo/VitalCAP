@@ -32,6 +32,9 @@ function toRawCandidate(row: typeof rawCandidates.$inferSelect): RawCandidate {
     sourceExternalId: row.sourceExternalId,
     sourceUrl: row.sourceUrl,
     rawPayload: row.rawPayload as Record<string, unknown>,
+    searchSeedRunId: row.searchSeedRunId,
+    providerRunId: row.providerRunId,
+    accountId: row.accountId,
     discoveredAt: row.discoveredAt.toISOString(),
   };
 }
@@ -200,6 +203,8 @@ export interface InsertRawCandidateInput {
   sourceExternalId: string | null;
   sourceUrl: string | null;
   rawPayload: Record<string, unknown>;
+  searchSeedRunId?: string | null;
+  providerRunId?: string | null;
 }
 
 export async function insertRawCandidates(rows: readonly InsertRawCandidateInput[]): Promise<string[]> {
@@ -211,6 +216,51 @@ export async function insertRawCandidates(rows: readonly InsertRawCandidateInput
     .onConflictDoNothing()
     .returning({ id: rawCandidates.id });
   return inserted.map((row) => row.id);
+}
+
+export async function updateRawCandidateAccountId(rawCandidateId: string, accountId: string): Promise<void> {
+  const db = getDb();
+  await db.update(rawCandidates).set({ accountId }).where(eq(rawCandidates.id, rawCandidateId));
+}
+
+export async function refreshSearchSeedQualification(searchSeedRunId: string): Promise<void> {
+  const db = getDb();
+  await db.transaction(async (tx) => {
+    const counts = await tx.execute(sql`
+      SELECT
+        ssr.seed_id,
+        count(DISTINCT rc.account_id) FILTER (WHERE cm.account_id IS NOT NULL)::int AS qualified_count,
+        count(*) FILTER (WHERE rc.processed = false)::int AS pending_count
+      FROM search_seed_runs ssr
+      LEFT JOIN raw_candidates rc ON rc.search_seed_run_id = ssr.id
+      LEFT JOIN campaign_memberships cm ON cm.campaign_id = rc.campaign_id
+        AND cm.account_id = rc.account_id AND cm.stage = 'qualified'
+      WHERE ssr.id = ${searchSeedRunId}::uuid
+      GROUP BY ssr.seed_id
+    `);
+    const row = counts.rows[0] as { seed_id: string; qualified_count: number; pending_count: number } | undefined;
+    if (!row) return;
+    await tx.execute(sql`
+      UPDATE search_seed_runs
+      SET ready_count = ${Number(row.qualified_count)},
+          qualification_finalized_at = CASE WHEN ${Number(row.pending_count)} = 0 THEN now() ELSE qualification_finalized_at END
+      WHERE id = ${searchSeedRunId}::uuid
+    `);
+    await tx.execute(sql`
+      UPDATE search_seeds ss
+      SET total_raw = totals.total_raw,
+          total_unique = totals.total_unique,
+          total_ready = totals.total_ready,
+          yield_rate = CASE WHEN totals.total_unique > 0 THEN totals.total_ready::numeric / totals.total_unique ELSE 0 END
+      FROM (
+        SELECT seed_id, coalesce(sum(raw_count), 0)::int AS total_raw,
+               coalesce(sum(unique_count), 0)::int AS total_unique,
+               coalesce(sum(ready_count), 0)::int AS total_ready
+        FROM search_seed_runs WHERE seed_id = ${row.seed_id}::uuid GROUP BY seed_id
+      ) totals
+      WHERE ss.id = totals.seed_id
+    `);
+  });
 }
 
 export async function getRawCandidateById(id: string): Promise<RawCandidate | null> {

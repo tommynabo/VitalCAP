@@ -22,6 +22,8 @@ export interface ApifyMapsProviderConfig {
   apiToken: string;
   actorId: string;
   dailyCostLimitUsd: number;
+  workspaceDailyCostLimitUsd?: number | null;
+  getWorkspaceDailyCostLimitUsd?: () => Promise<number | null>;
   batchCostLimitUsd: number;
   maxCrawledPlacesPerSearch?: number;
   /** Injected so this provider never imports the Neon repository layer directly (keeps it DB-free and unit-testable). */
@@ -64,17 +66,27 @@ export class ApifyMapsDiscoveryProvider implements MapsDiscoveryProvider {
     this.client = config.client ?? new ApifyClient({ apiToken: config.apiToken });
   }
 
+  private async getEffectiveDailyLimit(): Promise<number> {
+    const workspaceLimit = this.config.getWorkspaceDailyCostLimitUsd
+      ? await this.config.getWorkspaceDailyCostLimitUsd()
+      : this.config.workspaceDailyCostLimitUsd;
+    return Math.min(this.config.dailyCostLimitUsd, workspaceLimit ?? this.config.dailyCostLimitUsd);
+  }
+
+  private async getChargeLimit(): Promise<number> {
+    const remainingBudget = await this.getEffectiveDailyLimit() - await this.config.getTodaySpendUsd();
+    if (remainingBudget <= 0) {
+      throw new ApifyCostLimitExceededError("Apify daily budget is exhausted; refusing to start a run.");
+    }
+    return Math.min(this.config.batchCostLimitUsd, remainingBudget);
+  }
+
   async startAsync(input: MapsSearchInput): Promise<AsyncMapsRun> {
     const autopilotState = await this.config.getAutopilotState?.();
     if (autopilotState && !allowsNewApifyRun(autopilotState)) {
       throw new Error(`Autopilot is ${autopilotState}; refusing to start a new Apify run.`);
     }
-    const todaySpend = await this.config.getTodaySpendUsd();
-    if (todaySpend >= this.config.dailyCostLimitUsd) {
-      throw new ApifyCostLimitExceededError(
-        `Apify daily cost limit reached ($${todaySpend.toFixed(2)} >= $${this.config.dailyCostLimitUsd.toFixed(2)}); refusing to start a new run.`,
-      );
-    }
+    const maxTotalChargeUsd = await this.getChargeLimit();
     if (this.config.actorId !== COMPASS_ACTOR_ID) {
       throw new Error(`No verified input adapter exists for Apify actor ${this.config.actorId}.`);
     }
@@ -82,7 +94,7 @@ export class ApifyMapsDiscoveryProvider implements MapsDiscoveryProvider {
     if (!startActorRun) throw new Error("Async Apify client support is not configured.");
     const maxResults = Math.min(this.config.maxCrawledPlacesPerSearch ?? 20, Math.max(1, Math.floor(input.maxResults ?? this.config.maxCrawledPlacesPerSearch ?? 20)));
     const actorInput = buildCompassActorInput(input, maxResults);
-    const run = await startActorRun.call(this.client, this.config.actorId, actorInput, { maxTotalChargeUsd: this.config.batchCostLimitUsd });
+    const run = await startActorRun.call(this.client, this.config.actorId, actorInput, { maxTotalChargeUsd });
     return {
       actorId: this.config.actorId,
       externalRunId: run.id,
@@ -97,12 +109,7 @@ export class ApifyMapsDiscoveryProvider implements MapsDiscoveryProvider {
   async search(input: MapsSearchInput): Promise<MapsSearchOutput> {
     const start = Date.now();
 
-    const todaySpend = await this.config.getTodaySpendUsd();
-    if (todaySpend >= this.config.dailyCostLimitUsd) {
-      throw new ApifyCostLimitExceededError(
-        `Apify daily cost limit reached ($${todaySpend.toFixed(2)} >= $${this.config.dailyCostLimitUsd.toFixed(2)}); refusing to start a new run.`,
-      );
-    }
+    const maxTotalChargeUsd = await this.getChargeLimit();
 
     if (this.config.actorId !== COMPASS_ACTOR_ID) {
       throw new Error(`No verified input adapter exists for Apify actor ${this.config.actorId}.`);
@@ -112,7 +119,7 @@ export class ApifyMapsDiscoveryProvider implements MapsDiscoveryProvider {
     let run;
     try {
       run = await this.client.runAndWait(this.config.actorId, actorInput, {
-        maxTotalChargeUsd: this.config.batchCostLimitUsd,
+        maxTotalChargeUsd,
       });
     } catch (error) {
       await this.config.recordRun?.({

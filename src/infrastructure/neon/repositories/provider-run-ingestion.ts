@@ -62,11 +62,14 @@ async function ensureProcessingJob(tx: Transaction, campaignId: string, rawCandi
 async function resolveRawCandidate(tx: Transaction, row: InsertRawCandidateInput): Promise<{ id: string; inserted: boolean }> {
   if (row.sourceExternalId) {
     const result = await tx.execute(sql`
-      INSERT INTO raw_candidates (discovery_job_id, campaign_id, engine_type, source_external_id, source_url, raw_payload)
-      VALUES (${row.discoveryJobId}::uuid, ${row.campaignId}::uuid, ${row.engineType}, ${row.sourceExternalId}, ${row.sourceUrl}, ${JSON.stringify(row.rawPayload)}::jsonb)
+      INSERT INTO raw_candidates (discovery_job_id, campaign_id, engine_type, source_external_id, source_url, raw_payload, search_seed_run_id, provider_run_id)
+      VALUES (${row.discoveryJobId}::uuid, ${row.campaignId}::uuid, ${row.engineType}, ${row.sourceExternalId}, ${row.sourceUrl}, ${JSON.stringify(row.rawPayload)}::jsonb,
+        ${row.searchSeedRunId ?? null}::uuid, ${row.providerRunId ?? null}::uuid)
       ON CONFLICT (campaign_id, engine_type, source_external_id)
       WHERE source_external_id IS NOT NULL
-      DO UPDATE SET source_url = EXCLUDED.source_url, raw_payload = EXCLUDED.raw_payload
+      DO UPDATE SET source_url = EXCLUDED.source_url, raw_payload = EXCLUDED.raw_payload,
+        search_seed_run_id = COALESCE(raw_candidates.search_seed_run_id, EXCLUDED.search_seed_run_id),
+        provider_run_id = COALESCE(raw_candidates.provider_run_id, EXCLUDED.provider_run_id)
       RETURNING id, (xmax = 0) AS inserted
     `);
     const resolved = result.rows[0] as { id: string; inserted: boolean } | undefined;
@@ -89,8 +92,9 @@ async function resolveRawCandidate(tx: Transaction, row: InsertRawCandidateInput
   if (existingRow) return { id: existingRow.id, inserted: false };
 
   const inserted = await tx.execute(sql`
-    INSERT INTO raw_candidates (discovery_job_id, campaign_id, engine_type, source_external_id, source_url, raw_payload)
-    VALUES (${row.discoveryJobId}::uuid, ${row.campaignId}::uuid, ${row.engineType}, NULL, ${row.sourceUrl}, ${JSON.stringify(row.rawPayload)}::jsonb)
+      INSERT INTO raw_candidates (discovery_job_id, campaign_id, engine_type, source_external_id, source_url, raw_payload, search_seed_run_id, provider_run_id)
+      VALUES (${row.discoveryJobId}::uuid, ${row.campaignId}::uuid, ${row.engineType}, NULL, ${row.sourceUrl}, ${JSON.stringify(row.rawPayload)}::jsonb,
+        ${row.searchSeedRunId ?? null}::uuid, ${row.providerRunId ?? null}::uuid)
     RETURNING id
   `);
   const insertedRow = inserted.rows[0] as { id: string } | undefined;

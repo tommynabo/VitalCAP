@@ -42,6 +42,9 @@ export interface RawCandidate {
   sourceExternalId: string | null;
   sourceUrl: string | null;
   rawPayload: Record<string, unknown>;
+  searchSeedRunId?: string | null;
+  providerRunId?: string | null;
+  accountId?: string | null;
   discoveredAt: string;
 }
 

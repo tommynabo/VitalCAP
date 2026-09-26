@@ -79,12 +79,12 @@ export async function getAutopilotPacingMetrics(workspaceId: string, timeZone: s
     `),
     db.execute(sql`
       SELECT
-        count(DISTINCT rc.id)::int AS raw_sample_size,
-        count(DISTINCT cm.account_id)::int AS qualified_count
+        count(DISTINCT rc.id) FILTER (WHERE rc.processed = true AND rc.account_id IS NOT NULL)::int AS raw_sample_size,
+        count(DISTINCT rc.account_id) FILTER (WHERE cm.account_id IS NOT NULL)::int AS qualified_count
       FROM raw_candidates rc
       INNER JOIN campaigns c ON c.id = rc.campaign_id
       LEFT JOIN campaign_memberships cm
-        ON cm.campaign_id = rc.campaign_id
+        ON cm.campaign_id = rc.campaign_id AND cm.account_id = rc.account_id
        AND cm.stage = 'qualified'
        AND cm.updated_at >= ${historyStart.toISOString()}::timestamptz
        AND cm.updated_at < ${end.toISOString()}::timestamptz

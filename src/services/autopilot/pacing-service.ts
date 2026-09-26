@@ -38,7 +38,7 @@ export interface AutopilotPacingState {
   hoursRemaining: number;
   apifySpendToday: number;
   apifyDailyBudgetRemaining: number;
-  providerHealth: "healthy" | "degraded" | "paused" | "unknown";
+  providerHealth: "untested" | "healthy" | "degraded" | "paused" | "unknown";
   status: PacingStatus;
   qualifiedNeededToPlan: number;
   rawNeededToPlan: number;
@@ -139,7 +139,8 @@ export function computeAutopilotPacing(input: PacingComputationInput): Autopilot
   const paceDeficit = Math.max(0, expectedAchievedByNow - input.targetAchievedToday - input.expectedQualifiedFromInFlight);
   const minimumYieldFloor = 0.1;
   const boundedYield = Math.max(minimumYieldFloor, Math.min(1, input.estimatedYield || 0));
-  const qualifiedNeededToPlan = input.providerHealth === "paused" || input.apifyDailyBudgetRemaining <= 0
+  const windowClosed = nowMinutes < startMinutes || nowMinutes >= endMinutes;
+  const qualifiedNeededToPlan = windowClosed || input.providerHealth === "paused" || input.apifyDailyBudgetRemaining <= 0
     ? 0
     : Math.min(remainingTarget, Math.ceil(paceDeficit * 1.1));
   const rawNeededToPlan = qualifiedNeededToPlan > 0 ? Math.min(100, Math.ceil(qualifiedNeededToPlan / boundedYield)) : 0;

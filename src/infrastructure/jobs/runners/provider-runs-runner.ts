@@ -95,6 +95,8 @@ export async function runProviderRunsCronTick(maxRuns = MAX_RUNS_PER_TICK): Prom
           sourceExternalId: place.externalPlaceId,
           sourceUrl: place.sourceUrl,
           rawPayload: { kind: "maps", place },
+          searchSeedRunId: typeof metadata.seedRunId === "string" ? metadata.seedRunId : null,
+          providerRunId: providerRun.id,
         })),
         finishedAt: run.finishedAt ? new Date(run.finishedAt) : new Date(),
         costUsd: usageCost,

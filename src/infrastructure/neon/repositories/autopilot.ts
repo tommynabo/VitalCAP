@@ -259,7 +259,7 @@ async function getEngineTargetState(workspaceId: string, engineType: EngineType)
     rawQueueDepth: rawDepthRow?.total ?? 0,
     processingQueueDepth: processingDepthRow?.total ?? 0,
     currentYield: yieldRow?.avgYield ?? 0,
-    providerHealth: "unknown",
+    providerHealth: engineType === "maps_fast" ? evaluateProviderHealth(await getRecentProviderUsage(workspaceId, "apify")) : "unknown",
     lastRunAt: yieldRow?.lastRunAt ? new Date(yieldRow.lastRunAt).toISOString() : null,
     nextPlannedAction: null,
   };

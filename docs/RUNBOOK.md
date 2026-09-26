@@ -67,8 +67,8 @@ permanent).
 ## 4. Rotate provider keys
 
 **Mechanism:** every provider credential is a plain env var name in `.env.example`
-(`MAPS_PROVIDER_API_KEY`, `SERP_PROVIDER_API_KEY`, `EMAIL_VERIFICATION_PROVIDER_API_KEY`,
-`INSTANTLY_API_KEY`, `SMS_PROVIDER_API_KEY`, `LLM_PROVIDER_API_KEY`) — never hardcoded in source.
+(`APIFY_API_TOKEN`, with SERP, email verification, email delivery, LLM, and SMS providers explicitly
+disabled) — never hardcoded in source.
 
 **Steps:**
 1. Generate a new key with the provider.
@@ -84,7 +84,7 @@ permanent).
 
 ## 5. Disable a provider
 
-**Mechanism:** `ProviderHealthStatus` (`"healthy" | "degraded" | "paused" | "unknown"`) and
+**Mechanism:** `ProviderHealthStatus` (`"untested" | "healthy" | "degraded" | "paused" | "unknown"`) and
 `evaluateProviderHealth` (`src/services/discovery/provider-health.ts`) already compute a `"paused"`
 verdict automatically from error-rate/quota thresholds — this procedure is the **manual** equivalent
 (an operator disabling a provider deliberately, e.g. ahead of planned maintenance) rather than the

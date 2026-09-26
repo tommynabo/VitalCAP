@@ -6,6 +6,7 @@ export interface EngineCapability {
   available: boolean;
   providerConfigured: boolean;
   providerHealthy: boolean;
+  providerUntested: boolean;
   costAllowed: boolean;
   campaignCount: number;
   reasonUnavailable: string | null;
@@ -30,7 +31,8 @@ export function buildEngineCapabilities(input: EngineCapabilityInput): EngineCap
 
   return definitions.map(([engineType, providerConfigured, providerHealthyByConfig, health]) => {
     const campaignCount = input.campaignCounts[engineType] ?? 0;
-    const providerHealthy = providerHealthyByConfig && health === "healthy";
+    const providerUntested = providerHealthyByConfig && health === "untested";
+    const providerHealthy = providerHealthyByConfig && (health === "healthy" || providerUntested);
     const available = engineType === "hybrid_fill"
       ? input.mapsProvider === "apify" && providerHealthy && input.costAllowed
       : providerConfigured && providerHealthy && input.costAllowed && campaignCount > 0;
@@ -39,6 +41,7 @@ export function buildEngineCapabilities(input: EngineCapabilityInput): EngineCap
       available,
       providerConfigured,
       providerHealthy,
+      providerUntested,
       costAllowed: input.costAllowed,
       campaignCount,
       reasonUnavailable: available

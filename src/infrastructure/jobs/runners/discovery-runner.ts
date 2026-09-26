@@ -18,7 +18,7 @@ import {
   updateSearchSeedAfterRun,
   getRemainingDiscoveryTarget,
 } from "@/infrastructure/neon/repositories/discovery";
-import { getProviderRunByRequestKey, reserveApifyProviderRun, updateProviderRun } from "@/infrastructure/neon/repositories/provider-runs";
+import { getProviderRunByRequestKey, getRecentProviderUsage, reserveApifyProviderRun, updateProviderRun } from "@/infrastructure/neon/repositories/provider-runs";
 import { getAutopilotSettings } from "@/infrastructure/neon/repositories/autopilot";
 import { getEffectiveAutopilotState } from "@/domain/autopilot/types";
 import { getDayBounds } from "@/lib/time/day-bounds";
@@ -26,6 +26,7 @@ import { recordSeedRun } from "@/services/discovery/geography-planner";
 import { buildMapsSeedCatalog, buildSerpSeedCatalog, LINKEDIN_OWNER_ROLE_QUERIES, ICP_CATEGORY_TERMS } from "@/services/discovery/spain-search-catalog";
 import { createDiscoveryEngine } from "./engine-factory";
 import type { SearchSeed } from "@/domain/discovery/types";
+import { evaluateProviderHealth } from "@/services/discovery/provider-health";
 
 const DISCOVERY_JOB_TYPE = "run_engine_batch";
 const MAX_SEEDS_PER_JOB = 3;
@@ -75,10 +76,17 @@ async function executeDiscoveryJob(job: { id: string; campaignId: string; payloa
   if (getEffectiveAutopilotState(settings) !== "running") return 0;
 
   const engine = createDiscoveryEngine(campaign.workspaceId, job.payload.engineType);
+  if (job.payload.engineType === "maps_fast" || job.payload.engineType === "maps_deep") {
+    await bootstrapSearchSeeds(campaign.id, job.payload.engineType, catalogForEngine(campaign.id, job.payload.engineType));
+  }
   const persistedSeeds = await listSearchSeedsForCampaignEngine(campaign.id, job.payload.engineType);
   if ("seeds" in engine) (engine as { seeds: SearchSeed[] }).seeds = persistedSeeds;
 
-  const desiredRawCount = Math.min(100, Math.max(0, Math.floor(job.payload.desiredRawCount)));
+  const providerHealth = job.payload.engineType === "maps_fast"
+    ? evaluateProviderHealth(await getRecentProviderUsage(campaign.workspaceId, "apify"))
+    : "healthy";
+  const bootstrapCap = providerHealth === "untested" ? 10 : 100;
+  const desiredRawCount = Math.min(bootstrapCap, Math.max(0, Math.floor(job.payload.desiredRawCount)));
   if (desiredRawCount <= 0) return 0;
   const maxSeeds = Math.min(MAX_SEEDS_PER_JOB, Math.max(1, Math.ceil(desiredRawCount / 10)));
   const { seeds } = await engine.planDiscoveryBatch({ campaignId: campaign.id, remainingTarget: desiredRawCount });
@@ -143,7 +151,7 @@ async function executeDiscoveryJob(job: { id: string; campaignId: string; payloa
       continue;
     }
 
-    await insertSearchSeedRun({
+    const completedSeedRunId = await insertSearchSeedRun({
       seedId: seed.id,
       startedAt: startedAt.toISOString(),
       finishedAt: finishedAt.toISOString(),
@@ -163,6 +171,7 @@ async function executeDiscoveryJob(job: { id: string; campaignId: string; payloa
               sourceExternalId: candidate.sourceExternalId,
               sourceUrl: candidate.sourceUrl,
               rawPayload: candidate.rawPayload,
+              searchSeedRunId: completedSeedRunId,
             })),
           )
         : [];

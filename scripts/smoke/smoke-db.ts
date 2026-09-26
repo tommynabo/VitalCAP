@@ -69,6 +69,8 @@ const requiredMigrationFiles = [
   "0003_phase8f_apify_async.sql",
   "0004_phase8g_autopilot_control.sql",
   "0005_phase8g1_stabilization.sql",
+  "0006_phase8i_rebalancing.sql",
+  "0007_phase8i1_corrective.sql",
 ];
 const appliedMigrationRows = await db`
   SELECT filename FROM vitalcap_migrations WHERE filename = ANY(${requiredMigrationFiles})
@@ -163,6 +165,31 @@ const providerRunIndexes = await db`
   SELECT indexname FROM pg_indexes
   WHERE schemaname = 'public' AND indexname = 'uq_provider_runs_request_key'
 `;
+const rebalanceColumns = await db`
+  SELECT column_name FROM information_schema.columns
+  WHERE table_schema = 'public' AND table_name = 'rebalance_decisions'
+    AND column_name = ANY(${["from_campaign_id", "to_campaign_id", "metric_snapshot", "idempotency_key"]})
+`;
+const rebalanceColumnNames = new Set(rebalanceColumns.map((row) => String((row as { column_name: string }).column_name)));
+const rebalanceIndex = await db`
+  SELECT indexdef FROM pg_indexes
+  WHERE schemaname = 'public' AND indexname = 'uq_rebalance_decisions_idempotency'
+`;
+const attributionColumns = await db`
+  SELECT table_name, column_name FROM information_schema.columns
+  WHERE table_schema = 'public'
+    AND ((table_name = 'raw_candidates' AND column_name = ANY(${["search_seed_run_id", "provider_run_id", "account_id"]}))
+      OR (table_name = 'search_seed_runs' AND column_name = 'qualification_finalized_at'))
+`;
+const attributionColumnKeys = new Set(attributionColumns.map((row) => {
+  const value = row as { table_name: string; column_name: string };
+  return `${value.table_name}.${value.column_name}`;
+}));
+const attributionIndexes = await db`
+  SELECT indexname FROM pg_indexes
+  WHERE schemaname = 'public'
+    AND indexname IN ('idx_raw_candidates_search_seed_run', 'idx_raw_candidates_provider_run', 'idx_raw_candidates_account')
+`;
 
 await db.transaction([db`SELECT 1`]);
 
@@ -182,6 +209,21 @@ if (!providerRunIndexes.length) throw new Error("Provider-run request-key index:
 if (requiredAutopilotColumns.some((column) => !autopilotColumnNames.has(column)) || !targetMetricConstraint.length) {
   throw new Error("Autopilot control columns/constraint: FAIL (Phase 8G/8G.1 migration missing)");
 }
+if (["from_campaign_id", "to_campaign_id", "metric_snapshot", "idempotency_key"].some((column) => !rebalanceColumnNames.has(column))) {
+  throw new Error("Rebalance columns: FAIL (Phase 8I migration missing)");
+}
+if (!rebalanceIndex.length || /WHERE/i.test(String((rebalanceIndex[0] as { indexdef: string }).indexdef))) {
+  throw new Error("Rebalance idempotency index: FAIL (must be non-partial)");
+}
+const requiredAttributionColumns = [
+  "raw_candidates.search_seed_run_id",
+  "raw_candidates.provider_run_id",
+  "raw_candidates.account_id",
+  "search_seed_runs.qualification_finalized_at",
+];
+if (requiredAttributionColumns.some((column) => !attributionColumnKeys.has(column)) || attributionIndexes.length !== 3) {
+  throw new Error("Seed attribution columns/indexes: FAIL (Phase 8I.1 migration missing)");
+}
 
 console.log("Neon connection: PASS");
 console.log("Core tables: PASS");
@@ -192,5 +234,7 @@ console.log("Replay idempotency indexes: PASS");
 console.log("Provider-run async columns and request-key index: PASS");
 console.log("Autopilot settings and target metric constraint: PASS");
 console.log("Migration tracking: PASS");
-console.log("Migrations 0000-0005: PASS");
+console.log("Migrations 0000-0007: PASS");
+console.log("Phase 8I rebalance columns and non-partial unique index: PASS");
+console.log("Raw candidate seed/provider/account attribution: PASS");
 console.log("Transaction round-trip: PASS");

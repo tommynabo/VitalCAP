@@ -31,7 +31,7 @@ export function evaluateProviderHealth(
   const opts = { ...DEFAULT_PROVIDER_HEALTH_THRESHOLDS, ...options };
 
   if (usage.quotaRemaining !== null && usage.quotaRemaining <= 0) return "paused";
-  if (usage.calls < opts.minCallsForJudgement) return usage.calls === 0 ? "unknown" : "healthy";
+  if (usage.calls < opts.minCallsForJudgement) return usage.calls === 0 ? "untested" : "healthy";
 
   const errorRate = usage.errors / usage.calls;
   if (errorRate >= opts.pausedErrorRate) return "paused";

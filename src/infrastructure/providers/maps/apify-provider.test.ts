@@ -72,6 +72,35 @@ describe("ApifyMapsDiscoveryProvider", () => {
     await expect(provider.search({ query: "farmacia", geography: "Madrid", pageToken: null })).rejects.toThrow(ApifyCostLimitExceededError);
   });
 
+  it("caps a batch at the remaining daily budget", async () => {
+    const startActorRun = vi.fn().mockResolvedValue({ ...SUCCEEDED_RUN, status: "READY", defaultDatasetId: null });
+    const provider = new ApifyMapsDiscoveryProvider({
+      apiToken: "token",
+      actorId: "compass/crawler-google-places",
+      dailyCostLimitUsd: 10,
+      batchCostLimitUsd: 2,
+      getTodaySpendUsd: vi.fn().mockResolvedValue(9.9),
+      client: { runAndWait: vi.fn(), startActorRun, getDatasetItems: vi.fn() },
+    });
+    await provider.startAsync({ query: "farmacia", geography: "Madrid", pageToken: null, maxResults: 5 });
+    expect(startActorRun).toHaveBeenCalledWith(expect.any(String), expect.any(Object), { maxTotalChargeUsd: 0.09999999999999964 });
+  });
+
+  it("uses the lower workspace daily cap", async () => {
+    const startActorRun = vi.fn();
+    const provider = new ApifyMapsDiscoveryProvider({
+      apiToken: "token",
+      actorId: "compass/crawler-google-places",
+      dailyCostLimitUsd: 10,
+      workspaceDailyCostLimitUsd: 5,
+      batchCostLimitUsd: 2,
+      getTodaySpendUsd: vi.fn().mockResolvedValue(5),
+      client: { runAndWait: vi.fn(), startActorRun, getDatasetItems: vi.fn() },
+    });
+    await expect(provider.startAsync({ query: "farmacia", geography: "Madrid", pageToken: null })).rejects.toThrow(ApifyCostLimitExceededError);
+    expect(startActorRun).not.toHaveBeenCalled();
+  });
+
   it("does not start a new run while the workspace is paused", async () => {
     const startActorRun = vi.fn();
     const provider = new ApifyMapsDiscoveryProvider({
