@@ -29,6 +29,13 @@
       "when": 1790418000000,
       "tag": "0005_phase8g1_stabilization",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1790499905240,
+      "tag": "0008_phase8j_website_enrichment",
+      "breakpoints": true
     }
   ]
 }

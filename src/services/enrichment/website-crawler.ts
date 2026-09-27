@@ -66,24 +66,45 @@ export async function crawlWebsite(fetcher: WebsiteFetcher, rootUrl: string, opt
   const visited = new Set<string>();
   const pages: CrawledPage[] = [];
 
-  const home = await fetcher.fetchPage(rootUrl);
+  let home: CrawledPage;
+  try {
+    home = await fetcher.fetchPage(rootUrl);
+  } catch (error) {
+    throw error;
+  }
+  
   visited.add(home.url);
   pages.push({ url: home.url, body: home.body });
 
   const candidateLinks = extractLinks(home.body, home.url).filter(isTargetPath).filter((url) => !visited.has(url));
   const uniqueCandidates = Array.from(new Set(candidateLinks));
 
-  for (const link of uniqueCandidates) {
-    if (pages.length >= opts.maxPages) break;
-    if (visited.has(link)) continue;
-    visited.add(link);
-    try {
-      const page = await fetcher.fetchPage(link);
-      pages.push({ url: page.url, body: page.body });
-    } catch {
-      // A single unreachable internal page must not fail the whole crawl.
+  const maxConcurrency = 3;
+  let index = 0;
+  let attemptedPages = pages.length;
+  
+  const worker = async () => {
+    while (index < uniqueCandidates.length && attemptedPages < opts.maxPages) {
+      const link = uniqueCandidates[index++];
+      if (!link) break;
+      if (visited.has(link)) continue;
+      visited.add(link);
+      attemptedPages++;
+      try {
+        const page = await fetcher.fetchPage(link);
+        if (pages.length < opts.maxPages) {
+          pages.push({ url: page.url, body: page.body });
+        }
+      } catch {
+        // if it failed, we could theoretically try another page by decrementing attemptedPages, 
+        // but for safety we'll just let it count towards the limit.
+      }
     }
-  }
+  };
+
+  const workers = Array.from({ length: Math.min(maxConcurrency, uniqueCandidates.length) }, () => worker());
+  await Promise.all(workers);
 
   return pages;
 }
+

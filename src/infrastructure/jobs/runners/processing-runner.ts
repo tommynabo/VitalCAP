@@ -23,6 +23,9 @@ import type { EmailVerificationProvider, WebsiteFetcher } from "@/domain/provide
 import { processRawCandidate, deriveIncomingIdentitySignals, type CandidateRawPayload, type ProcessedCandidateResult } from "@/services/discovery/candidate-processor";
 import { mergeMissingAccountFields, type IncomingAccountFields } from "@/services/accounts/account-enrichment-merge";
 import { realWebsiteFetcher, providerLabelForEngine } from "./engine-factory";
+import { WebsiteEnrichmentService } from "@/services/enrichment/website-enrichment-service";
+import { getWebsiteEnrichmentStatus, upsertWebsiteEnrichmentStatus, insertWebsiteEvidence } from "@/infrastructure/neon/repositories/enrichment";
+import { DomainFetchCache } from "@/lib/security/safe-fetch";
 
 interface ProcessingJobPayload {
   rawCandidateId: string;
@@ -146,9 +149,20 @@ async function executeProcessingJob(
   const incoming = deriveIncomingIdentitySignals(payload);
   const existingAccounts = await findCandidateAccountMatches(campaign.workspaceId, incoming);
 
+  const fetchCache = new DomainFetchCache();
+  const cachedFetcher = {
+    fetchPage: async (url: string) => {
+      const cached = fetchCache.get(url);
+      if (cached) return cached;
+      const res = await realWebsiteFetcher.fetchPage(url);
+      fetchCache.set(url, res);
+      return res;
+    },
+  };
+
   const processed = await processRawCandidate(payload, raw.engineType, {
     existingAccounts,
-    websiteFetcher: options.enrichContacts === false ? smokeWebsiteFetcher : realWebsiteFetcher,
+    websiteFetcher: options.enrichContacts === false ? smokeWebsiteFetcher : cachedFetcher,
     verificationProvider: options.enrichContacts === false ? smokeVerificationProvider : createEmailVerificationProvider(campaign.workspaceId),
     verificationCacheStore: createInMemoryVerificationCacheStore(),
     now: new Date(),
@@ -224,6 +238,71 @@ async function executeProcessingJob(
       sourceUrl: raw.sourceUrl,
       rawSnapshot: raw.rawPayload,
     });
+  }
+
+  // --- WEBSITE ENRICHMENT ---
+  if (accountFields.websiteUrl && incoming.normalizedDomain && options.enrichContacts !== false) {
+    const cache = await getWebsiteEnrichmentStatus(campaign.workspaceId, incoming.normalizedDomain);
+    const now = new Date();
+    const needsRefresh = !cache || !cache.nextRefreshAt || cache.nextRefreshAt <= now;
+
+    if (needsRefresh) {
+      const service = new WebsiteEnrichmentService(cachedFetcher);
+      const result = await service.enrich({
+        workspaceId: campaign.workspaceId,
+        accountId,
+        websiteUrl: accountFields.websiteUrl,
+      });
+
+      const nextRefreshAt = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000); // 30 days
+      await upsertWebsiteEnrichmentStatus({
+        workspaceId: campaign.workspaceId,
+        accountId,
+        normalizedDomain: incoming.normalizedDomain,
+        status: result.status,
+        startedAt: now,
+        completedAt: new Date(),
+        lastSuccessAt: result.status === "completed" ? new Date() : cache?.lastSuccessAt ?? undefined,
+        contentHash: result.contentHash,
+        pagesFetched: result.pagesFetched,
+        error: result.errorDetails,
+        nextRefreshAt: result.status === "completed" ? nextRefreshAt : new Date(now.getTime() + 24 * 60 * 60 * 1000),
+      });
+
+      for (const fact of result.evidence) {
+        await insertWebsiteEvidence({
+          workspaceId: campaign.workspaceId,
+          accountId,
+          normalizedDomain: incoming.normalizedDomain!,
+          sourceUrl: fact.sourceUrl,
+          evidenceType: fact.evidenceType,
+          value: fact.value,
+          snippet: fact.snippet,
+          contentHash: result.contentHash ?? "",
+        });
+
+        if (fact.evidenceType === "email") {
+          const emailLower = fact.value.toLowerCase();
+          if (!processed.contactPoints.some((cp) => cp.email.toLowerCase() === emailLower)) {
+            await insertContactPoint({
+              workspaceId: campaign.workspaceId,
+              accountId,
+              type: "email",
+              value: fact.value,
+              normalizedValue: emailLower,
+              label: fact.value.split("@")[0] ?? "",
+              isGeneric: false,
+              isPersonalOrNamed: true, // We assume if it wasn't picked up generically it might be named
+              priorityScore: 0,
+              verificationStatus: "unverified",
+              verificationProvider: null,
+              sourceUrl: fact.sourceUrl,
+              sourceType: "website_enrichment",
+            });
+          }
+        }
+      }
+    }
   }
 
   for (const contactPoint of processed.contactPoints) {

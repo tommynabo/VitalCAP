@@ -119,6 +119,17 @@ export async function ingestApifyProviderRun(input: IngestApifyProviderRunInput)
           ingested_at = ${input.finishedAt.toISOString()}::timestamptz, finished_at = COALESCE(finished_at, ${input.finishedAt.toISOString()}::timestamptz), error = NULL
       WHERE id = ${input.providerRunId}::uuid
     `);
+    if (input.seedRunId) {
+      await tx.execute(sql`
+        UPDATE search_seed_runs
+        SET finished_at = ${input.finishedAt.toISOString()}::timestamptz,
+            raw_count = ${input.candidates.length},
+            unique_count = ${resolvedIds.size},
+            ready_count = 0,
+            qualification_finalized_at = NULL
+        WHERE id = ${input.seedRunId}::uuid
+      `);
+    }
     return { rawCandidatesTotal: input.candidates.length, rawCandidatesInserted, processingJobsEnsured, seedMetricsUpdated: false, alreadyIngested: false };
   });
   if (input.seedRunId) await refreshSearchSeedQualification(input.seedRunId);

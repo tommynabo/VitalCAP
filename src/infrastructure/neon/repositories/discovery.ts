@@ -273,13 +273,20 @@ export async function refreshSearchSeedQualification(searchSeedRunId: string): P
       yieldRate: Number(seedRow.yield_rate), exhaustionScore: Number(seedRow.exhaustion_score),
       nextEligibleAt: seedRow.next_eligible_at ? new Date(String(seedRow.next_eligible_at)).toISOString() : null,
     };
-    const totals = finalizedRuns.rows.reduce<{ totalRaw: number; totalUnique: number; totalReady: number; lastRunAt: string | null }>((acc, run) => ({
+    const lastRunResult = await tx.execute(sql`
+      SELECT MAX(finished_at) as last_run_at
+      FROM search_seed_runs
+      WHERE seed_id = ${row.seed_id}::uuid
+        AND finished_at IS NOT NULL
+    `);
+    const trueLastRunAt = (lastRunResult.rows[0] as { last_run_at: string | null } | undefined)?.last_run_at ?? null;
+
+    const totals = finalizedRuns.rows.reduce<{ totalRaw: number; totalUnique: number; totalReady: number }>((acc, run) => ({
       totalRaw: acc.totalRaw + Number((run as { raw_count: number }).raw_count),
       totalUnique: acc.totalUnique + Number((run as { unique_count: number }).unique_count),
       totalReady: acc.totalReady + Number((run as { ready_count: number }).ready_count),
-      lastRunAt: (run as { finished_at: string | null }).finished_at ?? acc.lastRunAt,
-    }), { totalRaw: 0, totalUnique: 0, totalReady: 0, lastRunAt: null });
-    const updated = recomputeSeedMetrics(seed, { ...totals, runCount: finalizedRuns.rows.length });
+    }), { totalRaw: 0, totalUnique: 0, totalReady: 0 });
+    const updated = recomputeSeedMetrics(seed, { ...totals, lastRunAt: trueLastRunAt, runCount: finalizedRuns.rows.length });
     await tx.execute(sql`
       UPDATE search_seeds ss
       SET last_run_at = ${updated.lastRunAt}::timestamptz,
