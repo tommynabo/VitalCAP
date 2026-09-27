@@ -12,17 +12,21 @@ import { getServerEnv, isDevSeedMode } from "@/lib/config/env";
  * via `CRON_SECRET`/provider signatures, not a user session.
  */
 export default async function middleware(request: NextRequest) {
-  if (isDevSeedMode()) return NextResponse.next();
+  try {
+    if (isDevSeedMode()) return NextResponse.next();
+    const env = getServerEnv();
+    if (!env.NEON_AUTH_BASE_URL || !env.NEON_AUTH_COOKIE_SECRET) {
+      // Auth not configured yet — fail closed rather than silently allow access.
+      return new NextResponse("Authentication is not configured.", { status: 503 });
+    }
 
-  const env = getServerEnv();
-  if (!env.NEON_AUTH_BASE_URL || !env.NEON_AUTH_COOKIE_SECRET) {
-    // Auth not configured yet — fail closed rather than silently allow access.
-    return new NextResponse("Authentication is not configured.", { status: 503 });
+    const { getAuth } = await import("@/lib/auth/server");
+    const handler = getAuth().middleware({ loginUrl: "/sign-in" });
+    return handler(request);
+  } catch (error) {
+    console.error("Middleware invocation failed:", error);
+    return new NextResponse("Server configuration or dependency error in middleware. Please check Vercel application logs.", { status: 500 });
   }
-
-  const { getAuth } = await import("@/lib/auth/server");
-  const handler = getAuth().middleware({ loginUrl: "/sign-in" });
-  return handler(request);
 }
 
 export const config = {
