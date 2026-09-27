@@ -68,7 +68,7 @@ export class ProspectContextBuilder {
     for (const source of accountSources) {
       if (source.sourceProvider === 'apify' || source.sourceProvider === 'google_maps' || source.sourceProvider === 'google') {
         const snap = source.rawSnapshot as any;
-        const url = snap?.url || source.externalUrl || null;
+        const url = snap?.url || source.sourceUrl || null;
         if (snap?.categories && Array.isArray(snap.categories)) {
           evidence.push({
             id: `source:${source.id}:categories`,
@@ -118,7 +118,7 @@ export class ProspectContextBuilder {
         type: we.evidenceType,
         value: we.normalizedValue,
         sourceUrl: we.sourceUrl,
-        snippet: we.rawContext,
+        snippet: we.snippet,
       });
     }
 
@@ -168,9 +168,9 @@ export class ProspectContextBuilder {
       evidence,
       contactPoints: contactPoints.map(cp => ({
         id: cp.id,
-        channel: cp.channel,
-        title: cp.title,
-        name: cp.name,
+        channel: cp.type,
+        title: cp.label,
+        name: cp.isPersonalOrNamed ? "Named" : "Generic",
       })),
     };
   }

@@ -38,7 +38,7 @@ export class OutreachReadinessService {
     if (!membership || (membership.stage !== "qualified" && membership.stage !== "ready")) return false;
 
     // 5. Verification status
-    const [cp] = await db.select({ verificationStatus: schema.contactPoints.verificationStatus, channel: schema.contactPoints.channel })
+    const [cp] = await db.select({ verificationStatus: schema.contactPoints.verificationStatus })
       .from(schema.contactPoints)
       .where(eq(schema.contactPoints.id, contactPointId))
       .limit(1);

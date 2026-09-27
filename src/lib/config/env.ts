@@ -89,6 +89,8 @@ const serverEnvSchema = z
     LLM_PROVIDER_API_KEY: z.string().optional(),
     LLM_MODEL: z.string().default("gpt-4.1-mini"),
     PROSPECT_LLM_MODEL: z.string().default("gpt-4o-2024-08-06"),
+    LLM_DAILY_COST_LIMIT_USD: z.coerce.number().default(10),
+    LLM_BATCH_COST_LIMIT_USD: z.coerce.number().default(2),
   })
   .superRefine((env, ctx) => {
     if (env.VERCEL_ENV === "production" && optionalEnvValue(process.env.APP_ENV) !== "production") {
@@ -180,6 +182,8 @@ export function getServerEnv(): ServerEnv {
     LLM_PROVIDER_API_KEY: optionalEnvValue(process.env.LLM_PROVIDER_API_KEY),
     LLM_MODEL: optionalEnvValue(process.env.LLM_MODEL),
     PROSPECT_LLM_MODEL: optionalEnvValue(process.env.PROSPECT_LLM_MODEL),
+    LLM_DAILY_COST_LIMIT_USD: optionalEnvValue(process.env.LLM_DAILY_COST_LIMIT_USD),
+    LLM_BATCH_COST_LIMIT_USD: optionalEnvValue(process.env.LLM_BATCH_COST_LIMIT_USD),
   });
   return cached;
 }

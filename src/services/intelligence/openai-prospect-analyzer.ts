@@ -20,9 +20,9 @@ export class OpenAIProspectAnalyzer {
     // Do not fabricate a model ID, require explicit config
     this.model = env.PROSPECT_LLM_MODEL || "gpt-4o"; 
     
-    // Use OPENAI_API_KEY explicitly for Prospect Intelligence
-    if (this.provider === "openai" && env.OPENAI_API_KEY) {
-      this.client = new OpenAI({ apiKey: env.OPENAI_API_KEY });
+    // Use LLM_PROVIDER_API_KEY explicitly for Prospect Intelligence
+    if (this.provider === "openai" && env.LLM_PROVIDER_API_KEY) {
+      this.client = new OpenAI({ apiKey: env.LLM_PROVIDER_API_KEY });
     }
   }
 
