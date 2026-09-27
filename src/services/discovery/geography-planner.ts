@@ -15,6 +15,15 @@ export interface GeographyPlannerOptions {
   minRunsBeforeExhaustionJudgement: number;
   cooldownHoursHealthy: number;
   cooldownHoursExhausted: number;
+  runCount?: number;
+}
+
+export interface FinalizedSeedMetrics {
+  totalRaw: number;
+  totalUnique: number;
+  totalReady: number;
+  runCount: number;
+  lastRunAt: string | null;
 }
 
 export const DEFAULT_GEOGRAPHY_PLANNER_OPTIONS: GeographyPlannerOptions = {
@@ -58,10 +67,10 @@ export function recordSeedRun(
   const totalRaw = seed.totalRaw + run.rawCount;
   const totalUnique = seed.totalUnique + run.uniqueCount;
   const totalReady = seed.totalReady + run.readyCount;
-  const yieldRate = totalRaw > 0 ? totalReady / totalRaw : 0;
+  const yieldRate = totalUnique > 0 ? totalReady / totalUnique : 0;
 
-  const runsSoFar = seed.lastRunAt ? 2 : 1; // this function only sees one run at a time; caller tracks run count via totalRaw > 0 as a proxy
-  const judgedEnough = totalRaw > 0 && runsSoFar >= 1 && seed.totalRaw > 0; // has at least one prior run recorded
+  const runsSoFar = opts.runCount ?? (seed.lastRunAt ? 2 : 1);
+  const judgedEnough = runsSoFar >= opts.minRunsBeforeExhaustionJudgement;
   const isExhausted = judgedEnough && yieldRate <= opts.exhaustionYieldThreshold;
   const exhaustionScore = totalRaw > 0 ? Math.max(0, 1 - yieldRate / Math.max(opts.exhaustionYieldThreshold * 4, 0.01)) : 0;
 
@@ -75,6 +84,34 @@ export function recordSeedRun(
     totalRaw,
     totalUnique,
     totalReady,
+    yieldRate,
+    exhaustionScore: Math.min(1, exhaustionScore),
+    nextEligibleAt,
+  };
+}
+
+export function recomputeSeedMetrics(
+  seed: SearchSeed,
+  metrics: FinalizedSeedMetrics,
+  options: Partial<GeographyPlannerOptions> = {},
+): SearchSeed {
+  const opts = { ...DEFAULT_GEOGRAPHY_PLANNER_OPTIONS, ...options };
+  const yieldRate = metrics.totalUnique > 0 ? metrics.totalReady / metrics.totalUnique : 0;
+  const judgedEnough = metrics.runCount >= opts.minRunsBeforeExhaustionJudgement;
+  const isExhausted = judgedEnough && yieldRate <= opts.exhaustionYieldThreshold;
+  const exhaustionScore = metrics.totalUnique > 0
+    ? Math.max(0, 1 - yieldRate / Math.max(opts.exhaustionYieldThreshold * 4, 0.01))
+    : 0;
+  const lastRunAt = metrics.lastRunAt ? new Date(metrics.lastRunAt) : null;
+  const nextEligibleAt = lastRunAt
+    ? new Date(lastRunAt.getTime() + (isExhausted ? opts.cooldownHoursExhausted : opts.cooldownHoursHealthy) * 60 * 60 * 1000).toISOString()
+    : null;
+  return {
+    ...seed,
+    lastRunAt: lastRunAt?.toISOString() ?? null,
+    totalRaw: metrics.totalRaw,
+    totalUnique: metrics.totalUnique,
+    totalReady: metrics.totalReady,
     yieldRate,
     exhaustionScore: Math.min(1, exhaustionScore),
     nextEligibleAt,

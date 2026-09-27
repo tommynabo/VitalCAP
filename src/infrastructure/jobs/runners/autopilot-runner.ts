@@ -8,7 +8,8 @@ import { getServerEnv } from "@/lib/config/env";
 import { buildEngineCapabilities } from "@/services/autopilot/engine-capability";
 import { planRebalancing, type CampaignPerformance } from "@/services/autopilot/rebalancing";
 import { planHybridFill } from "@/services/autopilot/hybrid-fill-planner";
-import { buildHybridMapsSeedCatalog } from "@/services/discovery/spain-search-catalog";
+import { buildMapsSeedCatalog, buildHybridMapsSeedCatalog } from "@/services/discovery/spain-search-catalog";
+import type { SearchSeed } from "@/domain/discovery/types";
 import { bootstrapSearchSeeds, listSearchSeedsForCampaignEngine } from "@/infrastructure/neon/repositories/discovery";
 import { insertRebalanceDecision, listRebalanceDecisions } from "@/infrastructure/neon/repositories/autopilot";
 
@@ -52,6 +53,10 @@ export async function runAutopilotCronTick(now: Date = new Date()): Promise<Auto
     }
     const campaigns = await listAutopilotEnabledCampaigns(workspaceId);
     if (campaigns.length === 0) continue;
+    const mapsCampaigns = campaigns.filter((campaign) => campaign.engineType === "maps_fast");
+    for (const campaign of mapsCampaigns) {
+      await bootstrapSearchSeeds(campaign.id, "maps_fast", buildMapsSeedCatalog(campaign.id, "maps_fast"));
+    }
     const pacing = await getAutopilotPacingState(workspaceId, now);
     pacingStates.push(pacing);
     const env = getServerEnv();
@@ -65,8 +70,8 @@ export async function runAutopilotCronTick(now: Date = new Date()): Promise<Auto
     const mapsFast = capabilities.find((capability) => capability.engineType === "maps_fast");
     const maySchedulePaidWork = pacing.status === "behind_pace";
     if (mapsFast?.available && maySchedulePaidWork && pacing.qualifiedNeededToPlan > 0 && pacing.rawNeededToPlan > 0) {
-      const seedSets = await Promise.all(campaigns.filter((campaign) => campaign.engineType === "maps_fast").map((campaign) => listSearchSeedsForCampaignEngine(campaign.id, "maps_fast")));
-      const performances: CampaignPerformance[] = campaigns.filter((campaign) => campaign.engineType === "maps_fast").map((campaign, index) => {
+      const seedSets = await Promise.all(mapsCampaigns.map((campaign) => listSearchSeedsForCampaignEngine(campaign.id, "maps_fast")));
+      const performances: CampaignPerformance[] = mapsCampaigns.map((campaign, index) => {
         const seeds = seedSets[index] ?? [];
         return {
           campaignId: campaign.id,
@@ -91,7 +96,7 @@ export async function runAutopilotCronTick(now: Date = new Date()): Promise<Auto
       });
       const mapsSeeds = seedSets.flat();
       const seedInventoryExhausted = mapsSeeds.length > 0 && mapsSeeds.every((seed) => seed.exhaustionScore >= 0.8);
-      const rescueSignal = pacing.hoursRemaining <= 2 || pacing.estimatedYield < 0.1 || seedInventoryExhausted || mapsSeeds.length === 0;
+      const rescueSignal = pacing.hoursRemaining <= 2 || pacing.estimatedYield < 0.1 || seedInventoryExhausted;
       const rebalanceOrders = rebalanceActions.map((action) => ({
         workspaceId,
         campaignId: action.toCampaignId,
@@ -130,9 +135,18 @@ export async function runAutopilotCronTick(now: Date = new Date()): Promise<Auto
         rebalanceDecisionsRecorded += 1;
       }
 
-      const campaign = campaigns.find((candidate) => candidate.engineType === "maps_fast");
+      const campaign = mapsCampaigns[0];
       if (campaign) {
-        let seeds = seedSets[campaigns.filter((candidate) => candidate.engineType === "maps_fast").indexOf(campaign)] ?? [];
+        let seeds = seedSets[mapsCampaigns.indexOf(campaign)] ?? [];
+        const shouldBootstrapHybrid = rescueSignal || seedInventoryExhausted;
+        let hybridSeeds: SearchSeed[] = [];
+        if (shouldBootstrapHybrid) {
+          const hybridCatalog = buildHybridMapsSeedCatalog(campaign.id);
+          await bootstrapSearchSeeds(campaign.id, "maps_fast", hybridCatalog);
+          seeds = await listSearchSeedsForCampaignEngine(campaign.id, "maps_fast");
+          const hybridKeys = new Set(hybridCatalog.map((seed) => `${seed.query}|${seed.geography}`));
+          hybridSeeds = seeds.filter((seed) => hybridKeys.has(`${seed.query}|${seed.geography}`));
+        }
         const hybrid = planHybridFill({
           remainingEffectiveTarget: pacing.remainingTarget,
           hoursRemaining: pacing.hoursRemaining,
@@ -143,12 +157,11 @@ export async function runAutopilotCronTick(now: Date = new Date()): Promise<Auto
           budgetRemaining: pacing.apifyDailyBudgetRemaining,
           onPace: pacing.status === "on_pace",
           seeds,
+          hybridSeeds,
           campaignId: campaign.id,
           now,
         });
         if (hybrid.active) {
-          await bootstrapSearchSeeds(campaign.id, "maps_fast", buildHybridMapsSeedCatalog(campaign.id));
-          seeds = await listSearchSeedsForCampaignEngine(campaign.id, "maps_fast");
           const hybridOrder = allocateMapsFastRawNeed({ workspaceId, campaigns: [campaign], rawNeeded: hybrid.rawCount, reason: hybrid.reason, now, timeZone: settings.timezone, origin: "hybrid_fill" })[0];
           if (hybridOrder) {
             await enqueueDiscoveryJob({

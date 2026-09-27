@@ -255,7 +255,6 @@ async function executeProcessingJob(
 
   await updateRawCandidateAccountId(raw.id, accountId);
   await markRawCandidateProcessed(raw.id);
-  if (raw.searchSeedRunId) await refreshSearchSeedQualification(raw.searchSeedRunId);
 }
 
 export interface ProcessingRunnerResult {
@@ -283,8 +282,12 @@ export async function runProcessingCronTick(
     try {
       await executeProcessingJob(job, options);
       await completeProcessingJob({ jobId: job.id, workerId, now });
+      const raw = await getRawCandidateById(job.payload.rawCandidateId);
+      if (raw?.searchSeedRunId) await refreshSearchSeedQualification(raw.searchSeedRunId);
     } catch (error) {
       await failProcessingJob({ workerId, job, error, now });
+      const raw = await getRawCandidateById(job.payload.rawCandidateId);
+      if (raw?.searchSeedRunId) await refreshSearchSeedQualification(raw.searchSeedRunId);
     }
   }
 

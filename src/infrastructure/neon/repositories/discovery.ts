@@ -5,7 +5,7 @@ import { campaigns } from "../schema/campaigns";
 import type { EngineType } from "@/domain/campaigns/types";
 import type { RawCandidate, SearchSeed, SearchSeedRun } from "@/domain/discovery/types";
 import { getDayBounds } from "@/lib/time/day-bounds";
-import { recordSeedRun } from "@/services/discovery/geography-planner";
+import { recomputeSeedMetrics, recordSeedRun } from "@/services/discovery/geography-planner";
 
 function toSearchSeed(row: typeof searchSeeds.$inferSelect): SearchSeed {
   return {
@@ -230,7 +230,11 @@ export async function refreshSearchSeedQualification(searchSeedRunId: string): P
       SELECT
         ssr.seed_id,
         count(DISTINCT rc.account_id) FILTER (WHERE cm.account_id IS NOT NULL)::int AS qualified_count,
-        count(*) FILTER (WHERE rc.processed = false)::int AS pending_count
+        count(*) FILTER (WHERE NOT EXISTS (
+          SELECT 1 FROM processing_jobs pj
+          WHERE pj.payload->>'rawCandidateId' = rc.id::text
+            AND pj.status IN ('completed', 'dead_letter')
+        ))::int AS pending_count
       FROM search_seed_runs ssr
       LEFT JOIN raw_candidates rc ON rc.search_seed_run_id = ssr.id
       LEFT JOIN campaign_memberships cm ON cm.campaign_id = rc.campaign_id
@@ -243,22 +247,46 @@ export async function refreshSearchSeedQualification(searchSeedRunId: string): P
     await tx.execute(sql`
       UPDATE search_seed_runs
       SET ready_count = ${Number(row.qualified_count)},
-          qualification_finalized_at = CASE WHEN ${Number(row.pending_count)} = 0 THEN now() ELSE qualification_finalized_at END
+          qualification_finalized_at = CASE WHEN ${Number(row.pending_count)} = 0 THEN COALESCE(qualification_finalized_at, now()) ELSE NULL END
       WHERE id = ${searchSeedRunId}::uuid
     `);
+    const finalizedRuns = await tx.execute(sql`
+      SELECT ssr.raw_count, ssr.unique_count, ssr.ready_count, ssr.finished_at, ssr.qualification_finalized_at
+      FROM search_seed_runs ssr
+      WHERE ssr.seed_id = ${row.seed_id}::uuid
+        AND ssr.qualification_finalized_at IS NOT NULL
+      ORDER BY ssr.finished_at ASC NULLS LAST
+    `);
+    const seedResult = await tx.execute(sql`
+      SELECT id, campaign_id, engine_type, query, geography, last_run_at,
+             total_raw, total_unique, total_ready, yield_rate,
+             exhaustion_score, next_eligible_at
+      FROM search_seeds WHERE id = ${row.seed_id}::uuid FOR UPDATE
+    `);
+    const seedRow = seedResult.rows[0] as Record<string, unknown> | undefined;
+    if (!seedRow) return;
+    const seed: SearchSeed = {
+      id: String(seedRow.id), campaignId: String(seedRow.campaign_id), engineType: seedRow.engine_type as SearchSeed["engineType"],
+      query: String(seedRow.query), geography: String(seedRow.geography),
+      lastRunAt: seedRow.last_run_at ? new Date(String(seedRow.last_run_at)).toISOString() : null,
+      totalRaw: Number(seedRow.total_raw), totalUnique: Number(seedRow.total_unique), totalReady: Number(seedRow.total_ready),
+      yieldRate: Number(seedRow.yield_rate), exhaustionScore: Number(seedRow.exhaustion_score),
+      nextEligibleAt: seedRow.next_eligible_at ? new Date(String(seedRow.next_eligible_at)).toISOString() : null,
+    };
+    const totals = finalizedRuns.rows.reduce<{ totalRaw: number; totalUnique: number; totalReady: number; lastRunAt: string | null }>((acc, run) => ({
+      totalRaw: acc.totalRaw + Number((run as { raw_count: number }).raw_count),
+      totalUnique: acc.totalUnique + Number((run as { unique_count: number }).unique_count),
+      totalReady: acc.totalReady + Number((run as { ready_count: number }).ready_count),
+      lastRunAt: (run as { finished_at: string | null }).finished_at ?? acc.lastRunAt,
+    }), { totalRaw: 0, totalUnique: 0, totalReady: 0, lastRunAt: null });
+    const updated = recomputeSeedMetrics(seed, { ...totals, runCount: finalizedRuns.rows.length });
     await tx.execute(sql`
       UPDATE search_seeds ss
-      SET total_raw = totals.total_raw,
-          total_unique = totals.total_unique,
-          total_ready = totals.total_ready,
-          yield_rate = CASE WHEN totals.total_unique > 0 THEN totals.total_ready::numeric / totals.total_unique ELSE 0 END
-      FROM (
-        SELECT seed_id, coalesce(sum(raw_count), 0)::int AS total_raw,
-               coalesce(sum(unique_count), 0)::int AS total_unique,
-               coalesce(sum(ready_count), 0)::int AS total_ready
-        FROM search_seed_runs WHERE seed_id = ${row.seed_id}::uuid GROUP BY seed_id
-      ) totals
-      WHERE ss.id = totals.seed_id
+      SET last_run_at = ${updated.lastRunAt}::timestamptz,
+          total_raw = ${updated.totalRaw}, total_unique = ${updated.totalUnique}, total_ready = ${updated.totalReady},
+          yield_rate = ${updated.yieldRate}, exhaustion_score = ${updated.exhaustionScore},
+          next_eligible_at = ${updated.nextEligibleAt}::timestamptz
+      WHERE ss.id = ${row.seed_id}::uuid
     `);
   });
 }

@@ -187,9 +187,11 @@ export async function getRecentProviderUsage(workspaceId: string, provider: stri
   let errors = 0;
   let costUsd = 0;
   for (const row of rows) {
+    if (row.status !== "succeeded" && row.status !== "ingested" && row.status !== "completed" && row.status !== "failed" && row.status !== "aborted" && row.status !== "timed_out") continue;
     items += row.itemsReturned;
     costUsd += row.costUsd;
-    if (row.status === "failed") errors += 1;
+    if (row.status === "failed" || row.status === "aborted" || row.status === "timed_out") errors += 1;
   }
-  return { calls: rows.length, items, errors, totalLatencyMs: 0, costUsd, quotaRemaining: null };
+  const terminalRows = rows.filter((row) => ["succeeded", "ingested", "completed", "failed", "aborted", "timed_out"].includes(row.status));
+  return { calls: terminalRows.length, items, errors, totalLatencyMs: 0, costUsd, quotaRemaining: null };
 }

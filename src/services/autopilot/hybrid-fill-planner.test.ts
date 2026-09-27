@@ -56,4 +56,10 @@ describe("Maps-only Hybrid Fill", () => {
     expect(HYBRID_GEOGRAPHIES.some((geography) => plan.seed?.geography === geography)).toBe(true);
     expect(ICP_CATEGORY_TERMS.some((term) => plan.seed?.query === term)).toBe(true);
   });
+
+  it("does not select an exhausted canonical seed for Hybrid Fill", () => {
+    const hybridSeed = { ...seed, id: "hybrid-1", query: "herbolario", geography: "Madrid" };
+    const plan = planHybridFill({ ...base, seedInventoryExhausted: true, seeds: [{ ...seed, exhaustionScore: 1 }], hybridSeeds: [hybridSeed] });
+    expect(plan.seed).toEqual({ query: "herbolario", geography: "Madrid" });
+  });
 });

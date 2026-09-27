@@ -10,6 +10,7 @@ import {
   getGlobalAutopilotStateData,
 } from "@/lib/data/repository";
 import { buildAdminDiagnostics } from "@/lib/observability/admin-diagnostics";
+import { requireWorkspaceAdmin } from "@/lib/auth/workspace";
 
 export const dynamic = "force-dynamic";
 
@@ -21,6 +22,7 @@ export const dynamic = "force-dynamic";
  * not for day-to-day sales use.
  */
 export default async function AdminDiagnosticsPage() {
+  await requireWorkspaceAdmin();
   const [
     autopilotState,
     seedQueueHealth,
@@ -136,7 +138,7 @@ export default async function AdminDiagnosticsPage() {
         </CardHeader>
         <CardContent className="grid grid-cols-3 gap-3">
           <Stat label="Daily target" value={snapshot.currentTargetState.dailyTarget} />
-          <Stat label="Ready today" value={snapshot.currentTargetState.readyToday} />
+          <Stat label="Qualified today" value={snapshot.currentTargetState.readyToday} />
           <div>
             <p className="text-xs font-medium text-text-muted">System health</p>
             <Badge variant={snapshot.currentTargetState.systemHealth === "healthy" ? "success" : "warning"} className="mt-1">

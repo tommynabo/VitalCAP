@@ -13,6 +13,7 @@ export interface HybridFillPlanInput {
   budgetRemaining: number;
   onPace: boolean;
   seeds: readonly SearchSeed[];
+  hybridSeeds?: readonly SearchSeed[];
   campaignId: string;
   now: Date;
 }
@@ -34,9 +35,9 @@ export function planHybridFill(input: HybridFillPlanInput): HybridFillPlan {
   }
 
   const approvedHybridSeeds = input.seedInventoryExhausted
-    ? buildHybridMapsSeedCatalog(input.campaignId)
+    ? (input.hybridSeeds ?? buildHybridMapsSeedCatalog(input.campaignId))
     : [];
-  const eligible = [...input.seeds, ...approvedHybridSeeds]
+  const eligible = (input.seedInventoryExhausted ? approvedHybridSeeds : input.seeds)
     .filter((seed) => seed.engineType === "maps_fast" && (!seed.nextEligibleAt || new Date(seed.nextEligibleAt) <= input.now))
     .sort((a, b) => a.exhaustionScore - b.exhaustionScore || b.yieldRate - a.yieldRate || a.query.localeCompare(b.query) || a.geography.localeCompare(b.geography));
   const seed = eligible[0] ?? null;

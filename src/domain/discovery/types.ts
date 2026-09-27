@@ -72,6 +72,7 @@ export interface SearchSeedRun {
   uniqueCount: number;
   readyCount: number;
   error: string | null;
+  qualificationFinalizedAt?: string | null;
 }
 
 /**

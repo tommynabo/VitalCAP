@@ -15,14 +15,13 @@ import {
   insertRawCandidates,
   insertSearchSeedRun,
   listSearchSeedsForCampaignEngine,
-  updateSearchSeedAfterRun,
+  refreshSearchSeedQualification,
   getRemainingDiscoveryTarget,
 } from "@/infrastructure/neon/repositories/discovery";
 import { getProviderRunByRequestKey, getRecentProviderUsage, reserveApifyProviderRun, updateProviderRun } from "@/infrastructure/neon/repositories/provider-runs";
 import { getAutopilotSettings } from "@/infrastructure/neon/repositories/autopilot";
 import { getEffectiveAutopilotState } from "@/domain/autopilot/types";
 import { getDayBounds } from "@/lib/time/day-bounds";
-import { recordSeedRun } from "@/services/discovery/geography-planner";
 import { buildMapsSeedCatalog, buildSerpSeedCatalog, LINKEDIN_OWNER_ROLE_QUERIES, ICP_CATEGORY_TERMS } from "@/services/discovery/spain-search-catalog";
 import { createDiscoveryEngine } from "./engine-factory";
 import type { SearchSeed } from "@/domain/discovery/types";
@@ -185,13 +184,7 @@ async function executeDiscoveryJob(job: { id: string; campaignId: string; payloa
       });
     }
 
-    const updatedSeed = recordSeedRun(seed, {
-      rawCount: result.rawCandidates.length,
-      uniqueCount: result.rawCandidates.length,
-      readyCount: 0,
-      finishedAt: finishedAt.toISOString(),
-    });
-    await updateSearchSeedAfterRun(updatedSeed);
+    await refreshSearchSeedQualification(completedSeedRunId);
 
     totalRawCandidates += result.rawCandidates.length;
     remainingRaw = Math.max(0, remainingRaw - result.rawCandidates.length);

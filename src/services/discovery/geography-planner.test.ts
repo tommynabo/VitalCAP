@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { SearchSeed } from "@/domain/discovery/types";
-import { recordSeedRun, selectNextSeeds } from "./geography-planner";
+import { recomputeSeedMetrics, recordSeedRun, selectNextSeeds } from "./geography-planner";
 
 function makeSeed(overrides: Partial<SearchSeed> = {}): SearchSeed {
   return {
@@ -52,7 +52,7 @@ describe("recordSeedRun", () => {
     const updated = recordSeedRun(seed, { rawCount: 20, uniqueCount: 15, readyCount: 5, finishedAt: "2025-01-01T00:00:00Z" });
     expect(updated.totalRaw).toBe(20);
     expect(updated.totalReady).toBe(5);
-    expect(updated.yieldRate).toBeCloseTo(0.25);
+    expect(updated.yieldRate).toBeCloseTo(1 / 3);
     expect(updated.lastRunAt).toBe("2025-01-01T00:00:00.000Z");
     expect(updated.nextEligibleAt).not.toBeNull();
   });
@@ -62,10 +62,25 @@ describe("recordSeedRun", () => {
     const healthyUpdated = recordSeedRun(healthySeed, { rawCount: 20, uniqueCount: 15, readyCount: 5, finishedAt: "2025-01-01T00:00:00Z" });
 
     const exhaustedSeed = makeSeed({ totalRaw: 100, totalReady: 1, yieldRate: 0.01, lastRunAt: "2024-12-01T00:00:00Z" });
-    const exhaustedUpdated = recordSeedRun(exhaustedSeed, { rawCount: 20, uniqueCount: 18, readyCount: 0, finishedAt: "2025-01-01T00:00:00Z" });
+    const exhaustedUpdated = recordSeedRun(exhaustedSeed, { rawCount: 20, uniqueCount: 20, readyCount: 0, finishedAt: "2025-01-01T00:00:00Z" }, { runCount: 3 });
 
     const healthyCooldown = new Date(healthyUpdated.nextEligibleAt!).getTime() - new Date("2025-01-01T00:00:00Z").getTime();
     const exhaustedCooldown = new Date(exhaustedUpdated.nextEligibleAt!).getTime() - new Date("2025-01-01T00:00:00Z").getTime();
     expect(exhaustedCooldown).toBeGreaterThan(healthyCooldown);
+  });
+});
+
+describe("recomputeSeedMetrics", () => {
+  it("uses finalized unique and qualified totals for yield and exhaustion", () => {
+    const updated = recomputeSeedMetrics(makeSeed(), {
+      totalRaw: 20,
+      totalUnique: 20,
+      totalReady: 12,
+      runCount: 1,
+      lastRunAt: "2025-01-01T00:00:00Z",
+    });
+    expect(updated.yieldRate).toBeCloseTo(0.6);
+    expect(updated.exhaustionScore).toBe(0);
+    expect(new Date(updated.nextEligibleAt!).getTime()).toBe(new Date("2025-01-02T00:00:00Z").getTime());
   });
 });
