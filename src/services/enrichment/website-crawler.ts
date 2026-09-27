@@ -1,4 +1,5 @@
 import type { WebsiteFetcher } from "@/domain/providers/types";
+import { normalizeDomain } from "@/lib/normalization";
 
 /**
  * Targeted internal-page crawl (Prompt 2 §2.4–2.5). Never crawls the whole
@@ -34,7 +35,7 @@ export interface WebsiteCrawlOptions {
 
 const DEFAULT_OPTIONS: WebsiteCrawlOptions = { maxPages: 6 };
 
-function extractLinks(html: string, baseUrl: string): string[] {
+function extractLinks(html: string, baseUrl: string, allowedDomain: string): string[] {
   const links: string[] = [];
   const hrefRe = /href=["']([^"'#]+)["']/gi;
   for (const match of html.matchAll(hrefRe)) {
@@ -42,7 +43,8 @@ function extractLinks(html: string, baseUrl: string): string[] {
     if (!href) continue;
     try {
       const resolved = new URL(href, baseUrl);
-      if (resolved.origin === new URL(baseUrl).origin) links.push(resolved.toString());
+      const normalizedResolved = normalizeDomain(resolved.hostname);
+      if (allowedDomain && normalizedResolved === allowedDomain) links.push(resolved.toString());
     } catch {
       // ignore malformed hrefs (mailto:, tel:, javascript:, etc.)
     }
@@ -76,7 +78,8 @@ export async function crawlWebsite(fetcher: WebsiteFetcher, rootUrl: string, opt
   visited.add(home.url);
   pages.push({ url: home.url, body: home.body });
 
-  const candidateLinks = extractLinks(home.body, home.url).filter(isTargetPath).filter((url) => !visited.has(url));
+  const allowedDomain = normalizeDomain(new URL(rootUrl).hostname);
+  const candidateLinks = extractLinks(home.body, home.url, allowedDomain!).filter(isTargetPath).filter((url) => !visited.has(url));
   const uniqueCandidates = Array.from(new Set(candidateLinks));
 
   const maxConcurrency = 3;

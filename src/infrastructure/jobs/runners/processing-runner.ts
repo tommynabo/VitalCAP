@@ -242,7 +242,7 @@ async function executeProcessingJob(
 
   // --- WEBSITE ENRICHMENT ---
   if (accountFields.websiteUrl && incoming.normalizedDomain && options.enrichContacts !== false) {
-    const cache = await getWebsiteEnrichmentStatus(campaign.workspaceId, incoming.normalizedDomain);
+    const cache = await getWebsiteEnrichmentStatus(accountId, incoming.normalizedDomain);
     const now = new Date();
     const needsRefresh = !cache || !cache.nextRefreshAt || cache.nextRefreshAt <= now;
 
@@ -255,6 +255,17 @@ async function executeProcessingJob(
       });
 
       const nextRefreshAt = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000); // 30 days
+      const failureRefreshAt = new Date(now.getTime() + 24 * 60 * 60 * 1000); // 1 day
+      
+      let finalNextRefreshAt: Date | undefined;
+      if (result.status === "completed") {
+        finalNextRefreshAt = nextRefreshAt;
+      } else if (result.status === "blocked_unsafe_url" || result.status === "no_website") {
+        finalNextRefreshAt = new Date(now.getTime() + 365 * 24 * 60 * 60 * 1000); // 1 year, basically permanent
+      } else {
+        finalNextRefreshAt = failureRefreshAt;
+      }
+
       await upsertWebsiteEnrichmentStatus({
         workspaceId: campaign.workspaceId,
         accountId,
@@ -266,7 +277,7 @@ async function executeProcessingJob(
         contentHash: result.contentHash,
         pagesFetched: result.pagesFetched,
         error: result.errorDetails,
-        nextRefreshAt: result.status === "completed" ? nextRefreshAt : new Date(now.getTime() + 24 * 60 * 60 * 1000),
+        nextRefreshAt: finalNextRefreshAt,
       });
 
       for (const fact of result.evidence) {
@@ -277,6 +288,7 @@ async function executeProcessingJob(
           sourceUrl: fact.sourceUrl,
           evidenceType: fact.evidenceType,
           value: fact.value,
+          normalizedValue: fact.normalizedValue ?? fact.value,
           snippet: fact.snippet,
           contentHash: result.contentHash ?? "",
         });
@@ -291,8 +303,8 @@ async function executeProcessingJob(
               value: fact.value,
               normalizedValue: emailLower,
               label: fact.value.split("@")[0] ?? "",
-              isGeneric: false,
-              isPersonalOrNamed: true, // We assume if it wasn't picked up generically it might be named
+              isGeneric: fact.isGeneric ?? true, // use fact metadata
+              isPersonalOrNamed: fact.isPersonalOrNamed ?? false, // use fact metadata
               priorityScore: 0,
               verificationStatus: "unverified",
               verificationProvider: null,
@@ -300,6 +312,27 @@ async function executeProcessingJob(
               sourceType: "website_enrichment",
             });
           }
+        }
+        
+        if (fact.evidenceType === "phone") {
+          const phoneNorm = fact.normalizedValue ?? fact.value;
+          // Note: duplicate checking for phones across the account should ideally happen here or rely on DB upsert logic.
+          // For now we just insert it since contact points can have multiple.
+          await insertContactPoint({
+            workspaceId: campaign.workspaceId,
+            accountId,
+            type: "phone",
+            value: fact.value,
+            normalizedValue: phoneNorm,
+            label: "Teléfono",
+            isGeneric: true,
+            isPersonalOrNamed: false,
+            priorityScore: 0,
+            verificationStatus: "unverified",
+            verificationProvider: null,
+            sourceUrl: fact.sourceUrl,
+            sourceType: "website_enrichment",
+          });
         }
       }
     }

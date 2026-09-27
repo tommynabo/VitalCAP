@@ -24,7 +24,7 @@ export const websiteEnrichments = pgTable(
   },
   (table) => [
     index("idx_website_enrichments_workspace").on(table.workspaceId),
-    uniqueIndex("uq_website_enrichments_domain").on(table.workspaceId, table.normalizedDomain),
+    uniqueIndex("uq_website_enrichments_account_domain").on(table.accountId, table.normalizedDomain),
     index("idx_website_enrichments_account").on(table.accountId),
   ],
 );
@@ -43,6 +43,7 @@ export const websiteEvidence = pgTable(
     sourceUrl: text("source_url").notNull(),
     evidenceType: text("evidence_type").notNull(),
     value: text("value").notNull(),
+    normalizedValue: text("normalized_value").notNull(),
     snippet: text("snippet"),
     contentHash: text("content_hash").notNull(),
     fetchedAt: timestamp("fetched_at", { withTimezone: true }).notNull().defaultNow(),
@@ -50,6 +51,6 @@ export const websiteEvidence = pgTable(
   },
   (table) => [
     index("idx_website_evidence_account").on(table.accountId),
-    uniqueIndex("uq_website_evidence_idempotency").on(table.accountId, table.sourceUrl, table.evidenceType, table.contentHash),
+    uniqueIndex("uq_website_evidence_idempotency").on(table.accountId, table.sourceUrl, table.evidenceType, table.normalizedValue),
   ],
 );

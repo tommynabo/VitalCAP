@@ -6,10 +6,13 @@ import { extractCandidateEmails } from "./email-extraction";
 import { SafeFetchError } from "@/lib/security/safe-fetch";
 
 export interface WebsiteEvidenceFact {
-  evidenceType: "email" | "phone" | "named_role" | "business_signal" | "supplement_signal";
+  evidenceType: "email" | "phone" | "named_role" | "role_signal" | "business_signal" | "supplement_signal";
   value: string;
+  normalizedValue?: string;
   snippet: string | null;
   sourceUrl: string;
+  isGeneric?: boolean;
+  isPersonalOrNamed?: boolean;
 }
 
 export interface WebsiteEnrichmentResult {
@@ -40,14 +43,14 @@ const ICP_SIGNALS = [
 ];
 
 const NAMED_ROLES = [
-  "titular",
+  "responsable de compras",
   "farmacéutico titular",
+  "equipo farmacéutico",
   "propietario",
   "fundador",
-  "gerente",
-  "responsable de compras",
   "director",
-  "equipo farmacéutico",
+  "titular",
+  "gerente",
 ];
 
 function extractVisibleTextContext(html: string, index: number, matchLength: number): string {
@@ -74,7 +77,8 @@ function extractPhones(text: string, sourceUrl: string): WebsiteEvidenceFact[] {
       found.add(norm);
       facts.push({
         evidenceType: "phone",
-        value: norm,
+        value: match[0].trim(),
+        normalizedValue: norm,
         snippet: extractVisibleTextContext(text, match.index ?? 0, match[0].length),
         sourceUrl,
       });
@@ -96,6 +100,7 @@ function extractBusinessSignals(text: string, sourceUrl: string): WebsiteEvidenc
       facts.push({
         evidenceType: type,
         value: signal,
+        normalizedValue: signal,
         snippet: extractVisibleTextContext(text, idx, signal.length),
         sourceUrl,
       });
@@ -113,16 +118,27 @@ function extractNamedRoles(text: string, sourceUrl: string): WebsiteEvidenceFact
     const regex = new RegExp(`([^.?!]*(?:${role})[^.?!]*)`, "gi");
     while ((match = regex.exec(text)) !== null) {
       const snippet = (match[1] || "").replace(/\s+/g, " ").trim();
-      // Heuristic: If snippet contains a likely name (capitalized words) near the role.
-      // We'll just capture the whole sentence/clause as the snippet.
-      // To avoid junk, limit snippet length.
       if (snippet.length > 5 && snippet.length < 150) {
-        facts.push({
-          evidenceType: "named_role",
-          value: role,
-          snippet: snippet,
-          sourceUrl,
-        });
+        // Look for capitalized words that might be a name
+        const nameMatch = snippet.match(/([A-ZÁÉÍÓÚÑ][a-záéíóúñ]+(?:\s+[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+)+)/);
+        
+        if (nameMatch) {
+          facts.push({
+            evidenceType: "named_role",
+            value: role,
+            normalizedValue: nameMatch[1],
+            snippet: snippet,
+            sourceUrl,
+          });
+        } else {
+          facts.push({
+            evidenceType: "role_signal",
+            value: role,
+            normalizedValue: role,
+            snippet: snippet,
+            sourceUrl,
+          });
+        }
       }
     }
   }
@@ -175,8 +191,11 @@ export class WebsiteEnrichmentService {
         addFact({
           evidenceType: "email",
           value: email.email,
+          normalizedValue: email.email,
           snippet: email.context,
           sourceUrl: page.url,
+          isGeneric: email.isGeneric,
+          isPersonalOrNamed: false, // Do not assume personhood just because it's not in the generic list
         });
       }
 
