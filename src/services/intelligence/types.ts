@@ -1,10 +1,22 @@
 import { z } from "zod";
+import { createHash } from "node:crypto";
+
+export const EvidenceFactSchema = z.object({
+  id: z.string(),
+  type: z.string(),
+  value: z.string(),
+  sourceUrl: z.string().nullable(),
+  snippet: z.string().nullable(),
+});
+
+export type EvidenceFact = z.infer<typeof EvidenceFactSchema>;
 
 export const ProspectContextSchema = z.object({
   workspaceId: z.string(),
   campaignId: z.string(),
   accountId: z.string(),
   account: z.object({
+    id: z.string(),
     normalizedName: z.string(),
     normalizedDomain: z.string().nullable(),
     businessType: z.string(),
@@ -30,22 +42,44 @@ export const ProspectContextSchema = z.object({
     name: z.string(),
     description: z.string().nullable(),
   }),
-  evidence: z.object({
-    website: z.object({
-      textContent: z.string().nullable(),
-      scrapedAt: z.string().nullable(),
-    }),
-    maps: z.object({
-      categories: z.array(z.string()),
-      summary: z.string().nullable(),
-      reviews: z.array(
-        z.object({
-          text: z.string(),
-          rating: z.number(),
-        })
-      ),
-    }),
-  }),
+  evidence: z.array(EvidenceFactSchema),
+  contactPoints: z.array(z.object({
+    id: z.string(),
+    channel: z.string(),
+    title: z.string().nullable(),
+    name: z.string().nullable(),
+  })),
 });
 
 export type ProspectContext = z.infer<typeof ProspectContextSchema>;
+
+export function hashProspectContext(context: ProspectContext): string {
+  return createHash("sha256").update(JSON.stringify(context)).digest("hex");
+}
+
+export const PersonalizationFactSchema = z.object({
+  fact: z.string(),
+  evidenceIds: z.array(z.string()),
+});
+
+export const ProspectAnalysisOutputSchema = z.object({
+  businessType: z.string(),
+  fitScore: z.number().min(0).max(100),
+  fitTier: z.string(),
+  confidence: z.number().min(0).max(1),
+  qualified: z.boolean(),
+  qualificationReason: z.string(),
+  positiveSignals: z.array(z.string()),
+  negativeSignals: z.array(z.string()),
+  supplementSignals: z.array(z.string()),
+  decisionMakerSignals: z.array(z.string()),
+  personalizationFacts: z.array(PersonalizationFactSchema),
+  suggestedAngle: z.string(),
+  dataQualityScore: z.number().min(0).max(100),
+  missingInformation: z.array(z.string()),
+  nextEnrichmentActions: z.array(z.string()),
+  riskFlags: z.array(z.string()),
+  needsHumanReview: z.boolean(),
+});
+
+export type ProspectAnalysisOutput = z.infer<typeof ProspectAnalysisOutputSchema>;

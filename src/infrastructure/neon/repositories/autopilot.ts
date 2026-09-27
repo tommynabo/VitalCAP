@@ -141,6 +141,31 @@ export async function getGlobalAutopilotState(workspaceId: string): Promise<Glob
       and(eq(campaigns.workspaceId, workspaceId), eq(campaignMemberships.stage, "qualified"), gte(campaignMemberships.updatedAt, today)),
     );
 
+  const [analyzedQualifiedRow] = await db
+    .select({ total: sql<number>`count(distinct ${campaignMemberships.accountId})` })
+    .from(campaignMemberships)
+    .innerJoin(campaigns, eq(campaignMemberships.campaignId, campaigns.id))
+    .where(
+      and(
+        eq(campaigns.workspaceId, workspaceId),
+        sql`${campaignMemberships.stage} IN ('qualified', 'ready')`,
+        gte(campaignMemberships.updatedAt, today),
+        sql`EXISTS (
+          SELECT 1 FROM prospect_analyses pa
+          WHERE pa.campaign_id = ${campaignMemberships.campaignId}
+            AND pa.account_id = ${campaignMemberships.accountId}
+            AND pa.status = 'completed'
+            AND pa.qualified = true
+            AND pa.id = (
+              SELECT id FROM prospect_analyses pa2
+              WHERE pa2.campaign_id = ${campaignMemberships.campaignId}
+                AND pa2.account_id = ${campaignMemberships.accountId}
+              ORDER BY created_at DESC LIMIT 1
+            )
+        )`
+      )
+    );
+
   const [outreachReadyRow] = await db
     .select({ total: sql<number>`count(distinct ${campaignMemberships.accountId})` })
     .from(campaignMemberships)
@@ -150,18 +175,32 @@ export async function getGlobalAutopilotState(workspaceId: string): Promise<Glob
       and(
         eq(campaigns.workspaceId, workspaceId),
         eq(campaigns.status, "active"),
-        sql`EXISTS (
-          SELECT 1 FROM compliance_decisions cd
-          WHERE cd.account_id = ${campaignMemberships.accountId}
-            AND cd.decision = 'allowed'
+        sql`NOT EXISTS (
+          SELECT 1 FROM autopilot_settings aps
+          WHERE aps.workspace_id = ${workspaceId}
+            AND aps.emergency_stopped = true
         )`,
-        gte(campaignMemberships.updatedAt, today)
+        sql`EXISTS (
+          SELECT 1 FROM contact_points cp
+          JOIN compliance_decisions cd ON cd.contact_point_id = cp.id
+          LEFT JOIN suppression_entries se ON (se.contact_point_id = cp.id OR se.account_id = cp.account_id) AND se.workspace_id = ${workspaceId}
+          WHERE cp.account_id = ${campaignMemberships.accountId}
+            AND cd.campaign_id = ${campaignMemberships.campaignId}
+            AND cd.decision = 'allowed'
+            AND cd.superseded_at IS NULL
+            AND cp.verification_status NOT IN ('unverified', 'invalid', 'bounced')
+            AND se.id IS NULL
+        )`,
+        gte(campaignMemberships.updatedAt, today),
+        sql`${campaignMemberships.stage} IN ('qualified', 'ready')`
       )
     );
 
   const targetAchievedToday = settings.targetMetric === "outreach_ready" 
     ? (outreachReadyRow?.total ?? 0) 
-    : (qualifiedRow?.total ?? 0);
+    : settings.targetMetric === "analyzed_qualified"
+      ? (analyzedQualifiedRow?.total ?? 0)
+      : (qualifiedRow?.total ?? 0);
 
   const [sentRow] = await db
     .select({ total: count() })
@@ -261,16 +300,29 @@ async function getEngineTargetState(workspaceId: string, engineType: EngineType)
       and(
         eq(campaigns.workspaceId, workspaceId),
         eq(campaigns.engineType, engineType),
+        eq(campaigns.status, "active"),
+        sql`NOT EXISTS (
+          SELECT 1 FROM autopilot_settings aps
+          WHERE aps.workspace_id = ${workspaceId}
+            AND aps.emergency_stopped = true
+        )`,
         sql`EXISTS (
-          SELECT 1 FROM compliance_decisions cd
-          WHERE cd.account_id = ${campaignMemberships.accountId}
+          SELECT 1 FROM contact_points cp
+          JOIN compliance_decisions cd ON cd.contact_point_id = cp.id
+          LEFT JOIN suppression_entries se ON (se.contact_point_id = cp.id OR se.account_id = cp.account_id) AND se.workspace_id = ${workspaceId}
+          WHERE cp.account_id = ${campaignMemberships.accountId}
+            AND cd.campaign_id = ${campaignMemberships.campaignId}
             AND cd.decision = 'allowed'
+            AND cd.superseded_at IS NULL
+            AND cp.verification_status NOT IN ('unverified', 'invalid', 'bounced')
+            AND se.id IS NULL
         )`,
         gte(campaignMemberships.updatedAt, startOfToday((await getAutopilotSettings(workspaceId)).timezone)),
+        sql`${campaignMemberships.stage} IN ('qualified', 'ready')`
       ),
     );
     
-  const [qualifiedRow] = await db
+    const [qualifiedRow] = await db
     .select({ total: count() })
     .from(campaignMemberships)
     .innerJoin(campaigns, eq(campaignMemberships.campaignId, campaigns.id))
@@ -283,17 +335,48 @@ async function getEngineTargetState(workspaceId: string, engineType: EngineType)
       ),
     );
 
+  const [analyzedQualifiedRow] = await db
+    .select({ total: count() })
+    .from(campaignMemberships)
+    .innerJoin(campaigns, eq(campaignMemberships.campaignId, campaigns.id))
+    .where(
+      and(
+        eq(campaigns.workspaceId, workspaceId),
+        eq(campaigns.engineType, engineType),
+        sql`${campaignMemberships.stage} IN ('qualified', 'ready')`,
+        gte(campaignMemberships.updatedAt, startOfToday((await getAutopilotSettings(workspaceId)).timezone)),
+        sql`EXISTS (
+          SELECT 1 FROM prospect_analyses pa
+          WHERE pa.campaign_id = ${campaignMemberships.campaignId}
+            AND pa.account_id = ${campaignMemberships.accountId}
+            AND pa.status = 'completed'
+            AND pa.qualified = true
+            AND pa.id = (
+              SELECT id FROM prospect_analyses pa2
+              WHERE pa2.campaign_id = ${campaignMemberships.campaignId}
+                AND pa2.account_id = ${campaignMemberships.accountId}
+              ORDER BY created_at DESC LIMIT 1
+            )
+        )`
+      ),
+    );
+
   const [yieldRow] = await db
     .select({ avgYield: sql<number>`coalesce(avg(${searchSeeds.yieldRate}), 0)`, lastRunAt: sql<Date | null>`max(${searchSeeds.lastRunAt})` })
     .from(searchSeeds)
     .innerJoin(campaigns, eq(searchSeeds.campaignId, campaigns.id))
     .where(and(eq(campaigns.workspaceId, workspaceId), eq(campaigns.engineType, engineType)));
 
+  const targetMetric = (await getAutopilotSettings(workspaceId)).targetMetric;
   return {
     engineType,
     softTarget: targetRow?.total ?? 0,
     readyToday: readyRow?.total ?? 0,
-    targetAchievedToday: (await getAutopilotSettings(workspaceId)).targetMetric === "outreach_ready" ? (readyRow?.total ?? 0) : (qualifiedRow?.total ?? 0),
+    targetAchievedToday: targetMetric === "outreach_ready" 
+      ? (readyRow?.total ?? 0) 
+      : targetMetric === "analyzed_qualified"
+        ? (analyzedQualifiedRow?.total ?? 0)
+        : (qualifiedRow?.total ?? 0),
     qualifiedToday: qualifiedRow?.total ?? 0,
     rawQueueDepth: rawDepthRow?.total ?? 0,
     processingQueueDepth: processingDepthRow?.total ?? 0,

@@ -81,6 +81,8 @@ const requiredMigrationFiles = [
   "0007_phase8i1_corrective.sql",
   "0008_phase8j_website_enrichment.sql",
   "0005_fast_moonstone.sql",
+  "0006_bouncy_bromley.sql",
+  "0009_phase8l1_intelligence_compliance_fix.sql",
 ];
 const appliedMigrationRows = await db`
   SELECT filename FROM vitalcap_migrations WHERE filename = ANY(${requiredMigrationFiles})
@@ -235,6 +237,34 @@ if (requiredAttributionColumns.some((column) => !attributionColumnKeys.has(colum
   throw new Error("Seed attribution columns/indexes: FAIL (Phase 8I.1 migration missing)");
 }
 
+const prospectCols = await db`
+  SELECT column_name FROM information_schema.columns 
+  WHERE table_schema = 'public' AND table_name = 'prospect_analyses'
+  AND column_name = ANY(${["fit_score", "fit_tier", "confidence", "qualified", "needs_human_review", "input_hash", "prompt_version"]})
+`;
+if (prospectCols.length < 7) throw new Error("prospect_analyses columns: FAIL");
+
+const complianceCols = await db`
+  SELECT column_name FROM information_schema.columns
+  WHERE table_schema = 'public' AND table_name = 'compliance_decisions'
+  AND column_name = ANY(${["channel", "decision", "eligibility_after", "superseded_at"]})
+`;
+if (complianceCols.length < 4) throw new Error("compliance_decisions columns: FAIL");
+
+const verificationCols = await db`
+  SELECT column_name FROM information_schema.columns
+  WHERE table_schema = 'public' AND table_name = 'email_verifications'
+  AND column_name = ANY(${["normalized_email", "provider", "status", "expires_at"]})
+`;
+if (verificationCols.length < 4) throw new Error("email_verifications columns: FAIL");
+
+const mappingsCols = await db`
+  SELECT column_name FROM information_schema.columns
+  WHERE table_schema = 'public' AND table_name = 'campaign_provider_mappings'
+  AND column_name = ANY(${["provider", "provider_campaign_id", "enabled"]})
+`;
+if (mappingsCols.length < 3) throw new Error("campaign_provider_mappings columns: FAIL");
+
 console.log("Neon connection: PASS");
 console.log("Core tables: PASS");
 console.log("Queue tables: PASS");
@@ -244,7 +274,7 @@ console.log("Replay idempotency indexes: PASS");
 console.log("Provider-run async columns and request-key index: PASS");
 console.log("Autopilot settings and target metric constraint: PASS");
 console.log("Migration tracking: PASS");
-console.log("Migrations 0000-0007: PASS");
+console.log("Migrations 0000-0008: PASS");
 console.log("Phase 8I rebalance columns and non-partial unique index: PASS");
 console.log("Raw candidate seed/provider/account attribution: PASS");
 console.log("Prospect Intelligence tables: PASS");

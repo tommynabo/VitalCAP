@@ -59,11 +59,11 @@ export class ChannelEligibilityService {
       decision = "blocked";
       reasonCode = cp.channelEligibility;
       reasonText = `Explicitly blocked due to existing status: ${cp.channelEligibility}`;
-    } else if (cp.channelEligibility === "invalid" || cp.channelEligibility === "bounced") {
+    } else if (cp.verificationStatus === "invalid" || cp.verificationStatus === "bounced") {
       decision = "blocked";
-      reasonCode = cp.channelEligibility;
+      reasonCode = cp.verificationStatus;
       reasonText = `Endpoint is invalid or bounced.`;
-    } else if (cp.channelEligibility === "unverified" || cp.channelEligibility === "unknown") {
+    } else if (cp.verificationStatus === "unverified" || cp.verificationStatus === "unknown") {
       // Unknown remains unknown unless verification changes it
       decision = "review_required";
       reasonCode = "unverified";

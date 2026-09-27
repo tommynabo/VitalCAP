@@ -71,12 +71,14 @@ export const intelligenceJobs = pgTable(
     nextAttemptAt: timestamp("next_attempt_at", { withTimezone: true }),
     lastError: text("last_error"),
     idempotencyKey: text("idempotency_key").notNull(),
+    status: text("status").default("pending").notNull(), // pending|processing|completed|failed|dead_letter|budget_paused
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+    completedAt: timestamp("completed_at", { withTimezone: true }),
   },
   (table) => [
     uniqueIndex("uq_intelligence_jobs_idempotency").on(table.campaignId, table.accountId, table.idempotencyKey),
-    // Simplified index for queue fetching:
     index("idx_intelligence_jobs_locked_at").on(table.lockedAt),
+    index("idx_intelligence_jobs_status").on(table.status),
   ]
 );

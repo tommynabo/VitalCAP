@@ -365,6 +365,26 @@ async function executeProcessingJob(
     readyAt: membership.stage === "ready" ? new Date() : null,
   });
 
+  if (membership.stage === "qualified" || membership.stage === "ready") {
+    // Dynamically import to avoid circular dependency issues if any
+    const { ProspectContextBuilder } = await import("@/services/intelligence/prospect-context-builder");
+    const { hashProspectContext } = await import("@/services/intelligence/types");
+    const { enqueueIntelligenceJob } = await import("@/infrastructure/neon/repositories/intelligence-queue");
+    
+    const contextBuilder = new ProspectContextBuilder();
+    const context = await contextBuilder.buildContext(campaign.id, accountId);
+    
+    if (context) {
+      const inputHash = hashProspectContext(context);
+      await enqueueIntelligenceJob({
+        workspaceId: campaign.workspaceId,
+        campaignId: campaign.id,
+        accountId: accountId,
+        idempotencyKey: inputHash,
+      });
+    }
+  }
+
   await updateRawCandidateAccountId(raw.id, accountId);
   await markRawCandidateProcessed(raw.id);
 }

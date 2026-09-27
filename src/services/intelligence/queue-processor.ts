@@ -1,5 +1,5 @@
 import { getDb, schema } from "@/infrastructure/neon/db";
-import { eq, isNull, lt, and, inArray, sql } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { ProspectContextBuilder } from "./prospect-context-builder";
 import { OpenAIProspectAnalyzer } from "./openai-prospect-analyzer";
 
@@ -19,7 +19,7 @@ export class IntelligenceQueueProcessor {
         SELECT id FROM intelligence_jobs
         WHERE (locked_at IS NULL OR locked_at < ${lockExpiry.toISOString()})
           AND (next_attempt_at IS NULL OR next_attempt_at <= ${now.toISOString()})
-          AND attempt_count < max_attempts
+          AND status IN ('pending', 'failed', 'processing') -- processing means lock expired
         ORDER BY created_at ASC
         LIMIT ${BATCH_SIZE}
         FOR UPDATE SKIP LOCKED
@@ -27,7 +27,8 @@ export class IntelligenceQueueProcessor {
       UPDATE intelligence_jobs
       SET locked_at = ${now.toISOString()},
           locked_by = ${lockedById},
-          attempt_count = attempt_count + 1
+          attempt_count = attempt_count + 1,
+          status = 'processing'
       FROM available
       WHERE intelligence_jobs.id = available.id
       RETURNING intelligence_jobs.*
@@ -47,8 +48,54 @@ export class IntelligenceQueueProcessor {
           throw new Error("Failed to build prospect context (missing data).");
         }
 
+        // Hard Deterministic Gates
+        const membershipRows = await db.select().from(schema.campaignMemberships)
+          .where(sql`campaign_id = ${job.campaign_id} AND account_id = ${job.account_id}`)
+          .limit(1);
+        const membership = membershipRows[0];
+        
+        const accountRows = await db.select().from(schema.accounts).where(sql`id = ${job.account_id}`).limit(1);
+        const account = accountRows[0];
+
+        const campaignRows = await db.select().from(schema.campaigns).where(sql`id = ${job.campaign_id}`).limit(1);
+        const campaign = campaignRows[0];
+        
+        if (!membership || membership.stage !== 'qualified') {
+          throw new Error(`Hard Gate: Membership stage is ${membership?.stage}`);
+        }
+        if (!account || account.status === 'rejected_country' || account.status === 'no_contact_found') {
+          throw new Error(`Hard Gate: Account status is ${account?.status}`);
+        }
+        if (!campaign || campaign.status !== 'active') {
+          throw new Error(`Hard Gate: Campaign is not active`);
+        }
+        
+        // Suppression check (Global suppression repo to be added per Objective 31)
+        const { checkSuppression } = await import("@/services/compliance/suppression");
+        const isSuppressed = await checkSuppression(account.workspaceId, { accountId: account.id });
+        if (isSuppressed) {
+          throw new Error("Hard Gate: Account is globally suppressed");
+        }
+
         const analysis = await analyzer.analyze(context);
         if (!analysis) throw new Error("No analysis returned.");
+        
+        if (analysis.status === "budget_paused") {
+          // Pause queue job
+          await db.update(schema.intelligenceJobs)
+            .set({
+              lockedAt: null,
+              lockedBy: null,
+              status: "budget_paused",
+              lastError: "Budget exhausted",
+            })
+            .where(eq(schema.intelligenceJobs.id, job.id));
+          continue; // Move to next but this might happen for all
+        }
+
+        if (analysis.status === "failed") {
+          throw new Error(analysis.error || "Analysis failed");
+        }
 
         // Update Account
         await db.update(schema.accounts)
@@ -58,20 +105,31 @@ export class IntelligenceQueueProcessor {
           })
           .where(eq(schema.accounts.id, job.account_id));
 
-        // Delete job on success
-        await db.delete(schema.intelligenceJobs).where(eq(schema.intelligenceJobs.id, job.id));
+        // Mark job as completed, DO NOT DELETE
+        await db.update(schema.intelligenceJobs)
+          .set({
+            status: "completed",
+            lockedAt: null,
+            lockedBy: null,
+            completedAt: new Date(),
+          })
+          .where(eq(schema.intelligenceJobs.id, job.id));
+        
         processedCount++;
 
       } catch (error: any) {
-        // Unlock and increment next attempt (exponential backoff)
-        const nextAttempt = new Date(now.getTime() + Math.pow(2, job.attempt_count) * 60000);
-        
+        // Handle failure
+        const isDeadLetter = job.attempt_count >= job.max_attempts;
+        const nextAttempt = isDeadLetter ? null : new Date(now.getTime() + Math.pow(2, job.attempt_count) * 60000);
+        const newStatus = isDeadLetter ? "dead_letter" : "failed";
+
         await db.update(schema.intelligenceJobs)
           .set({
             lockedAt: null,
             lockedBy: null,
             lastError: error.message,
             nextAttemptAt: nextAttempt,
+            status: newStatus,
           })
           .where(eq(schema.intelligenceJobs.id, job.id));
       }
