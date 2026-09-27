@@ -2,7 +2,12 @@ import { NextResponse } from "next/server";
 import { getServerEnv } from "@/lib/config/env";
 
 export function GET() {
-  const env = getServerEnv();
+  let env: any = {};
+  try {
+    env = getServerEnv();
+  } catch (e) {
+    // Validation failed; env will be empty, fallback to process.env where safe.
+  }
 
   return NextResponse.json({
     status: "ok",

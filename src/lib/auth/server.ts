@@ -1,5 +1,5 @@
 import { createNeonAuth } from "@neondatabase/auth/next/server";
-import { getServerEnv } from "@/lib/config/env";
+import { getAuthEnv } from "@/lib/config/auth-env";
 
 /**
  * Singleton Neon Auth server instance (Better Auth under the hood). Reads
@@ -8,7 +8,7 @@ import { getServerEnv } from "@/lib/config/env";
  * Do not construct a second instance elsewhere — import `auth` from here.
  */
 function buildAuth() {
-  const env = getServerEnv();
+  const env = getAuthEnv();
   if (!env.NEON_AUTH_BASE_URL || !env.NEON_AUTH_COOKIE_SECRET) {
     // Constructed lazily (see `getAuth()`) so importing this module never
     // throws just because auth isn't configured yet (e.g. dev-seed mode).

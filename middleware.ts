@@ -1,5 +1,6 @@
 import { NextResponse, type NextRequest } from "next/server";
-import { getServerEnv, isDevSeedMode } from "@/lib/config/env";
+import { isDevSeedMode } from "@/lib/config/env";
+import { getAuthEnv } from "@/lib/config/auth-env";
 
 /**
  * Protects every dashboard/admin page behind a Neon Auth session. Skipped
@@ -14,7 +15,7 @@ import { getServerEnv, isDevSeedMode } from "@/lib/config/env";
 export default async function middleware(request: NextRequest) {
   try {
     if (isDevSeedMode()) return NextResponse.next();
-    const env = getServerEnv();
+    const env = getAuthEnv();
     if (!env.NEON_AUTH_BASE_URL || !env.NEON_AUTH_COOKIE_SECRET) {
       // Auth not configured yet — fail closed rather than silently allow access.
       return new NextResponse("Authentication is not configured.", { status: 503 });
@@ -24,8 +25,15 @@ export default async function middleware(request: NextRequest) {
     const handler = getAuth().middleware({ loginUrl: "/sign-in" });
     return handler(request);
   } catch (error) {
-    console.error("Middleware invocation failed:", error);
-    return new NextResponse("Server configuration or dependency error in middleware. Please check Vercel application logs.", { status: 500 });
+    // Distinguish validation errors from unexpected runtime errors
+    const isZod = typeof (error as any).errors !== 'undefined';
+    if (isZod) {
+      // Log the specific missing/invalid env variables without exposing secrets
+      console.error('Middleware configuration validation failed:', (error as any).errors);
+      return new NextResponse('Configuration error: missing or invalid environment variables.', { status: 503 });
+    }
+    console.error('Middleware invocation failed:', error);
+    return new NextResponse('Server configuration or dependency error in middleware. Please check Vercel application logs.', { status: 500 });
   }
 }
 
