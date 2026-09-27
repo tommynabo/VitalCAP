@@ -11,6 +11,7 @@ import { campaigns, campaignMemberships } from "../schema/campaigns";
 import { accounts } from "../schema/accounts";
 import { contactPoints } from "../schema/contacts";
 import { toContactPoint } from "./accounts";
+import { complianceDecisions } from "../schema/compliance";
 import type { OutreachQueueItem, OutreachEvent, SendingDomain, Mailbox, SuppressionEntry } from "@/domain/outreach/types";
 import type { ContactPoint } from "@/domain/contacts/types";
 import type { OutreachCandidate } from "@/services/outreach/outreach-orchestrator";
@@ -161,7 +162,14 @@ export async function listOutreachCandidatesForCampaign(campaignId: string, limi
     .select({ accountId: campaignMemberships.accountId, accountName: accounts.canonicalName, contactId: campaignMemberships.contactId })
     .from(campaignMemberships)
     .innerJoin(accounts, eq(campaignMemberships.accountId, accounts.id))
-    .where(and(eq(campaignMemberships.campaignId, campaignId), eq(campaignMemberships.stage, "ready")))
+    .innerJoin(campaigns, eq(campaignMemberships.campaignId, campaigns.id))
+    .where(
+      and(
+        eq(campaignMemberships.campaignId, campaignId),
+        eq(campaignMemberships.stage, "ready"),
+        eq(campaigns.status, "active")
+      )
+    )
     .limit(limit);
 
   if (memberships.length === 0) return [];
@@ -169,6 +177,23 @@ export async function listOutreachCandidatesForCampaign(campaignId: string, limi
   const candidates: OutreachCandidate[] = [];
   for (const membership of memberships) {
     const points = await db.select().from(contactPoints).where(eq(contactPoints.accountId, membership.accountId));
+    
+    // Check if at least one contact point has an "allowed" compliance decision
+    const allowedDecisions = await db
+      .select()
+      .from(complianceDecisions)
+      .where(
+        and(
+          eq(complianceDecisions.accountId, membership.accountId),
+          eq(complianceDecisions.campaignId, campaignId),
+          eq(complianceDecisions.decision, "allowed")
+        )
+      );
+
+    if (allowedDecisions.length === 0) {
+      continue; // Skip if no contact point is actually allowed
+    }
+
     candidates.push({
       accountId: membership.accountId,
       campaignId,

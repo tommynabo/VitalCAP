@@ -141,6 +141,28 @@ export async function getGlobalAutopilotState(workspaceId: string): Promise<Glob
       and(eq(campaigns.workspaceId, workspaceId), eq(campaignMemberships.stage, "qualified"), gte(campaignMemberships.updatedAt, today)),
     );
 
+  const [outreachReadyRow] = await db
+    .select({ total: sql<number>`count(distinct ${campaignMemberships.accountId})` })
+    .from(campaignMemberships)
+    .innerJoin(campaigns, eq(campaignMemberships.campaignId, campaigns.id))
+    // We join on compliance decisions via sql trick to avoid importing it here if it gets cyclical, but let's import it.
+    .where(
+      and(
+        eq(campaigns.workspaceId, workspaceId),
+        eq(campaigns.status, "active"),
+        sql`EXISTS (
+          SELECT 1 FROM compliance_decisions cd
+          WHERE cd.account_id = ${campaignMemberships.accountId}
+            AND cd.decision = 'allowed'
+        )`,
+        gte(campaignMemberships.updatedAt, today)
+      )
+    );
+
+  const targetAchievedToday = settings.targetMetric === "outreach_ready" 
+    ? (outreachReadyRow?.total ?? 0) 
+    : (qualifiedRow?.total ?? 0);
+
   const [sentRow] = await db
     .select({ total: count() })
     .from(outreachEvents)
@@ -183,8 +205,8 @@ export async function getGlobalAutopilotState(workspaceId: string): Promise<Glob
 
   return {
     dailyTarget: settings.globalDailyTarget,
-    readyToday: qualifiedRow?.total ?? 0,
-    targetAchievedToday: qualifiedRow?.total ?? 0,
+    readyToday: outreachReadyRow?.total ?? 0,
+    targetAchievedToday,
     targetMetric: settings.targetMetric,
     sentToday: sentRow?.total ?? 0,
     repliesToday: repliesRow?.total ?? 0,
@@ -239,6 +261,23 @@ async function getEngineTargetState(workspaceId: string, engineType: EngineType)
       and(
         eq(campaigns.workspaceId, workspaceId),
         eq(campaigns.engineType, engineType),
+        sql`EXISTS (
+          SELECT 1 FROM compliance_decisions cd
+          WHERE cd.account_id = ${campaignMemberships.accountId}
+            AND cd.decision = 'allowed'
+        )`,
+        gte(campaignMemberships.updatedAt, startOfToday((await getAutopilotSettings(workspaceId)).timezone)),
+      ),
+    );
+    
+  const [qualifiedRow] = await db
+    .select({ total: count() })
+    .from(campaignMemberships)
+    .innerJoin(campaigns, eq(campaignMemberships.campaignId, campaigns.id))
+    .where(
+      and(
+        eq(campaigns.workspaceId, workspaceId),
+        eq(campaigns.engineType, engineType),
         eq(campaignMemberships.stage, "qualified"),
         gte(campaignMemberships.updatedAt, startOfToday((await getAutopilotSettings(workspaceId)).timezone)),
       ),
@@ -254,8 +293,8 @@ async function getEngineTargetState(workspaceId: string, engineType: EngineType)
     engineType,
     softTarget: targetRow?.total ?? 0,
     readyToday: readyRow?.total ?? 0,
-    targetAchievedToday: readyRow?.total ?? 0,
-    qualifiedToday: readyRow?.total ?? 0,
+    targetAchievedToday: (await getAutopilotSettings(workspaceId)).targetMetric === "outreach_ready" ? (readyRow?.total ?? 0) : (qualifiedRow?.total ?? 0),
+    qualifiedToday: qualifiedRow?.total ?? 0,
     rawQueueDepth: rawDepthRow?.total ?? 0,
     processingQueueDepth: processingDepthRow?.total ?? 0,
     currentYield: yieldRow?.avgYield ?? 0,

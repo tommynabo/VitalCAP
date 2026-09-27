@@ -10,3 +10,5 @@ export * from "./audit";
 export * from "./autopilot";
 export * from "./jobs-meta";
 export * from "./website";
+export * from "./intelligence";
+export * from "./compliance";

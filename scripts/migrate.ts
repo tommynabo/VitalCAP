@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
+import { execSync } from "node:child_process";
 import { neon } from "@neondatabase/serverless";
 
 const migrationDirectory = join(process.cwd(), "drizzle");
@@ -21,28 +22,28 @@ if (!databaseUrl) {
 
 const db = neon(databaseUrl);
 
-await db.unsafe(`
-  CREATE TABLE IF NOT EXISTS ${migrationTable} (
+await db`
+  CREATE TABLE IF NOT EXISTS vitalcap_migrations (
     filename text NOT NULL UNIQUE,
     hash text NOT NULL,
     applied_at timestamptz NOT NULL DEFAULT now()
   )
-`);
+`;
 
-await db.unsafe(`
-  ALTER TABLE ${migrationTable}
+await db`
+  ALTER TABLE vitalcap_migrations
   ADD COLUMN IF NOT EXISTS filename text;
-`);
+`;
 
-await db.unsafe(`
-  ALTER TABLE ${migrationTable}
-  DROP CONSTRAINT IF EXISTS ${migrationTable}_pkey;
-`);
+await db`
+  ALTER TABLE vitalcap_migrations
+  DROP CONSTRAINT IF EXISTS vitalcap_migrations_pkey;
+`;
 
 const migrationColumns = await db`
   SELECT column_name
   FROM information_schema.columns
-  WHERE table_schema = 'public' AND table_name = ${migrationTable}
+  WHERE table_schema = 'public' AND table_name = 'vitalcap_migrations'
 `;
 const hasLegacyId = migrationColumns.some((row) => (row as { column_name: string }).column_name === "id");
 
@@ -55,7 +56,7 @@ for (const filename of files) {
   const hash = createHash("sha256").update(contents).digest("hex");
   const existing = await db`
     SELECT filename, hash
-    FROM ${db.unsafe(migrationTable)}
+    FROM vitalcap_migrations
     WHERE filename = ${filename}
   `;
   const applied = existing[0] as { filename: string; hash: string } | undefined;
@@ -70,12 +71,18 @@ for (const filename of files) {
 
   console.log(`Applying migration ${filename}`);
   const insertMigration = hasLegacyId
-    ? db`INSERT INTO ${db.unsafe(migrationTable)} (id, filename, hash) SELECT COALESCE(MAX(id), 0) + 1, ${filename}, ${hash} FROM ${db.unsafe(migrationTable)}`
-    : db`INSERT INTO ${db.unsafe(migrationTable)} (filename, hash) VALUES (${filename}, ${hash})`;
-  await db.transaction([
-    db`${db.unsafe(contents)}`,
-    insertMigration,
-  ]);
+    ? db`INSERT INTO vitalcap_migrations (id, filename, hash) SELECT COALESCE(MAX(id), 0) + 1, ${filename}, ${hash} FROM vitalcap_migrations`
+    : db`INSERT INTO vitalcap_migrations (filename, hash) VALUES (${filename}, ${hash})`;
+
+  const psqlCommand = `psql "${databaseUrl}" -v ON_ERROR_STOP=1 -c "${contents.replace(/"/g, '\\"').replace(/\$/g, '\\$')}"`;
+  try {
+    execSync(psqlCommand, { stdio: "pipe" });
+  } catch (err: any) {
+    throw new Error(`Failed to execute migration ${filename}: ${err.message}\n${err.stdout}\n${err.stderr}`);
+  }
+
+  // Record the migration after all statements succeeded
+  await insertMigration;
   console.log(`Migration ${filename}: applied`);
 }
 

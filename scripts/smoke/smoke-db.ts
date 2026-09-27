@@ -33,6 +33,14 @@ const requiredTables = [
   "audit_log",
   "conversation_messages",
   "cron_runs",
+  "website_enrichments",
+  "website_evidence",
+  "intelligence_jobs",
+  "prospect_analyses",
+  "compliance_decisions",
+  "email_verifications",
+  "verification_jobs",
+  "campaign_provider_mappings",
 ];
 
 function resolveDatabaseUrl(name: "DATABASE_URL"): string | undefined {
@@ -71,6 +79,8 @@ const requiredMigrationFiles = [
   "0005_phase8g1_stabilization.sql",
   "0006_phase8i_rebalancing.sql",
   "0007_phase8i1_corrective.sql",
+  "0008_phase8j_website_enrichment.sql",
+  "0005_fast_moonstone.sql",
 ];
 const appliedMigrationRows = await db`
   SELECT filename FROM vitalcap_migrations WHERE filename = ANY(${requiredMigrationFiles})
@@ -103,7 +113,7 @@ const queueColumns = await db`
   SELECT table_name, column_name
   FROM information_schema.columns
   WHERE table_schema = 'public'
-    AND table_name IN ('discovery_jobs', 'processing_jobs', 'outreach_queue')
+    AND table_name IN ('discovery_jobs', 'processing_jobs', 'outreach_queue', 'intelligence_jobs', 'verification_jobs')
     AND column_name IN ('next_attempt_at', 'idempotency_key', 'locked_at', 'locked_by')
 `;
 const queueColumnKeys = new Set(
@@ -112,8 +122,8 @@ const queueColumnKeys = new Set(
     return `${value.table_name}.${value.column_name}`;
   }),
 );
-const expectedQueueColumns = ["discovery_jobs", "processing_jobs", "outreach_queue"].flatMap((table) =>
-  ["next_attempt_at", "idempotency_key", "locked_at", "locked_by"].map((column) => `${table}.${column}`),
+const expectedQueueColumns = ["discovery_jobs", "processing_jobs", "outreach_queue", "intelligence_jobs", "verification_jobs"].flatMap((table) =>
+  table === "verification_jobs" ? ["next_attempt_at", "locked_at", "locked_by"].map(c => `${table}.${c}`) : ["next_attempt_at", "idempotency_key", "locked_at", "locked_by"].map((column) => `${table}.${column}`),
 );
 
 const indexes = await db`
@@ -237,4 +247,6 @@ console.log("Migration tracking: PASS");
 console.log("Migrations 0000-0007: PASS");
 console.log("Phase 8I rebalance columns and non-partial unique index: PASS");
 console.log("Raw candidate seed/provider/account attribution: PASS");
+console.log("Prospect Intelligence tables: PASS");
+console.log("Compliance & Provider Readiness tables: PASS");
 console.log("Transaction round-trip: PASS");

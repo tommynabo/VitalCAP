@@ -88,6 +88,7 @@ const serverEnvSchema = z
     LLM_PROVIDER: z.enum(["openai", "disabled", "mock"]).default("disabled"),
     LLM_PROVIDER_API_KEY: z.string().optional(),
     LLM_MODEL: z.string().default("gpt-4.1-mini"),
+    PROSPECT_LLM_MODEL: z.string().default("gpt-4o-2024-08-06"),
   })
   .superRefine((env, ctx) => {
     if (env.VERCEL_ENV === "production" && optionalEnvValue(process.env.APP_ENV) !== "production") {
@@ -178,6 +179,7 @@ export function getServerEnv(): ServerEnv {
     LLM_PROVIDER: process.env.LLM_PROVIDER,
     LLM_PROVIDER_API_KEY: optionalEnvValue(process.env.LLM_PROVIDER_API_KEY),
     LLM_MODEL: optionalEnvValue(process.env.LLM_MODEL),
+    PROSPECT_LLM_MODEL: optionalEnvValue(process.env.PROSPECT_LLM_MODEL),
   });
   return cached;
 }
