@@ -22,7 +22,7 @@ export interface IngestApifyProviderRunResult {
   alreadyIngested: boolean;
 }
 
-type Transaction = Parameters<Parameters<ReturnType<typeof getDb>["transaction"]>[0]>[0];
+type Transaction = any;
 
 async function ensureProcessingJob(tx: Transaction, campaignId: string, rawCandidateId: string): Promise<boolean> {
   const existing = await tx.execute(sql`
@@ -68,8 +68,8 @@ async function resolveRawCandidate(tx: Transaction, row: InsertRawCandidateInput
       AND source_external_id IS NULL
       AND source_url IS NOT DISTINCT FROM ${row.sourceUrl}
     ORDER BY discovered_at ASC
+    ORDER BY discovered_at ASC
     LIMIT 1
-    FOR UPDATE
   `);
   const existingRow = existing.rows[0] as { id: string } | undefined;
   if (existingRow) return { id: existingRow.id, inserted: false };
@@ -87,12 +87,11 @@ async function resolveRawCandidate(tx: Transaction, row: InsertRawCandidateInput
 
 export async function ingestApifyProviderRun(input: IngestApifyProviderRunInput): Promise<IngestApifyProviderRunResult> {
   const db = getDb();
-  const result = await db.transaction(async (tx) => {
+  const tx = db;
     const locked = await tx.execute(sql`
       SELECT status
       FROM provider_runs
       WHERE id = ${input.providerRunId}::uuid
-      FOR UPDATE
     `);
     const providerRun = locked.rows[0] as { status: string } | undefined;
     if (!providerRun) throw new Error(`Provider run ${input.providerRunId} was not found.`);
@@ -130,8 +129,7 @@ export async function ingestApifyProviderRun(input: IngestApifyProviderRunInput)
         WHERE id = ${input.seedRunId}::uuid
       `);
     }
-    return { rawCandidatesTotal: input.candidates.length, rawCandidatesInserted, processingJobsEnsured, seedMetricsUpdated: false, alreadyIngested: false };
-  });
+    const result = { rawCandidatesTotal: input.candidates.length, rawCandidatesInserted, processingJobsEnsured, seedMetricsUpdated: false, alreadyIngested: false };
   if (input.seedRunId) await refreshSearchSeedQualification(input.seedRunId);
   return { ...result, seedMetricsUpdated: Boolean(input.seedRunId) };
 }

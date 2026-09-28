@@ -59,7 +59,8 @@ export class MapsFastEngine implements DiscoveryEngine {
         discoveredAt: new Date().toISOString(),
       }));
       return { rawCandidates, providerCalls: 1, providerErrors, latencyMs: Date.now() - start };
-    } catch {
+    } catch (err) {
+      console.error("executeDiscovery caught error:", err);
       providerErrors = 1;
       return { rawCandidates: [], providerCalls: 1, providerErrors, latencyMs: Date.now() - start };
     }

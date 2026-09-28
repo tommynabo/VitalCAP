@@ -225,7 +225,7 @@ export async function updateRawCandidateAccountId(rawCandidateId: string, accoun
 
 export async function refreshSearchSeedQualification(searchSeedRunId: string): Promise<void> {
   const db = getDb();
-  await db.transaction(async (tx) => {
+  const tx = db;
     const counts = await tx.execute(sql`
       SELECT
         ssr.seed_id,
@@ -295,7 +295,6 @@ export async function refreshSearchSeedQualification(searchSeedRunId: string): P
           next_eligible_at = ${updated.nextEligibleAt}::timestamptz
       WHERE ss.id = ${row.seed_id}::uuid
     `);
-  });
 }
 
 export async function getRawCandidateById(id: string): Promise<RawCandidate | null> {

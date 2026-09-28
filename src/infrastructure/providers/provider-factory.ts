@@ -44,7 +44,7 @@ export function createMapsDiscoveryProvider(workspaceId: string, role: MapsEngin
     throw new Error("MAPS_PROVIDER=apify requires APIFY_API_TOKEN to be set.");
   }
 
-  const actorId = role === "maps_fast" ? env.APIFY_MAPS_FAST_ACTOR : role === "maps_deep" ? env.APIFY_MAPS_DEEP_ACTOR : env.APIFY_MAPS_FALLBACK_ACTOR;
+  const actorId = role === "maps_fast" ? (env.APIFY_MAPS_FAST_ACTOR || "compass/crawler-google-places") : role === "maps_deep" ? (env.APIFY_MAPS_DEEP_ACTOR || "compass/crawler-google-places") : (env.APIFY_MAPS_FALLBACK_ACTOR || "compass/crawler-google-places");
 
   return new ApifyMapsDiscoveryProvider({
     apiToken: env.APIFY_API_TOKEN,

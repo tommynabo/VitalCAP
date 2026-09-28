@@ -14,6 +14,7 @@ export interface EngineCapability {
 
 export interface EngineCapabilityInput {
   mapsProvider: "apify" | "mock";
+  mapsProviderConfigured: boolean;
   serpProvider: "serper" | "disabled" | "mock";
   mapsFastHealth: ProviderHealthStatus;
   costAllowed: boolean;
@@ -22,7 +23,7 @@ export interface EngineCapabilityInput {
 
 export function buildEngineCapabilities(input: EngineCapabilityInput): EngineCapability[] {
   const definitions: Array<[EngineType, boolean, boolean, ProviderHealthStatus]> = [
-    ["maps_fast", input.mapsProvider === "apify", true, input.mapsFastHealth],
+    ["maps_fast", input.mapsProvider === "apify" && input.mapsProviderConfigured, true, input.mapsFastHealth],
     ["maps_deep", false, false, "paused"],
     ["google_serp", input.serpProvider === "serper", input.serpProvider === "serper", "paused"],
     ["linkedin_owner", input.serpProvider === "serper", input.serpProvider === "serper", "paused"],

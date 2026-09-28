@@ -8,7 +8,7 @@ export function buildCompassActorInput(input: MapsSearchInput, maxResults: numbe
     locationQuery: input.geography,
     maxCrawledPlacesPerSearch: maxResults,
     language: "es",
-    countryCode: "ES",
+    countryCode: "es",
     skipClosedPlaces: true,
     scrapePlaceDetailPage: false,
     scrapeContacts: false,

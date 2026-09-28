@@ -63,6 +63,7 @@ export async function runAutopilotCronTick(now: Date = new Date()): Promise<Auto
     const serperEnv = getSerperEnv();
     const capabilities = buildEngineCapabilities({
       mapsProvider: mapsEnv.MAPS_PROVIDER,
+      mapsProviderConfigured: Boolean(mapsEnv.APIFY_API_TOKEN),
       serpProvider: serperEnv.SERP_PROVIDER,
       mapsFastHealth: pacing.providerHealth,
       costAllowed: pacing.apifyDailyBudgetRemaining > 0,

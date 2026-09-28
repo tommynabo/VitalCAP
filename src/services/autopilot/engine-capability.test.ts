@@ -5,6 +5,7 @@ describe("engine capabilities", () => {
   it("only exposes configured healthy Maps Fast as available", () => {
     const capabilities = buildEngineCapabilities({
       mapsProvider: "apify",
+      mapsProviderConfigured: true,
       serpProvider: "disabled",
       mapsFastHealth: "healthy",
       costAllowed: true,
@@ -18,6 +19,7 @@ describe("engine capabilities", () => {
   it("blocks Maps Fast when provider health or budget blocks paid work", () => {
     const capabilities = buildEngineCapabilities({
       mapsProvider: "apify",
+      mapsProviderConfigured: true,
       serpProvider: "disabled",
       mapsFastHealth: "paused",
       costAllowed: false,
@@ -29,6 +31,7 @@ describe("engine capabilities", () => {
   it("allows a configured untested provider to bootstrap paid work", () => {
     const maps = buildEngineCapabilities({
       mapsProvider: "apify",
+      mapsProviderConfigured: true,
       serpProvider: "disabled",
       mapsFastHealth: "untested",
       costAllowed: true,
