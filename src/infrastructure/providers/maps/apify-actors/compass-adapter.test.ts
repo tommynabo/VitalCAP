@@ -9,7 +9,7 @@ describe("Compass adapter", () => {
     expect(input.searchStringsArray).toEqual(["farmacia"]);
     expect(input.locationQuery).toBe("Barcelona, Spain");
     expect(input.maxCrawledPlacesPerSearch).toBe(5);
-    expect(input.countryCode).toBe("ES");
+    expect(input.countryCode).toBe("es");
     expect(input.language).toBe("es");
     expect(input.scrapeContacts).toBe(false);
     expect(input.maximumLeadsEnrichmentRecords).toBe(0);

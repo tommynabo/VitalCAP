@@ -10,6 +10,7 @@ const coreEnvSchema = z.object({
   DEFAULT_DELIVERY_MODE: z.enum(["dry_run", "live"]).default("dry_run"),
   DEFAULT_BOOKING_URL: z.string().optional(),
   CRON_SECRET: z.string().optional(),
+  ACTIVATION_MAX_DAILY_RAW_REQUESTS: z.coerce.number().default(15),
 }).superRefine((env, ctx) => {
   if (env.VERCEL_ENV === "production" && optionalEnvValue(process.env.APP_ENV) !== "production") {
     ctx.addIssue({ code: "custom", message: "VERCEL_ENV=production requires APP_ENV=production.", path: ["APP_ENV"] });
@@ -40,6 +41,7 @@ export function getCoreEnv() {
     DEFAULT_DELIVERY_MODE: optionalEnvValue(process.env.DEFAULT_DELIVERY_MODE),
     DEFAULT_BOOKING_URL: optionalEnvValue(process.env.DEFAULT_BOOKING_URL),
     CRON_SECRET: optionalEnvValue(process.env.CRON_SECRET),
+    ACTIVATION_MAX_DAILY_RAW_REQUESTS: optionalEnvValue(process.env.ACTIVATION_MAX_DAILY_RAW_REQUESTS),
   });
   return cachedCoreEnv;
 }

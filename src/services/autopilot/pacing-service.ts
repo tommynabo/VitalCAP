@@ -123,6 +123,7 @@ export interface PacingComputationInput {
   now: Date;
   operatingStartHour?: number | null;
   operatingEndHour?: number | null;
+  maxDailyRawRequests?: number | null;
 }
 
 export function computeAutopilotPacing(input: PacingComputationInput): AutopilotPacingState {
@@ -143,7 +144,12 @@ export function computeAutopilotPacing(input: PacingComputationInput): Autopilot
   const qualifiedNeededToPlan = windowClosed || input.providerHealth === "paused" || input.apifyDailyBudgetRemaining <= 0
     ? 0
     : Math.min(remainingTarget, Math.ceil(paceDeficit * 1.1));
-  const rawNeededToPlan = qualifiedNeededToPlan > 0 ? Math.min(100, Math.ceil(qualifiedNeededToPlan / boundedYield)) : 0;
+  
+  const rawRemainingToday = typeof input.maxDailyRawRequests === "number" 
+    ? Math.max(0, input.maxDailyRawRequests - input.rawCandidatesToday) 
+    : 1000;
+  const rawNeededToPlan = qualifiedNeededToPlan > 0 ? Math.min(100, rawRemainingToday, Math.ceil(qualifiedNeededToPlan / boundedYield)) : 0;
+  
   const hoursRemaining = Math.max(0, (endMinutes - nowMinutes) / 60);
   const status: PacingStatus = nowMinutes < startMinutes
     ? "before_window"

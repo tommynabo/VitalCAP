@@ -113,6 +113,7 @@ export async function getAutopilotPacingState(workspaceId: string, now = new Dat
     now,
     operatingStartHour: settings.operatingStartHour,
     operatingEndHour: settings.operatingEndHour,
+    maxDailyRawRequests: (await import("@/lib/config/env")).getCoreEnv().ACTIVATION_MAX_DAILY_RAW_REQUESTS,
   });
 }
 
