@@ -35,6 +35,7 @@ export const autopilotSettings = pgTable("autopilot_settings", {
     .references(() => workspaces.id, { onDelete: "cascade" }),
   enabled: boolean("enabled").notNull().default(false),
   emergencyStopped: boolean("emergency_stopped").notNull().default(false),
+  systemPaused: boolean("system_paused").notNull().default(false),
   globalDailyTarget: integer("global_daily_target").notNull().default(25),
   targetMetric: text("target_metric").notNull().default("qualified"),
   timezone: text("timezone").notNull().default("Europe/Madrid"),

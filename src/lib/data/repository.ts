@@ -98,6 +98,7 @@ export async function getAutopilotSettingsData(): Promise<AutopilotSettings> {
       workspaceId: "ws_demo",
       enabled: false,
       emergencyStopped: false,
+      systemPaused: false,
       globalDailyTarget: 25,
       targetMetric: "qualified",
       timezone: "Europe/Madrid",

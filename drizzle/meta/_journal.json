@@ -57,6 +57,13 @@
       "when": 1790523994272,
       "tag": "0007_freezing_hawkeye",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1790600537050,
+      "tag": "0008_illegal_misty_knight",
+      "breakpoints": true
     }
   ]
 }

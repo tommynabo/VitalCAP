@@ -19,6 +19,7 @@ import { computeAutopilotPacing } from "@/services/autopilot/pacing-service";
 const DEFAULT_AUTOPILOT_SETTINGS = {
   enabled: false,
   emergencyStopped: false,
+  systemPaused: false,
   globalDailyTarget: 25,
   targetMetric: "qualified",
   timezone: "Europe/Madrid",
@@ -32,6 +33,7 @@ function toAutopilotSettings(row: typeof autopilotSettings.$inferSelect): Autopi
     workspaceId: row.workspaceId,
     enabled: row.enabled,
     emergencyStopped: row.emergencyStopped,
+    systemPaused: row.systemPaused,
     globalDailyTarget: row.globalDailyTarget,
     targetMetric: row.targetMetric as AutopilotSettings["targetMetric"],
     timezone: row.timezone,

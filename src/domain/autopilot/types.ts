@@ -19,6 +19,7 @@ export interface AutopilotSettings {
   workspaceId: string;
   enabled: boolean;
   emergencyStopped: boolean;
+  systemPaused: boolean;
   globalDailyTarget: number;
   targetMetric: AutopilotTargetMetric;
   timezone: string;

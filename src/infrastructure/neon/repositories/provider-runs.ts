@@ -23,7 +23,7 @@ export interface RecordProviderRunInput {
   metadata?: Record<string, unknown>;
 }
 
-export type ProviderRunStatus = "starting" | "queued" | "running" | "succeeded" | "failed" | "aborted" | "timed_out" | "ingested" | "completed";
+export type ProviderRunStatus = "starting" | "queued" | "running" | "succeeded" | "failed" | "aborted" | "timed_out" | "ingested" | "completed" | "manual_reconciliation_required";
 
 /**
  * Persists one provider-run event (Prompt 7 §14 cost-guard audit trail —
