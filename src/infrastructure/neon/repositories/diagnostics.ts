@@ -5,7 +5,7 @@ import { outreachQueue, outreachEvents, deadLetterJobs } from "../schema/outreac
 import { campaigns } from "../schema/campaigns";
 import { providerRuns } from "../schema/providers";
 import { cronRuns } from "../schema/jobs-meta";
-import { getServerEnv } from "@/lib/config/env";
+import { getMapsEnv, getSerperEnv, getVerificationEnv, getDeliveryEnv, getIntelligenceEnv } from "@/lib/config/env";
 import type { ProviderUsageStats } from "@/domain/providers/types";
 
 export type ProviderRowStatus = "connected" | "degraded" | "paused" | "missing_configuration" | "unknown";
@@ -19,37 +19,41 @@ export type ProviderRowStatus = "connected" | "degraded" | "paused" | "missing_c
  * asserts with confidence, everything else is reported as "unknown".
  */
 export function getProviderRows(): Array<{ name: string; status: ProviderRowStatus; detail: string }> {
-  const env = getServerEnv();
+  const mapsEnv = getMapsEnv();
+  const serperEnv = getSerperEnv();
+  const verifyEnv = getVerificationEnv();
+  const deliveryEnv = getDeliveryEnv();
+  const intelEnv = getIntelligenceEnv();
   const rows: Array<{ name: string; status: ProviderRowStatus; detail: string }> = [];
 
   rows.push(
-    env.EMAIL_DELIVERY_PROVIDER === "instantly" && env.INSTANTLY_API_KEY
+    deliveryEnv.EMAIL_DELIVERY_PROVIDER === "instantly" && deliveryEnv.INSTANTLY_API_KEY
       ? { name: "Email delivery (Instantly)", status: "unknown", detail: "Configured — health not yet probed" }
       : { name: "Email delivery (Instantly)", status: "missing_configuration", detail: "INSTANTLY_API_KEY not set" },
   );
   rows.push({ name: "SMS delivery", status: "paused", detail: "SMS is disabled by product policy" });
   rows.push(
-    env.EMAIL_VERIFICATION_PROVIDER === "millionverifier" && env.MILLIONVERIFIER_API_KEY
+    verifyEnv.EMAIL_VERIFICATION_PROVIDER === "millionverifier" && verifyEnv.MILLIONVERIFIER_API_KEY
       ? { name: "Email verification", status: "unknown", detail: "Configured — health not yet probed" }
       : { name: "Email verification", status: "missing_configuration", detail: "MILLIONVERIFIER_API_KEY not set" },
   );
   rows.push(
-    env.MAPS_PROVIDER === "apify" && env.APIFY_API_TOKEN
+    mapsEnv.MAPS_PROVIDER === "apify" && mapsEnv.APIFY_API_TOKEN
       ? { name: "Maps discovery", status: "unknown", detail: "Configured — health not yet probed" }
       : { name: "Maps discovery", status: "missing_configuration", detail: "APIFY_API_TOKEN not set" },
   );
   rows.push(
-    env.SERP_PROVIDER === "serper" && env.SERPER_API_KEY
+    serperEnv.SERP_PROVIDER === "serper" && serperEnv.SERPER_API_KEY
       ? { name: "Google SERP / LinkedIn owner", status: "unknown", detail: "Configured — health not yet probed" }
       : { name: "Google SERP / LinkedIn owner", status: "missing_configuration", detail: "SERPER_API_KEY not set" },
   );
   rows.push(
-    env.LLM_PROVIDER === "openai" && env.LLM_PROVIDER_API_KEY
+    intelEnv.LLM_PROVIDER === "openai" && intelEnv.LLM_PROVIDER_API_KEY
       ? { name: "LLM (setter drafts)", status: "unknown", detail: "Configured — health not yet probed" }
       : { name: "LLM (setter drafts)", status: "missing_configuration", detail: "LLM_PROVIDER_API_KEY not set" },
   );
   rows.push(
-    env.INSTANTLY_WEBHOOK_SECRET
+    deliveryEnv.INSTANTLY_WEBHOOK_SECRET
       ? { name: "Outreach webhooks", status: "unknown", detail: "Signature secret configured" }
       : { name: "Outreach webhooks", status: "missing_configuration", detail: "INSTANTLY_WEBHOOK_SECRET not set" },
   );

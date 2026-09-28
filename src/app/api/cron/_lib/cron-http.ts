@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { NextResponse, type NextRequest } from "next/server";
-import { getServerEnv } from "@/lib/config/env";
+import { getCoreEnv } from "@/lib/config/env";
 import { startCronRun, finishCronRun } from "@/infrastructure/neon/repositories/cron-runs";
 import { logEvent } from "@/lib/observability/structured-logger";
 
@@ -13,7 +13,7 @@ import { logEvent } from "@/lib/observability/structured-logger";
  * duplicated here (§25).
  */
 export function isAuthorizedCronRequest(request: NextRequest): boolean {
-  const env = getServerEnv();
+  const env = getCoreEnv();
   if (!env.CRON_SECRET) {
     // env validation already hard-requires CRON_SECRET when APP_ENV === "production" (see lib/config/env.ts),
     // so reaching here with no secret configured only happens in local/dev/test — allow it there only.

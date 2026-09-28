@@ -6,7 +6,7 @@ import {
   ProviderUsageStats,
   emptyProviderUsageStats
 } from "@/domain/providers/types";
-import { getServerEnv } from "@/lib/config/env";
+import { getCoreEnv, getDeliveryEnv } from "@/lib/config/env";
 
 /**
  * Real Instantly EmailDeliveryProvider.
@@ -17,7 +17,7 @@ export class InstantlyEmailDeliveryProvider implements EmailDeliveryProvider {
   private apiKey: string | null;
 
   constructor() {
-    const env = getServerEnv();
+    const env = getDeliveryEnv();
     this.apiKey = env.INSTANTLY_API_KEY || null;
   }
 
@@ -29,11 +29,11 @@ export class InstantlyEmailDeliveryProvider implements EmailDeliveryProvider {
 
   async addLead(input: EmailLeadInput): Promise<{ result: EmailLeadResult; usage: ProviderUsageStats }> {
     this.ensureConfigured();
-    const env = getServerEnv();
+    const coreEnv = getCoreEnv();
     
     let data: any;
 
-    if (env.DEFAULT_DELIVERY_MODE === "dry_run") {
+    if (coreEnv.DEFAULT_DELIVERY_MODE === "dry_run") {
       data = {
         status: "success",
         message: "Lead uploaded successfully",
@@ -111,7 +111,7 @@ export class InstantlyEmailDeliveryProvider implements EmailDeliveryProvider {
         status: status as any
       },
       usage: {
-        calls: env.DEFAULT_DELIVERY_MODE === "dry_run" ? 0 : 1,
+        calls: coreEnv.DEFAULT_DELIVERY_MODE === "dry_run" ? 0 : 1,
         items: 1,
         errors: 0,
         totalLatencyMs: 0,

@@ -12,7 +12,7 @@ import type { AutopilotSettings, EngineTargetState, GlobalAutopilotState, Rebala
 import { getDayBounds } from "@/lib/time/day-bounds";
 import { getAutopilotPacingMetrics } from "./autopilot-pacing";
 import { getRecentProviderUsage } from "./provider-runs";
-import { getServerEnv } from "@/lib/config/env";
+import { getMapsEnv } from "@/lib/config/env";
 import { evaluateProviderHealth } from "@/services/discovery/provider-health";
 import { computeAutopilotPacing } from "@/services/autopilot/pacing-service";
 
@@ -94,7 +94,7 @@ export async function getAutopilotPacingState(workspaceId: string, now = new Dat
   const estimatedYield = metrics.historicalRawSampleSize >= 20
     ? Math.min(1, Math.max(0.1, metrics.historicalQualifiedCount / metrics.historicalRawSampleSize))
     : 0.25;
-  const env = getServerEnv();
+  const env = getMapsEnv();
   const effectiveBudget = Math.min(env.APIFY_DAILY_COST_LIMIT_USD, settings.maxDailyApifySpendUsd ?? Number.POSITIVE_INFINITY);
   return computeAutopilotPacing({
     workspaceId,

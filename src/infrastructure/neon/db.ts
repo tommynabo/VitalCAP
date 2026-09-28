@@ -1,6 +1,6 @@
 import { neon } from "@neondatabase/serverless";
 import { drizzle } from "drizzle-orm/neon-http";
-import { getServerEnv } from "@/lib/config/env";
+import { getDatabaseEnv } from "@/lib/config/env";
 import * as schema from "./schema";
 
 /**
@@ -15,7 +15,7 @@ let cachedDb: ReturnType<typeof drizzle<typeof schema>> | undefined;
 
 export function getDb() {
   if (cachedDb) return cachedDb;
-  const env = getServerEnv();
+  const env = getDatabaseEnv();
   if (!env.DATABASE_URL) {
     throw new Error(
       "DATABASE_URL is not configured. Set it (or the Neon-integration-provided " +

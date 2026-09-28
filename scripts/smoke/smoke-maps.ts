@@ -8,7 +8,7 @@
  */
 import { writeFileSync } from "node:fs";
 import { and, eq, inArray, sql } from "drizzle-orm";
-import { getServerEnv } from "../../src/lib/config/env";
+import { getMapsEnv } from "../../src/lib/config/env";
 import { getDb, schema } from "../../src/infrastructure/neon/db";
 import { getTodaySpendUsd, recordProviderRun } from "../../src/infrastructure/neon/repositories/provider-runs";
 import { insertRawCandidates } from "../../src/infrastructure/neon/repositories/discovery";
@@ -128,7 +128,7 @@ function writeReport(values: Record<string, string | number>): void {
 }
 
 async function main(): Promise<void> {
-  const env = getServerEnv();
+  const env = getMapsEnv();
   if (!env.APIFY_API_TOKEN) throw new Error("APIFY_API_TOKEN is required; no mock fallback is allowed.");
   if (env.MAPS_PROVIDER !== "apify") throw new Error('MAPS_PROVIDER must be "apify" for smoke:maps.');
   if (env.APIFY_MAPS_FAST_ACTOR !== COMPASS_ACTOR_ID) throw new Error(`APIFY_MAPS_FAST_ACTOR must be ${COMPASS_ACTOR_ID}.`);

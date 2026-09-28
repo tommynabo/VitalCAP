@@ -4,7 +4,7 @@ import { getAutopilotSettings, getAutopilotPacingState } from "@/infrastructure/
 import { enqueueDiscoveryJob } from "@/infrastructure/neon/repositories/job-queue";
 import { allocateMapsFastRawNeed } from "@/services/autopilot/target-planner";
 import { getEffectiveAutopilotState } from "@/domain/autopilot/types";
-import { getServerEnv } from "@/lib/config/env";
+import { getMapsEnv, getSerperEnv } from "@/lib/config/env";
 import { buildEngineCapabilities } from "@/services/autopilot/engine-capability";
 import { planRebalancing, type CampaignPerformance } from "@/services/autopilot/rebalancing";
 import { planHybridFill } from "@/services/autopilot/hybrid-fill-planner";
@@ -59,10 +59,11 @@ export async function runAutopilotCronTick(now: Date = new Date()): Promise<Auto
     }
     const pacing = await getAutopilotPacingState(workspaceId, now);
     pacingStates.push(pacing);
-    const env = getServerEnv();
+    const mapsEnv = getMapsEnv();
+    const serperEnv = getSerperEnv();
     const capabilities = buildEngineCapabilities({
-      mapsProvider: env.MAPS_PROVIDER,
-      serpProvider: env.SERP_PROVIDER,
+      mapsProvider: mapsEnv.MAPS_PROVIDER,
+      serpProvider: serperEnv.SERP_PROVIDER,
       mapsFastHealth: pacing.providerHealth,
       costAllowed: pacing.apifyDailyBudgetRemaining > 0,
       campaignCounts: { maps_fast: campaigns.filter((campaign) => campaign.engineType === "maps_fast").length },

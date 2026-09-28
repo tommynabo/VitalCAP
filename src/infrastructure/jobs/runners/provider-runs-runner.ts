@@ -1,6 +1,6 @@
 import { listWorkspaceIds } from "@/infrastructure/neon/repositories/workspace";
 import { getTodaySpendUsd, listApifyRunsForPolling, updateProviderRun } from "@/infrastructure/neon/repositories/provider-runs";
-import { getServerEnv } from "@/lib/config/env";
+import { getMapsEnv } from "@/lib/config/env";
 import { getAutopilotSettings } from "@/infrastructure/neon/repositories/autopilot";
 import { ApifyClient } from "@/infrastructure/providers/maps/apify-client";
 import { mapCompassItemToPlaceResult } from "@/infrastructure/providers/maps/apify-actors/compass-adapter";
@@ -40,7 +40,7 @@ export interface ProviderRunsCronResult {
 
 /** Polls a bounded number of durable Compass runs; it never waits for an Actor. */
 export async function runProviderRunsCronTick(maxRuns = MAX_RUNS_PER_TICK): Promise<ProviderRunsCronResult> {
-  const env = getServerEnv();
+  const env = getMapsEnv();
   if (!env.APIFY_API_TOKEN) return { runsChecked: 0, runsIngested: 0, candidatesInserted: 0, warnings: ["APIFY_API_TOKEN is not configured."] };
 
   const client = new ApifyClient({ apiToken: env.APIFY_API_TOKEN });
@@ -116,7 +116,7 @@ export async function runProviderRunsCronTick(maxRuns = MAX_RUNS_PER_TICK): Prom
 
 /** Cost/health audit retained alongside the async poller. */
 export async function runProviderRunsCronCheck(): Promise<ProviderRunsCheckResult> {
-  const env = getServerEnv();
+  const env = getMapsEnv();
   const workspaceIds = await listWorkspaceIds();
   const warnings: string[] = [];
   for (const workspaceId of workspaceIds) {

@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getServerEnv } from "@/lib/config/env";
+import { getCoreEnv } from "@/lib/config/env";
 import { IntelligenceQueueProcessor } from "@/services/intelligence/queue-processor";
 import { getDb, schema } from "@/infrastructure/neon/db";
 import { eq } from "drizzle-orm";
@@ -8,7 +8,7 @@ export const maxDuration = 300; // 5 minutes max
 export const dynamic = "force-dynamic";
 
 export async function GET(request: NextRequest) {
-  const env = getServerEnv();
+  const env = getCoreEnv();
   const authHeader = request.headers.get("authorization");
   
   if (env.APP_ENV === "production" && authHeader !== `Bearer ${env.CRON_SECRET}`) {

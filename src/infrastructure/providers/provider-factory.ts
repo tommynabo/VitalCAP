@@ -1,5 +1,5 @@
 import type { EmailVerificationProvider, MapsDiscoveryProvider, SerpDiscoveryProvider } from "@/domain/providers/types";
-import { getServerEnv } from "@/lib/config/env";
+import { getMapsEnv, getSerperEnv, getVerificationEnv } from "@/lib/config/env";
 import { MockMapsDiscoveryProvider } from "./maps/mock-provider";
 import { ApifyMapsDiscoveryProvider } from "./maps/apify-provider";
 import { MockSerpDiscoveryProvider } from "./serp/mock-provider";
@@ -37,7 +37,7 @@ const disabledEmailVerificationProvider: EmailVerificationProvider = {
  * "which concrete class".
  */
 export function createMapsDiscoveryProvider(workspaceId: string, role: MapsEngineRole): MapsDiscoveryProvider {
-  const env = getServerEnv();
+  const env = getMapsEnv();
   if (env.MAPS_PROVIDER === "mock") return new MockMapsDiscoveryProvider();
 
   if (!env.APIFY_API_TOKEN) {
@@ -74,7 +74,7 @@ export function createMapsDiscoveryProvider(workspaceId: string, role: MapsEngin
 }
 
 export function createSerpDiscoveryProvider(workspaceId: string): SerpDiscoveryProvider {
-  const env = getServerEnv();
+  const env = getSerperEnv();
   if (env.SERP_PROVIDER === "disabled") throw new ProviderDisabledError("SERP_PROVIDER");
   if (env.SERP_PROVIDER === "mock") return new MockSerpDiscoveryProvider();
 
@@ -111,7 +111,7 @@ export function createSerpDiscoveryProvider(workspaceId: string): SerpDiscoveryP
 }
 
 export function createEmailVerificationProvider(workspaceId: string): EmailVerificationProvider {
-  const env = getServerEnv();
+  const env = getVerificationEnv();
   if (env.EMAIL_VERIFICATION_PROVIDER === "disabled") return disabledEmailVerificationProvider;
   if (env.EMAIL_VERIFICATION_PROVIDER === "mock") return new MockEmailVerificationProvider();
 

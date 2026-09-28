@@ -1,5 +1,5 @@
 import OpenAI from "openai";
-import { getServerEnv } from "@/lib/config/env";
+import { getIntelligenceEnv } from "@/lib/config/env";
 import { ProspectContext, ProspectAnalysisOutputSchema, ProspectAnalysisOutput } from "./types";
 import { createHash } from "node:crypto";
 import { getDb, schema } from "@/infrastructure/neon/db";
@@ -14,7 +14,7 @@ export class OpenAIProspectAnalyzer {
   private provider: string;
 
   constructor() {
-    const env = getServerEnv();
+    const env = getIntelligenceEnv();
     this.provider = env.LLM_PROVIDER;
     
     // Do not fabricate a model ID, require explicit config
@@ -47,7 +47,7 @@ ${JSON.stringify(context, null, 2)}`;
   }
 
   private async checkBudget(): Promise<boolean> {
-    const env = getServerEnv();
+    const env = getIntelligenceEnv();
     if (env.LLM_DAILY_COST_LIMIT_USD || env.LLM_BATCH_COST_LIMIT_USD) {
       // Very basic budget placeholder logic. 
       // A robust implementation would query the db for daily spend and compare against the limits.

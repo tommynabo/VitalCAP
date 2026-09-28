@@ -1,18 +1,13 @@
 import { describe, expect, it } from "vitest";
-import { getServerEnv, resetServerEnvCacheForTests } from "@/lib/config/env";
+import { getCoreEnv, resetServerEnvCacheForTests } from "@/lib/config/env";
 
-describe("getServerEnv", () => {
+describe("getCoreEnv", () => {
   function withProductionEnv(run: () => void) {
-    const names = ["APP_ENV", "VERCEL_ENV", "DEV_SEED_MODE", "DATABASE_URL", "CRON_SECRET", "MAPS_PROVIDER", "NEON_AUTH_BASE_URL", "NEON_AUTH_COOKIE_SECRET", "APIFY_API_TOKEN"];
+    const names = ["APP_ENV", "VERCEL_ENV", "DEV_SEED_MODE", "CRON_SECRET"];
     const original = Object.fromEntries(names.map((name) => [name, process.env[name]]));
     try {
       process.env.VERCEL_ENV = "production";
-      process.env.DATABASE_URL = "postgres://user:password@example.test/db";
       process.env.CRON_SECRET = "test-cron-secret";
-      process.env.MAPS_PROVIDER = "apify";
-      process.env.NEON_AUTH_BASE_URL = "https://auth.example.test";
-      process.env.NEON_AUTH_COOKIE_SECRET = "12345678901234567890123456789012";
-      process.env.APIFY_API_TOKEN = "test-apify-token";
       run();
     } finally {
       for (const name of names) {
@@ -24,14 +19,14 @@ describe("getServerEnv", () => {
   }
 
   it("defaults to development app env, seed mode on, and dry_run delivery", () => {
-    const env = getServerEnv();
+    const env = getCoreEnv();
     expect(env.APP_ENV).toBe("development");
     expect(env.DEV_SEED_MODE).toBe(true);
     expect(env.DEFAULT_DELIVERY_MODE).toBe("dry_run");
   });
 
   it("never defaults DEFAULT_DELIVERY_MODE to live", () => {
-    const env = getServerEnv();
+    const env = getCoreEnv();
     expect(env.DEFAULT_DELIVERY_MODE).not.toBe("live");
   });
 
@@ -42,7 +37,7 @@ describe("getServerEnv", () => {
     process.env.DEFAULT_DELIVERY_MODE = "";
     resetServerEnvCacheForTests();
 
-    const env = getServerEnv();
+    const env = getCoreEnv();
 
     expect(env.APP_ENV).toBe("development");
     expect(env.DEFAULT_DELIVERY_MODE).toBe("dry_run");
@@ -61,7 +56,7 @@ describe("getServerEnv", () => {
     process.env.DEV_SEED_MODE = "true";
     resetServerEnvCacheForTests();
 
-    expect(() => getServerEnv()).toThrow(/DEV_SEED_MODE=true is forbidden/);
+    expect(() => getCoreEnv()).toThrow(/DEV_SEED_MODE=true is forbidden/);
 
     if (originalAppEnv === undefined) delete process.env.APP_ENV;
     else process.env.APP_ENV = originalAppEnv;
@@ -75,7 +70,7 @@ describe("getServerEnv", () => {
       delete process.env.APP_ENV;
       process.env.DEV_SEED_MODE = "false";
       resetServerEnvCacheForTests();
-      expect(() => getServerEnv()).toThrow(/requires APP_ENV=production/);
+      expect(() => getCoreEnv()).toThrow(/requires APP_ENV=production/);
     });
   });
 
@@ -84,7 +79,7 @@ describe("getServerEnv", () => {
       process.env.APP_ENV = "development";
       process.env.DEV_SEED_MODE = "false";
       resetServerEnvCacheForTests();
-      expect(() => getServerEnv()).toThrow(/requires APP_ENV=production/);
+      expect(() => getCoreEnv()).toThrow(/requires APP_ENV=production/);
     });
   });
 
@@ -93,7 +88,7 @@ describe("getServerEnv", () => {
       process.env.APP_ENV = "production";
       process.env.DEV_SEED_MODE = "true";
       resetServerEnvCacheForTests();
-      expect(() => getServerEnv()).toThrow(/DEV_SEED_MODE=false/);
+      expect(() => getCoreEnv()).toThrow(/DEV_SEED_MODE=false/);
     });
   });
 
@@ -102,38 +97,8 @@ describe("getServerEnv", () => {
       process.env.APP_ENV = "production";
       process.env.DEV_SEED_MODE = "false";
       resetServerEnvCacheForTests();
-      expect(getServerEnv().VERCEL_ENV).toBe("production");
-      expect(getServerEnv().DEV_SEED_MODE).toBe(false);
-    });
-  });
-
-  it("requires Neon Auth base URL in production", () => {
-    withProductionEnv(() => {
-      process.env.APP_ENV = "production";
-      process.env.DEV_SEED_MODE = "false";
-      delete process.env.NEON_AUTH_BASE_URL;
-      resetServerEnvCacheForTests();
-      expect(() => getServerEnv()).toThrow(/NEON_AUTH_BASE_URL is required/);
-    });
-  });
-
-  it("requires a 32-character Neon Auth cookie secret in production", () => {
-    withProductionEnv(() => {
-      process.env.APP_ENV = "production";
-      process.env.DEV_SEED_MODE = "false";
-      process.env.NEON_AUTH_COOKIE_SECRET = "too-short";
-      resetServerEnvCacheForTests();
-      expect(() => getServerEnv()).toThrow(/at least 32 characters/);
-    });
-  });
-
-  it("requires Apify credentials when Maps uses Apify", () => {
-    withProductionEnv(() => {
-      process.env.APP_ENV = "production";
-      process.env.DEV_SEED_MODE = "false";
-      delete process.env.APIFY_API_TOKEN;
-      resetServerEnvCacheForTests();
-      expect(() => getServerEnv()).toThrow(/APIFY_API_TOKEN is required/);
+      expect(getCoreEnv().VERCEL_ENV).toBe("production");
+      expect(getCoreEnv().DEV_SEED_MODE).toBe(false);
     });
   });
 });

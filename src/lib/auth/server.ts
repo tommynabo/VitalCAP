@@ -3,7 +3,7 @@ import { getAuthEnv } from "@/lib/config/auth-env";
 
 /**
  * Singleton Neon Auth server instance (Better Auth under the hood). Reads
- * `NEON_AUTH_BASE_URL`/`NEON_AUTH_COOKIE_SECRET` via `getServerEnv()`, which
+ * `NEON_AUTH_BASE_URL`/`NEON_AUTH_COOKIE_SECRET` via `getAuthEnv()`, which
  * already resolves the Neon Vercel integration's prefixed variable names.
  * Do not construct a second instance elsewhere — import `auth` from here.
  */
