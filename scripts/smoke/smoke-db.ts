@@ -83,6 +83,7 @@ const requiredMigrationFiles = [
   "0005_fast_moonstone.sql",
   "0006_bouncy_bromley.sql",
   "0009_phase8l1_intelligence_compliance_fix.sql",
+  "0010_phase8o_reliability_fix.sql",
 ];
 const appliedMigrationRows = await db`
   SELECT filename FROM vitalcap_migrations WHERE filename = ANY(${requiredMigrationFiles})
@@ -96,10 +97,10 @@ const rawAndSourceIndexes = await db`
   SELECT indexname
   FROM pg_indexes
   WHERE schemaname = 'public'
-    AND indexname IN ('uq_raw_candidates_campaign_engine_external', 'uq_account_sources_external')
+    AND indexname IN ('uq_raw_candidates_campaign_engine_fingerprint', 'uq_account_sources_external')
 `;
 const expectedReplayIndexes = new Set(rawAndSourceIndexes.map((row) => (row as { indexname: string }).indexname));
-if (!expectedReplayIndexes.has("uq_raw_candidates_campaign_engine_external") || !expectedReplayIndexes.has("uq_account_sources_external")) {
+if (!expectedReplayIndexes.has("uq_raw_candidates_campaign_engine_fingerprint") || !expectedReplayIndexes.has("uq_account_sources_external")) {
   throw new Error("Replay idempotency indexes: FAIL");
 }
 const tables = await db`
@@ -151,19 +152,19 @@ const providerRunColumns = await db`
   SELECT column_name
   FROM information_schema.columns
   WHERE table_schema = 'public' AND table_name = 'provider_runs'
-    AND column_name = ANY(${["request_key", "actor_id", "seed_id", "ingested_at", "error"]})
+    AND column_name = ANY(${["request_key", "actor_id", "seed_id", "ingested_at", "error", "ingestion_attempt_count", "seed_run_id"]})
 `;
 const providerRunColumnNames = new Set(providerRunColumns.map((row) => String((row as { column_name: string }).column_name)));
-const requiredProviderRunColumns = ["request_key", "actor_id", "seed_id", "ingested_at", "error"];
+const requiredProviderRunColumns = ["request_key", "actor_id", "seed_id", "ingested_at", "error", "ingestion_attempt_count", "seed_run_id"];
 
 const autopilotColumns = await db`
   SELECT column_name
   FROM information_schema.columns
   WHERE table_schema = 'public' AND table_name = 'autopilot_settings'
-    AND column_name = ANY(${["workspace_id", "enabled", "emergency_stopped", "global_daily_target", "target_metric", "timezone"]})
+    AND column_name = ANY(${["workspace_id", "enabled", "emergency_stopped", "global_daily_target", "target_metric", "timezone", "system_paused"]})
 `;
 const autopilotColumnNames = new Set(autopilotColumns.map((row) => String((row as { column_name: string }).column_name)));
-const requiredAutopilotColumns = ["workspace_id", "enabled", "emergency_stopped", "global_daily_target", "target_metric", "timezone"];
+const requiredAutopilotColumns = ["workspace_id", "enabled", "emergency_stopped", "global_daily_target", "target_metric", "timezone", "system_paused"];
 const targetMetricConstraint = await db`
   SELECT 1
   FROM pg_constraint

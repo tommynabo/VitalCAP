@@ -31,6 +31,10 @@ export const providerRuns = pgTable(
     startedAt: timestamp("started_at", { withTimezone: true }).notNull().defaultNow(),
     finishedAt: timestamp("finished_at", { withTimezone: true }),
     ingestedAt: timestamp("ingested_at", { withTimezone: true }),
+    ingestionStartedAt: timestamp("ingestion_started_at", { withTimezone: true }),
+    ingestionAttemptCount: integer("ingestion_attempt_count").notNull().default(0),
+    lastIngestionError: text("last_ingestion_error"),
+    seedRunId: uuid("seed_run_id"),
     error: text("error"),
   },
   (table) => [

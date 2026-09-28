@@ -28,7 +28,7 @@ export interface ApifyMapsProviderConfig {
   maxCrawledPlacesPerSearch?: number;
   /** Injected so this provider never imports the Neon repository layer directly (keeps it DB-free and unit-testable). */
   getTodaySpendUsd: () => Promise<number>;
-  getAutopilotState?: () => Promise<"running" | "paused" | "emergency_stopped">;
+  getAutopilotState?: () => Promise<"running" | "paused" | "emergency_stopped" | "system_paused">;
   recordRun?: (run: {
     actorId: string;
     externalRunId: string | null;

@@ -1,5 +1,6 @@
 import { listWorkspaceIds } from "@/infrastructure/neon/repositories/workspace";
-import { getTodaySpendUsd, listApifyRunsForPolling, updateProviderRun } from "@/infrastructure/neon/repositories/provider-runs";
+import { getTodaySpendUsd, listApifyRunsForPolling, updateProviderRun, claimProviderRunForIngestion } from "@/infrastructure/neon/repositories/provider-runs";
+import crypto from "crypto";
 import { getMapsEnv } from "@/lib/config/env";
 import { getAutopilotSettings } from "@/infrastructure/neon/repositories/autopilot";
 import { ApifyClient } from "@/infrastructure/providers/maps/apify-client";
@@ -79,25 +80,40 @@ export async function runProviderRunsCronTick(maxRuns = MAX_RUNS_PER_TICK): Prom
       const metadata = (providerRun.metadata ?? {}) as Record<string, unknown>;
       const discoveryJobId = typeof metadata.discoveryJobId === "string" ? metadata.discoveryJobId : null;
       if (!discoveryJobId) throw new Error(`Provider run ${providerRun.id} has no discovery job metadata.`);
+      
+      const claimed = await claimProviderRunForIngestion(providerRun.id);
+      if (!claimed) {
+        if (providerRun.status === 'ingesting') {
+           warnings.push(`provider_run ${providerRun.id} is already ingesting, skipping.`);
+        }
+        continue;
+      }
+
       const rawItems = await fetchBoundedDatasetItems(client, datasetId, providerRun.itemsRequested || 1);
 
       const places = rawItems.map(mapCompassItemToPlaceResult).filter((place): place is NonNullable<ReturnType<typeof mapCompassItemToPlaceResult>> => place !== null);
+      
       const ingestion = await ingestApifyProviderRun({
         providerRunId: providerRun.id,
         campaignId: providerRun.campaignId!,
         discoveryJobId,
-        seedRunId: typeof metadata.seedRunId === "string" ? metadata.seedRunId : null,
+        seedRunId: typeof metadata.seedRunId === "string" ? metadata.seedRunId : (providerRun.seedRunId ?? null),
         externalDatasetId: datasetId,
-        candidates: places.map((place) => ({
-          discoveryJobId,
-          campaignId: providerRun.campaignId!,
-          engineType: "maps_fast" as const,
-          sourceExternalId: place.externalPlaceId,
-          sourceUrl: place.sourceUrl,
-          rawPayload: { kind: "maps", place },
-          searchSeedRunId: typeof metadata.seedRunId === "string" ? metadata.seedRunId : null,
-          providerRunId: providerRun.id,
-        })),
+        candidates: places.map((place) => {
+          const fingerprintString = place.externalPlaceId ? place.externalPlaceId : place.sourceUrl || crypto.randomUUID();
+          const fingerprint = crypto.createHash("sha256").update(fingerprintString).digest("hex");
+          return {
+            discoveryJobId,
+            campaignId: providerRun.campaignId!,
+            engineType: "maps_fast" as const,
+            sourceExternalId: place.externalPlaceId,
+            sourceUrl: place.sourceUrl,
+            sourceFingerprint: fingerprint,
+            rawPayload: { kind: "maps", place },
+            searchSeedRunId: typeof metadata.seedRunId === "string" ? metadata.seedRunId : (providerRun.seedRunId ?? null),
+            providerRunId: providerRun.id,
+          };
+        }),
         finishedAt: run.finishedAt ? new Date(run.finishedAt) : new Date(),
         costUsd: usageCost,
         itemsReturned: places.length,
@@ -108,6 +124,9 @@ export async function runProviderRunsCronTick(maxRuns = MAX_RUNS_PER_TICK): Prom
       }
     } catch (error) {
       warnings.push(`provider_run ${providerRun.id}: ${error instanceof Error ? error.message : String(error)}`);
+      await updateProviderRun(providerRun.id, { 
+        lastIngestionError: error instanceof Error ? error.message : String(error)
+      });
     }
   }
 

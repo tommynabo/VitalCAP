@@ -99,6 +99,8 @@ export async function getAutopilotSettingsData(): Promise<AutopilotSettings> {
       enabled: false,
       emergencyStopped: false,
       systemPaused: false,
+      systemPauseReason: null,
+      systemPausedAt: null,
       globalDailyTarget: 25,
       targetMetric: "qualified",
       timezone: "Europe/Madrid",

@@ -13,13 +13,15 @@ export type ProviderHealthStatus = "untested" | "healthy" | "degraded" | "paused
 export type AutopilotTargetMetric = "qualified" | "analyzed_qualified" | "outreach_ready";
 export type AutopilotTargetRisk = "on_track" | "recoverable" | "target_at_risk_budget" | "target_at_risk_provider" | "target_at_risk_exhaustion" | "target_at_risk_time";
 
-export type AutopilotEffectiveState = "running" | "paused" | "emergency_stopped";
+export type AutopilotEffectiveState = "running" | "paused" | "system_paused" | "emergency_stopped";
 
 export interface AutopilotSettings {
   workspaceId: string;
   enabled: boolean;
   emergencyStopped: boolean;
   systemPaused: boolean;
+  systemPauseReason: string | null;
+  systemPausedAt: string | null;
   globalDailyTarget: number;
   targetMetric: AutopilotTargetMetric;
   timezone: string;
@@ -30,9 +32,11 @@ export interface AutopilotSettings {
   updatedAt: string;
 }
 
-export function getEffectiveAutopilotState(settings: Pick<AutopilotSettings, "enabled" | "emergencyStopped">): AutopilotEffectiveState {
+export function getEffectiveAutopilotState(settings: Pick<AutopilotSettings, "enabled" | "emergencyStopped" | "systemPaused">): AutopilotEffectiveState {
   if (settings.emergencyStopped) return "emergency_stopped";
-  return settings.enabled ? "running" : "paused";
+  if (!settings.enabled) return "paused";
+  if (settings.systemPaused) return "system_paused";
+  return "running";
 }
 
 export interface EngineTargetState {

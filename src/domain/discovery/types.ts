@@ -35,6 +35,10 @@ export interface JobRecord<TPayload = Record<string, unknown>> {
 export type DiscoveryJob = JobRecord<{ engineType: EngineType; seedId?: string }>;
 export type ProcessingJob = JobRecord<{ rawCandidateId: string }>;
 
+export function processingJobIdempotencyKey(rawCandidateId: string): string {
+  return `raw_candidate:${rawCandidateId}`;
+}
+
 export interface RawCandidate {
   id: string;
   campaignId: string;

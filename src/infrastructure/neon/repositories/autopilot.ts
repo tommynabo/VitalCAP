@@ -34,6 +34,8 @@ function toAutopilotSettings(row: typeof autopilotSettings.$inferSelect): Autopi
     enabled: row.enabled,
     emergencyStopped: row.emergencyStopped,
     systemPaused: row.systemPaused,
+    systemPauseReason: row.systemPauseReason,
+    systemPausedAt: row.systemPausedAt?.toISOString() ?? null,
     globalDailyTarget: row.globalDailyTarget,
     targetMetric: row.targetMetric as AutopilotSettings["targetMetric"],
     timezone: row.timezone,

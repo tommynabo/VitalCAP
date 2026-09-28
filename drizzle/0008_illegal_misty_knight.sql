@@ -1,1 +1,0 @@
-ALTER TABLE "autopilot_settings" ADD COLUMN "system_paused" boolean DEFAULT false NOT NULL;

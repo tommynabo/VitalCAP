@@ -75,6 +75,7 @@ export const campaignMemberships = pgTable(
     selectedContactPointId: uuid("selected_contact_point_id").references(() => contactPoints.id, { onDelete: "set null" }),
     stage: text("stage").notNull().default("discovered"),
     rejectionReason: text("rejection_reason"),
+    qualifiedAt: timestamp("qualified_at", { withTimezone: true }),
     readyAt: timestamp("ready_at", { withTimezone: true }),
     contactedAt: timestamp("contacted_at", { withTimezone: true }),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),

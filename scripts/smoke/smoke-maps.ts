@@ -191,6 +191,7 @@ async function main(): Promise<void> {
       engineType: "maps_fast" as const,
       sourceExternalId: place.externalPlaceId,
       sourceUrl: place.sourceUrl,
+      sourceFingerprint: place.externalPlaceId || place.sourceUrl || "unknown",
       rawPayload: { kind: "maps", place },
     }));
     const insertedIds = await insertRawCandidates(candidates);

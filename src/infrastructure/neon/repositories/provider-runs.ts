@@ -23,7 +23,7 @@ export interface RecordProviderRunInput {
   metadata?: Record<string, unknown>;
 }
 
-export type ProviderRunStatus = "starting" | "queued" | "running" | "succeeded" | "failed" | "aborted" | "timed_out" | "ingested" | "completed" | "manual_reconciliation_required";
+export type ProviderRunStatus = "starting" | "queued" | "running" | "succeeded" | "ingesting" | "failed" | "aborted" | "timed_out" | "ingested" | "completed" | "manual_reconciliation_required";
 
 /**
  * Persists one provider-run event (Prompt 7 §14 cost-guard audit trail —
@@ -133,9 +133,23 @@ export async function listApifyRunsForPolling(limit: number) {
   return db
     .select()
     .from(providerRuns)
-    .where(and(eq(providerRuns.provider, "apify"), inArray(providerRuns.status, ["starting", "queued", "running", "succeeded"])))
+    .where(and(eq(providerRuns.provider, "apify"), inArray(providerRuns.status, ["starting", "queued", "running", "succeeded", "ingesting"])))
     .orderBy(asc(providerRuns.startedAt), asc(providerRuns.id))
     .limit(limit);
+}
+
+export async function claimProviderRunForIngestion(id: string) {
+  const db = getDb();
+  const [claimed] = await db
+    .update(providerRuns)
+    .set({
+      status: "ingesting",
+      ingestionStartedAt: new Date(),
+      ingestionAttemptCount: sql`${providerRuns.ingestionAttemptCount} + 1`
+    })
+    .where(and(eq(providerRuns.id, id), eq(providerRuns.status, "succeeded")))
+    .returning();
+  return claimed ?? null;
 }
 
 export async function updateProviderRun(
@@ -151,6 +165,8 @@ export async function updateProviderRun(
     ingestedAt: Date | null;
     error: string | null;
     metadata: Record<string, unknown>;
+    seedRunId: string | null;
+    lastIngestionError: string | null;
   }>,
 ): Promise<void> {
   const db = getDb();

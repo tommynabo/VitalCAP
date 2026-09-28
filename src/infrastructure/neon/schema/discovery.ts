@@ -53,6 +53,7 @@ export const rawCandidates = pgTable(
     engineType: text("engine_type").notNull(),
     sourceExternalId: text("source_external_id"),
     sourceUrl: text("source_url"),
+    sourceFingerprint: text("source_fingerprint").notNull(),
     rawPayload: jsonb("raw_payload").notNull().default({}),
     searchSeedRunId: uuid("search_seed_run_id").references(() => searchSeedRuns.id, { onDelete: "set null" }),
     providerRunId: uuid("provider_run_id").references(() => providerRuns.id, { onDelete: "set null" }),
@@ -63,9 +64,8 @@ export const rawCandidates = pgTable(
   (table) => [
     index("idx_raw_candidates_job").on(table.discoveryJobId),
     index("idx_raw_candidates_campaign").on(table.campaignId),
-    uniqueIndex("uq_raw_candidates_campaign_engine_external")
-      .on(table.campaignId, table.engineType, table.sourceExternalId)
-      .where(sql`${table.sourceExternalId} is not null`),
+    uniqueIndex("uq_raw_candidates_campaign_engine_fingerprint")
+      .on(table.campaignId, table.engineType, table.sourceFingerprint),
   ],
 );
 

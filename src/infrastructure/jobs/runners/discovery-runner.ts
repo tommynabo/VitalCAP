@@ -169,6 +169,7 @@ async function executeDiscoveryJob(job: { id: string; campaignId: string; payloa
               engineType: candidate.engineType,
               sourceExternalId: candidate.sourceExternalId,
               sourceUrl: candidate.sourceUrl,
+              sourceFingerprint: candidate.sourceExternalId || candidate.sourceUrl || randomUUID(),
               rawPayload: candidate.rawPayload,
               searchSeedRunId: completedSeedRunId,
             })),

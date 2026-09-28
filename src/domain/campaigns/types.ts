@@ -73,6 +73,7 @@ export interface CampaignMembership {
   selectedContactPointId: string | null;
   stage: CampaignMembershipStage;
   rejectionReason: string | null;
+  qualifiedAt: string | null;
   readyAt: string | null;
   contactedAt: string | null;
   createdAt: string;

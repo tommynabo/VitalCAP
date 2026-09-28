@@ -1,5 +1,5 @@
 {
-  "id": "1a375974-e7c1-4039-998a-a56ae6542fff",
+  "id": "024a9a9c-6ead-4468-a5b4-734ccca0d0f1",
   "prevId": "0eedd0ef-87f7-46ed-9ac7-05e2a2e0fa13",
   "version": "7",
   "dialect": "postgresql",
@@ -1224,6 +1224,12 @@
           "primaryKey": false,
           "notNull": false
         },
+        "qualified_at": {
+          "name": "qualified_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
         "ready_at": {
           "name": "ready_at",
           "type": "timestamp with time zone",
@@ -2116,6 +2122,12 @@
           "primaryKey": false,
           "notNull": false
         },
+        "source_fingerprint": {
+          "name": "source_fingerprint",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
         "raw_payload": {
           "name": "raw_payload",
           "type": "jsonb",
@@ -2187,8 +2199,8 @@
           "method": "btree",
           "with": {}
         },
-        "uq_raw_candidates_campaign_engine_external": {
-          "name": "uq_raw_candidates_campaign_engine_external",
+        "uq_raw_candidates_campaign_engine_fingerprint": {
+          "name": "uq_raw_candidates_campaign_engine_fingerprint",
           "columns": [
             {
               "expression": "campaign_id",
@@ -2203,14 +2215,13 @@
               "nulls": "last"
             },
             {
-              "expression": "source_external_id",
+              "expression": "source_fingerprint",
               "isExpression": false,
               "asc": true,
               "nulls": "last"
             }
           ],
           "isUnique": true,
-          "where": "\"raw_candidates\".\"source_external_id\" is not null",
           "concurrently": false,
           "method": "btree",
           "with": {}
@@ -4259,6 +4270,31 @@
           "primaryKey": false,
           "notNull": false
         },
+        "ingestion_started_at": {
+          "name": "ingestion_started_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "ingestion_attempt_count": {
+          "name": "ingestion_attempt_count",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "last_ingestion_error": {
+          "name": "last_ingestion_error",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "seed_run_id": {
+          "name": "seed_run_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": false
+        },
         "error": {
           "name": "error",
           "type": "text",
@@ -4519,6 +4555,18 @@
           "primaryKey": false,
           "notNull": true,
           "default": false
+        },
+        "system_pause_reason": {
+          "name": "system_pause_reason",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "system_paused_at": {
+          "name": "system_paused_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
         },
         "global_daily_target": {
           "name": "global_daily_target",

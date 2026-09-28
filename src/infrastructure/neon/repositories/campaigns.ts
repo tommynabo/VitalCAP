@@ -36,6 +36,7 @@ function toCampaignMembership(row: typeof campaignMemberships.$inferSelect): Cam
     rejectionReason: row.rejectionReason,
     readyAt: row.readyAt?.toISOString() ?? null,
     contactedAt: row.contactedAt?.toISOString() ?? null,
+    qualifiedAt: row.qualifiedAt?.toISOString() ?? null,
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),
   };

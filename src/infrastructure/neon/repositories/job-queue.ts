@@ -125,6 +125,7 @@ async function claim<T>(
               AND (${inputCampaignId}::uuid IS NULL OR j.campaign_id = ${inputCampaignId}::uuid)
               AND j.status IN ('pending', 'processing')
               AND (j.next_attempt_at IS NULL OR j.next_attempt_at <= ${nowIso}::timestamptz)
+              AND j.attempt_count < j.max_attempts
               AND (
                 j.status = 'pending'
                 OR j.locked_at IS NULL
@@ -155,6 +156,7 @@ async function claim<T>(
               AND (${inputCampaignId}::uuid IS NULL OR j.campaign_id = ${inputCampaignId}::uuid)
               AND j.status IN ('pending', 'processing')
               AND (j.next_attempt_at IS NULL OR j.next_attempt_at <= ${nowIso}::timestamptz)
+              AND j.attempt_count < j.max_attempts
               AND (
                 j.status = 'pending'
                 OR j.locked_at IS NULL
@@ -465,4 +467,44 @@ export async function enqueueDiscoveryJob(input: EnqueueJobInput): Promise<strin
 
 export async function enqueueProcessingJob(input: EnqueueJobInput): Promise<string> {
   return enqueueProcessing(input);
+}
+
+export async function deadLetterExpiredJobs(table: QueueTable, leaseMs: number = JOB_LEASE_MS, message: string = "Max attempts exceeded via watchdog"): Promise<number> {
+  const db = getDb();
+  const leaseSeconds = Math.max(1, Math.ceil(leaseMs / 1000));
+  
+  return db.transaction(async (tx) => {
+    const expired = table === "discovery_jobs" 
+      ? await tx.execute(sql`
+          UPDATE discovery_jobs
+          SET status = 'dead_letter', locked_at = NULL, locked_by = NULL
+          WHERE status IN ('pending', 'processing')
+            AND attempt_count >= max_attempts
+            AND (status = 'pending' OR locked_at IS NULL OR locked_at + (${leaseSeconds} * interval '1 second') <= NOW())
+          RETURNING id, campaign_id, payload, attempt_count
+        `)
+      : await tx.execute(sql`
+          UPDATE processing_jobs
+          SET status = 'dead_letter', locked_at = NULL, locked_by = NULL
+          WHERE status IN ('pending', 'processing')
+            AND attempt_count >= max_attempts
+            AND (status = 'pending' OR locked_at IS NULL OR locked_at + (${leaseSeconds} * interval '1 second') <= NOW())
+          RETURNING id, campaign_id, payload, attempt_count
+        `);
+
+    if (expired.rows.length === 0) return 0;
+
+    const values = expired.rows.map(r => ({
+      sourceTable: table,
+      sourceJobId: String(r.id),
+      campaignId: String(r.campaign_id),
+      payload: r.payload as Record<string, unknown>,
+      attemptCount: Number(r.attempt_count),
+      lastError: message
+    }));
+
+    await tx.insert(deadLetterJobs).values(values).onConflictDoNothing({ target: [deadLetterJobs.sourceTable, deadLetterJobs.sourceJobId] });
+    
+    return expired.rows.length;
+  });
 }

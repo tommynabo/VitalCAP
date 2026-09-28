@@ -4,16 +4,16 @@ import { autopilotControlSchema } from "./control";
 
 describe("Autopilot control plane", () => {
   it("treats missing/default settings as paused", () => {
-    expect(getEffectiveAutopilotState({ enabled: false, emergencyStopped: false })).toBe("paused");
+    expect(getEffectiveAutopilotState({ enabled: false, emergencyStopped: false, systemPaused: false })).toBe("paused");
   });
 
   it("gives emergency stop precedence over enabled", () => {
-    expect(getEffectiveAutopilotState({ enabled: true, emergencyStopped: true })).toBe("emergency_stopped");
+    expect(getEffectiveAutopilotState({ enabled: true, emergencyStopped: true, systemPaused: false })).toBe("emergency_stopped");
   });
 
   it("requires clearing emergency stop before returning to running", () => {
-    expect(getEffectiveAutopilotState({ enabled: false, emergencyStopped: false })).toBe("paused");
-    expect(getEffectiveAutopilotState({ enabled: true, emergencyStopped: false })).toBe("running");
+    expect(getEffectiveAutopilotState({ enabled: false, emergencyStopped: false, systemPaused: false })).toBe("paused");
+    expect(getEffectiveAutopilotState({ enabled: true, emergencyStopped: false, systemPaused: false })).toBe("running");
   });
 
   it("accepts the safe daily target range and rejects invalid values", () => {
@@ -24,8 +24,8 @@ describe("Autopilot control plane", () => {
   });
 
   it("keeps workspace state independent by evaluating each settings row separately", () => {
-    const workspaceA = getEffectiveAutopilotState({ enabled: false, emergencyStopped: false });
-    const workspaceB = getEffectiveAutopilotState({ enabled: true, emergencyStopped: false });
+    const workspaceA = getEffectiveAutopilotState({ enabled: false, emergencyStopped: false, systemPaused: false });
+    const workspaceB = getEffectiveAutopilotState({ enabled: true, emergencyStopped: false, systemPaused: false });
     expect(workspaceA).toBe("paused");
     expect(workspaceB).toBe("running");
   });

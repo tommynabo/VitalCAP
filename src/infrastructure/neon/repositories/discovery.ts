@@ -202,6 +202,7 @@ export interface InsertRawCandidateInput {
   engineType: EngineType;
   sourceExternalId: string | null;
   sourceUrl: string | null;
+  sourceFingerprint: string;
   rawPayload: Record<string, unknown>;
   searchSeedRunId?: string | null;
   providerRunId?: string | null;
@@ -326,7 +327,7 @@ export async function hasInFlightDiscoveryJob(campaignId: string): Promise<boole
   return Boolean(row);
 }
 
-/** Temporary discovery-level budget until qualified Autopilot metrics replace it. */
+/** Uses qualified Autopilot metrics. */
 export async function getRemainingDiscoveryTarget(
   campaignId: string,
   dailySoftTarget: number,
@@ -337,17 +338,18 @@ export async function getRemainingDiscoveryTarget(
   const { start: dayStart, end: dayEnd } = getDayBounds(timeZone, now);
   const progressResult = await db.execute(sql`
     SELECT
-      (SELECT COUNT(DISTINCT rc.id)::int
-       FROM raw_candidates rc
-       WHERE rc.campaign_id = ${campaignId}::uuid
-         AND rc.discovered_at >= ${dayStart.toISOString()}::timestamptz
-         AND rc.discovered_at < ${dayEnd.toISOString()}::timestamptz
+      (SELECT COUNT(DISTINCT cm.id)::int
+       FROM campaign_memberships cm
+       WHERE cm.campaign_id = ${campaignId}::uuid
+         AND cm.stage = 'qualified'
+         AND cm.qualified_at >= ${dayStart.toISOString()}::timestamptz
+         AND cm.qualified_at < ${dayEnd.toISOString()}::timestamptz
       ) AS generated_today,
       (SELECT COALESCE(SUM(pr.items_requested), 0)::int
        FROM provider_runs pr
        WHERE pr.campaign_id = ${campaignId}::uuid
          AND pr.provider = 'apify'
-         AND pr.status IN ('starting', 'queued', 'running')
+         AND pr.status IN ('starting', 'queued', 'running', 'ingesting')
          AND pr.started_at >= ${dayStart.toISOString()}::timestamptz
          AND pr.started_at < ${dayEnd.toISOString()}::timestamptz
       ) AS in_flight_provider_items;
