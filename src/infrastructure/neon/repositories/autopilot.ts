@@ -69,18 +69,18 @@ export async function updateAutopilotSettingsWithAudit(input: {
   // Let's use a CTE to do it atomically:
   const query = sql`
     WITH inserted_default AS (
-      INSERT INTO autopilot_settings (workspace_id, enabled, daily_target, timezone, created_at, updated_at)
-      VALUES (${input.workspaceId}::uuid, false, 0, 'UTC', NOW(), NOW())
+      INSERT INTO autopilot_settings (workspace_id, enabled, emergency_stopped, system_paused, global_daily_target, target_metric, timezone, created_at, updated_at)
+      VALUES (${input.workspaceId}::uuid, false, false, false, 25, 'qualified', 'Europe/Madrid', NOW(), NOW())
       ON CONFLICT (workspace_id) DO NOTHING
     ),
     updated AS (
       UPDATE autopilot_settings
       SET enabled = coalesce(${input.patch.enabled ?? null}, enabled),
           emergency_stopped = coalesce(${input.patch.emergencyStopped ?? null}, emergency_stopped),
-          daily_target = coalesce(${input.patch.globalDailyTarget ?? null}, daily_target),
+          global_daily_target = coalesce(${input.patch.globalDailyTarget ?? null}, global_daily_target),
           updated_at = NOW()
       WHERE workspace_id = ${input.workspaceId}::uuid
-      RETURNING workspace_id, enabled, emergency_stopped, daily_target, timezone, system_paused, system_pause_reason, system_paused_at, created_at, updated_at
+      RETURNING workspace_id, enabled, emergency_stopped, system_paused, system_pause_reason, system_paused_at, global_daily_target, target_metric, timezone, operating_start_hour, operating_end_hour, max_daily_apify_spend_usd, created_at, updated_at
     ),
     audit_insert AS (
       INSERT INTO audit_log (workspace_id, actor_user_id, action, entity_type, entity_id, metadata, created_at)
@@ -161,7 +161,7 @@ export async function getGlobalAutopilotState(workspaceId: string): Promise<Glob
     .from(campaignMemberships)
     .innerJoin(campaigns, eq(campaignMemberships.campaignId, campaigns.id))
     .where(
-      and(eq(campaigns.workspaceId, workspaceId), eq(campaignMemberships.stage, "qualified"), gte(campaignMemberships.updatedAt, today)),
+      and(eq(campaigns.workspaceId, workspaceId), gte(campaignMemberships.qualifiedAt, today)),
     );
 
   const [analyzedQualifiedRow] = await db
@@ -172,13 +172,13 @@ export async function getGlobalAutopilotState(workspaceId: string): Promise<Glob
       and(
         eq(campaigns.workspaceId, workspaceId),
         sql`${campaignMemberships.stage} IN ('qualified', 'ready')`,
-        gte(campaignMemberships.updatedAt, today),
         sql`EXISTS (
           SELECT 1 FROM prospect_analyses pa
           WHERE pa.campaign_id = ${campaignMemberships.campaignId}
             AND pa.account_id = ${campaignMemberships.accountId}
             AND pa.status = 'completed'
             AND pa.qualified = true
+            AND pa.completed_at >= ${today.toISOString()}::timestamptz
             AND pa.id = (
               SELECT id FROM prospect_analyses pa2
               WHERE pa2.campaign_id = ${campaignMemberships.campaignId}
@@ -353,8 +353,7 @@ async function getEngineTargetState(workspaceId: string, engineType: EngineType)
       and(
         eq(campaigns.workspaceId, workspaceId),
         eq(campaigns.engineType, engineType),
-        eq(campaignMemberships.stage, "qualified"),
-        gte(campaignMemberships.updatedAt, startOfToday((await getAutopilotSettings(workspaceId)).timezone)),
+        gte(campaignMemberships.qualifiedAt, startOfToday((await getAutopilotSettings(workspaceId)).timezone)),
       ),
     );
 

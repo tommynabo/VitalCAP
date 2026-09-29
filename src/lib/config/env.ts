@@ -159,7 +159,7 @@ const intelligenceEnvSchema = z.object({
   LLM_PROVIDER: z.enum(["openai", "disabled", "mock"]).default("disabled"),
   LLM_PROVIDER_API_KEY: z.string().optional(),
   LLM_MODEL: z.string().default("gpt-4.1-mini"),
-  PROSPECT_LLM_MODEL: z.string().default("gpt-4o-2024-08-06"),
+  PROSPECT_LLM_MODEL: z.string().optional(),
   LLM_DAILY_COST_LIMIT_USD: z.coerce.number().default(10),
   LLM_BATCH_COST_LIMIT_USD: z.coerce.number().default(2),
 });

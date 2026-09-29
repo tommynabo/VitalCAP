@@ -51,6 +51,7 @@ export async function runProviderRunsCronTick(maxRuns = MAX_RUNS_PER_TICK): Prom
   const warnings: string[] = [];
 
   for (const providerRun of runs) {
+    let token = "";
     try {
       if (!providerRun.externalRunId) {
         warnings.push(`provider_run ${providerRun.id}: starting reservation has no external run ID; automatic retry skipped.`);
@@ -91,7 +92,7 @@ export async function runProviderRunsCronTick(maxRuns = MAX_RUNS_PER_TICK): Prom
       const discoveryJobId = typeof metadata.discoveryJobId === "string" ? metadata.discoveryJobId : null;
       if (!discoveryJobId) throw new Error(`Provider run ${providerRun.id} has no discovery job metadata.`);
       
-      const token = require("node:crypto").randomUUID();
+      token = require("node:crypto").randomUUID();
       const claimed = await claimProviderRunForIngestion(providerRun.id, token);
       if (!claimed) {
         if (providerRun.status === 'ingesting') {
@@ -113,8 +114,8 @@ export async function runProviderRunsCronTick(maxRuns = MAX_RUNS_PER_TICK): Prom
         seedRunId: typeof metadata.seedRunId === "string" ? metadata.seedRunId : (providerRun.seedRunId ?? null),
         externalDatasetId: datasetId,
         candidates: places.map((place) => {
-          const fingerprintString = place.externalPlaceId ? place.externalPlaceId : place.sourceUrl || crypto.randomUUID();
-          const fingerprint = crypto.createHash("sha256").update(fingerprintString).digest("hex");
+          const { buildRawSourceFingerprint } = require("@/infrastructure/neon/repositories/discovery");
+          const { fingerprint } = buildRawSourceFingerprint(place.externalPlaceId, place.sourceUrl, { kind: "maps", place });
           return {
             discoveryJobId,
             campaignId: providerRun.campaignId!,
@@ -125,7 +126,6 @@ export async function runProviderRunsCronTick(maxRuns = MAX_RUNS_PER_TICK): Prom
             rawPayload: { kind: "maps", place },
             searchSeedRunId: typeof metadata.seedRunId === "string" ? metadata.seedRunId : (providerRun.seedRunId ?? null),
             providerRunId: providerRun.id,
-        token,
           };
         }),
         finishedAt: run.finishedAt ? new Date(run.finishedAt) : new Date(),
@@ -138,9 +138,9 @@ export async function runProviderRunsCronTick(maxRuns = MAX_RUNS_PER_TICK): Prom
       }
     } catch (error) {
       warnings.push(`provider_run ${providerRun.id}: ${error instanceof Error ? error.message : String(error)}`);
-      await updateProviderRun(providerRun.id, { 
-        lastIngestionError: error instanceof Error ? error.message : String(error)
-      });
+      if (token) {
+        await import("@/infrastructure/neon/repositories/provider-runs").then(m => m.recoverFailedIngestion(providerRun.id, token, providerRun.workspaceId, error instanceof Error ? error.message : String(error)));
+      }
     }
   }
 

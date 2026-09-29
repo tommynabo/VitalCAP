@@ -85,28 +85,60 @@ export interface ReserveApifyProviderRunInput {
 
 export async function reserveApifyProviderRun(input: ReserveApifyProviderRunInput): Promise<{ providerRun: typeof providerRuns.$inferSelect; created: boolean }> {
   const db = getDb();
-  const [inserted] = await db
-    .insert(providerRuns)
-    .values({
-      workspaceId: input.workspaceId,
-      campaignId: input.campaignId,
-      provider: "apify",
-      operation: input.operation,
-      requestKey: input.requestKey,
-      actorId: input.actorId ?? null,
-      seedId: input.seedId,
-      status: "starting",
-      itemsRequested: input.itemsRequested,
-      itemsReturned: 0,
-      costUsd: 0,
-      metadata: input.metadata ?? {},
-    })
-    .onConflictDoNothing({ target: providerRuns.requestKey })
-    .returning();
-  if (inserted) return { providerRun: inserted, created: true };
+  
+  // 1. Get settings and limits
+  const { autopilotSettings } = await import("../schema/autopilot");
+  const [settings] = await db.select({
+    timezone: autopilotSettings.timezone,
+    maxDailySpend: autopilotSettings.maxDailyApifySpendUsd
+  }).from(autopilotSettings).where(eq(autopilotSettings.workspaceId, input.workspaceId));
+  if (!settings) throw new Error("Autopilot settings not found for workspace.");
+
+  const env = await import("@/lib/config/env");
+  const maxRequests = env.getCoreEnv().ACTIVATION_MAX_DAILY_RAW_REQUESTS;
+  const maxCost = Math.min(env.getMapsEnv().APIFY_DAILY_COST_LIMIT_USD, settings.maxDailySpend ?? Number.POSITIVE_INFINITY);
+  
+  const { start } = getDayBounds(settings.timezone);
+  const expectedCostUsd = input.itemsRequested * 0.005; // conservative
+
+  // 2. Atomic Insertion with Guard Conditions
+  const query = sql`
+    WITH safety_check AS (
+      SELECT
+        (SELECT COUNT(*) FROM provider_runs WHERE workspace_id = ${input.workspaceId}::uuid AND status = 'manual_reconciliation_required')::int as unreconciled_count,
+        (SELECT COALESCE(SUM(items_requested), 0) FROM provider_runs WHERE workspace_id = ${input.workspaceId}::uuid AND provider = 'apify' AND started_at >= ${start.toISOString()}::timestamptz)::int as requested_today,
+        (SELECT COALESCE(SUM(cost_usd), 0) FROM provider_runs WHERE workspace_id = ${input.workspaceId}::uuid AND provider = 'apify' AND started_at >= ${start.toISOString()}::timestamptz)::numeric as cost_today
+    ),
+    insertion AS (
+      INSERT INTO provider_runs (
+        workspace_id, campaign_id, provider, operation, request_key, actor_id, seed_id, status, items_requested, items_returned, cost_usd, metadata, started_at
+      )
+      SELECT 
+        ${input.workspaceId}::uuid, ${input.campaignId}::uuid, 'apify', ${input.operation}, ${input.requestKey}, 
+        ${input.actorId ?? null}, ${input.seedId}::uuid, 'starting', ${input.itemsRequested}, 0, ${expectedCostUsd}, 
+        ${JSON.stringify(input.metadata ?? {})}::jsonb, NOW()
+      FROM safety_check
+      WHERE unreconciled_count = 0
+        AND requested_today + ${input.itemsRequested} <= ${maxRequests}
+        AND cost_today + ${expectedCostUsd} <= ${maxCost}
+      ON CONFLICT (request_key) DO NOTHING
+      RETURNING *
+    )
+    SELECT * FROM insertion;
+  `;
+  
+  const result = await db.execute(query);
+  if (result.rows.length > 0) {
+    // Need to parse back camelCase if returning from raw sql, but we can just query it normally
+    const existing = await getProviderRunByRequestKey(input.requestKey);
+    return { providerRun: existing!, created: true };
+  }
+
   const existing = await getProviderRunByRequestKey(input.requestKey);
-  if (!existing) throw new Error(`Unable to resolve provider run request key ${input.requestKey}.`);
-  return { providerRun: existing, created: false };
+  if (existing) return { providerRun: existing, created: false };
+  
+  // If it wasn't inserted and didn't exist, it means safety checks failed.
+  throw new Error(`Provider run reservation rejected by safety constraints for workspace ${input.workspaceId}`);
 }
 
 export async function createProviderRun(input: CreateProviderRunInput): Promise<string> {
@@ -133,7 +165,7 @@ export async function listApifyRunsForPolling(limit: number) {
   return db
     .select()
     .from(providerRuns)
-    .where(and(eq(providerRuns.provider, "apify"), inArray(providerRuns.status, ["starting", "queued", "running", "succeeded", "ingesting"])))
+    .where(and(eq(providerRuns.provider, "apify"), inArray(providerRuns.status, ["starting", "queued", "running", "succeeded"])))
     .orderBy(asc(providerRuns.startedAt), asc(providerRuns.id))
     .limit(limit);
 }
@@ -172,6 +204,34 @@ export async function updateProviderRun(
 ): Promise<void> {
   const db = getDb();
   await db.update(providerRuns).set(patch).where(eq(providerRuns.id, id));
+}
+
+export async function recoverFailedIngestion(id: string, token: string, workspaceId: string, errorString: string): Promise<void> {
+  const db = getDb();
+  const [current] = await db.select({ attempt: providerRuns.ingestionAttemptCount }).from(providerRuns).where(and(eq(providerRuns.id, id), eq(providerRuns.ingestionClaimToken, token)));
+  if (!current) return;
+  
+  if (current.attempt < 5) {
+    await db.update(providerRuns).set({
+      status: "succeeded",
+      ingestionClaimToken: null,
+      ingestionStartedAt: null,
+      lastIngestionError: errorString
+    }).where(and(eq(providerRuns.id, id), eq(providerRuns.ingestionClaimToken, token)));
+  } else {
+    await db.update(providerRuns).set({
+      status: "manual_reconciliation_required",
+      lastIngestionError: errorString
+    }).where(and(eq(providerRuns.id, id), eq(providerRuns.ingestionClaimToken, token)));
+    
+    // Autopilot settings update
+    const { autopilotSettings } = await import("../schema/autopilot");
+    await db.update(autopilotSettings).set({
+      systemPaused: true,
+      systemPauseReason: "provider_reconciliation",
+      updatedAt: new Date()
+    }).where(eq(autopilotSettings.workspaceId, workspaceId));
+  }
 }
 
 /**

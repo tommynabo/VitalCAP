@@ -84,8 +84,27 @@ export async function runOutreachDryRunCronTick(now: Date = new Date()): Promise
         generateId: randomUUID,
       });
 
-      for (const item of cycle.newQueueItems) await insertOutreachQueueItem(item);
-      for (const event of cycle.newEvents) await insertOutreachEvent(event);
+      const { OutreachReadinessService } = await import("@/services/compliance/outreach-readiness-service");
+      const readinessService = new OutreachReadinessService();
+
+      for (const item of cycle.newQueueItems) {
+        if (!item.contactPointId) continue;
+        const isReady = await readinessService.evaluateCandidate(workspaceId, item.campaignId, item.accountId, item.contactPointId);
+        if (isReady) {
+          await insertOutreachQueueItem(item);
+        } else {
+          cycle.results = cycle.results.map(r => r.accountId === item.accountId ? { ...r, outcome: "skipped", reason: "not_ready_at_insertion" } : r);
+        }
+      }
+      
+      for (const event of cycle.newEvents) {
+        const item = cycle.newQueueItems.find(i => i.id === event.outreachQueueItemId);
+        if (!item || !item.contactPointId) continue;
+        const isReady = await readinessService.evaluateCandidate(workspaceId, item.campaignId, item.accountId, item.contactPointId);
+        if (isReady) {
+          await insertOutreachEvent(event);
+        }
+      }
 
       for (const result of cycle.results) {
         if (result.outcome === "scheduled") scheduled += 1;

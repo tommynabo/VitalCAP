@@ -126,12 +126,24 @@ export async function updateSearchSeedRun(
 }
 
 export function buildRawSourceFingerprint(externalId: string | null | undefined, sourceUrl: string | null | undefined, fallbackObj: Record<string, unknown>): { fingerprint: string; version: string } {
-  if (externalId) return { fingerprint: `place:v1:${externalId}`, version: "v1" };
-  if (sourceUrl) return { fingerprint: `url:v1:${sourceUrl}`, version: "v1" };
+  if (externalId) return { fingerprint: `place:v1:${externalId.trim()}`, version: "v1" };
+  const { normalizeUrl } = require("@/lib/normalization/normalize-url");
+  const normalizedUrl = normalizeUrl(sourceUrl);
+  if (normalizedUrl) return { fingerprint: `url:v1:${normalizedUrl}`, version: "v1" };
+  
+  // Try business identity hash if available (name + phone)
+  if (fallbackObj && typeof fallbackObj === 'object' && fallbackObj.name) {
+    const name = String(fallbackObj.name).toLowerCase().replace(/[^a-z0-9]/g, '');
+    const phone = fallbackObj.phone ? String(fallbackObj.phone).replace(/[^0-9]/g, '') : '';
+    if (name) {
+       const businessHash = require("node:crypto").createHash("sha256").update(`${name}|${phone}`).digest("hex");
+       return { fingerprint: `business:v1:${businessHash}`, version: "v1" };
+    }
+  }
+
   const jsonStr = JSON.stringify(fallbackObj || {});
-  // Use a simple hash or just fallback string if no crypto is available, but crypto is in node.
   const hash = require("node:crypto").createHash("sha256").update(jsonStr).digest("hex");
-  return { fingerprint: `hash:v1:${hash}`, version: "v1" };
+  return { fingerprint: `payload:v1:${hash}`, version: "v1" };
 }
 
 /** Finalizes the seed run and folds its metrics. (Transaction removed for Neon HTTP compatibility) */

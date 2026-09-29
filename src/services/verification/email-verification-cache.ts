@@ -14,15 +14,15 @@ export interface CachedVerification extends EmailVerificationOutcome {
 }
 
 export interface EmailVerificationCacheStore {
-  get(email: string): CachedVerification | undefined;
-  set(email: string, value: CachedVerification): void;
+  get(email: string): Promise<CachedVerification | undefined>;
+  set(email: string, value: CachedVerification): Promise<void>;
 }
 
 export function createInMemoryVerificationCacheStore(): EmailVerificationCacheStore {
   const map = new Map<string, CachedVerification>();
   return {
-    get: (email) => map.get(email),
-    set: (email, value) => void map.set(email, value),
+    get: async (email) => map.get(email),
+    set: async (email, value) => void map.set(email, value),
   };
 }
 
@@ -51,7 +51,7 @@ export async function verifyEmailsWithCache(
   const toVerify: string[] = [];
 
   for (const email of unique) {
-    const cached = store.get(email);
+    const cached = await store.get(email);
     if (cached && new Date(cached.expiresAt).getTime() > now.getTime()) {
       fresh.push(cached);
     } else {
@@ -68,7 +68,9 @@ export async function verifyEmailsWithCache(
     ...outcome,
     expiresAt: new Date(now.getTime() + ttlMs).toISOString(),
   }));
-  for (const entry of newlyCached) store.set(entry.email, entry);
+  for (const entry of newlyCached) {
+    await store.set(entry.email, entry);
+  }
 
   return { outcomes: [...fresh, ...newlyCached], usage, cacheHits: fresh.length };
 }

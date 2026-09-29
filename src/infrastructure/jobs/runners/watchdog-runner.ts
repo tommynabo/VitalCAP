@@ -46,12 +46,24 @@ export async function runWatchdogCronTick(): Promise<WatchdogCronResult> {
         WHEN status = 'starting' AND external_run_id IS NULL THEN 'manual_reconciliation_required'
         WHEN status = 'running' THEN 'manual_reconciliation_required'
         WHEN status = 'succeeded' THEN 'succeeded'
+        WHEN status = 'ingesting' AND ingestion_attempt_count >= 5 THEN 'manual_reconciliation_required'
+        WHEN status = 'ingesting' AND ingestion_attempt_count < 5 THEN 'succeeded'
         ELSE status
+      END,
+      ingestion_claim_token = CASE
+        WHEN status = 'ingesting' AND ingestion_attempt_count < 5 THEN NULL
+        ELSE ingestion_claim_token
+      END,
+      ingestion_started_at = CASE
+        WHEN status = 'ingesting' AND ingestion_attempt_count < 5 THEN NULL
+        ELSE ingestion_started_at
       END,
       error = CASE 
         WHEN status = 'starting' AND external_run_id IS NULL THEN 'Stuck in starting without external ID (watchdog)'
         WHEN status = 'running' THEN 'Provider run stalled locally (watchdog)'
         WHEN status = 'succeeded' THEN 'Max ingestion attempts exceeded (watchdog)'
+        WHEN status = 'ingesting' AND ingestion_attempt_count >= 5 THEN 'Max ingestion attempts exceeded (watchdog)'
+        WHEN status = 'ingesting' AND ingestion_attempt_count < 5 THEN 'Stale ingestion lease (watchdog)'
         ELSE error
       END
     WHERE 
@@ -60,6 +72,8 @@ export async function runWatchdogCronTick(): Promise<WatchdogCronResult> {
       (status = 'running' AND started_at < NOW() - INTERVAL '2 hours')
       OR
       (status = 'succeeded' AND ingested_at IS NULL AND finished_at < NOW() - INTERVAL '1 hour' AND ingestion_attempt_count >= 5)
+      OR
+      (status = 'ingesting' AND ingestion_started_at < NOW() - INTERVAL '15 minutes')
     RETURNING id
   `);
   const stuckProviderRuns = providerRunsHeal.rows.length;
@@ -80,36 +94,51 @@ export async function runWatchdogCronTick(): Promise<WatchdogCronResult> {
   await db.execute(sql`
     WITH workspace_health AS (
       SELECT 
-        c.workspace_id,
-        count(*) FILTER (WHERE dj.status = 'pending' AND dj.created_at < NOW() - INTERVAL '30 minutes')::int as old_discovery,
-        count(*) FILTER (WHERE pj.status = 'pending' AND pj.created_at < NOW() - INTERVAL '30 minutes')::int as old_processing,
-        count(*) FILTER (WHERE dj.status = 'processing' AND dj.locked_at < NOW() - INTERVAL '10 minutes')::int as stuck_discovery,
-        count(*) FILTER (WHERE pj.status = 'processing' AND pj.locked_at < NOW() - INTERVAL '10 minutes')::int as stuck_processing
-      FROM campaigns c
-      LEFT JOIN discovery_jobs dj ON dj.campaign_id = c.id
-      LEFT JOIN processing_jobs pj ON pj.campaign_id = c.id
-      GROUP BY c.workspace_id
+        w.id as workspace_id,
+        (SELECT count(*) FROM discovery_jobs dj JOIN campaigns c ON dj.campaign_id = c.id WHERE c.workspace_id = w.id AND dj.status = 'pending' AND (dj.next_attempt_at IS NULL OR dj.next_attempt_at <= NOW()) AND dj.created_at < NOW() - INTERVAL '30 minutes')::int as old_discovery,
+        (SELECT count(*) FROM processing_jobs pj JOIN campaigns c ON pj.campaign_id = c.id WHERE c.workspace_id = w.id AND pj.status = 'pending' AND (pj.next_attempt_at IS NULL OR pj.next_attempt_at <= NOW()) AND pj.created_at < NOW() - INTERVAL '30 minutes')::int as old_processing,
+        (SELECT count(*) FROM discovery_jobs dj JOIN campaigns c ON dj.campaign_id = c.id WHERE c.workspace_id = w.id AND dj.status = 'processing' AND dj.locked_at < NOW() - INTERVAL '10 minutes')::int as stuck_discovery,
+        (SELECT count(*) FROM processing_jobs pj JOIN campaigns c ON pj.campaign_id = c.id WHERE c.workspace_id = w.id AND pj.status = 'processing' AND pj.locked_at < NOW() - INTERVAL '10 minutes')::int as stuck_processing,
+        (SELECT count(*) FROM provider_runs pr WHERE pr.workspace_id = w.id AND pr.status = 'manual_reconciliation_required')::int as provider_reconciliations
+      FROM workspaces w
     )
     UPDATE autopilot_settings aps
     SET 
       system_paused = CASE 
+        WHEN aps.system_paused = true AND aps.system_pause_reason NOT IN ('Queue health deteriorated (watchdog)', 'provider_reconciliation') THEN true
+        WHEN wh.provider_reconciliations > 0 THEN true
         WHEN (wh.old_discovery > 0 OR wh.old_processing > 0 OR wh.stuck_discovery > 0 OR wh.stuck_processing > 0) THEN true 
         ELSE false 
       END,
       system_pause_reason = CASE 
+        WHEN aps.system_paused = true AND aps.system_pause_reason NOT IN ('Queue health deteriorated (watchdog)', 'provider_reconciliation') THEN aps.system_pause_reason
+        WHEN wh.provider_reconciliations > 0 THEN 'provider_reconciliation'
         WHEN (wh.old_discovery > 0 OR wh.old_processing > 0 OR wh.stuck_discovery > 0 OR wh.stuck_processing > 0) THEN 'Queue health deteriorated (watchdog)' 
         ELSE NULL 
       END,
       system_paused_at = CASE 
+        WHEN aps.system_paused = true AND aps.system_pause_reason NOT IN ('Queue health deteriorated (watchdog)', 'provider_reconciliation') THEN aps.system_paused_at
+        WHEN wh.provider_reconciliations > 0 AND aps.system_paused = false THEN NOW()
         WHEN (wh.old_discovery > 0 OR wh.old_processing > 0 OR wh.stuck_discovery > 0 OR wh.stuck_processing > 0) AND aps.system_paused = false THEN NOW()
-        WHEN NOT (wh.old_discovery > 0 OR wh.old_processing > 0 OR wh.stuck_discovery > 0 OR wh.stuck_processing > 0) THEN NULL
+        WHEN wh.provider_reconciliations = 0 AND NOT (wh.old_discovery > 0 OR wh.old_processing > 0 OR wh.stuck_discovery > 0 OR wh.stuck_processing > 0) THEN NULL
         ELSE aps.system_paused_at
       END
     FROM workspace_health wh
     WHERE aps.workspace_id = wh.workspace_id
       AND aps.enabled = true
       AND (
-        aps.system_paused != CASE WHEN (wh.old_discovery > 0 OR wh.old_processing > 0 OR wh.stuck_discovery > 0 OR wh.stuck_processing > 0) THEN true ELSE false END
+        aps.system_paused != CASE 
+          WHEN aps.system_paused = true AND aps.system_pause_reason NOT IN ('Queue health deteriorated (watchdog)', 'provider_reconciliation') THEN true
+          WHEN wh.provider_reconciliations > 0 THEN true 
+          WHEN (wh.old_discovery > 0 OR wh.old_processing > 0 OR wh.stuck_discovery > 0 OR wh.stuck_processing > 0) THEN true 
+          ELSE false 
+        END
+        OR (aps.system_paused = true AND aps.system_pause_reason != CASE 
+          WHEN aps.system_paused = true AND aps.system_pause_reason NOT IN ('Queue health deteriorated (watchdog)', 'provider_reconciliation') THEN aps.system_pause_reason
+          WHEN wh.provider_reconciliations > 0 THEN 'provider_reconciliation' 
+          WHEN (wh.old_discovery > 0 OR wh.old_processing > 0 OR wh.stuck_discovery > 0 OR wh.stuck_processing > 0) THEN 'Queue health deteriorated (watchdog)'
+          ELSE NULL 
+        END)
       )
   `);
 

@@ -20,6 +20,7 @@ export class IntelligenceQueueProcessor {
         WHERE (locked_at IS NULL OR locked_at < ${lockExpiry.toISOString()})
           AND (next_attempt_at IS NULL OR next_attempt_at <= ${now.toISOString()})
           AND status IN ('pending', 'failed', 'processing') -- processing means lock expired
+          AND attempt_count < max_attempts
         ORDER BY created_at ASC
         LIMIT ${BATCH_SIZE}
         FOR UPDATE SKIP LOCKED
@@ -35,6 +36,24 @@ export class IntelligenceQueueProcessor {
     `);
 
     if (leased.rows.length === 0) return 0;
+
+    const { getIntelligenceEnv } = await import("@/lib/config/env");
+    const env = getIntelligenceEnv();
+    if (env.LLM_PROVIDER === "disabled" || (env.LLM_PROVIDER === "openai" && (!env.LLM_PROVIDER_API_KEY || !env.PROSPECT_LLM_MODEL))) {
+      // Mark all leased jobs as provider_disabled
+      for (const job of leased.rows as any[]) {
+        await db.update(schema.intelligenceJobs)
+          .set({
+            lockedAt: null,
+            lockedBy: null,
+            status: "provider_disabled",
+            lastError: env.LLM_PROVIDER === "disabled" ? "Provider intentionally disabled" : "Missing LLM API key or explicitly configured model",
+            nextAttemptAt: null,
+          })
+          .where(eq(schema.intelligenceJobs.id, job.id));
+      }
+      return 0;
+    }
 
     const contextBuilder = new ProspectContextBuilder();
     const analyzer = new OpenAIProspectAnalyzer();
@@ -60,8 +79,8 @@ export class IntelligenceQueueProcessor {
         const campaignRows = await db.select().from(schema.campaigns).where(sql`id = ${job.campaign_id}`).limit(1);
         const campaign = campaignRows[0];
         
-        if (!membership || membership.stage !== 'qualified') {
-          throw new Error(`Hard Gate: Membership stage is ${membership?.stage}`);
+        if (!membership || !membership.qualifiedAt) {
+          throw new Error(`Hard Gate: Membership has no qualifiedAt timestamp`);
         }
         if (!account || account.status === 'rejected_country' || account.status === 'no_contact_found') {
           throw new Error(`Hard Gate: Account status is ${account?.status}`);

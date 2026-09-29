@@ -18,6 +18,7 @@ export interface AutopilotRunnerResult {
   rebalanceDecisionsRecorded: number;
   pausedWorkspaces: number;
   emergencyStoppedWorkspaces: number;
+  systemPausedWorkspaces: number;
   pacingStates: Array<Awaited<ReturnType<typeof getAutopilotPacingState>>>;
   ordersScheduled: number;
 }
@@ -37,18 +38,17 @@ export async function runAutopilotCronTick(now: Date = new Date()): Promise<Auto
   let rebalanceDecisionsRecorded = 0;
   let pausedWorkspaces = 0;
   let emergencyStoppedWorkspaces = 0;
+  let systemPausedWorkspaces = 0;
   let ordersScheduled = 0;
   const pacingStates: AutopilotRunnerResult["pacingStates"] = [];
 
   for (const workspaceId of workspaceIds) {
     const settings = await getAutopilotSettings(workspaceId);
     const effectiveState = getEffectiveAutopilotState(settings);
-    if (effectiveState === "paused") {
-      pausedWorkspaces += 1;
-      continue;
-    }
-    if (effectiveState === "emergency_stopped") {
-      emergencyStoppedWorkspaces += 1;
+    if (effectiveState !== "running") {
+      if (effectiveState === "paused") pausedWorkspaces += 1;
+      else if (effectiveState === "system_paused") systemPausedWorkspaces += 1;
+      else if (effectiveState === "emergency_stopped") emergencyStoppedWorkspaces += 1;
       continue;
     }
     const campaigns = await listAutopilotEnabledCampaigns(workspaceId);
@@ -180,5 +180,5 @@ export async function runAutopilotCronTick(now: Date = new Date()): Promise<Auto
     campaignsTicked += campaigns.length;
   }
 
-  return { campaignsTicked, rebalanceDecisionsRecorded, pausedWorkspaces, emergencyStoppedWorkspaces, pacingStates, ordersScheduled };
+  return { campaignsTicked, rebalanceDecisionsRecorded, pausedWorkspaces, emergencyStoppedWorkspaces, systemPausedWorkspaces, pacingStates, ordersScheduled };
 }

@@ -58,7 +58,7 @@ async function main() {
   console.log("\n[5] Operational Snapshot & Cost Intelligence...");
   const pacing = await getAutopilotPacingState(workspaceId);
   const apifySpend = pacing.apifySpendToday;
-  const rawYield = pacing.rawCandidatesToday;
+  const rawYield = pacing.rawReturnedToday;
   const qualified = pacing.targetAchievedToday;
 
   const costPerRaw = rawYield > 0 ? (apifySpend / rawYield).toFixed(3) : "N/A";
