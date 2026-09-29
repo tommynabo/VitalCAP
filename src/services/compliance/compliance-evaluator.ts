@@ -24,15 +24,20 @@ export async function evaluateComplianceForAccount(workspaceId: string, accountI
       let decision = "review_required";
       let reasonText = "No explicit policy evaluated yet.";
       
+      const [vJob] = await db.select().from(schema.verificationJobs)
+        .where(eq(schema.verificationJobs.contactPointId, cp.id))
+        .orderBy(sql`${schema.verificationJobs.createdAt} DESC`)
+        .limit(1);
+
       if (isSuppressed) {
         decision = "blocked";
         reasonText = "Suppressed via account or contact point.";
       } else if (cp.verificationStatus === "unverified" || cp.verificationStatus === "unknown") {
         decision = "review_required";
-        reasonText = "Email is not verified yet.";
+        reasonText = `Email is not verified yet. ${vJob ? `Job status: ${vJob.status}, Error: ${vJob.lastError ?? 'none'}, Attempt: ${vJob.attemptCount}` : 'No verification job found'}`;
       } else if (cp.verificationStatus === "invalid" || cp.verificationStatus === "bounced" || cp.verificationStatus === "disposable") {
         decision = "blocked";
-        reasonText = "Verification status is strictly unacceptable.";
+        reasonText = `Verification status is strictly unacceptable. ${vJob ? `Job completed at: ${vJob.completedAt}, Error: ${vJob.lastError ?? 'none'}` : ''}`;
       } else if (isContactPointAcceptable(cp.verificationStatus as any, DEFAULT_VERIFICATION_ACCEPTANCE_POLICY)) {
         // Here we could implement the full legal basis. For now, we follow Phase 8Q prompt #20:
         // "If operational legal rules have not been approved: decision: review_required not: allowed."

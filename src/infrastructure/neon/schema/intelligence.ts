@@ -34,6 +34,8 @@ export const prospectAnalyses = pgTable(
     estimatedCostUsd: numeric("estimated_cost_usd", { mode: "number" }),
     providerRequestId: text("provider_request_id"),
     error: text("error"),
+    claimToken: text("claim_token"),
+    startedAt: timestamp("started_at", { withTimezone: true }),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     completedAt: timestamp("completed_at", { withTimezone: true }),
   },

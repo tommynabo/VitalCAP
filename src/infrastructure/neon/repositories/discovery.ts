@@ -361,7 +361,7 @@ export async function getRemainingDiscoveryTarget(
       (SELECT COUNT(DISTINCT cm.id)::int
        FROM campaign_memberships cm
        WHERE cm.campaign_id = ${campaignId}::uuid
-         AND cm.stage = 'qualified'
+         AND cm.qualified_at IS NOT NULL
          AND cm.qualified_at >= ${dayStart.toISOString()}::timestamptz
          AND cm.qualified_at < ${dayEnd.toISOString()}::timestamptz
       ) AS generated_today,
@@ -369,7 +369,7 @@ export async function getRemainingDiscoveryTarget(
        FROM provider_runs pr
        WHERE pr.campaign_id = ${campaignId}::uuid
          AND pr.provider = 'apify'
-         AND pr.status IN ('starting', 'queued', 'running', 'ingesting')
+         AND pr.status IN ('starting', 'queued', 'running', 'succeeded', 'ingesting')
          AND pr.started_at >= ${dayStart.toISOString()}::timestamptz
          AND pr.started_at < ${dayEnd.toISOString()}::timestamptz
       ) AS in_flight_provider_items;

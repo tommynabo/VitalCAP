@@ -79,6 +79,9 @@ export async function ingestApifyProviderRun(input: IngestApifyProviderRunInput)
     if (providerRun.status === "ingested") {
       return { rawCandidatesTotal: input.candidates.length, rawCandidatesInserted: 0, processingJobsEnsured: 0, seedMetricsUpdated: false, alreadyIngested: true };
     }
+    if (providerRun.status !== "ingesting") {
+      throw new Error(`Provider run ${input.providerRunId} is not in ingesting state, got ${providerRun.status}`);
+    }
     if (providerRun.ingestion_claim_token !== input.token) {
       throw new Error(`Provider run ${input.providerRunId} ingestion claim token mismatch. Expected ${providerRun.ingestion_claim_token}, got ${input.token}`);
     }
@@ -108,13 +111,18 @@ export async function ingestApifyProviderRun(input: IngestApifyProviderRunInput)
     }
 
     // Ingested MUST be the final write
-    await tx.execute(sql`
+    const finalUpdate = await tx.execute(sql`
       UPDATE provider_runs
       SET status = 'ingested', items_returned = ${input.itemsReturned}, cost_usd = ${input.costUsd},
           external_dataset_id = ${input.externalDatasetId},
-          ingested_at = ${input.finishedAt.toISOString()}::timestamptz, finished_at = COALESCE(finished_at, ${input.finishedAt.toISOString()}::timestamptz), error = NULL
-      WHERE id = ${input.providerRunId}::uuid AND ingestion_claim_token = ${input.token}
+          ingested_at = ${input.finishedAt.toISOString()}::timestamptz, finished_at = COALESCE(finished_at, ${input.finishedAt.toISOString()}::timestamptz), error = NULL,
+          ingestion_claim_token = NULL, ingestion_started_at = NULL
+      WHERE id = ${input.providerRunId}::uuid AND ingestion_claim_token = ${input.token} AND status = 'ingesting'
     `);
+    
+    if (finalUpdate.rowCount !== 1) {
+      throw new Error("claim-lost/stale-worker error: unable to finalize provider_run, zero rows affected");
+    }
   const result = { rawCandidatesTotal: input.candidates.length, rawCandidatesInserted, processingJobsEnsured, seedMetricsUpdated: false, alreadyIngested: false };
   if (input.seedRunId) await refreshSearchSeedQualification(input.seedRunId);
   return { ...result, seedMetricsUpdated: Boolean(input.seedRunId) };

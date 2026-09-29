@@ -44,7 +44,6 @@ export async function runWatchdogCronTick(): Promise<WatchdogCronResult> {
     SET 
       status = CASE 
         WHEN status = 'starting' AND external_run_id IS NULL THEN 'manual_reconciliation_required'
-        WHEN status = 'running' THEN 'manual_reconciliation_required'
         WHEN status = 'succeeded' THEN 'succeeded'
         WHEN status = 'ingesting' AND ingestion_attempt_count >= 5 THEN 'manual_reconciliation_required'
         WHEN status = 'ingesting' AND ingestion_attempt_count < 5 THEN 'succeeded'
@@ -60,7 +59,6 @@ export async function runWatchdogCronTick(): Promise<WatchdogCronResult> {
       END,
       error = CASE 
         WHEN status = 'starting' AND external_run_id IS NULL THEN 'Stuck in starting without external ID (watchdog)'
-        WHEN status = 'running' THEN 'Provider run stalled locally (watchdog)'
         WHEN status = 'succeeded' THEN 'Max ingestion attempts exceeded (watchdog)'
         WHEN status = 'ingesting' AND ingestion_attempt_count >= 5 THEN 'Max ingestion attempts exceeded (watchdog)'
         WHEN status = 'ingesting' AND ingestion_attempt_count < 5 THEN 'Stale ingestion lease (watchdog)'
@@ -68,8 +66,6 @@ export async function runWatchdogCronTick(): Promise<WatchdogCronResult> {
       END
     WHERE 
       (status = 'starting' AND external_run_id IS NULL AND started_at < NOW() - INTERVAL '15 minutes')
-      OR
-      (status = 'running' AND started_at < NOW() - INTERVAL '2 hours')
       OR
       (status = 'succeeded' AND ingested_at IS NULL AND finished_at < NOW() - INTERVAL '1 hour' AND ingestion_attempt_count >= 5)
       OR

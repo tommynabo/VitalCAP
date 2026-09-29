@@ -84,6 +84,8 @@ const requiredMigrationFiles = [
   "0006_bouncy_bromley.sql",
   "0009_phase8l1_intelligence_compliance_fix.sql",
   "0010_phase8o_reliability_fix.sql",
+  "0011_phase8o2_final_reliability.sql",
+  "0012_phase8q1_corrective.sql",
 ];
 const appliedMigrationRows = await db`
   SELECT filename FROM vitalcap_migrations WHERE filename = ANY(${requiredMigrationFiles})
@@ -126,7 +128,7 @@ const queueColumnKeys = new Set(
   }),
 );
 const expectedQueueColumns = ["discovery_jobs", "processing_jobs", "outreach_queue", "intelligence_jobs", "verification_jobs"].flatMap((table) =>
-  table === "verification_jobs" ? ["next_attempt_at", "locked_at", "locked_by"].map(c => `${table}.${c}`) : ["next_attempt_at", "idempotency_key", "locked_at", "locked_by"].map((column) => `${table}.${column}`),
+  ["next_attempt_at", "idempotency_key", "locked_at", "locked_by"].map((column) => `${table}.${column}`),
 );
 
 const indexes = await db`
@@ -152,19 +154,19 @@ const providerRunColumns = await db`
   SELECT column_name
   FROM information_schema.columns
   WHERE table_schema = 'public' AND table_name = 'provider_runs'
-    AND column_name = ANY(${["request_key", "actor_id", "seed_id", "ingested_at", "error", "ingestion_attempt_count", "seed_run_id"]})
+    AND column_name = ANY(${["request_key", "actor_id", "seed_id", "ingested_at", "error", "ingestion_attempt_count", "seed_run_id", "ingestion_claim_token", "ingestion_started_at"]})
 `;
 const providerRunColumnNames = new Set(providerRunColumns.map((row) => String((row as { column_name: string }).column_name)));
-const requiredProviderRunColumns = ["request_key", "actor_id", "seed_id", "ingested_at", "error", "ingestion_attempt_count", "seed_run_id"];
+const requiredProviderRunColumns = ["request_key", "actor_id", "seed_id", "ingested_at", "error", "ingestion_attempt_count", "seed_run_id", "ingestion_claim_token", "ingestion_started_at"];
 
 const autopilotColumns = await db`
   SELECT column_name
   FROM information_schema.columns
   WHERE table_schema = 'public' AND table_name = 'autopilot_settings'
-    AND column_name = ANY(${["workspace_id", "enabled", "emergency_stopped", "global_daily_target", "target_metric", "timezone", "system_paused"]})
+    AND column_name = ANY(${["workspace_id", "enabled", "emergency_stopped", "global_daily_target", "target_metric", "timezone", "system_paused", "system_pause_reason", "system_paused_at"]})
 `;
 const autopilotColumnNames = new Set(autopilotColumns.map((row) => String((row as { column_name: string }).column_name)));
-const requiredAutopilotColumns = ["workspace_id", "enabled", "emergency_stopped", "global_daily_target", "target_metric", "timezone", "system_paused"];
+const requiredAutopilotColumns = ["workspace_id", "enabled", "emergency_stopped", "global_daily_target", "target_metric", "timezone", "system_paused", "system_pause_reason", "system_paused_at"];
 const targetMetricConstraint = await db`
   SELECT 1
   FROM pg_constraint
@@ -241,9 +243,9 @@ if (requiredAttributionColumns.some((column) => !attributionColumnKeys.has(colum
 const prospectCols = await db`
   SELECT column_name FROM information_schema.columns 
   WHERE table_schema = 'public' AND table_name = 'prospect_analyses'
-  AND column_name = ANY(${["fit_score", "fit_tier", "confidence", "qualified", "needs_human_review", "input_hash", "prompt_version"]})
+  AND column_name = ANY(${["fit_score", "fit_tier", "confidence", "qualified", "needs_human_review", "input_hash", "prompt_version", "claim_token", "started_at"]})
 `;
-if (prospectCols.length < 7) throw new Error("prospect_analyses columns: FAIL");
+if (prospectCols.length < 9) throw new Error("prospect_analyses columns: FAIL");
 
 const complianceCols = await db`
   SELECT column_name FROM information_schema.columns
@@ -258,6 +260,13 @@ const verificationCols = await db`
   AND column_name = ANY(${["normalized_email", "provider", "status", "expires_at"]})
 `;
 if (verificationCols.length < 4) throw new Error("email_verifications columns: FAIL");
+
+const verificationJobsCols = await db`
+  SELECT column_name FROM information_schema.columns
+  WHERE table_schema = 'public' AND table_name = 'verification_jobs'
+  AND column_name = ANY(${["completed_at", "provider_request_id", "cost_usd", "normalized_email", "idempotency_key"]})
+`;
+if (verificationJobsCols.length < 5) throw new Error("verification_jobs columns: FAIL");
 
 const mappingsCols = await db`
   SELECT column_name FROM information_schema.columns
@@ -275,7 +284,7 @@ console.log("Replay idempotency indexes: PASS");
 console.log("Provider-run async columns and request-key index: PASS");
 console.log("Autopilot settings and target metric constraint: PASS");
 console.log("Migration tracking: PASS");
-console.log("Migrations 0000-0008: PASS");
+console.log("Migrations 0000-0012: PASS");
 console.log("Phase 8I rebalance columns and non-partial unique index: PASS");
 console.log("Raw candidate seed/provider/account attribution: PASS");
 console.log("Prospect Intelligence tables: PASS");

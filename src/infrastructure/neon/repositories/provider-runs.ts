@@ -102,43 +102,51 @@ export async function reserveApifyProviderRun(input: ReserveApifyProviderRunInpu
   const expectedCostUsd = input.itemsRequested * 0.005; // conservative
 
   // 2. Atomic Insertion with Guard Conditions
-  const query = sql`
-    WITH safety_check AS (
+  return db.transaction(async (tx) => {
+    await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${input.workspaceId}::text || ${start.toISOString()}::text))`);
+
+    const safetyCheck = await tx.execute(sql`
       SELECT
         (SELECT COUNT(*) FROM provider_runs WHERE workspace_id = ${input.workspaceId}::uuid AND status = 'manual_reconciliation_required')::int as unreconciled_count,
         (SELECT COALESCE(SUM(items_requested), 0) FROM provider_runs WHERE workspace_id = ${input.workspaceId}::uuid AND provider = 'apify' AND started_at >= ${start.toISOString()}::timestamptz)::int as requested_today,
         (SELECT COALESCE(SUM(cost_usd), 0) FROM provider_runs WHERE workspace_id = ${input.workspaceId}::uuid AND provider = 'apify' AND started_at >= ${start.toISOString()}::timestamptz)::numeric as cost_today
-    ),
-    insertion AS (
+    `);
+
+    const row = safetyCheck.rows[0] as { unreconciled_count: number; requested_today: number; cost_today: number } | undefined;
+    if (!row) throw new Error("Safety check failed");
+
+    if (row.unreconciled_count > 0) {
+      throw new Error(`Provider run reservation rejected: unresolved manual reconciliation required for workspace ${input.workspaceId}`);
+    }
+    if (row.requested_today + input.itemsRequested > maxRequests) {
+      throw new Error(`Provider run reservation rejected: max daily requests exceeded for workspace ${input.workspaceId}`);
+    }
+    if (row.cost_today + expectedCostUsd > maxCost) {
+      throw new Error(`Provider run reservation rejected: daily cost limit exceeded for workspace ${input.workspaceId}`);
+    }
+
+    const result = await tx.execute(sql`
       INSERT INTO provider_runs (
         workspace_id, campaign_id, provider, operation, request_key, actor_id, seed_id, status, items_requested, items_returned, cost_usd, metadata, started_at
-      )
-      SELECT 
+      ) VALUES (
         ${input.workspaceId}::uuid, ${input.campaignId}::uuid, 'apify', ${input.operation}, ${input.requestKey}, 
         ${input.actorId ?? null}, ${input.seedId}::uuid, 'starting', ${input.itemsRequested}, 0, ${expectedCostUsd}, 
         ${JSON.stringify(input.metadata ?? {})}::jsonb, NOW()
-      FROM safety_check
-      WHERE unreconciled_count = 0
-        AND requested_today + ${input.itemsRequested} <= ${maxRequests}
-        AND cost_today + ${expectedCostUsd} <= ${maxCost}
+      )
       ON CONFLICT (request_key) DO NOTHING
       RETURNING *
-    )
-    SELECT * FROM insertion;
-  `;
-  
-  const result = await db.execute(query);
-  if (result.rows.length > 0) {
-    // Need to parse back camelCase if returning from raw sql, but we can just query it normally
-    const existing = await getProviderRunByRequestKey(input.requestKey);
-    return { providerRun: existing!, created: true };
-  }
+    `);
 
-  const existing = await getProviderRunByRequestKey(input.requestKey);
-  if (existing) return { providerRun: existing, created: false };
-  
-  // If it wasn't inserted and didn't exist, it means safety checks failed.
-  throw new Error(`Provider run reservation rejected by safety constraints for workspace ${input.workspaceId}`);
+    if (result.rows.length > 0) {
+      const insertedRow = await getProviderRunByRequestKey(input.requestKey);
+      return { providerRun: insertedRow!, created: true };
+    }
+
+    const existing = await getProviderRunByRequestKey(input.requestKey);
+    if (existing) return { providerRun: existing, created: false };
+    
+    throw new Error(`Unable to resolve provider run reservation for workspace ${input.workspaceId}`);
+  });
 }
 
 export async function createProviderRun(input: CreateProviderRunInput): Promise<string> {
@@ -235,9 +243,11 @@ export async function recoverFailedIngestion(id: string, token: string, workspac
 }
 
 /**
- * Sum of `cost_usd` for a provider within the current UTC calendar day —
- * backs the pre-run daily cost-limit check (§14) without the provider
- * adapter itself needing a DB import.
+ * Sum of `cost_usd` for a provider within the current UTC calendar day.
+ * Semantics of `cost_usd`: 
+ * - Represents the reserved expected cost until the run is terminal.
+ * - Represents the actual final cost afterward.
+ * This budget query accounts conservatively without double-counting.
  */
 export async function getTodaySpendUsd(workspaceId: string, provider: string, timeZone = "Europe/Madrid", now = new Date()): Promise<number> {
   const db = getDb();

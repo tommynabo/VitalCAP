@@ -96,7 +96,7 @@ export class IntelligenceQueueProcessor {
           throw new Error("Hard Gate: Account is globally suppressed");
         }
 
-        const analysis = await analyzer.analyze(context);
+        const analysis = await analyzer.analyze(context) as any;
         if (!analysis) throw new Error("No analysis returned.");
         
         if (analysis.status === "budget_paused") {
@@ -113,7 +113,7 @@ export class IntelligenceQueueProcessor {
         }
 
         if (analysis.status === "failed") {
-          throw new Error(analysis.error || "Analysis failed");
+          throw new Error(String(analysis.error || "Analysis failed"));
         }
 
         // Update Account

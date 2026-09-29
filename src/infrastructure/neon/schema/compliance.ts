@@ -38,6 +38,7 @@ export const complianceDecisions = pgTable(
     index("idx_compliance_decisions_campaign").on(table.campaignId),
     index("idx_compliance_decisions_contact_point").on(table.contactPointId),
     index("idx_compliance_decisions_active").on(table.workspaceId).where(sql`superseded_at IS NULL`),
+    uniqueIndex("uq_compliance_decisions_current").on(table.campaignId, table.contactPointId, table.channel).where(sql`superseded_at IS NULL`),
   ]
 );
 
@@ -81,6 +82,11 @@ export const verificationJobs = pgTable(
     lockedBy: text("locked_by"),
     nextAttemptAt: timestamp("next_attempt_at", { withTimezone: true }),
     lastError: text("last_error"),
+    completedAt: timestamp("completed_at", { withTimezone: true }),
+    providerRequestId: text("provider_request_id"),
+    costUsd: numeric("cost_usd", { mode: "number" }),
+    normalizedEmail: text("normalized_email"),
+    idempotencyKey: text("idempotency_key"),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
