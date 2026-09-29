@@ -62,20 +62,38 @@ export async function updateAutopilotSettingsWithAudit(input: {
   audit: { actorUserId: string | null; action: string; metadata: Record<string, unknown> };
 }): Promise<AutopilotSettings> {
   const db = getDb();
-  return db.transaction(async (tx) => {
-    await tx.insert(autopilotSettings).values({ workspaceId: input.workspaceId, ...DEFAULT_AUTOPILOT_SETTINGS }).onConflictDoNothing({ target: autopilotSettings.workspaceId });
-    const [updated] = await tx.update(autopilotSettings).set({ ...input.patch, updatedAt: new Date() }).where(eq(autopilotSettings.workspaceId, input.workspaceId)).returning();
-    if (!updated) throw new Error("Failed to update Autopilot settings.");
-    await tx.insert(auditLog).values({
-      workspaceId: input.workspaceId,
-      actorUserId: input.audit.actorUserId,
-      action: input.audit.action,
-      entityType: "autopilot_settings",
-      entityId: input.workspaceId,
-      metadata: input.audit.metadata,
-    });
-    return toAutopilotSettings(updated);
-  });
+  // We must execute this safely without interactive transactions.
+  // We can just execute the queries sequentially, or use a CTE if needed.
+  // Since autopilot_settings is a single row per workspace, the conflict chance is low, but we'll do it sequentially
+  // and accept a very slight non-atomicity between the update and audit log, or use a CTE.
+  // Let's use a CTE to do it atomically:
+  const query = sql`
+    WITH inserted_default AS (
+      INSERT INTO autopilot_settings (workspace_id, enabled, daily_target, timezone, created_at, updated_at)
+      VALUES (${input.workspaceId}::uuid, false, 0, 'UTC', NOW(), NOW())
+      ON CONFLICT (workspace_id) DO NOTHING
+    ),
+    updated AS (
+      UPDATE autopilot_settings
+      SET enabled = coalesce(${input.patch.enabled ?? null}, enabled),
+          emergency_stopped = coalesce(${input.patch.emergencyStopped ?? null}, emergency_stopped),
+          daily_target = coalesce(${input.patch.globalDailyTarget ?? null}, daily_target),
+          updated_at = NOW()
+      WHERE workspace_id = ${input.workspaceId}::uuid
+      RETURNING workspace_id, enabled, emergency_stopped, daily_target, timezone, system_paused, system_pause_reason, system_paused_at, created_at, updated_at
+    ),
+    audit_insert AS (
+      INSERT INTO audit_log (workspace_id, actor_user_id, action, entity_type, entity_id, metadata, created_at)
+      SELECT ${input.workspaceId}::uuid, ${input.audit.actorUserId}::uuid, ${input.audit.action}, 'autopilot_settings', ${input.workspaceId}, ${JSON.stringify(input.audit.metadata)}::jsonb, NOW()
+      FROM updated
+    )
+    SELECT * FROM updated;
+  `;
+  const result = await db.execute(query);
+  if (result.rows.length === 0) throw new Error("Failed to update Autopilot settings.");
+  
+  const row = result.rows[0] as Record<string, unknown>;
+  return toAutopilotSettings(row as any);
 }
 
 export async function updateAutopilotSettings(
@@ -105,7 +123,7 @@ export async function getAutopilotPacingState(workspaceId: string, now = new Dat
     timeZone: settings.timezone,
     dailyTarget: settings.globalDailyTarget,
     targetAchievedToday: metrics.qualifiedToday,
-    rawCandidatesToday: metrics.rawCandidatesToday,
+    rawRequestedToday: metrics.rawRequestedToday, rawReturnedToday: metrics.rawReturnedToday,
     processingInFlight: metrics.processingInFlight,
     providerRunsInFlight: metrics.providerRunsInFlight,
     expectedQualifiedFromInFlight: (metrics.providerRawItemsInFlight + metrics.processingInFlight) * estimatedYield,

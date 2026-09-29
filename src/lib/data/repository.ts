@@ -38,6 +38,7 @@ import {
   listEngineTargets,
   listRebalanceDecisions,
 } from "@/infrastructure/neon/repositories/autopilot";
+import { getAutopilotPacingMetrics } from "@/infrastructure/neon/repositories/autopilot-pacing";
 import {
   getProviderRows,
   getEmailVerificationUsage,
@@ -241,4 +242,23 @@ export async function getDeadLetterSamplesData(): Promise<DeadLetterSample[]> {
   if (isDevSeedMode()) return seed.seedDeadLetterSamples;
   const workspaceId = await getCurrentWorkspaceId();
   return getDeadLetterSamples(workspaceId);
+}
+
+export async function getAutopilotPacingMetricsData(now = new Date()) {
+  if (isDevSeedMode()) {
+    return {
+      qualifiedToday: 0,
+      rawRequestedToday: 0,
+      rawReturnedToday: 0,
+      processingInFlight: 0,
+      providerRunsInFlight: 0,
+      providerRawItemsInFlight: 0,
+      apifySpendToday: 0,
+      historicalRawSampleSize: 0,
+      historicalQualifiedCount: 0,
+    };
+  }
+  const workspaceId = await getCurrentWorkspaceId();
+  const settings = await getAutopilotSettings(workspaceId);
+  return getAutopilotPacingMetrics(workspaceId, settings.timezone, now);
 }

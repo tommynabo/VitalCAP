@@ -5,6 +5,7 @@ import { processingJobIdempotencyKey } from "@/domain/discovery/types";
 
 export interface IngestApifyProviderRunInput {
   providerRunId: string;
+  token: string;
   campaignId: string;
   discoveryJobId: string;
   seedRunId: string | null;
@@ -69,14 +70,17 @@ export async function ingestApifyProviderRun(input: IngestApifyProviderRunInput)
   const db = getDb();
   const tx = db;
     const locked = await tx.execute(sql`
-      SELECT status
+      SELECT status, ingestion_claim_token
       FROM provider_runs
       WHERE id = ${input.providerRunId}::uuid
     `);
-    const providerRun = locked.rows[0] as { status: string } | undefined;
+    const providerRun = locked.rows[0] as { status: string, ingestion_claim_token: string | null } | undefined;
     if (!providerRun) throw new Error(`Provider run ${input.providerRunId} was not found.`);
     if (providerRun.status === "ingested") {
       return { rawCandidatesTotal: input.candidates.length, rawCandidatesInserted: 0, processingJobsEnsured: 0, seedMetricsUpdated: false, alreadyIngested: true };
+    }
+    if (providerRun.ingestion_claim_token !== input.token) {
+      throw new Error(`Provider run ${input.providerRunId} ingestion claim token mismatch. Expected ${providerRun.ingestion_claim_token}, got ${input.token}`);
     }
 
     const resolvedIds = new Set<string>();
@@ -91,13 +95,6 @@ export async function ingestApifyProviderRun(input: IngestApifyProviderRunInput)
       if (await ensureProcessingJob(tx, input.campaignId, rawCandidateId)) processingJobsEnsured += 1;
     }
 
-    await tx.execute(sql`
-      UPDATE provider_runs
-      SET status = 'ingested', items_returned = ${input.itemsReturned}, cost_usd = ${input.costUsd},
-          external_dataset_id = ${input.externalDatasetId},
-          ingested_at = ${input.finishedAt.toISOString()}::timestamptz, finished_at = COALESCE(finished_at, ${input.finishedAt.toISOString()}::timestamptz), error = NULL
-      WHERE id = ${input.providerRunId}::uuid
-    `);
     if (input.seedRunId) {
       await tx.execute(sql`
         UPDATE search_seed_runs
@@ -109,7 +106,16 @@ export async function ingestApifyProviderRun(input: IngestApifyProviderRunInput)
         WHERE id = ${input.seedRunId}::uuid
       `);
     }
-    const result = { rawCandidatesTotal: input.candidates.length, rawCandidatesInserted, processingJobsEnsured, seedMetricsUpdated: false, alreadyIngested: false };
+
+    // Ingested MUST be the final write
+    await tx.execute(sql`
+      UPDATE provider_runs
+      SET status = 'ingested', items_returned = ${input.itemsReturned}, cost_usd = ${input.costUsd},
+          external_dataset_id = ${input.externalDatasetId},
+          ingested_at = ${input.finishedAt.toISOString()}::timestamptz, finished_at = COALESCE(finished_at, ${input.finishedAt.toISOString()}::timestamptz), error = NULL
+      WHERE id = ${input.providerRunId}::uuid AND ingestion_claim_token = ${input.token}
+    `);
+  const result = { rawCandidatesTotal: input.candidates.length, rawCandidatesInserted, processingJobsEnsured, seedMetricsUpdated: false, alreadyIngested: false };
   if (input.seedRunId) await refreshSearchSeedQualification(input.seedRunId);
   return { ...result, seedMetricsUpdated: Boolean(input.seedRunId) };
 }

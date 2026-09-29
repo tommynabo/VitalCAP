@@ -43,7 +43,7 @@ describe("computeAutopilotPacing", () => {
     timeZone: "Europe/Madrid",
     dailyTarget: 25,
     targetAchievedToday: 7,
-    rawCandidatesToday: 4,
+    rawRequestedToday: 4, rawReturnedToday: 4,
     processingInFlight: 0,
     providerRunsInFlight: 0,
     expectedQualifiedFromInFlight: 0,

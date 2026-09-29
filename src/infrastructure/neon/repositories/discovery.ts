@@ -125,7 +125,16 @@ export async function updateSearchSeedRun(
   }).where(eq(searchSeedRuns.id, id));
 }
 
-/** Finalizes the seed run and folds its metrics exactly once in one DB transaction. */
+export function buildRawSourceFingerprint(externalId: string | null | undefined, sourceUrl: string | null | undefined, fallbackObj: Record<string, unknown>): { fingerprint: string; version: string } {
+  if (externalId) return { fingerprint: `place:v1:${externalId}`, version: "v1" };
+  if (sourceUrl) return { fingerprint: `url:v1:${sourceUrl}`, version: "v1" };
+  const jsonStr = JSON.stringify(fallbackObj || {});
+  // Use a simple hash or just fallback string if no crypto is available, but crypto is in node.
+  const hash = require("node:crypto").createHash("sha256").update(jsonStr).digest("hex");
+  return { fingerprint: `hash:v1:${hash}`, version: "v1" };
+}
+
+/** Finalizes the seed run and folds its metrics. (Transaction removed for Neon HTTP compatibility) */
 export async function finalizeSearchSeedRun(input: {
   seedRunId: string;
   rawCount: number;
@@ -135,65 +144,64 @@ export async function finalizeSearchSeedRun(input: {
   error: string | null;
 }): Promise<boolean> {
   const db = getDb();
-  return db.transaction(async (tx) => {
-    const runResult = await tx.execute(sql`
-      SELECT id, seed_id, finished_at
-      FROM search_seed_runs
-      WHERE id = ${input.seedRunId}::uuid
-      FOR UPDATE
-    `);
-    const run = runResult.rows[0] as { id: string; seed_id: string; finished_at: string | null } | undefined;
-    if (!run) throw new Error(`Search seed run ${input.seedRunId} was not found.`);
-    if (run.finished_at) return false;
+  
+  // 1. Mark run finished
+  const runResult = await db.execute(sql`
+    UPDATE search_seed_runs
+    SET finished_at = ${input.finishedAt.toISOString()}::timestamptz,
+        raw_count = ${input.rawCount}, unique_count = ${input.uniqueCount},
+        ready_count = ${input.readyCount}, error = ${input.error}
+    WHERE id = ${input.seedRunId}::uuid AND finished_at IS NULL
+    RETURNING seed_id
+  `);
+  
+  if (runResult.rows.length === 0) return false;
+  const seedId = runResult.rows[0]?.seed_id as string;
 
-    const seedResult = await tx.execute(sql`
-      SELECT id, campaign_id, engine_type, query, geography, last_run_at,
-             total_raw, total_unique, total_ready, yield_rate,
-             exhaustion_score, next_eligible_at
-      FROM search_seeds
-      WHERE id = ${run.seed_id}::uuid
-      FOR UPDATE
-    `);
-    const seedRow = seedResult.rows[0] as Record<string, unknown> | undefined;
-    if (!seedRow) throw new Error(`Search seed ${run.seed_id} was not found.`);
-    const seed: SearchSeed = {
-      id: String(seedRow.id),
-      campaignId: String(seedRow.campaign_id),
-      engineType: seedRow.engine_type as SearchSeed["engineType"],
-      query: String(seedRow.query),
-      geography: String(seedRow.geography),
-      lastRunAt: seedRow.last_run_at ? new Date(String(seedRow.last_run_at)).toISOString() : null,
-      totalRaw: Number(seedRow.total_raw),
-      totalUnique: Number(seedRow.total_unique),
-      totalReady: Number(seedRow.total_ready),
-      yieldRate: Number(seedRow.yield_rate),
-      exhaustionScore: Number(seedRow.exhaustion_score),
-      nextEligibleAt: seedRow.next_eligible_at ? new Date(String(seedRow.next_eligible_at)).toISOString() : null,
-    };
-    const updated = recordSeedRun(seed, {
-      rawCount: input.rawCount,
-      uniqueCount: input.uniqueCount,
-      readyCount: input.readyCount,
-      finishedAt: input.finishedAt.toISOString(),
-    });
-    await tx.execute(sql`
-      UPDATE search_seed_runs
-      SET finished_at = ${input.finishedAt.toISOString()}::timestamptz,
-          raw_count = ${input.rawCount}, unique_count = ${input.uniqueCount},
-          ready_count = ${input.readyCount}, error = ${input.error}
-      WHERE id = ${input.seedRunId}::uuid
-    `);
-    await tx.execute(sql`
-      UPDATE search_seeds
-      SET last_run_at = ${updated.lastRunAt}::timestamptz,
-          total_raw = ${updated.totalRaw}, total_unique = ${updated.totalUnique},
-          total_ready = ${updated.totalReady}, yield_rate = ${updated.yieldRate},
-          exhaustion_score = ${updated.exhaustionScore},
-          next_eligible_at = ${updated.nextEligibleAt}::timestamptz
-      WHERE id = ${updated.id}::uuid
-    `);
-    return true;
+  // 2. Load seed to recompute
+  const seedResult = await db.execute(sql`
+    SELECT id, campaign_id, engine_type, query, geography, last_run_at,
+           total_raw, total_unique, total_ready, yield_rate,
+           exhaustion_score, next_eligible_at
+    FROM search_seeds
+    WHERE id = ${seedId}::uuid
+  `);
+  const seedRow = seedResult.rows[0] as Record<string, unknown> | undefined;
+  if (!seedRow) return true;
+
+  const seed: SearchSeed = {
+    id: String(seedRow.id),
+    campaignId: String(seedRow.campaign_id),
+    engineType: seedRow.engine_type as SearchSeed["engineType"],
+    query: String(seedRow.query),
+    geography: String(seedRow.geography),
+    lastRunAt: seedRow.last_run_at ? new Date(String(seedRow.last_run_at)).toISOString() : null,
+    totalRaw: Number(seedRow.total_raw),
+    totalUnique: Number(seedRow.total_unique),
+    totalReady: Number(seedRow.total_ready),
+    yieldRate: Number(seedRow.yield_rate),
+    exhaustionScore: Number(seedRow.exhaustion_score),
+    nextEligibleAt: seedRow.next_eligible_at ? new Date(String(seedRow.next_eligible_at)).toISOString() : null,
+  };
+
+  const updated = recordSeedRun(seed, {
+    rawCount: input.rawCount,
+    uniqueCount: input.uniqueCount,
+    readyCount: input.readyCount,
+    finishedAt: input.finishedAt.toISOString(),
   });
+
+  // 3. Update seed
+  await db.execute(sql`
+    UPDATE search_seeds
+    SET last_run_at = ${updated.lastRunAt}::timestamptz,
+        total_raw = ${updated.totalRaw}, total_unique = ${updated.totalUnique},
+        total_ready = ${updated.totalReady}, yield_rate = ${updated.yieldRate},
+        exhaustion_score = ${updated.exhaustionScore},
+        next_eligible_at = ${updated.nextEligibleAt}::timestamptz
+    WHERE id = ${updated.id}::uuid
+  `);
+  return true;
 }
 
 export interface InsertRawCandidateInput {
@@ -239,7 +247,7 @@ export async function refreshSearchSeedQualification(searchSeedRunId: string): P
       FROM search_seed_runs ssr
       LEFT JOIN raw_candidates rc ON rc.search_seed_run_id = ssr.id
       LEFT JOIN campaign_memberships cm ON cm.campaign_id = rc.campaign_id
-        AND cm.account_id = rc.account_id AND cm.stage = 'qualified'
+        AND cm.account_id = rc.account_id AND cm.qualified_at IS NOT NULL
       WHERE ssr.id = ${searchSeedRunId}::uuid
       GROUP BY ssr.seed_id
     `);

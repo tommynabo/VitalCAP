@@ -1,4 +1,4 @@
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { getDb } from "../db";
 import { campaigns, campaignMemberships } from "../schema/campaigns";
 import type { Campaign, CampaignMembership, CampaignMembershipStage } from "@/domain/campaigns/types";
@@ -86,22 +86,37 @@ export interface UpsertCampaignMembershipInput {
 /** Upserts on the existing `(campaign_id, account_id)` unique index — an account can only ever have one membership row per campaign, so re-processing the same account is idempotent. */
 export async function upsertCampaignMembership(input: UpsertCampaignMembershipInput): Promise<void> {
   const db = getDb();
-  const values = {
-    campaignId: input.campaignId,
-    accountId: input.accountId,
-    contactId: input.contactId ?? null,
-    selectedContactPointId: input.selectedContactPointId ?? null,
-    stage: input.stage,
-    rejectionReason: input.rejectionReason ?? null,
-    readyAt: input.readyAt ?? null,
-  };
-  await db
-    .insert(campaignMemberships)
-    .values(values)
-    .onConflictDoUpdate({
-      target: [campaignMemberships.campaignId, campaignMemberships.accountId],
-      set: { ...values, updatedAt: new Date() },
-    });
+  
+  const isQualifiedOrLater = ["qualified", "contact_selected", "ready", "contacted"].includes(input.stage);
+  
+  await db.execute(sql`
+    INSERT INTO campaign_memberships (
+      campaign_id, account_id, contact_id, selected_contact_point_id,
+      stage, rejection_reason, ready_at, qualified_at, created_at, updated_at
+    )
+    VALUES (
+      ${input.campaignId}::uuid, ${input.accountId}::uuid, ${input.contactId ?? null}::uuid, ${input.selectedContactPointId ?? null}::uuid,
+      ${input.stage}, ${input.rejectionReason ?? null}, ${input.readyAt ? input.readyAt.toISOString() : null}::timestamptz,
+      CASE WHEN ${isQualifiedOrLater} THEN NOW() ELSE NULL END, NOW(), NOW()
+    )
+    ON CONFLICT (campaign_id, account_id) DO UPDATE SET
+      stage = CASE
+        WHEN campaign_memberships.stage = 'contacted' AND ${input.stage} IN ('qualified', 'contact_selected', 'ready') THEN campaign_memberships.stage
+        WHEN campaign_memberships.stage = 'ready' AND ${input.stage} IN ('qualified', 'contact_selected') THEN campaign_memberships.stage
+        WHEN campaign_memberships.stage = 'contact_selected' AND ${input.stage} = 'qualified' THEN campaign_memberships.stage
+        ELSE ${input.stage}
+      END,
+      contact_id = coalesce(EXCLUDED.contact_id, campaign_memberships.contact_id),
+      selected_contact_point_id = coalesce(EXCLUDED.selected_contact_point_id, campaign_memberships.selected_contact_point_id),
+      ready_at = coalesce(EXCLUDED.ready_at, campaign_memberships.ready_at),
+      rejection_reason = CASE WHEN ${input.stage} = 'rejected' THEN EXCLUDED.rejection_reason ELSE campaign_memberships.rejection_reason END,
+      qualified_at = CASE
+        WHEN campaign_memberships.qualified_at IS NOT NULL THEN campaign_memberships.qualified_at
+        WHEN ${isQualifiedOrLater} THEN NOW()
+        ELSE NULL
+      END,
+      updated_at = NOW()
+  `);
 }
 
 export async function listCampaignMembershipsByStage(campaignId: string, stage: CampaignMembershipStage, limit: number): Promise<CampaignMembership[]> {

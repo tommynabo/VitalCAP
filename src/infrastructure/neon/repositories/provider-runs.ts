@@ -138,14 +138,15 @@ export async function listApifyRunsForPolling(limit: number) {
     .limit(limit);
 }
 
-export async function claimProviderRunForIngestion(id: string) {
+export async function claimProviderRunForIngestion(id: string, token: string) {
   const db = getDb();
   const [claimed] = await db
     .update(providerRuns)
     .set({
       status: "ingesting",
       ingestionStartedAt: new Date(),
-      ingestionAttemptCount: sql`${providerRuns.ingestionAttemptCount} + 1`
+      ingestionAttemptCount: sql`${providerRuns.ingestionAttemptCount} + 1`,
+      ingestionClaimToken: token,
     })
     .where(and(eq(providerRuns.id, id), eq(providerRuns.status, "succeeded")))
     .returning();

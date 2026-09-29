@@ -33,6 +33,7 @@ export const providerRuns = pgTable(
     ingestedAt: timestamp("ingested_at", { withTimezone: true }),
     ingestionStartedAt: timestamp("ingestion_started_at", { withTimezone: true }),
     ingestionAttemptCount: integer("ingestion_attempt_count").notNull().default(0),
+    ingestionClaimToken: text("ingestion_claim_token"),
     lastIngestionError: text("last_ingestion_error"),
     seedRunId: uuid("seed_run_id"),
     error: text("error"),
@@ -42,5 +43,6 @@ export const providerRuns = pgTable(
     index("idx_provider_runs_campaign").on(table.campaignId),
     index("idx_provider_runs_provider").on(table.provider, table.startedAt),
     uniqueIndex("uq_provider_runs_request_key").on(table.requestKey),
+    index("idx_provider_runs_seed_run").on(table.seedRunId),
   ],
 );

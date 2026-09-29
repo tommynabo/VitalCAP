@@ -31,7 +31,8 @@ export interface AutopilotPacingState {
   expectedAchievedByNow: number;
   paceDeficit: number;
   qualifiedToday: number;
-  rawCandidatesToday: number;
+  rawRequestedToday: number;
+  rawReturnedToday: number;
   processingInFlight: number;
   providerRunsInFlight: number;
   expectedQualifiedFromInFlight: number;
@@ -111,7 +112,8 @@ export interface PacingComputationInput {
   timeZone: string;
   dailyTarget: number;
   targetAchievedToday: number;
-  rawCandidatesToday: number;
+  rawRequestedToday: number;
+  rawReturnedToday: number;
   processingInFlight: number;
   providerRunsInFlight: number;
   expectedQualifiedFromInFlight: number;
@@ -146,7 +148,7 @@ export function computeAutopilotPacing(input: PacingComputationInput): Autopilot
     : Math.min(remainingTarget, Math.ceil(paceDeficit * 1.1));
   
   const rawRemainingToday = typeof input.maxDailyRawRequests === "number" 
-    ? Math.max(0, input.maxDailyRawRequests - input.rawCandidatesToday) 
+    ? Math.max(0, input.maxDailyRawRequests - input.rawRequestedToday) 
     : 1000;
   const rawNeededToPlan = qualifiedNeededToPlan > 0 ? Math.min(100, rawRemainingToday, Math.ceil(qualifiedNeededToPlan / boundedYield)) : 0;
   
@@ -187,7 +189,8 @@ export function computeAutopilotPacing(input: PacingComputationInput): Autopilot
     expectedAchievedByNow,
     paceDeficit,
     qualifiedToday: input.targetAchievedToday,
-    rawCandidatesToday: input.rawCandidatesToday,
+    rawRequestedToday: input.rawRequestedToday,
+    rawReturnedToday: input.rawReturnedToday,
     processingInFlight: input.processingInFlight,
     providerRunsInFlight: input.providerRunsInFlight,
     expectedQualifiedFromInFlight: input.expectedQualifiedFromInFlight,

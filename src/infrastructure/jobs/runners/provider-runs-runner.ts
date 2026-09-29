@@ -75,13 +75,24 @@ export async function runProviderRunsCronTick(maxRuns = MAX_RUNS_PER_TICK): Prom
         continue;
       }
 
+      // FIRST atomically persist: status = succeeded
+      if (providerRun.status !== "succeeded" && providerRun.status !== "ingesting") {
+        await updateProviderRun(providerRun.id, {
+          status: "succeeded",
+          externalDatasetId: run.defaultDatasetId ?? providerRun.externalDatasetId,
+          costUsd: usageCost,
+          finishedAt: run.finishedAt ? new Date(run.finishedAt) : new Date(),
+        });
+      }
+
       const datasetId = run.defaultDatasetId ?? providerRun.externalDatasetId;
       if (!datasetId) throw new Error(`Apify run ${run.id} succeeded without a dataset ID.`);
       const metadata = (providerRun.metadata ?? {}) as Record<string, unknown>;
       const discoveryJobId = typeof metadata.discoveryJobId === "string" ? metadata.discoveryJobId : null;
       if (!discoveryJobId) throw new Error(`Provider run ${providerRun.id} has no discovery job metadata.`);
       
-      const claimed = await claimProviderRunForIngestion(providerRun.id);
+      const token = require("node:crypto").randomUUID();
+      const claimed = await claimProviderRunForIngestion(providerRun.id, token);
       if (!claimed) {
         if (providerRun.status === 'ingesting') {
            warnings.push(`provider_run ${providerRun.id} is already ingesting, skipping.`);
@@ -92,9 +103,11 @@ export async function runProviderRunsCronTick(maxRuns = MAX_RUNS_PER_TICK): Prom
       const rawItems = await fetchBoundedDatasetItems(client, datasetId, providerRun.itemsRequested || 1);
 
       const places = rawItems.map(mapCompassItemToPlaceResult).filter((place): place is NonNullable<ReturnType<typeof mapCompassItemToPlaceResult>> => place !== null);
+
       
       const ingestion = await ingestApifyProviderRun({
         providerRunId: providerRun.id,
+        token,
         campaignId: providerRun.campaignId!,
         discoveryJobId,
         seedRunId: typeof metadata.seedRunId === "string" ? metadata.seedRunId : (providerRun.seedRunId ?? null),
@@ -112,6 +125,7 @@ export async function runProviderRunsCronTick(maxRuns = MAX_RUNS_PER_TICK): Prom
             rawPayload: { kind: "maps", place },
             searchSeedRunId: typeof metadata.seedRunId === "string" ? metadata.seedRunId : (providerRun.seedRunId ?? null),
             providerRunId: providerRun.id,
+        token,
           };
         }),
         finishedAt: run.finishedAt ? new Date(run.finishedAt) : new Date(),

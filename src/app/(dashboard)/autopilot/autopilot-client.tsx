@@ -114,7 +114,7 @@ export function AutopilotClient({
         <KpiStat label="Progress" value={`${progressPct}%`} />
         <KpiStat label="Soft target total" value={String(softTargetTotal)} />
         <KpiStat label="Sent today" value={String(state.sentToday)} />
-        <KpiStat label="Raw candidates" value={pacing ? String(pacing.rawCandidatesToday) : "Unavailable"} />
+        <KpiStat label="Raw candidates" value={pacing ? String(pacing.rawRequestedToday) : "Unavailable"} />
         <KpiStat label="Processing jobs" value={pacing ? String(pacing.processingInFlight) : "Unavailable"} />
         <KpiStat label="System health" value={state.systemHealth} />
       </div>
