@@ -5,7 +5,7 @@ import type { MapsPlaceResult, SerpResult, WebsiteFetcher, EmailVerificationProv
 import { normalizeBusinessName, normalizeDomain, normalizePhoneES } from "@/lib/normalization";
 import { evaluateSpainEligibility, type SpainEligibilityVerdict } from "@/lib/geography/spain-eligibility";
 import { evaluateAccountDedup, type AccountIdentitySignals } from "@/services/deduplication/account-dedup";
-import { classifyBusinessType } from "./business-type";
+import { classifyBusinessType, isAcceptedIcpBusinessType } from "./business-type";
 import { extractCandidateEmails } from "@/services/enrichment/email-extraction";
 import { computeStrategicPriority } from "@/services/routing/contact-priority";
 import { isContactPointAcceptable, DEFAULT_VERIFICATION_ACCEPTANCE_POLICY, type VerificationAcceptancePolicy } from "@/services/verification/acceptance-policy";
@@ -66,6 +66,7 @@ export interface ProcessedCandidateResult {
   matchedAccountKey: string | null;
   spainVerdict: SpainEligibilityVerdict;
   businessType: BusinessType;
+  icpQualified: boolean;
   contactPoints: ProcessedContactPoint[];
   readyForOutreach: boolean;
   rejectionReason: string | null;
@@ -212,9 +213,28 @@ export async function processRawCandidate(
       matchedAccountKey,
       spainVerdict: spainResult.verdict,
       businessType,
+      icpQualified: false,
       contactPoints: [],
       readyForOutreach: false,
       rejectionReason: `Rejected: ${spainResult.reason}`,
+    };
+  }
+
+  // Keep non-ICP discoveries auditable, but never spend enrichment or
+  // verification capacity on them and never allow them into qualification.
+  if (!isAcceptedIcpBusinessType(businessType)) {
+    return {
+      engineType,
+      accountKey,
+      businessNameGuess,
+      isDuplicate,
+      matchedAccountKey,
+      spainVerdict: spainResult.verdict,
+      businessType,
+      icpQualified: false,
+      contactPoints: [],
+      readyForOutreach: false,
+      rejectionReason: `Rejected ICP: ${businessType} is outside the pharmacy, parapharmacy, and herbal-shop scope`,
     };
   }
 
@@ -288,6 +308,7 @@ export async function processRawCandidate(
     matchedAccountKey,
     spainVerdict: spainResult.verdict,
     businessType,
+    icpQualified: true,
     contactPoints,
     readyForOutreach,
     rejectionReason,
