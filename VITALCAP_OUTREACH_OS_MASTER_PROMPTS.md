@@ -18,9 +18,9 @@ The initial customer/business is Vitalcap, a Spanish supplement brand. The syste
 
 Initial commercial facts supplied by the business:
 - Country: Spain only.
-- Main target: independent pharmacies.
-- Additional acceptable targets: parapharmacies, herbal shops, sports nutrition stores, supplement stores and other physical retailers reasonably capable of selling supplements.
-- Do not over-restrict the ICP in the first version. We need data before aggressively excluding categories.
+- Primary ICP: pharmacies, parapharmacies and herbal shops only.
+- Sports nutrition stores, supplement stores, generic fitness/wellness stores and other retail may be preserved as raw discoveries for audit, but must never be ICP-qualified.
+- Geographic scope: all Spain. Do not filter by municipality, city, population, province priority, or urban/rural location. Geographic units may only be used to partition the nationwide search.
 - Ideal decision maker: owner, titular pharmacist, pharmacy owner-manager, manager, purchasing manager or equivalent.
 - A generic pharmacy email can still be valuable and may reach the owner.
 - Multiple contacts for the same account are allowed.
@@ -989,11 +989,11 @@ Build query expansion.
 
 Example dimensions:
 - category:
-  farmacia, farmacia independiente, parafarmacia, herbolario, tienda de suplementos, nutrición deportiva, tienda fitness, complementos alimenticios
+  farmacia, farmacia independiente, parafarmacia, herbolario, herbolaria
 - geography:
   municipality, province
 - intent signals:
-  suplementos, complementos, nutrición, vitaminas, bienestar
+  pharmacy, parapharmacy and herbal-shop naming/context only; supplement, fitness and generic wellness terms must not qualify a business on their own
 
 Do not explode combinatorially without yield tracking.
 Search planner should choose high-yield combinations.
@@ -2573,6 +2573,7 @@ Name:
 - target business types:
   - pharmacy
   - parapharmacy
+  - herbal_shop
 - geography: Spain
 - offer: Vitalcap
 - primary CTA: configurable sales-director booking URL
