@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { ZodError } from "zod";
 import { createCampaignSchema } from "@/domain/campaigns/create";
 import { createCampaign } from "@/infrastructure/neon/repositories/campaigns";
-import { getOfferById, getPrimaryOffer } from "@/infrastructure/neon/repositories/offers";
+import { getOfferById, getOrCreatePrimaryOffer } from "@/infrastructure/neon/repositories/offers";
 import { UnauthorizedError, requireWorkspaceAdmin } from "@/lib/auth/workspace";
 
 export const dynamic = "force-dynamic";
@@ -13,9 +13,9 @@ export async function POST(request: Request) {
     const context = await requireWorkspaceAdmin();
     const offer = command.offerId
       ? await getOfferById(context.workspaceId, command.offerId)
-      : await getPrimaryOffer(context.workspaceId);
+      : await getOrCreatePrimaryOffer(context.workspaceId);
     if (!offer) {
-      return NextResponse.json({ error: "Create or select an offer before creating a campaign." }, { status: 409 });
+      return NextResponse.json({ error: "The selected offer is not available in this workspace." }, { status: 409 });
     }
 
     const campaign = await createCampaign({

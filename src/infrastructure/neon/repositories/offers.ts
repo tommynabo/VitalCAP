@@ -30,6 +30,40 @@ export async function getPrimaryOffer(workspaceId: string): Promise<Offer | null
   return row ? toOffer(row) : null;
 }
 
+/**
+ * A new workspace should be able to configure discovery before commercial
+ * details are entered. This placeholder carries no claims and remains
+ * inactive, but satisfies the campaign foreign key until the offer is
+ * configured in Settings.
+ */
+export async function getOrCreatePrimaryOffer(workspaceId: string): Promise<Offer> {
+  const existing = await getPrimaryOffer(workspaceId);
+  if (existing) return existing;
+
+  const db = getDb();
+  const [created] = await db
+    .insert(offers)
+    .values({
+      workspaceId,
+      name: "Default workspace offer",
+      company: "Not configured",
+      description: "Commercial offer details have not been configured yet.",
+      primaryCta: "Contact",
+      bookingUrl: "",
+      approvedCommercialFacts: {},
+      approvedProductFacts: {},
+      approvedClaims: [],
+      forbiddenClaims: [],
+      faq: [],
+      objectionGuidance: {},
+      toneConfig: {},
+      active: false,
+    })
+    .returning();
+  if (!created) throw new Error("Failed to initialize workspace offer.");
+  return toOffer(created);
+}
+
 /** Looks up an offer only inside the calling workspace. */
 export async function getOfferById(workspaceId: string, offerId: string): Promise<Offer | null> {
   const db = getDb();
