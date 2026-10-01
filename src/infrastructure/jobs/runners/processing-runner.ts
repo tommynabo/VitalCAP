@@ -52,6 +52,7 @@ const smokeVerificationProvider: EmailVerificationProvider = {
 
 function resolveAccountStatus(processed: ProcessedCandidateResult): AccountStatus {
   if (processed.spainVerdict === "rejected") return "rejected_country";
+  if (!processed.icpQualified) return "rejected_icp";
   if (processed.spainVerdict === "needs_review") return "needs_review";
   if (processed.readyForOutreach) return "contactable";
   return "no_contact_found";
@@ -60,6 +61,7 @@ function resolveAccountStatus(processed: ProcessedCandidateResult): AccountStatu
 function resolveMembershipStage(processed: ProcessedCandidateResult): { stage: CampaignMembershipStage; rejectionReason: string | null } {
   if (processed.readyForOutreach) return { stage: "ready", rejectionReason: null };
   if (processed.spainVerdict === "rejected") return { stage: "rejected", rejectionReason: processed.rejectionReason };
+  if (!processed.icpQualified) return { stage: "rejected", rejectionReason: processed.rejectionReason };
   if (processed.spainVerdict === "needs_review") return { stage: "discovered", rejectionReason: processed.rejectionReason };
   return { stage: "qualified", rejectionReason: processed.rejectionReason };
 }
