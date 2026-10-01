@@ -79,8 +79,79 @@ describe("processRawCandidate — maps candidates", () => {
     const result = await processRawCandidate(payload, "maps_fast", baseContext());
     expect(result.spainVerdict).toBe("verified");
     expect(result.businessType).toBe("pharmacy");
+    expect(result.icpQualified).toBe(true);
     expect(result.contactPoints.length).toBeGreaterThan(0);
     expect(result.readyForOutreach).toBe(true);
+  });
+
+  it.each([
+    ["Farmacia del Pueblo", "farmacia", "09314", "Burgos"],
+    ["Herbolaria Sierra Verde", "herbolaria", "10849", "Cáceres"],
+  ])("accepts a valid ICP business in a Spanish village or rural area: %s", async (name, category, postalCode, province) => {
+    const result = await processRawCandidate(
+      {
+        kind: "maps",
+        place: {
+          externalPlaceId: `rural-${postalCode}`,
+          name,
+          category,
+          address: "Plaza Mayor 1",
+          postalCode,
+          province,
+          city: "Municipio rural",
+          countryCode: "ES",
+          websiteUrl: "https://example.es",
+          phone: null,
+          latitude: null,
+          longitude: null,
+          rating: null,
+          reviewCount: null,
+          sourceUrl: null,
+        },
+      },
+      "maps_fast",
+      baseContext(),
+    );
+
+    expect(result.spainVerdict).toBe("verified");
+    expect(result.icpQualified).toBe(true);
+    expect(result.readyForOutreach).toBe(true);
+  });
+
+  it.each([
+    ["Suplementos Pro", "tienda de suplementos", "supplement_store"],
+    ["Sport Nutrition Pro", "nutrición deportiva", "sports_nutrition_store"],
+    ["Fitness Store", "tienda fitness", "other_retail"],
+  ])("rejects a Spain-based non-ICP business: %s", async (name, category, expectedType) => {
+    const result = await processRawCandidate(
+      {
+        kind: "maps",
+        place: {
+          externalPlaceId: `non-icp-${expectedType}`,
+          name,
+          category,
+          address: "Calle Mayor 1",
+          postalCode: "28001",
+          province: "Madrid",
+          city: "Madrid",
+          countryCode: "ES",
+          websiteUrl: "https://example.es",
+          phone: null,
+          latitude: null,
+          longitude: null,
+          rating: null,
+          reviewCount: null,
+          sourceUrl: null,
+        },
+      },
+      "maps_fast",
+      baseContext(),
+    );
+
+    expect(result.businessType).toBe(expectedType);
+    expect(result.icpQualified).toBe(false);
+    expect(result.readyForOutreach).toBe(false);
+    expect(result.rejectionReason).toMatch(/^Rejected ICP:/);
   });
 
   it("marks a global duplicate as reusable campaign identity", async () => {
