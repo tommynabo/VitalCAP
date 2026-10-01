@@ -28,6 +28,18 @@ describe("engine capabilities", () => {
     expect(capabilities.find((item) => item.engineType === "maps_fast")?.available).toBe(false);
   });
 
+  it("blocks paid discovery when the provider is degraded", () => {
+    const maps = buildEngineCapabilities({
+      mapsProvider: "apify",
+      mapsProviderConfigured: true,
+      serpProvider: "disabled",
+      mapsFastHealth: "degraded",
+      costAllowed: true,
+      campaignCounts: { maps_fast: 1 },
+    }).find((item) => item.engineType === "maps_fast");
+    expect(maps).toMatchObject({ available: false, reasonUnavailable: "provider_degraded" });
+  });
+
   it("allows a configured untested provider to bootstrap paid work", () => {
     const maps = buildEngineCapabilities({
       mapsProvider: "apify",
