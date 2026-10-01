@@ -35,6 +35,9 @@ const ICP_SIGNALS = [
   "farmacia",
   "parafarmacia",
   "herbolario",
+  "herbolaria",
+  // These remain useful product-assortment evidence, but are explicitly not
+  // ICP evidence: the candidate processor only accepts the first four terms.
   "suplementos",
   "complementos alimenticios",
   "vitaminas",
@@ -94,11 +97,10 @@ function extractBusinessSignals(text: string, sourceUrl: string): WebsiteEvidenc
   for (const signal of ICP_SIGNALS) {
     const idx = lowerText.indexOf(signal);
     if (idx !== -1) {
-      const type = (signal === "suplementos" || signal === "complementos alimenticios" || signal === "vitaminas") 
-        ? "supplement_signal" 
-        : "business_signal";
       facts.push({
-        evidenceType: type,
+        evidenceType: ["suplementos", "complementos alimenticios", "vitaminas", "nutrición deportiva", "bienestar"].includes(signal)
+          ? "supplement_signal"
+          : "business_signal",
         value: signal,
         normalizedValue: signal,
         snippet: extractVisibleTextContext(text, idx, signal.length),
