@@ -11,7 +11,7 @@ import { Select } from "@/components/ui/select";
 import { Sheet } from "@/components/ui/sheet";
 import { Table, TableBody, TableCell, TableHead, TableHeadCell, TableRow } from "@/components/ui/table";
 import { Tabs } from "@/components/ui/tabs";
-import type { Campaign, EngineType, Offer } from "@/domain/campaigns/types";
+import type { Campaign, CampaignStatus, EngineType, Offer } from "@/domain/campaigns/types";
 import type { Conversation, Meeting } from "@/domain/conversations/types";
 import type { EngineTargetState } from "@/domain/autopilot/types";
 import type { OutreachQueueItem } from "@/domain/outreach/types";
@@ -50,6 +50,20 @@ const HEALTH_VARIANT: Record<string, "success" | "warning" | "danger" | "neutral
   unknown: "neutral",
 };
 
+const STATUS_LABELS: Record<CampaignStatus, string> = {
+  active: "Active",
+  paused: "Paused",
+  draft: "Draft",
+  archived: "Archived",
+};
+
+const STATUS_VARIANT: Record<CampaignStatus, "success" | "warning" | "neutral" | "danger"> = {
+  active: "success",
+  paused: "warning",
+  draft: "neutral",
+  archived: "danger",
+};
+
 const DETAIL_TABS = [
   { value: "overview", label: "Overview" },
   { value: "engine", label: "Engine config" },
@@ -61,7 +75,64 @@ const DETAIL_TABS = [
   { value: "settings", label: "Settings" },
 ];
 
-function CampaignDetail({ campaign, data }: { campaign: Campaign; data: CampaignsData }) {
+function CampaignSettings({ campaign, onUpdated }: { campaign: Campaign; onUpdated: (campaign: Campaign) => void }) {
+  const router = useRouter();
+  const [status, setStatus] = useState<CampaignStatus>(campaign.status);
+  const [autopilotEnabled, setAutopilotEnabled] = useState(campaign.autopilotEnabled);
+  const [dailySoftTarget, setDailySoftTarget] = useState(campaign.dailySoftTarget);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  async function saveCampaign(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setSaving(true);
+    setError(null);
+    try {
+      const response = await fetch("/api/campaigns", {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ id: campaign.id, status, autopilotEnabled, dailySoftTarget }),
+      });
+      const body = (await response.json()) as { campaign?: Campaign; error?: string };
+      if (!response.ok || !body.campaign) throw new Error(body.error ?? "Campaign update failed.");
+      onUpdated(body.campaign);
+      router.refresh();
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "Campaign update failed.");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <form className="space-y-4" onSubmit={(event) => void saveCampaign(event)}>
+      <div className="space-y-1.5">
+        <label htmlFor="campaign-status" className="text-xs font-medium text-text-muted">Status</label>
+        <Select id="campaign-status" value={status} onChange={(event) => setStatus(event.target.value as CampaignStatus)} className="w-full">
+          {Object.entries(STATUS_LABELS).map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+        </Select>
+      </div>
+      <div className="space-y-1.5">
+        <label htmlFor="campaign-autopilot" className="text-xs font-medium text-text-muted">Autopilot</label>
+        <Select id="campaign-autopilot" value={String(autopilotEnabled)} onChange={(event) => setAutopilotEnabled(event.target.value === "true")} className="w-full">
+          <option value="true">Enabled</option>
+          <option value="false">Disabled</option>
+        </Select>
+      </div>
+      <div className="space-y-1.5">
+        <label htmlFor="campaign-settings-target" className="text-xs font-medium text-text-muted">Daily soft target</label>
+        <Input id="campaign-settings-target" type="number" min={1} max={250} value={dailySoftTarget} onChange={(event) => setDailySoftTarget(Number(event.target.value))} />
+      </div>
+      <p className="text-xs text-text-muted">Timezone: Europe/Madrid</p>
+      {error && <p className="text-xs text-danger" role="alert">{error}</p>}
+      <div className="flex justify-end border-t border-border pt-4">
+        <Button type="submit" disabled={saving}>{saving ? "Saving…" : "Save"}</Button>
+      </div>
+    </form>
+  );
+}
+
+function CampaignDetail({ campaign, data, onUpdated }: { campaign: Campaign; data: CampaignsData; onUpdated: (campaign: Campaign) => void }) {
   const metrics = campaignMetrics(campaign, data);
   return (
     <Tabs items={DETAIL_TABS} defaultValue="overview">
@@ -76,7 +147,7 @@ function CampaignDetail({ campaign, data }: { campaign: Campaign; data: Campaign
                 </div>
                 <div>
                   <p className="text-xs text-text-muted">Status</p>
-                  <Badge variant="neutral">{campaign.status}</Badge>
+                  <Badge variant={STATUS_VARIANT[campaign.status]}>{STATUS_LABELS[campaign.status]}</Badge>
                 </div>
                 <div>
                   <p className="text-xs text-text-muted">Reply rate</p>
@@ -153,22 +224,19 @@ function CampaignDetail({ campaign, data }: { campaign: Campaign; data: Campaign
             </p>
           );
         }
-        return (
-          <p className="text-sm text-text-muted">
-            Campaign settings management is not available from this screen yet. New campaigns are saved to your
-            workspace and appear in this list immediately.
-          </p>
-        );
+        return <CampaignSettings campaign={campaign} onUpdated={onUpdated} />;
       }}
     </Tabs>
   );
 }
 
-function NewCampaignForm({ onClose, offerId }: { onClose: () => void; offerId: string | null }) {
+function NewCampaignForm({ onClose, offer }: { onClose: () => void; offer: Offer | null }) {
   const router = useRouter();
   const [name, setName] = useState("");
   const [engineType, setEngineType] = useState<EngineType>("maps_fast");
   const [dailySoftTarget, setDailySoftTarget] = useState(50);
+  const [status, setStatus] = useState<"active" | "draft">("active");
+  const [autopilotEnabled, setAutopilotEnabled] = useState(true);
   const [engineConfig, setEngineConfig] = useState("{}");
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
@@ -196,13 +264,13 @@ function NewCampaignForm({ onClose, offerId }: { onClose: () => void; offerId: s
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
           name,
-          status: "draft",
+          status,
           engineType,
           dailySoftTarget,
-          autopilotEnabled: false,
+          autopilotEnabled,
           engineConfig: parsedEngineConfig,
           desiredChannelMix: { email: 100, sms: 0 },
-          offerId: offerId ?? undefined,
+          offerId: offer?.id ?? undefined,
         }),
       });
       const body = (await response.json()) as { error?: string };
@@ -227,6 +295,21 @@ function NewCampaignForm({ onClose, offerId }: { onClose: () => void; offerId: s
         </label>
         <Input id="campaign-name" value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. Vitalcap - Maps Fast" />
       </div>
+      <p className="text-xs text-text-muted">Offer: {offer?.name ?? "Default workspace offer (created automatically)"}</p>
+      <div className="space-y-1.5">
+        <label htmlFor="campaign-create-status" className="text-xs font-medium text-text-muted">Status</label>
+        <Select id="campaign-create-status" value={status} onChange={(event) => setStatus(event.target.value as "active" | "draft")} className="w-full">
+          <option value="active">Active</option>
+          <option value="draft">Draft</option>
+        </Select>
+      </div>
+      <div className="space-y-1.5">
+        <label htmlFor="campaign-create-autopilot" className="text-xs font-medium text-text-muted">Autopilot</label>
+        <Select id="campaign-create-autopilot" value={String(autopilotEnabled)} onChange={(event) => setAutopilotEnabled(event.target.value === "true")} className="w-full">
+          <option value="true">Enabled</option>
+          <option value="false">Disabled</option>
+        </Select>
+      </div>
       <div className="space-y-1.5">
         <label htmlFor="campaign-engine" className="text-xs font-medium text-text-muted">
           Discovery engine
@@ -239,6 +322,7 @@ function NewCampaignForm({ onClose, offerId }: { onClose: () => void; offerId: s
           ))}
         </Select>
       </div>
+      <p className="text-xs text-text-muted">Timezone: Europe/Madrid</p>
       <div className="space-y-1.5">
         <label htmlFor="campaign-target" className="text-xs font-medium text-text-muted">
           Daily soft target
@@ -247,6 +331,7 @@ function NewCampaignForm({ onClose, offerId }: { onClose: () => void; offerId: s
           id="campaign-target"
           type="number"
           min={1}
+          max={250}
           value={dailySoftTarget}
           onChange={(e) => setDailySoftTarget(Number(e.target.value))}
         />
@@ -265,7 +350,7 @@ function NewCampaignForm({ onClose, offerId }: { onClose: () => void; offerId: s
         <Button type="button" variant="secondary" onClick={onClose} disabled={submitting}>
           Cancel
         </Button>
-        <Button type="submit" disabled={submitting}>{submitting ? "Creating…" : "Create campaign (draft)"}</Button>
+        <Button type="submit" disabled={submitting}>{submitting ? "Creating…" : "Create campaign"}</Button>
       </div>
     </form>
   );
@@ -287,8 +372,8 @@ export function CampaignsClient(data: CampaignsData) {
         </CardHeader>
         <CardContent>
           <p className="mb-4 text-sm text-text-muted">
-            One campaign per discovery engine, disabled by default until provider credentials and campaign
-            mappings are configured. Click a row for the full campaign detail.
+            Campaigns use the selected engine. Only active Maps Fast campaigns with Autopilot ON are scheduled
+            automatically. Click a row to manage its operational settings.
           </p>
           <Table>
             <TableHead>
@@ -296,6 +381,7 @@ export function CampaignsClient(data: CampaignsData) {
                 <TableHeadCell>Campaign</TableHeadCell>
                 <TableHeadCell>Engine</TableHeadCell>
                 <TableHeadCell>Status</TableHeadCell>
+                <TableHeadCell>Autopilot</TableHeadCell>
                 <TableHeadCell>Soft target</TableHeadCell>
                 <TableHeadCell>Today</TableHeadCell>
                 <TableHeadCell>Channel mix</TableHeadCell>
@@ -317,8 +403,9 @@ export function CampaignsClient(data: CampaignsData) {
                     <TableCell className="font-medium text-text">{campaign.name}</TableCell>
                     <TableCell>{ENGINE_LABELS[campaign.engineType]}</TableCell>
                     <TableCell>
-                      <Badge variant="neutral">{campaign.status}</Badge>
+                      <Badge variant={STATUS_VARIANT[campaign.status]}>{STATUS_LABELS[campaign.status]}</Badge>
                     </TableCell>
+                    <TableCell><Badge variant={campaign.autopilotEnabled ? "success" : "neutral"}>{campaign.autopilotEnabled ? "ON" : "OFF"}</Badge></TableCell>
                     <TableCell>{campaign.dailySoftTarget}</TableCell>
                     <TableCell>{engine?.readyToday ?? "—"}</TableCell>
                     <TableCell>
@@ -338,11 +425,11 @@ export function CampaignsClient(data: CampaignsData) {
       </Card>
 
       <Sheet open={selected !== null} onClose={() => setSelected(null)} title={selected?.name ?? ""} description="Campaign detail">
-        {selected ? <CampaignDetail campaign={selected} data={data} /> : null}
+        {selected ? <CampaignDetail key={selected.id} campaign={selected} data={data} onUpdated={setSelected} /> : null}
       </Sheet>
 
       <Sheet open={creating} onClose={() => setCreating(false)} title="New campaign" description="Guided setup — advanced config stays optional">
-        <NewCampaignForm onClose={() => setCreating(false)} offerId={data.offer?.id ?? null} />
+        <NewCampaignForm onClose={() => setCreating(false)} offer={data.offer} />
       </Sheet>
     </div>
   );

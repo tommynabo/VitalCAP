@@ -16,6 +16,12 @@ export interface CreateCampaignInput {
   desiredChannelMix: Campaign["desiredChannelMix"];
 }
 
+export interface UpdateCampaignInput {
+  workspaceId: string;
+  campaignId: string;
+  patch: Pick<Partial<Campaign>, "status" | "autopilotEnabled" | "dailySoftTarget">;
+}
+
 function toCampaign(row: typeof campaigns.$inferSelect): Campaign {
   return {
     id: row.id,
@@ -88,6 +94,26 @@ export async function createCampaign(input: CreateCampaignInput): Promise<Campai
     .returning();
   if (!row) throw new Error("Failed to create campaign.");
   return toCampaign(row);
+}
+
+/**
+ * Updates only the dashboard-operable settings and scopes the mutation by
+ * workspace. A campaign ID from another workspace therefore cannot be read
+ * or changed through this repository.
+ */
+export async function updateCampaign(input: UpdateCampaignInput): Promise<Campaign | null> {
+  const db = getDb();
+  const values: Partial<typeof campaigns.$inferInsert> = { updatedAt: new Date() };
+  if (input.patch.status !== undefined) values.status = input.patch.status;
+  if (input.patch.autopilotEnabled !== undefined) values.autopilotEnabled = input.patch.autopilotEnabled;
+  if (input.patch.dailySoftTarget !== undefined) values.dailySoftTarget = input.patch.dailySoftTarget;
+
+  const [row] = await db
+    .update(campaigns)
+    .set(values)
+    .where(and(eq(campaigns.id, input.campaignId), eq(campaigns.workspaceId, input.workspaceId)))
+    .returning();
+  return row ? toCampaign(row) : null;
 }
 
 /** Scheduled discovery only sees campaigns that are both active and explicitly autopilot-enabled. */

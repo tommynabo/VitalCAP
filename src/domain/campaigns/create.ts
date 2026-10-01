@@ -6,10 +6,10 @@ const campaignStatusSchema = z.enum(["draft", "active", "paused", "archived"]);
 export const createCampaignSchema = z.object({
   name: z.string().trim().min(1).max(160),
   description: z.string().trim().max(1_000).optional().nullable(),
-  status: campaignStatusSchema.default("draft"),
+  status: campaignStatusSchema.default("active"),
   engineType: engineTypeSchema,
   dailySoftTarget: z.number().int().min(1).max(250),
-  autopilotEnabled: z.boolean().default(false),
+  autopilotEnabled: z.boolean().default(true),
   engineConfig: z.record(z.string(), z.unknown()).default({}),
   desiredChannelMix: z.object({
     email: z.number().int().min(0).max(100),
