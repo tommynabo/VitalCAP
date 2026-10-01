@@ -10,7 +10,12 @@ const coreEnvSchema = z.object({
   DEFAULT_DELIVERY_MODE: z.enum(["dry_run", "live"]).default("dry_run"),
   DEFAULT_BOOKING_URL: z.string().optional(),
   CRON_SECRET: z.string().optional(),
-  ACTIVATION_MAX_DAILY_RAW_REQUESTS: z.coerce.number().default(15),
+  /**
+   * Production throughput guard. This is a daily ceiling, not a per-cron
+   * batch size: pacing still requests only the raw volume needed to close the
+   * qualified deficit at the observed yield.
+   */
+  ACTIVATION_MAX_DAILY_RAW_REQUESTS: z.coerce.number().int().min(1).default(1500),
 }).superRefine((env, ctx) => {
   if (env.VERCEL_ENV === "production" && optionalEnvValue(process.env.APP_ENV) !== "production") {
     ctx.addIssue({ code: "custom", message: "VERCEL_ENV=production requires APP_ENV=production.", path: ["APP_ENV"] });
@@ -77,7 +82,7 @@ const mapsEnvSchema = z.object({
   APIFY_MAPS_DEEP_ACTOR: z.string().default("compass/crawler-google-places"),
   APIFY_MAPS_FALLBACK_ACTOR: z.string().default("compass/crawler-google-places"),
   APIFY_MAPS_CONTACT_ENRICHMENT_ACTOR: z.string().optional(),
-  APIFY_DAILY_COST_LIMIT_USD: z.coerce.number().default(10),
+  APIFY_DAILY_COST_LIMIT_USD: z.coerce.number().positive().default(15),
   APIFY_BATCH_COST_LIMIT_USD: z.coerce.number().default(2),
 }).superRefine((env, ctx) => {
   if (getCoreEnv().APP_ENV === "production" && env.MAPS_PROVIDER === "mock") {
