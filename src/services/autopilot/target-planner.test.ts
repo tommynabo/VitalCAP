@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { Campaign } from "@/domain/campaigns/types";
-import { allocateMapsFastRawNeed, planningWindowKey } from "./target-planner";
+import { allocateMapsFastRawNeed, MAX_RAW_PER_PLANNING_WINDOW, planningWindowKey } from "./target-planner";
 
 function campaign(id: string, target: number, overrides: Partial<Campaign> = {}): Campaign {
   return {
@@ -37,5 +37,12 @@ describe("target planner", () => {
     expect(orders[0]?.desiredRawCount).toBe(10);
     expect(orders[0]?.idempotencyKey).toContain("autopilot:workspace-1:a:");
     expect(planningWindowKey(new Date("2025-01-01T13:14:00Z"), "Europe/Madrid")).toBe(planningWindowKey(new Date("2025-01-01T13:14:59Z"), "Europe/Madrid"));
+  });
+
+  it("supports a 250-qualified target without a legacy 100-raw planning ceiling", () => {
+    const orders = allocateMapsFastRawNeed({ workspaceId: "workspace-1", campaigns: [campaign("a", 250)], rawNeeded: 834, reason: "30% historical yield", now: new Date("2025-01-01T13:00:00Z"), timeZone: "Europe/Madrid" });
+    expect(orders).toHaveLength(1);
+    expect(orders[0]?.desiredRawCount).toBe(MAX_RAW_PER_PLANNING_WINDOW);
+    expect(orders[0]?.desiredRawCount).toBeGreaterThan(100);
   });
 });
