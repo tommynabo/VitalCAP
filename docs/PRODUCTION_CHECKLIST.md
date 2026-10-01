@@ -23,7 +23,7 @@ that explains *why* each step matters.
       real deployment.
 - [ ] **Cron secret** — `CRON_SECRET` set and the real cron route (once built) validates it before doing
       any work, so an unauthenticated request cannot trigger a dispatch cycle.
-- [ ] **Provider keys** — `APIFY_API_TOKEN` set for `MAPS_PROVIDER=apify`; deferred providers remain
+- [ ] **Provider keys** — `APIFY_API_TOKEN` set for `MAPS_PROVIDER=apify`; set `APIFY_DAILY_COST_LIMIT_USD=15` and `ACTIVATION_MAX_DAILY_RAW_REQUESTS=1500` for the initial 250-qualified/day activation; deferred providers remain
       explicitly disabled (`SERP_PROVIDER=disabled`, `EMAIL_VERIFICATION_PROVIDER=disabled`,
       `EMAIL_DELIVERY_PROVIDER=disabled`, `LLM_PROVIDER=disabled`, `SMS_PROVIDER=disabled`).
 - [ ] **Webhooks** — real webhook endpoint(s) built and registered with each provider that supports
