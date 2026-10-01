@@ -21,6 +21,14 @@ export interface MapsFastAllocationInput {
   origin?: DiscoveryOrder["origin"];
 }
 
+/**
+ * One planning window may issue enough work for five independently tracked
+ * Maps seed searches. This prevents a low 100-raw ceiling from starving a
+ * 250-qualified daily target while retaining a bounded, idempotent unit of
+ * work and leaving the daily safety cap to the provider reservation guard.
+ */
+export const MAX_RAW_PER_PLANNING_WINDOW = 500;
+
 export function planningWindowKey(now: Date, timeZone: string, windowMinutes = 15): string {
   const parts = new Intl.DateTimeFormat("en-CA", {
     timeZone,
@@ -42,7 +50,7 @@ export function allocateMapsFastRawNeed(input: MapsFastAllocationInput): Discove
   if (input.rawNeeded <= 0 || totalWeight <= 0) return [];
 
   const window = planningWindowKey(input.now, input.timeZone);
-  let remaining = Math.min(100, Math.ceil(input.rawNeeded));
+  let remaining = Math.min(MAX_RAW_PER_PLANNING_WINDOW, Math.ceil(input.rawNeeded));
   const orders: DiscoveryOrder[] = [];
   eligible.forEach((campaign, index) => {
     const share = index === eligible.length - 1 ? remaining : Math.min(remaining, Math.floor((input.rawNeeded * campaign.dailySoftTarget) / totalWeight));
