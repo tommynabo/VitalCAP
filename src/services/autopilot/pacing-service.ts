@@ -13,7 +13,8 @@ export interface OperatingWindow {
   endHour: number;
 }
 
-export const DEFAULT_OPERATING_WINDOW: OperatingWindow = { startHour: 8, endHour: 20 };
+/** Production discovery window in the configured workspace timezone. */
+export const DEFAULT_OPERATING_WINDOW: OperatingWindow = { startHour: 7, endHour: 22 };
 
 export type PacingStatus = "before_window" | "after_window" | "on_pace" | "behind_pace" | "budget_paused" | "provider_paused";
 type LegacyPacingStatus = "behind" | "ahead" | "on_track";
@@ -150,7 +151,11 @@ export function computeAutopilotPacing(input: PacingComputationInput): Autopilot
   const rawRemainingToday = typeof input.maxDailyRawRequests === "number" 
     ? Math.max(0, input.maxDailyRawRequests - input.rawRequestedToday) 
     : 1000;
-  const rawNeededToPlan = qualifiedNeededToPlan > 0 ? Math.min(100, rawRemainingToday, Math.ceil(qualifiedNeededToPlan / boundedYield)) : 0;
+  // Keep the daily guard as the only global raw cap. The target planner then
+  // turns this into bounded, idempotent planning-window orders. A fixed 100
+  // here made a 250-qualified/day target mathematically unreachable at
+  // ordinary yield rates.
+  const rawNeededToPlan = qualifiedNeededToPlan > 0 ? Math.min(rawRemainingToday, Math.ceil(qualifiedNeededToPlan / boundedYield)) : 0;
   
   const hoursRemaining = Math.max(0, (endMinutes - nowMinutes) / 60);
   const status: PacingStatus = nowMinutes < startMinutes
