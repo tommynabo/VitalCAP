@@ -41,7 +41,7 @@ describe("computeAutopilotPacing", () => {
   const base = {
     workspaceId: "workspace-1",
     timeZone: "Europe/Madrid",
-    dailyTarget: 25,
+    dailyTarget: 250,
     targetAchievedToday: 7,
     rawRequestedToday: 4, rawReturnedToday: 4,
     processingInFlight: 0,
@@ -52,38 +52,63 @@ describe("computeAutopilotPacing", () => {
     providerHealth: "healthy" as const,
     estimatedYield: 0.5,
     yieldSampleSize: 30,
-    operatingStartHour: 8,
-    operatingEndHour: 20,
+    operatingStartHour: 7,
+    operatingEndHour: 22,
   };
 
   it("does not schedule before or after the local operating window", () => {
-    expect(computeAutopilotPacing({ ...base, now: new Date("2025-06-15T05:00:00Z") }).status).toBe("before_window");
-    expect(computeAutopilotPacing({ ...base, now: new Date("2025-06-15T19:00:00Z") }).status).toBe("after_window");
+    expect(computeAutopilotPacing({ ...base, now: new Date("2025-06-15T04:00:00Z") }).status).toBe("before_window");
+    expect(computeAutopilotPacing({ ...base, now: new Date("2025-06-15T20:00:00Z") }).status).toBe("after_window");
   });
 
   it("stays on pace when achieved plus in-flight covers the checkpoint", () => {
-    const result = computeAutopilotPacing({ ...base, targetAchievedToday: 12, expectedQualifiedFromInFlight: 2, now: new Date("2025-06-15T12:00:00Z") });
+    const result = computeAutopilotPacing({ ...base, targetAchievedToday: 115, expectedQualifiedFromInFlight: 2, now: new Date("2025-06-15T12:00:00Z") });
     expect(result.status).toBe("on_pace");
     expect(result.rawNeededToPlan).toBe(0);
   });
 
-  it("converts a pace deficit into bounded raw work", () => {
-    const result = computeAutopilotPacing({ ...base, now: new Date("2025-06-15T12:00:00Z") });
+  it("calculates production above 100 raws when a 250 target is behind at medium yield", () => {
+    const result = computeAutopilotPacing({ ...base, targetAchievedToday: 0, estimatedYield: 0.3, now: new Date("2025-06-15T12:00:00Z") });
     expect(result.status).toBe("behind_pace");
-    expect(result.qualifiedNeededToPlan).toBe(7);
-    expect(result.rawNeededToPlan).toBe(14);
+    expect(result.qualifiedNeededToPlan).toBeGreaterThan(0);
+    expect(result.rawNeededToPlan).toBeGreaterThan(100);
+  });
+
+  it("starts production from zero progress during the operating day", () => {
+    const result = computeAutopilotPacing({ ...base, targetAchievedToday: 0, rawRequestedToday: 0, rawReturnedToday: 0, now: new Date("2025-06-15T07:30:00Z") });
+    expect(result.status).toBe("behind_pace");
+    expect(result.rawNeededToPlan).toBeGreaterThan(0);
   });
 
   it("lets in-flight work reduce the deficit and does not double count it", () => {
-    const result = computeAutopilotPacing({ ...base, expectedQualifiedFromInFlight: 6, now: new Date("2025-06-15T12:00:00Z") });
+    const result = computeAutopilotPacing({ ...base, targetAchievedToday: 110, expectedQualifiedFromInFlight: 7, now: new Date("2025-06-15T12:00:00Z") });
     expect(result.paceDeficit).toBe(0);
     expect(result.rawNeededToPlan).toBe(0);
   });
 
-  it("uses a conservative floor for low-yield samples", () => {
+  it("honours the remaining daily raw safety ceiling", () => {
+    const result = computeAutopilotPacing({
+      ...base,
+      targetAchievedToday: 0,
+      estimatedYield: 0.1,
+      rawRequestedToday: 1490,
+      maxDailyRawRequests: 1500,
+      now: new Date("2025-06-15T12:00:00Z"),
+    });
+    expect(result.rawNeededToPlan).toBe(10);
+  });
+
+  it("stops normal production once the qualified target is reached", () => {
+    const result = computeAutopilotPacing({ ...base, targetAchievedToday: 250, now: new Date("2025-06-15T12:00:00Z") });
+    expect(result.remainingTarget).toBe(0);
+    expect(result.qualifiedNeededToPlan).toBe(0);
+    expect(result.rawNeededToPlan).toBe(0);
+  });
+
+  it("uses a conservative floor for low-yield samples without imposing a 100-raw ceiling", () => {
     const result = computeAutopilotPacing({ ...base, estimatedYield: 0.001, yieldSampleSize: 2, now: new Date("2025-06-15T12:00:00Z") });
     expect(result.estimatedYield).toBe(0.1);
-    expect(result.rawNeededToPlan).toBeLessThanOrEqual(100);
+    expect(result.rawNeededToPlan).toBeGreaterThan(100);
   });
 
   it("pauses scheduling for exhausted budget or unhealthy provider", () => {
@@ -94,7 +119,7 @@ describe("computeAutopilotPacing", () => {
   it("uses the workspace timezone across DST boundaries", () => {
     const beforeDst = computeAutopilotPacing({ ...base, now: new Date("2025-03-30T06:00:00Z") });
     const afterDst = computeAutopilotPacing({ ...base, now: new Date("2025-03-30T07:00:00Z") });
-    expect(beforeDst.operatingStart).toBe("08:00");
+    expect(beforeDst.operatingStart).toBe("07:00");
     expect(afterDst.elapsedOperatingFraction).toBeGreaterThan(beforeDst.elapsedOperatingFraction);
   });
 });
