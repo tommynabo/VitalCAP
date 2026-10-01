@@ -46,7 +46,7 @@ export function planHybridFill(input: HybridFillPlanInput): HybridFillPlan {
     active: true,
     rawCount: Math.min(100, Math.max(1, input.remainingEffectiveTarget * 4)),
     targetRisk: "recoverable",
-    seed: { query: seed.query || ICP_CATEGORY_TERMS[0], geography: seed.geography || HYBRID_GEOGRAPHIES[0] },
+    seed: { query: seed.query || ICP_CATEGORY_TERMS[0], geography: seed.geography || HYBRID_GEOGRAPHIES[0] || "España" },
     reason: `hybrid_fill: ${input.seedInventoryExhausted ? "bootstrapped approved catalog; " : ""}late-day deficit rescue using approved Maps Fast seed ${seed.query} / ${seed.geography}.`,
   };
 }
