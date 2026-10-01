@@ -1,4 +1,4 @@
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { getDb } from "../db";
 import { offers } from "../schema/campaigns";
 import type { Offer } from "@/domain/campaigns/types";
@@ -27,5 +27,16 @@ function toOffer(row: typeof offers.$inferSelect): Offer {
 export async function getPrimaryOffer(workspaceId: string): Promise<Offer | null> {
   const db = getDb();
   const [row] = await db.select().from(offers).where(eq(offers.workspaceId, workspaceId)).limit(1);
+  return row ? toOffer(row) : null;
+}
+
+/** Looks up an offer only inside the calling workspace. */
+export async function getOfferById(workspaceId: string, offerId: string): Promise<Offer | null> {
+  const db = getDb();
+  const [row] = await db
+    .select()
+    .from(offers)
+    .where(and(eq(offers.workspaceId, workspaceId), eq(offers.id, offerId)))
+    .limit(1);
   return row ? toOffer(row) : null;
 }

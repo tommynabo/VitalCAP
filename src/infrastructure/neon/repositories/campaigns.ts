@@ -3,6 +3,19 @@ import { getDb } from "../db";
 import { campaigns, campaignMemberships } from "../schema/campaigns";
 import type { Campaign, CampaignMembership, CampaignMembershipStage } from "@/domain/campaigns/types";
 
+export interface CreateCampaignInput {
+  workspaceId: string;
+  offerId: string;
+  name: string;
+  description?: string | null;
+  status: Campaign["status"];
+  engineType: Campaign["engineType"];
+  engineConfig: Campaign["engineConfig"];
+  dailySoftTarget: number;
+  autopilotEnabled: boolean;
+  desiredChannelMix: Campaign["desiredChannelMix"];
+}
+
 function toCampaign(row: typeof campaigns.$inferSelect): Campaign {
   return {
     id: row.id,
@@ -52,6 +65,29 @@ export async function getCampaignById(campaignId: string): Promise<Campaign | nu
   const db = getDb();
   const [row] = await db.select().from(campaigns).where(eq(campaigns.id, campaignId));
   return row ? toCampaign(row) : null;
+}
+
+export async function createCampaign(input: CreateCampaignInput): Promise<Campaign> {
+  const db = getDb();
+  const [row] = await db
+    .insert(campaigns)
+    .values({
+      workspaceId: input.workspaceId,
+      offerId: input.offerId,
+      name: input.name,
+      description: input.description ?? null,
+      status: input.status,
+      countryCode: "ES",
+      engineType: input.engineType,
+      engineConfig: input.engineConfig,
+      dailySoftTarget: input.dailySoftTarget,
+      autopilotEnabled: input.autopilotEnabled,
+      desiredChannelMix: input.desiredChannelMix,
+      timeZone: "Europe/Madrid",
+    })
+    .returning();
+  if (!row) throw new Error("Failed to create campaign.");
+  return toCampaign(row);
 }
 
 /** Scheduled discovery only sees campaigns that are both active and explicitly autopilot-enabled. */

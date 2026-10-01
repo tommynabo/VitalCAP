@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import { useRouter } from "next/navigation";
 import { Plus } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -154,8 +155,8 @@ function CampaignDetail({ campaign, data }: { campaign: Campaign; data: Campaign
         }
         return (
           <p className="text-sm text-text-muted">
-            Campaign settings (renaming, archiving, offer reassignment) are not persisted in this demo build — no
-            database is wired yet.
+            Campaign settings management is not available from this screen yet. New campaigns are saved to your
+            workspace and appear in this list immediately.
           </p>
         );
       }}
@@ -163,18 +164,62 @@ function CampaignDetail({ campaign, data }: { campaign: Campaign; data: Campaign
   );
 }
 
-function NewCampaignForm({ onClose }: { onClose: () => void }) {
+function NewCampaignForm({ onClose, offerId }: { onClose: () => void; offerId: string | null }) {
+  const router = useRouter();
   const [name, setName] = useState("");
   const [engineType, setEngineType] = useState<EngineType>("maps_fast");
   const [dailySoftTarget, setDailySoftTarget] = useState(50);
+  const [engineConfig, setEngineConfig] = useState("{}");
+  const [error, setError] = useState<string | null>(null);
+  const [submitting, setSubmitting] = useState(false);
+
+  async function createCampaign(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setError(null);
+
+    let parsedEngineConfig: Record<string, unknown>;
+    try {
+      const parsed = JSON.parse(engineConfig || "{}");
+      if (!parsed || Array.isArray(parsed) || typeof parsed !== "object") {
+        throw new Error("Advanced JSON config must be an object.");
+      }
+      parsedEngineConfig = parsed as Record<string, unknown>;
+    } catch (configError) {
+      setError(configError instanceof Error ? configError.message : "Advanced JSON config must be valid JSON.");
+      return;
+    }
+
+    setSubmitting(true);
+    try {
+      const response = await fetch("/api/campaigns", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          name,
+          status: "draft",
+          engineType,
+          dailySoftTarget,
+          autopilotEnabled: false,
+          engineConfig: parsedEngineConfig,
+          desiredChannelMix: { email: 100, sms: 0 },
+          offerId: offerId ?? undefined,
+        }),
+      });
+      const body = (await response.json()) as { error?: string };
+      if (!response.ok) throw new Error(body.error ?? "Campaign creation failed.");
+      onClose();
+      router.refresh();
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "Campaign creation failed.");
+    } finally {
+      setSubmitting(false);
+    }
+  }
 
   return (
     <form
       className="space-y-4"
-      onSubmit={(e) => {
-        e.preventDefault();
-        onClose();
-      }}
+      onSubmit={(event) => void createCampaign(event)}
     >
       <div className="space-y-1.5">
         <label htmlFor="campaign-name" className="text-xs font-medium text-text-muted">
@@ -211,13 +256,16 @@ function NewCampaignForm({ onClose }: { onClose: () => void }) {
         <textarea
           className="mt-3 h-24 w-full rounded-[10px] border border-border bg-surface-muted p-2 text-xs text-text-muted"
           placeholder="{}"
+          value={engineConfig}
+          onChange={(event) => setEngineConfig(event.target.value)}
         />
       </details>
+      {error && <p className="text-xs text-danger" role="alert">{error}</p>}
       <div className="flex justify-end gap-2 border-t border-border pt-4">
-        <Button type="button" variant="secondary" onClick={onClose}>
+        <Button type="button" variant="secondary" onClick={onClose} disabled={submitting}>
           Cancel
         </Button>
-        <Button type="submit">Create campaign (draft)</Button>
+        <Button type="submit" disabled={submitting}>{submitting ? "Creating…" : "Create campaign (draft)"}</Button>
       </div>
     </form>
   );
@@ -294,7 +342,7 @@ export function CampaignsClient(data: CampaignsData) {
       </Sheet>
 
       <Sheet open={creating} onClose={() => setCreating(false)} title="New campaign" description="Guided setup — advanced config stays optional">
-        <NewCampaignForm onClose={() => setCreating(false)} />
+        <NewCampaignForm onClose={() => setCreating(false)} offerId={data.offer?.id ?? null} />
       </Sheet>
     </div>
   );
