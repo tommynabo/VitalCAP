@@ -30,6 +30,10 @@ describe("getCoreEnv", () => {
     expect(env.DEFAULT_DELIVERY_MODE).not.toBe("live");
   });
 
+  it("uses a production-capable daily raw safety ceiling by default", () => {
+    expect(getCoreEnv().ACTIVATION_MAX_DAILY_RAW_REQUESTS).toBe(1500);
+  });
+
   it("treats empty Vercel environment values as unset", () => {
     const originalAppEnv = process.env.APP_ENV;
     const originalDeliveryMode = process.env.DEFAULT_DELIVERY_MODE;
