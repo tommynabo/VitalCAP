@@ -7,7 +7,8 @@ Source of truth: [`VITALCAP_OUTREACH_OS_MASTER_PROMPTS.md`](../VITALCAP_OUTREACH
 Vitalcap Outreach OS identifies relevant physical retail businesses in Spain, discovers their best available business contacts, qualifies them, routes them into the correct outreach channel, manages responses with an AI Setter, and drives qualified prospects to a scheduled call with the sales director.
 
 - **Country**: Spain only.
-- **Primary ICP**: independent pharmacies. Acceptable: parapharmacies, herbal shops, sports nutrition stores, supplement stores, other physical retailers reasonably capable of selling supplements. The ICP is intentionally broad at launch — data first, aggressive exclusion later.
+- **Primary ICP**: pharmacies, parapharmacies and herbal shops only. Sports-nutrition stores, supplement stores, generic fitness/wellness stores and other retail may be retained as raw discoveries for audit, but are never ICP-qualified.
+- **Geographic scope**: all Spain, with no municipality, city-size, population, province-priority or urban/rural exclusion. Provinces/autonomous cities may be used only as deterministic search partitions.
 - **Ideal decision maker**: owner, titular pharmacist, owner-manager, manager, purchasing manager or equivalent. Generic account email is acceptable as a fallback and may still reach the owner.
 - **Sourcing constraint**: public business/professional info and publicly discoverable named contacts only. No Apollo/data-broker as primary discovery source. Third-party verification providers are fine for validating an already-discovered email.
 - **Final CTA**: book a call via a configurable scheduling link with the sales director.
@@ -31,9 +32,9 @@ All engines implement one shared `DiscoveryEngine` contract (see [`src/domain/di
 |---|---|
 | `maps_fast` | High-volume, low-cost establishment discovery (Maps/Places → Spain filter → normalize → dedup → light fit → website → light email extraction → validation → priority → outreach-ready). No expensive owner enrichment by default. |
 | `maps_deep` | Lower-volume, higher-quality account + decision-maker enrichment (adds website crawl, contact/about/legal-notice/team extraction, public owner search, public LinkedIn URL discovery). |
-| `google_serp` | Discovery via Google Search-style SERP providers with query expansion across category synonyms, Spanish geography, supplement-purchase terminology. |
+| `google_serp` | Discovery via Google Search-style SERP providers with query expansion across pharmacy/parapharmacy/herbal-shop Spanish category synonyms and all-Spain geographic partitions. |
 | `linkedin_owner` | Decision-maker-first discovery via public web/SERP search for owner/titular/manager/purchasing-manager profiles → company → domain → account → contacts. No authenticated LinkedIn scraping requirement. |
-| `hybrid_fill` | Target-aware deficit filler: broadens geography/subcategories, rotates queries, reprocesses incomplete accounts, deepens enrichment — always choosing the cheapest healthy path, never knowingly lowering below the configured minimum quality bar. |
+| `hybrid_fill` | Target-aware deficit filler that rotates the canonical ICP across the complete Spain geography catalog, reprocesses incomplete accounts and deepens enrichment — never narrowing coverage to major cities or lowering the minimum quality bar. |
 
 ## 4. Target model (Phase 2 — Autopilot Target Engine)
 
