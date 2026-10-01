@@ -28,7 +28,8 @@ import type { SearchSeed } from "@/domain/discovery/types";
 import { evaluateProviderHealth } from "@/services/discovery/provider-health";
 
 const DISCOVERY_JOB_TYPE = "run_engine_batch";
-const MAX_SEEDS_PER_JOB = 3;
+const MAX_SEEDS_PER_JOB = 5;
+const MAX_RAW_PER_SEED = 100;
 
 function catalogForEngine(campaignId: string, engineType: EngineType): SearchSeed[] {
   if (engineType === "maps_fast" || engineType === "maps_deep") return buildMapsSeedCatalog(campaignId, engineType);
@@ -84,7 +85,11 @@ async function executeDiscoveryJob(job: { id: string; campaignId: string; payloa
   const providerHealth = job.payload.engineType === "maps_fast"
     ? evaluateProviderHealth(await getRecentProviderUsage(campaign.workspaceId, "apify"))
     : "healthy";
-  const bootstrapCap = providerHealth === "untested" ? 10 : 100;
+  // The first provider run stays deliberately small. Once one terminal
+  // success establishes health, a job can use the full five-seed planning
+  // window (5 × 100 raw), still subject to the per-workspace daily raw and
+  // spend guards in reserveApifyProviderRun.
+  const bootstrapCap = providerHealth === "untested" ? 10 : MAX_SEEDS_PER_JOB * MAX_RAW_PER_SEED;
   const desiredRawCount = Math.min(bootstrapCap, Math.max(0, Math.floor(job.payload.desiredRawCount)));
   if (desiredRawCount <= 0) return 0;
   const maxSeeds = Math.min(MAX_SEEDS_PER_JOB, Math.max(1, Math.ceil(desiredRawCount / 10)));
@@ -98,7 +103,7 @@ async function executeDiscoveryJob(job: { id: string; campaignId: string; payloa
 
   let totalRawCandidates = 0;
   for (const [seedIndex, seed] of boundedSeeds.entries()) {
-    const requestedItems = Math.min(100, Math.max(1, Math.ceil(remainingRaw / (boundedSeeds.length - seedIndex))));
+    const requestedItems = Math.min(MAX_RAW_PER_SEED, Math.max(1, Math.ceil(remainingRaw / (boundedSeeds.length - seedIndex))));
     const startedAt = new Date();
     const requestKey = `apify:${campaign.id}:${seed.id}:${getDayBounds(campaign.timeZone, startedAt).start.toISOString()}`;
     let seedRunId: string | null = null;
