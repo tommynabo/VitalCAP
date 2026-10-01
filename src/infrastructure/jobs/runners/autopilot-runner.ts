@@ -1,17 +1,18 @@
+import type { Campaign, EngineType } from "@/domain/campaigns/types";
+import type { ProviderHealthStatus } from "@/domain/autopilot/types";
+import { getEffectiveAutopilotState } from "@/domain/autopilot/types";
 import { listAutopilotEnabledCampaigns } from "@/infrastructure/neon/repositories/campaigns";
 import { listWorkspaceIds } from "@/infrastructure/neon/repositories/workspace";
-import { getAutopilotSettings, getAutopilotPacingState } from "@/infrastructure/neon/repositories/autopilot";
+import { getAutopilotSettings, getAutopilotPacingState, insertRebalanceDecision } from "@/infrastructure/neon/repositories/autopilot";
 import { enqueueDiscoveryJob } from "@/infrastructure/neon/repositories/job-queue";
-import { allocateMapsFastRawNeed } from "@/services/autopilot/target-planner";
-import { getEffectiveAutopilotState } from "@/domain/autopilot/types";
-import { getMapsEnv, getSerperEnv } from "@/lib/config/env";
-import { buildEngineCapabilities } from "@/services/autopilot/engine-capability";
-import { planRebalancing, type CampaignPerformance } from "@/services/autopilot/rebalancing";
-import { planHybridFill } from "@/services/autopilot/hybrid-fill-planner";
-import { buildMapsSeedCatalog, buildHybridMapsSeedCatalog } from "@/services/discovery/spain-search-catalog";
-import type { SearchSeed } from "@/domain/discovery/types";
 import { bootstrapSearchSeeds, listSearchSeedsForCampaignEngine } from "@/infrastructure/neon/repositories/discovery";
-import { insertRebalanceDecision, listRebalanceDecisions } from "@/infrastructure/neon/repositories/autopilot";
+import { getRecentProviderUsage } from "@/infrastructure/neon/repositories/provider-runs";
+import { allocateEngineWork, type EnginePlanningPerformance } from "@/services/autopilot/target-planner";
+import { buildEngineCapabilities } from "@/services/autopilot/engine-capability";
+import { evaluateProviderHealth } from "@/services/discovery/provider-health";
+import { buildMapsSeedCatalog, buildSerpSeedCatalog, ICP_CATEGORY_TERMS, LINKEDIN_OWNER_ROLE_QUERIES } from "@/services/discovery/spain-search-catalog";
+import { getMapsEnv, getSerperEnv } from "@/lib/config/env";
+import type { SearchSeed } from "@/domain/discovery/types";
 
 export interface AutopilotRunnerResult {
   campaignsTicked: number;
@@ -23,15 +24,43 @@ export interface AutopilotRunnerResult {
   ordersScheduled: number;
 }
 
-/**
- * One bounded batch of autopilot work per active/autopilot-enabled
- * workspace: loads real `GlobalAutopilotState`, recomputes each engine's
- * `providerHealth` from real recent `provider_runs` (replacing the
- * dashboard's previously-hardcoded `"unknown"`), runs one pure
- * `runAutopilotTick`, and persists any `RebalanceDecision`s it produced.
- * Never touches outreach sending — this is target/quota bookkeeping only
- * (§2.11). Called once per `/api/cron/autopilot` invocation.
- */
+function catalogFor(campaign: Campaign): SearchSeed[] {
+  if (campaign.engineType === "maps_fast" || campaign.engineType === "maps_deep") return buildMapsSeedCatalog(campaign.id, campaign.engineType);
+  if (campaign.engineType === "google_serp") return buildSerpSeedCatalog(campaign.id, "google_serp", ICP_CATEGORY_TERMS);
+  if (campaign.engineType === "linkedin_owner") return buildSerpSeedCatalog(campaign.id, "linkedin_owner", LINKEDIN_OWNER_ROLE_QUERIES);
+  return [];
+}
+
+function weakestHealth(...health: ProviderHealthStatus[]): ProviderHealthStatus {
+  if (health.includes("paused")) return "paused";
+  if (health.includes("degraded")) return "degraded";
+  if (health.includes("unknown")) return "unknown";
+  if (health.includes("untested")) return "untested";
+  return "healthy";
+}
+
+function engineHealths(maps: ProviderHealthStatus, serp: ProviderHealthStatus): Partial<Record<EngineType, ProviderHealthStatus>> {
+  return {
+    maps_fast: maps,
+    maps_deep: weakestHealth(maps, serp),
+    google_serp: serp,
+    linkedin_owner: serp,
+    hybrid_fill: maps === "healthy" || serp === "healthy" || maps === "untested" || serp === "untested" ? "healthy" : weakestHealth(maps, serp),
+  };
+}
+
+function performance(campaign: Campaign, seeds: readonly SearchSeed[]): EnginePlanningPerformance {
+  const raw = seeds.reduce((sum, seed) => sum + seed.totalRaw, 0);
+  const qualified = seeds.reduce((sum, seed) => sum + seed.totalReady, 0);
+  return {
+    campaignId: campaign.id,
+    yield: raw > 0 ? qualified / raw : 0.25,
+    queueDepth: 0,
+    seedExhaustion: seeds.length ? seeds.reduce((sum, seed) => sum + seed.exhaustionScore, 0) / seeds.length : 0,
+  };
+}
+
+/** Schedules a single global qualified-target deficit across every eligible engine. */
 export async function runAutopilotCronTick(now: Date = new Date()): Promise<AutopilotRunnerResult> {
   const workspaceIds = await listWorkspaceIds();
   let campaignsTicked = 0;
@@ -48,137 +77,87 @@ export async function runAutopilotCronTick(now: Date = new Date()): Promise<Auto
     if (effectiveState !== "running") {
       if (effectiveState === "paused") pausedWorkspaces += 1;
       else if (effectiveState === "system_paused") systemPausedWorkspaces += 1;
-      else if (effectiveState === "emergency_stopped") emergencyStoppedWorkspaces += 1;
+      else emergencyStoppedWorkspaces += 1;
       continue;
     }
+
     const campaigns = await listAutopilotEnabledCampaigns(workspaceId);
-    if (campaigns.length === 0) continue;
-    const mapsCampaigns = campaigns.filter((campaign) => campaign.engineType === "maps_fast");
-    for (const campaign of mapsCampaigns) {
-      await bootstrapSearchSeeds(campaign.id, "maps_fast", buildMapsSeedCatalog(campaign.id, "maps_fast"));
+    if (!campaigns.length) continue;
+    for (const campaign of campaigns) {
+      const catalog = catalogFor(campaign);
+      if (catalog.length) await bootstrapSearchSeeds(campaign.id, campaign.engineType, catalog);
     }
+
     const pacing = await getAutopilotPacingState(workspaceId, now);
     pacingStates.push(pacing);
+    campaignsTicked += campaigns.length;
+    // The target and budget are workspace-wide, never multiplied by engines.
+    if (pacing.remainingTarget <= 0 || pacing.qualifiedNeededToPlan <= 0 || pacing.rawNeededToPlan <= 0 || pacing.status !== "behind_pace") continue;
+
     const mapsEnv = getMapsEnv();
     const serperEnv = getSerperEnv();
+    const mapsHealth = evaluateProviderHealth(await getRecentProviderUsage(workspaceId, "apify"));
+    const serpHealth = evaluateProviderHealth(await getRecentProviderUsage(workspaceId, "serper"));
+    const healths = engineHealths(mapsHealth, serpHealth);
+    const allTypes: EngineType[] = ["maps_fast", "maps_deep", "google_serp", "linkedin_owner", "hybrid_fill"];
     const capabilities = buildEngineCapabilities({
       mapsProvider: mapsEnv.MAPS_PROVIDER,
       mapsProviderConfigured: Boolean(mapsEnv.APIFY_API_TOKEN),
       serpProvider: serperEnv.SERP_PROVIDER,
-      mapsFastHealth: pacing.providerHealth,
+      serpProviderConfigured: Boolean(serperEnv.SERPER_API_KEY),
+      mapsFastHealth: mapsHealth,
+      providerHealth: healths,
       costAllowed: pacing.apifyDailyBudgetRemaining > 0,
-      campaignCounts: { maps_fast: campaigns.filter((campaign) => campaign.engineType === "maps_fast").length },
+      campaignCounts: Object.fromEntries(allTypes.map((engineType) => [engineType, campaigns.filter((campaign) => campaign.engineType === engineType).length])),
     });
-    const mapsFast = capabilities.find((capability) => capability.engineType === "maps_fast");
-    const maySchedulePaidWork = pacing.status === "behind_pace";
-    if (mapsFast?.available && maySchedulePaidWork && pacing.qualifiedNeededToPlan > 0 && pacing.rawNeededToPlan > 0) {
-      const seedSets = await Promise.all(mapsCampaigns.map((campaign) => listSearchSeedsForCampaignEngine(campaign.id, "maps_fast")));
-      const performances: CampaignPerformance[] = mapsCampaigns.map((campaign, index) => {
-        const seeds = seedSets[index] ?? [];
-        return {
-          campaignId: campaign.id,
-          engineType: "maps_fast",
-          recentRaw: seeds.reduce((sum, seed) => sum + seed.totalRaw, 0),
-          recentQualified: seeds.reduce((sum, seed) => sum + seed.totalReady, 0),
-          sampleSize: seeds.reduce((sum, seed) => sum + seed.totalRaw, 0),
-          providerCostUsd: null,
-          providerHealth: pacing.providerHealth,
-          seedExhaustion: seeds.length ? seeds.reduce((sum, seed) => sum + seed.exhaustionScore, 0) / seeds.length : 0,
-          queueDepth: 0,
-          activeRuns: pacing.providerRunsInFlight,
-          allocatedRaw: campaign.dailySoftTarget,
-        };
+
+    const concreteCampaigns = campaigns.filter((campaign) => campaign.engineType !== "hybrid_fill");
+    const seedSets = await Promise.all(concreteCampaigns.map((campaign) => listSearchSeedsForCampaignEngine(campaign.id, campaign.engineType)));
+    const performances = concreteCampaigns.map((campaign, index) => performance(campaign, seedSets[index] ?? []));
+    let orders = allocateEngineWork({
+      workspaceId, campaigns: concreteCampaigns, capabilities, performances,
+      rawNeeded: pacing.rawNeededToPlan, reason: pacing.explanation, now, timeZone: settings.timezone, origin: "normal",
+    });
+
+    // Hybrid Fill is a policy: it redirects to an alternative campaign and
+    // keeps that engine's real source/metrics, avoiding duplicate accounts.
+    const hasHybridPolicy = campaigns.some((campaign) => campaign.engineType === "hybrid_fill");
+    const mapsPerformance = performances.find((item) => concreteCampaigns.find((campaign) => campaign.id === item.campaignId)?.engineType === "maps_fast");
+    const mapsFastAvailable = capabilities.find((capability) => capability.engineType === "maps_fast")?.available ?? false;
+    if (hasHybridPolicy && (
+      !mapsFastAvailable
+      || (mapsPerformance?.yield ?? 0.25) < 0.1
+      || (mapsPerformance?.seedExhaustion ?? 0) >= 0.8
+    )) {
+      const alternatives = concreteCampaigns.filter((campaign) => campaign.engineType !== "maps_fast");
+      const hybridOrders = allocateEngineWork({
+        workspaceId, campaigns: alternatives, capabilities, performances,
+        rawNeeded: Math.min(pacing.rawNeededToPlan, 100),
+        reason: "hybrid_fill: Maps Fast underperformed or exhausted; routing to a healthy configured alternative.",
+        now, timeZone: settings.timezone, origin: "hybrid_fill",
       });
-      const previous = await listRebalanceDecisions(workspaceId);
-      const rebalanceActions = planRebalancing({ performances, uncoveredRaw: pacing.rawNeededToPlan, now }).filter((action) => {
-        const cooldownStart = now.getTime() - 30 * 60_000;
-        return !previous.some((decision) => decision.toCampaignId === action.toCampaignId
-          && decision.fromCampaignId === action.fromCampaignId
-          && new Date(decision.createdAt).getTime() > cooldownStart);
+      const divertedCampaignIds = new Set(hybridOrders.map((order) => order.campaignId));
+      orders = [...hybridOrders, ...orders.filter((order) => !divertedCampaignIds.has(order.campaignId))];
+    }
+
+    for (const order of orders) {
+      await enqueueDiscoveryJob({
+        campaignId: order.campaignId,
+        type: "run_engine_batch",
+        payload: { engineType: order.engineType, desiredRawCount: order.desiredRawCount, planningWindow: order.planningWindow, reason: order.reason, origin: order.origin },
+        idempotencyKey: order.idempotencyKey,
       });
-      const mapsSeeds = seedSets.flat();
-      const seedInventoryExhausted = mapsSeeds.length > 0 && mapsSeeds.every((seed) => seed.exhaustionScore >= 0.8);
-      const rescueSignal = pacing.hoursRemaining <= 2 || pacing.estimatedYield < 0.1 || seedInventoryExhausted;
-      const rebalanceOrders = rebalanceActions.map((action) => ({
-        workspaceId,
-        campaignId: action.toCampaignId,
-        engineType: "maps_fast" as const,
-        desiredRawCount: action.amount,
-        reason: action.reason,
-        planningWindow: `${now.toISOString()}:rebalance`,
-        idempotencyKey: `autopilot:rebalance:${workspaceId}:${action.toCampaignId}:${Math.floor(now.getTime() / 1_800_000)}`,
-        origin: "rebalance" as const,
-      }));
-      const orders = rescueSignal
-        ? []
-        : rebalanceOrders.length > 0
-        ? rebalanceOrders
-        : allocateMapsFastRawNeed({ workspaceId, campaigns, rawNeeded: pacing.rawNeededToPlan, reason: pacing.explanation, now, timeZone: settings.timezone, origin: "normal" });
-      for (const order of orders) {
-        await enqueueDiscoveryJob({
-          campaignId: order.campaignId,
-          type: "run_engine_batch",
-          payload: { engineType: order.engineType, desiredRawCount: order.desiredRawCount, planningWindow: order.planningWindow, reason: order.reason, origin: order.origin },
-          idempotencyKey: order.idempotencyKey,
-        });
-        ordersScheduled += order.desiredRawCount;
-      }
-      for (const action of rebalanceActions) {
+      ordersScheduled += order.desiredRawCount;
+      if (order.origin === "hybrid_fill") {
         await insertRebalanceDecision(workspaceId, {
-          fromEngine: action.fromCampaignId ? "maps_fast" : null,
-          toEngine: "maps_fast",
-          amount: action.amount,
-          reason: `${action.reason} fromCampaign=${action.fromCampaignId ?? "unallocated"} toCampaign=${action.toCampaignId} remainingDeficit=${pacing.remainingTarget}`,
-          fromCampaignId: action.fromCampaignId,
-          toCampaignId: action.toCampaignId,
-          metricSnapshot: { remainingTarget: pacing.remainingTarget, estimatedYield: pacing.estimatedYield, providerHealth: pacing.providerHealth, score: action.score },
-          idempotencyKey: `rebalance:${workspaceId}:${action.toCampaignId}:${Math.floor(now.getTime() / 1_800_000)}`,
+          fromEngine: "maps_fast", toEngine: order.engineType, amount: order.desiredRawCount, reason: order.reason,
+          fromCampaignId: null, toCampaignId: order.campaignId,
+          metricSnapshot: { remainingTarget: pacing.remainingTarget, healths },
+          idempotencyKey: `hybrid:${workspaceId}:${order.engineType}:${order.campaignId}:${order.planningWindow}`,
         });
         rebalanceDecisionsRecorded += 1;
       }
-
-      const campaign = mapsCampaigns[0];
-      if (campaign) {
-        let seeds = seedSets[mapsCampaigns.indexOf(campaign)] ?? [];
-        const shouldBootstrapHybrid = rescueSignal || seedInventoryExhausted;
-        let hybridSeeds: SearchSeed[] = [];
-        if (shouldBootstrapHybrid) {
-          const hybridCatalog = buildHybridMapsSeedCatalog(campaign.id);
-          await bootstrapSearchSeeds(campaign.id, "maps_fast", hybridCatalog);
-          seeds = await listSearchSeedsForCampaignEngine(campaign.id, "maps_fast");
-          const hybridKeys = new Set(hybridCatalog.map((seed) => `${seed.query}|${seed.geography}`));
-          hybridSeeds = seeds.filter((seed) => hybridKeys.has(`${seed.query}|${seed.geography}`));
-        }
-        const hybrid = planHybridFill({
-          remainingEffectiveTarget: pacing.remainingTarget,
-          hoursRemaining: pacing.hoursRemaining,
-          normalAllocationExhausted: rescueSignal,
-          sourceUnderperformed: pacing.estimatedYield < 0.1,
-          seedInventoryExhausted,
-          providerHealthy: mapsFast.available,
-          budgetRemaining: pacing.apifyDailyBudgetRemaining,
-          onPace: pacing.status === "on_pace",
-          seeds,
-          hybridSeeds,
-          campaignId: campaign.id,
-          now,
-        });
-        if (hybrid.active) {
-          const hybridOrder = allocateMapsFastRawNeed({ workspaceId, campaigns: [campaign], rawNeeded: hybrid.rawCount, reason: hybrid.reason, now, timeZone: settings.timezone, origin: "hybrid_fill" })[0];
-          if (hybridOrder) {
-            await enqueueDiscoveryJob({
-              campaignId: hybridOrder.campaignId,
-              type: "run_engine_batch",
-              payload: { engineType: "maps_fast", desiredRawCount: hybridOrder.desiredRawCount, planningWindow: hybridOrder.planningWindow, reason: hybridOrder.reason, origin: "hybrid_fill", seedQuery: hybrid.seed?.query, seedGeography: hybrid.seed?.geography },
-              idempotencyKey: `autopilot:hybrid_fill:${workspaceId}:${campaign.id}:${Math.floor(now.getTime() / 1_800_000)}`,
-            });
-            ordersScheduled += hybridOrder.desiredRawCount;
-          }
-        }
-      }
     }
-    campaignsTicked += campaigns.length;
   }
-
   return { campaignsTicked, rebalanceDecisionsRecorded, pausedWorkspaces, emergencyStoppedWorkspaces, systemPausedWorkspaces, pacingStates, ordersScheduled };
 }

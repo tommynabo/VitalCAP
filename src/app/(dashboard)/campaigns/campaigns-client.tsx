@@ -33,6 +33,13 @@ interface CampaignsData {
   outreachQueueItems: OutreachQueueItem[];
 }
 
+function providerWarning(engineType: EngineType, engineTargets: EngineTargetState[]) {
+  const health = engineTargets.find((engine) => engine.engineType === engineType)?.providerHealth;
+  if (health !== "paused") return null;
+  const provider = engineType === "maps_fast" ? "Apify Maps" : engineType === "maps_deep" ? "Apify Maps and Serper" : engineType === "hybrid_fill" ? "Apify Maps or Serper" : "Serper";
+  return `${provider} is not configured or is paused. The campaign can be saved, but Autopilot will not schedule it until the provider is available.`;
+}
+
 function campaignMetrics(campaign: Campaign, data: CampaignsData) {
   const conversations = data.conversations.filter((c) => c.campaignId === campaign.id);
   const conversationIds = new Set(conversations.map((c) => c.id));
@@ -75,13 +82,14 @@ const DETAIL_TABS = [
   { value: "settings", label: "Settings" },
 ];
 
-function CampaignSettings({ campaign, onUpdated }: { campaign: Campaign; onUpdated: (campaign: Campaign) => void }) {
+function CampaignSettings({ campaign, engineTargets, onUpdated }: { campaign: Campaign; engineTargets: EngineTargetState[]; onUpdated: (campaign: Campaign) => void }) {
   const router = useRouter();
   const [status, setStatus] = useState<CampaignStatus>(campaign.status);
   const [autopilotEnabled, setAutopilotEnabled] = useState(campaign.autopilotEnabled);
   const [dailySoftTarget, setDailySoftTarget] = useState(campaign.dailySoftTarget);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const warning = providerWarning(campaign.engineType, engineTargets);
 
   async function saveCampaign(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -124,6 +132,7 @@ function CampaignSettings({ campaign, onUpdated }: { campaign: Campaign; onUpdat
         <Input id="campaign-settings-target" type="number" min={1} max={250} value={dailySoftTarget} onChange={(event) => setDailySoftTarget(Number(event.target.value))} />
       </div>
       <p className="text-xs text-text-muted">Timezone: Europe/Madrid</p>
+      {warning && <p className="text-xs text-warning" role="status">{warning}</p>}
       {error && <p className="text-xs text-danger" role="alert">{error}</p>}
       <div className="flex justify-end border-t border-border pt-4">
         <Button type="submit" disabled={saving}>{saving ? "Saving…" : "Save"}</Button>
@@ -224,13 +233,13 @@ function CampaignDetail({ campaign, data, onUpdated }: { campaign: Campaign; dat
             </p>
           );
         }
-        return <CampaignSettings campaign={campaign} onUpdated={onUpdated} />;
+        return <CampaignSettings campaign={campaign} engineTargets={data.engineTargets} onUpdated={onUpdated} />;
       }}
     </Tabs>
   );
 }
 
-function NewCampaignForm({ onClose, offer }: { onClose: () => void; offer: Offer | null }) {
+function NewCampaignForm({ onClose, offer, engineTargets }: { onClose: () => void; offer: Offer | null; engineTargets: EngineTargetState[] }) {
   const router = useRouter();
   const [name, setName] = useState("");
   const [engineType, setEngineType] = useState<EngineType>("maps_fast");
@@ -240,6 +249,7 @@ function NewCampaignForm({ onClose, offer }: { onClose: () => void; offer: Offer
   const [engineConfig, setEngineConfig] = useState("{}");
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  const warning = providerWarning(engineType, engineTargets);
 
   async function createCampaign(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -323,6 +333,7 @@ function NewCampaignForm({ onClose, offer }: { onClose: () => void; offer: Offer
         </Select>
       </div>
       <p className="text-xs text-text-muted">Timezone: Europe/Madrid</p>
+      {warning && <p className="text-xs text-warning" role="status">{warning}</p>}
       <div className="space-y-1.5">
         <label htmlFor="campaign-target" className="text-xs font-medium text-text-muted">
           Daily soft target
@@ -372,8 +383,7 @@ export function CampaignsClient(data: CampaignsData) {
         </CardHeader>
         <CardContent>
           <p className="mb-4 text-sm text-text-muted">
-            Campaigns use the selected engine. Only active Maps Fast campaigns with Autopilot ON are scheduled
-            automatically. Click a row to manage its operational settings.
+            Active campaigns with Autopilot ON are scheduled by their selected engine when its provider is configured and healthy. Click a row to manage operational settings.
           </p>
           <Table>
             <TableHead>
@@ -429,7 +439,7 @@ export function CampaignsClient(data: CampaignsData) {
       </Sheet>
 
       <Sheet open={creating} onClose={() => setCreating(false)} title="New campaign" description="Guided setup — advanced config stays optional">
-        <NewCampaignForm onClose={() => setCreating(false)} offer={data.offer} />
+        <NewCampaignForm onClose={() => setCreating(false)} offer={data.offer} engineTargets={data.engineTargets} />
       </Sheet>
     </div>
   );

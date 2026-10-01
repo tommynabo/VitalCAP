@@ -8,11 +8,11 @@ import { conversations, meetings } from "../schema/conversations";
 import { autopilotSettings, rebalanceDecisions } from "../schema/autopilot";
 import { auditLog } from "../schema/audit";
 import type { EngineType } from "@/domain/campaigns/types";
-import type { AutopilotSettings, EngineTargetState, GlobalAutopilotState, RebalanceDecision } from "@/domain/autopilot/types";
+import type { AutopilotSettings, EngineTargetState, GlobalAutopilotState, ProviderHealthStatus, RebalanceDecision } from "@/domain/autopilot/types";
 import { getDayBounds } from "@/lib/time/day-bounds";
 import { getAutopilotPacingMetrics } from "./autopilot-pacing";
 import { getRecentProviderUsage } from "./provider-runs";
-import { getMapsEnv } from "@/lib/config/env";
+import { getMapsEnv, getSerperEnv } from "@/lib/config/env";
 import { evaluateProviderHealth } from "@/services/discovery/provider-health";
 import { computeAutopilotPacing } from "@/services/autopilot/pacing-service";
 
@@ -96,6 +96,28 @@ export async function updateAutopilotSettings(
 }
 
 const ENGINE_TYPES: EngineType[] = ["maps_fast", "maps_deep", "google_serp", "linkedin_owner", "hybrid_fill"];
+
+async function getEngineProviderHealth(workspaceId: string, engineType: EngineType): Promise<ProviderHealthStatus> {
+  const mapsEnv = getMapsEnv();
+  const serpEnv = getSerperEnv();
+  const maps = mapsEnv.MAPS_PROVIDER === "apify" && Boolean(mapsEnv.APIFY_API_TOKEN)
+    ? evaluateProviderHealth(await getRecentProviderUsage(workspaceId, "apify"))
+    : "paused";
+  const serp = serpEnv.SERP_PROVIDER === "serper" && Boolean(serpEnv.SERPER_API_KEY)
+    ? evaluateProviderHealth(await getRecentProviderUsage(workspaceId, "serper"))
+    : "paused";
+  if (engineType === "maps_fast") return maps;
+  if (engineType === "google_serp" || engineType === "linkedin_owner") return serp;
+  if (engineType === "maps_deep") {
+    if (maps === "paused" || serp === "paused") return "paused";
+    if (maps === "degraded" || serp === "degraded") return "degraded";
+    return maps === "untested" || serp === "untested" ? "untested" : "healthy";
+  }
+  // Hybrid Fill has no provider of its own: expose its actual routing
+  // capacity instead of the misleading historical `unknown` state.
+  if (maps === "healthy" || serp === "healthy" || maps === "untested" || serp === "untested") return "healthy";
+  return maps === "degraded" || serp === "degraded" ? "degraded" : "paused";
+}
 
 export async function getAutopilotPacingState(workspaceId: string, now = new Date()) {
   const settings = await getAutopilotSettings(workspaceId);
@@ -391,7 +413,7 @@ async function getEngineTargetState(workspaceId: string, engineType: EngineType)
     rawQueueDepth: rawDepthRow?.total ?? 0,
     processingQueueDepth: processingDepthRow?.total ?? 0,
     currentYield: yieldRow?.avgYield ?? 0,
-    providerHealth: engineType === "maps_fast" ? evaluateProviderHealth(await getRecentProviderUsage(workspaceId, "apify")) : "unknown",
+    providerHealth: await getEngineProviderHealth(workspaceId, engineType),
     lastRunAt: yieldRow?.lastRunAt ? new Date(yieldRow.lastRunAt).toISOString() : null,
     nextPlannedAction: null,
   };

@@ -76,15 +76,17 @@ async function executeDiscoveryJob(job: { id: string; campaignId: string; payloa
   if (getEffectiveAutopilotState(settings) !== "running") return 0;
 
   const engine = createDiscoveryEngine(campaign.workspaceId, job.payload.engineType);
-  if (job.payload.engineType === "maps_fast" || job.payload.engineType === "maps_deep") {
+  // Every concrete engine owns a persisted, idempotent seed catalog. Hybrid
+  // Fill is intentionally excluded: it routes work to one of these engines
+  // rather than creating a duplicate candidate source of its own.
+  if (job.payload.engineType !== "hybrid_fill") {
     await bootstrapSearchSeeds(campaign.id, job.payload.engineType, catalogForEngine(campaign.id, job.payload.engineType));
   }
   const persistedSeeds = await listSearchSeedsForCampaignEngine(campaign.id, job.payload.engineType);
   if ("seeds" in engine) (engine as { seeds: SearchSeed[] }).seeds = persistedSeeds;
 
-  const providerHealth = job.payload.engineType === "maps_fast"
-    ? evaluateProviderHealth(await getRecentProviderUsage(campaign.workspaceId, "apify"))
-    : "healthy";
+  const provider = job.payload.engineType === "maps_fast" || job.payload.engineType === "maps_deep" ? "apify" : "serper";
+  const providerHealth = evaluateProviderHealth(await getRecentProviderUsage(campaign.workspaceId, provider));
   // The first provider run stays deliberately small. Once one terminal
   // success establishes health, a job can use the full five-seed planning
   // window (5 × 100 raw), still subject to the per-workspace daily raw and
@@ -105,7 +107,7 @@ async function executeDiscoveryJob(job: { id: string; campaignId: string; payloa
   for (const [seedIndex, seed] of boundedSeeds.entries()) {
     const requestedItems = Math.min(MAX_RAW_PER_SEED, Math.max(1, Math.ceil(remainingRaw / (boundedSeeds.length - seedIndex))));
     const startedAt = new Date();
-    const requestKey = `apify:${campaign.id}:${seed.id}:${getDayBounds(campaign.timeZone, startedAt).start.toISOString()}`;
+    const requestKey = `${provider}:${campaign.id}:${seed.id}:${getDayBounds(campaign.timeZone, startedAt).start.toISOString()}`;
     let seedRunId: string | null = null;
     let reservationId: string | null = null;
     if (engine.usesAsyncProvider) {

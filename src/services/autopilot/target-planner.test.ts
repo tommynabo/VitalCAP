@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { Campaign } from "@/domain/campaigns/types";
-import { allocateMapsFastRawNeed, MAX_RAW_PER_PLANNING_WINDOW, planningWindowKey } from "./target-planner";
+import { allocateEngineWork, allocateMapsFastRawNeed, MAX_RAW_PER_PLANNING_WINDOW, planningWindowKey } from "./target-planner";
 
 function campaign(id: string, target: number, overrides: Partial<Campaign> = {}): Campaign {
   return {
@@ -44,5 +44,46 @@ describe("target planner", () => {
     expect(orders).toHaveLength(1);
     expect(orders[0]?.desiredRawCount).toBe(MAX_RAW_PER_PLANNING_WINDOW);
     expect(orders[0]?.desiredRawCount).toBeGreaterThan(100);
+  });
+
+  it("allocates the one global deficit across configured healthy engines by observed yield", () => {
+    const orders = allocateEngineWork({
+      workspaceId: "workspace-1",
+      campaigns: [campaign("maps", 100), campaign("serp", 100, { engineType: "google_serp" }), campaign("owner", 100, { engineType: "linkedin_owner" })],
+      capabilities: [
+        { engineType: "maps_fast", available: true, providerConfigured: true, providerHealthy: true, providerUntested: false, costAllowed: true, campaignCount: 1, reasonUnavailable: null, reason: null },
+        { engineType: "google_serp", available: true, providerConfigured: true, providerHealthy: true, providerUntested: false, costAllowed: true, campaignCount: 1, reasonUnavailable: null, reason: null },
+        { engineType: "linkedin_owner", available: true, providerConfigured: true, providerHealthy: true, providerUntested: false, costAllowed: true, campaignCount: 1, reasonUnavailable: null, reason: null },
+      ],
+      performances: [
+        { campaignId: "maps", yield: 0.35, queueDepth: 0, seedExhaustion: 0 },
+        { campaignId: "serp", yield: 0.18, queueDepth: 0, seedExhaustion: 0 },
+        { campaignId: "owner", yield: 0.1, queueDepth: 0, seedExhaustion: 0 },
+      ],
+      rawNeeded: 100,
+      reason: "behind pace",
+      now: new Date("2025-01-01T13:00:00Z"),
+      timeZone: "Europe/Madrid",
+    });
+    expect(orders.reduce((sum, order) => sum + order.desiredRawCount, 0)).toBe(100);
+    expect(orders.find((order) => order.engineType === "maps_fast")?.desiredRawCount).toBeGreaterThan(orders.find((order) => order.engineType === "google_serp")?.desiredRawCount ?? 0);
+    expect(orders.map((order) => order.engineType)).toEqual(expect.arrayContaining(["maps_fast", "google_serp", "linkedin_owner"]));
+  });
+
+  it("does not multiply the global target or schedule paused, draft, or unavailable engines", () => {
+    const orders = allocateEngineWork({
+      workspaceId: "workspace-1",
+      campaigns: [campaign("active", 250, { engineType: "maps_deep" }), campaign("paused", 250, { engineType: "google_serp", status: "paused" }), campaign("draft", 250, { engineType: "linkedin_owner", status: "draft" })],
+      capabilities: [
+        { engineType: "maps_deep", available: true, providerConfigured: true, providerHealthy: true, providerUntested: false, costAllowed: true, campaignCount: 1, reasonUnavailable: null, reason: null },
+        { engineType: "google_serp", available: false, providerConfigured: false, providerHealthy: false, providerUntested: false, costAllowed: true, campaignCount: 1, reasonUnavailable: "provider_not_configured", reason: "provider_not_configured" },
+      ],
+      rawNeeded: 500,
+      reason: "behind pace",
+      now: new Date("2025-01-01T13:00:00Z"),
+      timeZone: "Europe/Madrid",
+    });
+    expect(orders).toHaveLength(1);
+    expect(orders[0]).toMatchObject({ campaignId: "active", engineType: "maps_deep", desiredRawCount: MAX_RAW_PER_PLANNING_WINDOW });
   });
 });

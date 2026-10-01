@@ -104,7 +104,7 @@ export function AutopilotClient({
         <CardContent className="flex flex-wrap items-end gap-3">
           <label className="text-sm text-text-muted">Qualified prospects/day<input className="mt-1 block w-28 rounded border border-border bg-surface px-2 py-1 text-text" type="number" min="1" max="250" value={targetInput} onChange={(event) => setTargetInput(event.target.value)} /></label>
           <Button size="sm" disabled={pendingAction !== null} onClick={() => void control({ action: "target_change", globalDailyTarget: Number(targetInput) })}>Save target</Button>
-          <span className="text-xs text-text-muted">Recommended 25 · timezone {settings.timezone}</span>
+          <span className="text-xs text-text-muted">Recommended 250 · timezone {settings.timezone}</span>
           {softTargetTotal !== settings.globalDailyTarget && <span className="text-xs text-warning">Campaign soft targets total {softTargetTotal}; allocation is not changed automatically.</span>}
         </CardContent>
       </Card>

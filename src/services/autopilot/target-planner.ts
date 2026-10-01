@@ -1,9 +1,10 @@
-import type { Campaign } from "@/domain/campaigns/types";
+import type { Campaign, EngineType } from "@/domain/campaigns/types";
+import type { EngineCapability } from "./engine-capability";
 
 export interface DiscoveryOrder {
   workspaceId: string;
   campaignId: string;
-  engineType: "maps_fast";
+  engineType: EngineType;
   desiredRawCount: number;
   reason: string;
   planningWindow: string;
@@ -19,6 +20,20 @@ export interface MapsFastAllocationInput {
   now: Date;
   timeZone: string;
   origin?: DiscoveryOrder["origin"];
+}
+
+export interface EnginePlanningPerformance {
+  campaignId: string;
+  /** Historical qualified/raw yield, bounded by the planner. */
+  yield: number;
+  queueDepth: number;
+  seedExhaustion: number;
+}
+
+export interface EngineWorkAllocationInput extends Omit<MapsFastAllocationInput, "campaigns"> {
+  campaigns: readonly Campaign[];
+  capabilities: readonly EngineCapability[];
+  performances?: readonly EnginePlanningPerformance[];
 }
 
 /**
@@ -45,27 +60,49 @@ export function planningWindowKey(now: Date, timeZone: string, windowMinutes = 1
 }
 
 export function allocateMapsFastRawNeed(input: MapsFastAllocationInput): DiscoveryOrder[] {
-  const eligible = input.campaigns.filter((campaign) => campaign.status === "active" && campaign.autopilotEnabled && campaign.engineType === "maps_fast" && campaign.dailySoftTarget > 0);
-  const totalWeight = eligible.reduce((sum, campaign) => sum + campaign.dailySoftTarget, 0);
-  if (input.rawNeeded <= 0 || totalWeight <= 0) return [];
+  return allocateEngineWork({
+    ...input,
+    capabilities: [{ engineType: "maps_fast", available: true, providerConfigured: true, providerHealthy: true, providerUntested: false, costAllowed: true, campaignCount: input.campaigns.length, reasonUnavailable: null, reason: null }],
+  });
+}
+
+/**
+ * Global, yield-aware allocation. `rawNeeded` is the single workspace
+ * pacing deficit — it is intentionally not multiplied by the number of
+ * engines. Engines without a healthy configured provider are excluded before
+ * work is enqueued.
+ */
+export function allocateEngineWork(input: EngineWorkAllocationInput): DiscoveryOrder[] {
+  const available = new Set(input.capabilities.filter((capability) => capability.available).map((capability) => capability.engineType));
+  const performanceByCampaign = new Map((input.performances ?? []).map((performance) => [performance.campaignId, performance]));
+  const eligible = input.campaigns.filter((campaign) => campaign.status === "active" && campaign.autopilotEnabled && campaign.engineType !== "hybrid_fill" && campaign.dailySoftTarget > 0 && available.has(campaign.engineType));
+  if (input.rawNeeded <= 0 || eligible.length === 0) return [];
+
+  const weighted = eligible.map((campaign) => {
+    const performance = performanceByCampaign.get(campaign.id);
+    const yieldWeight = Math.max(0.1, Math.min(1, performance?.yield || 0.25));
+    const queuePenalty = Math.min(0.75, (performance?.queueDepth ?? 0) / 1_000);
+    const exhaustionPenalty = Math.min(0.75, performance?.seedExhaustion ?? 0);
+    return { campaign, weight: campaign.dailySoftTarget * yieldWeight * (1 - queuePenalty) * (1 - exhaustionPenalty) };
+  }).filter((item) => item.weight > 0);
+  const totalWeight = weighted.reduce((sum, item) => sum + item.weight, 0);
+  if (totalWeight <= 0) return [];
 
   const window = planningWindowKey(input.now, input.timeZone);
   let remaining = Math.min(MAX_RAW_PER_PLANNING_WINDOW, Math.ceil(input.rawNeeded));
-  const orders: DiscoveryOrder[] = [];
-  eligible.forEach((campaign, index) => {
-    const share = index === eligible.length - 1 ? remaining : Math.min(remaining, Math.floor((input.rawNeeded * campaign.dailySoftTarget) / totalWeight));
-    if (share <= 0) return;
+  return weighted.flatMap((item, index) => {
+    const share = index === weighted.length - 1 ? remaining : Math.min(remaining, Math.floor((Math.min(MAX_RAW_PER_PLANNING_WINDOW, input.rawNeeded) * item.weight) / totalWeight));
+    if (share <= 0) return [];
     remaining -= share;
-    orders.push({
+    return [{
       workspaceId: input.workspaceId,
-      campaignId: campaign.id,
-      engineType: "maps_fast",
+      campaignId: item.campaign.id,
+      engineType: item.campaign.engineType,
       desiredRawCount: share,
       reason: input.reason,
       planningWindow: window,
-      idempotencyKey: `autopilot:${input.workspaceId}:${campaign.id}:${window}`,
+      idempotencyKey: `autopilot:${input.workspaceId}:${item.campaign.id}:${window}`,
       origin: input.origin ?? "normal",
-    });
+    }];
   });
-  return orders;
 }
