@@ -12,18 +12,18 @@ export const ICP_CATEGORY_TERMS = [
   "farmacia independiente",
   "parafarmacia",
   "herbolario",
-  "tienda de suplementos",
-  "nutrición deportiva",
-  "tienda fitness",
-  "complementos alimenticios",
+  "herbolaria",
 ] as const;
 
-export const HYBRID_GEOGRAPHIES = [
-  "Madrid", "Barcelona", "Valencia", "Sevilla", "Zaragoza", "Málaga", "Bilbao", "Alicante", "Murcia", "Palma",
-  "Galicia", "Asturias", "Castilla y León", "Castilla-La Mancha", "Extremadura", "Andalucía", "Cataluña", "Comunidad Valenciana",
-] as const;
+/**
+ * Hybrid Fill uses the same complete Spain partition as the regular Maps
+ * engines. Provinces/autonomous cities are search partitions only: they do
+ * not impose a city, municipality, population, or urban/rural eligibility
+ * rule on a business.
+ */
+export const HYBRID_GEOGRAPHIES = SPAIN_PROVINCES.map((province) => province.name);
 
-export const ICP_INTENT_TERMS = ["suplementos", "complementos", "nutrición", "vitaminas", "bienestar"] as const;
+export const ICP_INTENT_TERMS = [] as const;
 
 function seedId(engineType: EngineType, query: string, geography: string): string {
   const slug = `${query}_${geography}`.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-z0-9]+/g, "_");
@@ -48,17 +48,20 @@ function emptySeed(campaignId: string, engineType: EngineType, query: string, ge
 }
 
 /**
- * Builds the initial Maps engine seed catalog: one seed per province (Prompt
- * 1's canonical 50-province dataset), rotating query terms are handled by
- * the provider itself — Maps engines search by geography, not by category
- * query the way SERP engines do.
+ * Builds the Maps seed catalog: every canonical ICP term across every Spanish
+ * province/autonomous city. Geography is used solely to make nationwide
+ * coverage tractable; it never filters candidates by city or population.
  */
 export function buildMapsSeedCatalog(campaignId: string, engineType: "maps_fast" | "maps_deep"): SearchSeed[] {
-  return SPAIN_PROVINCES.map((province) => emptySeed(campaignId, engineType, "farmacia", province.name));
+  return ICP_CATEGORY_TERMS.flatMap((query) =>
+    SPAIN_PROVINCES.map((province) => emptySeed(campaignId, engineType, query, province.name)),
+  );
 }
 
 export function buildHybridMapsSeedCatalog(campaignId: string): SearchSeed[] {
-  return HYBRID_GEOGRAPHIES.flatMap((geography) => ICP_CATEGORY_TERMS.slice(0, 6).map((query) => emptySeed(campaignId, "maps_fast", query, geography)));
+  return HYBRID_GEOGRAPHIES.flatMap((geography) =>
+    ICP_CATEGORY_TERMS.map((query) => emptySeed(campaignId, "maps_fast", query, geography)),
+  );
 }
 
 /**
