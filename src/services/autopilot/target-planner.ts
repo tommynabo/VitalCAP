@@ -80,7 +80,7 @@ export function allocateEngineWork(input: EngineWorkAllocationInput): DiscoveryO
 
   const weighted = eligible.map((campaign) => {
     const performance = performanceByCampaign.get(campaign.id);
-    const yieldWeight = Math.max(0.1, Math.min(1, performance?.yield || 0.25));
+    const yieldWeight = Math.max(0.1, Math.min(1, performance?.yield ?? 0.25));
     const queuePenalty = Math.min(0.75, (performance?.queueDepth ?? 0) / 1_000);
     const exhaustionPenalty = Math.min(0.75, performance?.seedExhaustion ?? 0);
     return { campaign, weight: campaign.dailySoftTarget * yieldWeight * (1 - queuePenalty) * (1 - exhaustionPenalty) };
@@ -105,4 +105,42 @@ export function allocateEngineWork(input: EngineWorkAllocationInput): DiscoveryO
       origin: input.origin ?? "normal",
     }];
   });
+}
+
+export function rerouteEngineOrders(input: EngineWorkAllocationInput & {
+  orders: readonly DiscoveryOrder[];
+  fromEngine: EngineType;
+  reason: string;
+}): DiscoveryOrder[] {
+  const divertedRaw = input.orders
+    .filter((order) => order.engineType === input.fromEngine)
+    .reduce((total, order) => total + order.desiredRawCount, 0);
+  if (divertedRaw <= 0) return [...input.orders];
+
+  const alternatives = allocateEngineWork({
+    workspaceId: input.workspaceId,
+    campaigns: input.campaigns.filter((campaign) => campaign.engineType !== input.fromEngine),
+    capabilities: input.capabilities,
+    performances: input.performances,
+    rawNeeded: divertedRaw,
+    reason: input.reason,
+    now: input.now,
+    timeZone: input.timeZone,
+    origin: "hybrid_fill",
+  });
+  const combined = new Map<string, DiscoveryOrder>();
+  for (const order of [...input.orders.filter((item) => item.engineType !== input.fromEngine), ...alternatives]) {
+    const existing = combined.get(order.campaignId);
+    if (!existing) {
+      combined.set(order.campaignId, order);
+      continue;
+    }
+    combined.set(order.campaignId, {
+      ...existing,
+      desiredRawCount: existing.desiredRawCount + order.desiredRawCount,
+      reason: order.origin === "hybrid_fill" ? order.reason : existing.reason,
+      origin: existing.origin === "hybrid_fill" || order.origin === "hybrid_fill" ? "hybrid_fill" : existing.origin,
+    });
+  }
+  return [...combined.values()];
 }

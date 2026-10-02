@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { getCoreEnv, resetServerEnvCacheForTests } from "@/lib/config/env";
+import { getCoreEnv, getSerperEnv, resetServerEnvCacheForTests } from "@/lib/config/env";
 
 describe("getCoreEnv", () => {
   function withProductionEnv(run: () => void) {
@@ -32,6 +32,23 @@ describe("getCoreEnv", () => {
 
   it("uses a production-capable daily raw safety ceiling by default", () => {
     expect(getCoreEnv().ACTIVATION_MAX_DAILY_RAW_REQUESTS).toBe(1500);
+  });
+
+  it("defaults the Serper daily cost ceiling conservatively and permits an explicit zero", () => {
+    const original = process.env.SERPER_DAILY_COST_LIMIT_USD;
+    try {
+      delete process.env.SERPER_DAILY_COST_LIMIT_USD;
+      resetServerEnvCacheForTests();
+      expect(getSerperEnv().SERPER_DAILY_COST_LIMIT_USD).toBe(0.5);
+
+      process.env.SERPER_DAILY_COST_LIMIT_USD = "0";
+      resetServerEnvCacheForTests();
+      expect(getSerperEnv().SERPER_DAILY_COST_LIMIT_USD).toBe(0);
+    } finally {
+      if (original === undefined) delete process.env.SERPER_DAILY_COST_LIMIT_USD;
+      else process.env.SERPER_DAILY_COST_LIMIT_USD = original;
+      resetServerEnvCacheForTests();
+    }
   });
 
   it("treats empty Vercel environment values as unset", () => {

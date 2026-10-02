@@ -110,6 +110,7 @@ export function getMapsEnv() {
 const serperEnvSchema = z.object({
   SERP_PROVIDER: z.enum(["serper", "disabled", "mock"]).default("disabled"),
   SERPER_API_KEY: z.string().optional(),
+  SERPER_DAILY_COST_LIMIT_USD: z.coerce.number().nonnegative().default(0.5),
   SERPER_COUNTRY: z.string().default("es"),
   SERPER_LANGUAGE: z.string().default("es"),
 });
@@ -119,6 +120,7 @@ export function getSerperEnv() {
   cachedSerperEnv = serperEnvSchema.parse({
     SERP_PROVIDER: process.env.SERP_PROVIDER,
     SERPER_API_KEY: optionalEnvValue(process.env.SERPER_API_KEY),
+    SERPER_DAILY_COST_LIMIT_USD: optionalEnvValue(process.env.SERPER_DAILY_COST_LIMIT_USD),
     SERPER_COUNTRY: optionalEnvValue(process.env.SERPER_COUNTRY),
     SERPER_LANGUAGE: optionalEnvValue(process.env.SERPER_LANGUAGE),
   });

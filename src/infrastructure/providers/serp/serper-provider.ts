@@ -2,7 +2,7 @@ import type { SerpDiscoveryProvider, SerpResult, SerpSearchInput, SerpSearchOutp
 
 const SERPER_SEARCH_URL = "https://google.serper.dev/search";
 /** Serper's lowest published rate ($50 / 50k credits, 1 credit/query) — used only as a cost estimate, not billed truth. */
-const ESTIMATED_COST_PER_QUERY_USD = 0.001;
+export const SERPER_ESTIMATED_COST_PER_QUERY_USD = 0.001;
 const DEFAULT_TIMEOUT_MS = 10_000;
 const MAX_RETRIES = 2;
 
@@ -107,7 +107,7 @@ export class SerperDiscoveryProvider implements SerpDiscoveryProvider {
             items: results.length,
             errors: 0,
             totalLatencyMs: Date.now() - start,
-            costUsd: ESTIMATED_COST_PER_QUERY_USD,
+            costUsd: SERPER_ESTIMATED_COST_PER_QUERY_USD,
             quotaRemaining: null,
           },
         };

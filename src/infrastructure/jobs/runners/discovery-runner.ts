@@ -1,10 +1,12 @@
 import { randomUUID } from "node:crypto";
 import type { EngineType } from "@/domain/campaigns/types";
+import { ProviderBudgetExceededError } from "@/domain/providers/errors";
 import { getCampaignById, listActiveCampaigns } from "@/infrastructure/neon/repositories/campaigns";
 import { listWorkspaceIds } from "@/infrastructure/neon/repositories/workspace";
 import {
   claimDiscoveryJobs,
   completeDiscoveryJob,
+  deferDiscoveryJob,
   failDiscoveryJob,
   enqueueDiscoveryJob,
   enqueueProcessingJob,
@@ -76,7 +78,7 @@ async function executeDiscoveryJob(job: { id: string; campaignId: string; payloa
   const settings = await getAutopilotSettings(campaign.workspaceId);
   if (getEffectiveAutopilotState(settings) !== "running") return 0;
 
-  const engine = createDiscoveryEngine(campaign.workspaceId, job.payload.engineType);
+  const engine = createDiscoveryEngine(campaign.workspaceId, job.payload.engineType, campaign.id);
   // Every concrete engine owns a persisted, idempotent seed catalog. Hybrid
   // Fill is intentionally excluded: it routes work to one of these engines
   // rather than creating a duplicate candidate source of its own.
@@ -244,7 +246,11 @@ export async function runDiscoveryCronTick(maxJobsPerTick: number, now: Date = n
       rawCandidatesProduced += await executeDiscoveryJob(job);
       await completeDiscoveryJob({ jobId: job.id, workerId, now });
     } catch (error) {
-      await failDiscoveryJob({ workerId, job, error, now });
+      if (error instanceof ProviderBudgetExceededError) {
+        await deferDiscoveryJob({ jobId: job.id, workerId, nextAttemptAt: error.retryAt, reason: error.message });
+      } else {
+        await failDiscoveryJob({ workerId, job, error, now });
+      }
     }
   }
 

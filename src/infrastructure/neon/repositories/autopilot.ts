@@ -1,8 +1,9 @@
-import { and, eq, gte, count, sql } from "drizzle-orm";
+import { and, eq, gte, lte, count, sql } from "drizzle-orm";
 import { getDb } from "../db";
 import { campaigns, campaignMemberships } from "../schema/campaigns";
-import { accounts } from "../schema/accounts";
-import { discoveryJobs, processingJobs, searchSeeds } from "../schema/discovery";
+import { accounts, accountSources } from "../schema/accounts";
+import { discoveryJobs, processingJobs, rawCandidates, searchSeeds } from "../schema/discovery";
+import { providerRuns } from "../schema/providers";
 import { outreachQueue, outreachEvents } from "../schema/outreach";
 import { conversations, meetings } from "../schema/conversations";
 import { autopilotSettings, rebalanceDecisions } from "../schema/autopilot";
@@ -269,6 +270,14 @@ export async function getGlobalAutopilotState(workspaceId: string): Promise<Glob
     .where(and(eq(conversations.workspaceId, workspaceId), gte(meetings.createdAt, today)));
 
   const engines = await listEngineTargets(workspaceId);
+  const concreteEngines = engines.filter((engine) => engine.engineType !== "hybrid_fill" && engine.providerConfigured);
+  const systemHealth: ProviderHealthStatus = concreteEngines.some((engine) => engine.providerHealth === "healthy")
+    ? "healthy"
+    : concreteEngines.some((engine) => engine.providerHealth === "untested")
+      ? "untested"
+      : concreteEngines.some((engine) => engine.providerHealth === "degraded")
+        ? "degraded"
+        : "paused";
   const pacing = await getAutopilotPacingState(workspaceId);
   const targetRisk = pacing.status === "on_pace" || pacing.status === "before_window"
     ? "on_track"
@@ -289,7 +298,7 @@ export async function getGlobalAutopilotState(workspaceId: string): Promise<Glob
     repliesToday: repliesRow?.total ?? 0,
     meetingsToday: meetingsRow?.total ?? 0,
     readyBufferDays: null,
-    systemHealth: "unknown",
+    systemHealth,
     engines,
     pacing,
     targetRisk,
@@ -302,6 +311,19 @@ export async function listEngineTargets(workspaceId: string): Promise<EngineTarg
 
 async function getEngineTargetState(workspaceId: string, engineType: EngineType): Promise<EngineTargetState> {
   const db = getDb();
+  const settings = await getAutopilotSettings(workspaceId);
+  const { start: dayStart, end: dayEnd } = getDayBounds(settings.timezone);
+  const mapsEnv = getMapsEnv();
+  const serpEnv = getSerperEnv();
+  const mapsConfigured = mapsEnv.MAPS_PROVIDER === "apify" && Boolean(mapsEnv.APIFY_API_TOKEN);
+  const serpConfigured = serpEnv.SERP_PROVIDER === "serper" && Boolean(serpEnv.SERPER_API_KEY);
+  const providerConfigured = engineType === "maps_fast"
+    ? mapsConfigured
+    : engineType === "maps_deep"
+      ? mapsConfigured && serpConfigured
+      : engineType === "google_serp" || engineType === "linkedin_owner"
+        ? serpConfigured
+        : mapsConfigured || serpConfigured;
 
   const [targetRow] = await db
     .select({ total: sql<number>`coalesce(sum(${campaigns.dailySoftTarget}), 0)` })
@@ -330,6 +352,36 @@ async function getEngineTargetState(workspaceId: string, engineType: EngineType)
       ),
     );
 
+  const [campaignStateRow] = await db
+    .select({
+      activeCount: sql<number>`count(*) filter (where ${campaigns.status} = 'active')`,
+      autopilotCount: sql<number>`count(*) filter (where ${campaigns.status} = 'active' and ${campaigns.autopilotEnabled} = true)`,
+    })
+    .from(campaigns)
+    .where(and(eq(campaigns.workspaceId, workspaceId), eq(campaigns.engineType, engineType)));
+
+  const [rawTodayRow] = await db
+    .select({ total: count() })
+    .from(rawCandidates)
+    .innerJoin(campaigns, eq(rawCandidates.campaignId, campaigns.id))
+    .where(and(
+      eq(campaigns.workspaceId, workspaceId),
+      eq(rawCandidates.engineType, engineType),
+      gte(rawCandidates.discoveredAt, dayStart),
+      lte(rawCandidates.discoveredAt, new Date()),
+    ));
+
+  const [accountsTodayRow] = await db
+    .select({ total: sql<number>`count(distinct ${accountSources.accountId})` })
+    .from(accountSources)
+    .innerJoin(accounts, eq(accountSources.accountId, accounts.id))
+    .where(and(
+      eq(accounts.workspaceId, workspaceId),
+      eq(accountSources.sourceType, engineType),
+      gte(accountSources.discoveredAt, dayStart),
+      lte(accountSources.discoveredAt, new Date()),
+    ));
+
   const [readyRow] = await db
     .select({ total: count() })
     .from(campaignMemberships)
@@ -355,20 +407,20 @@ async function getEngineTargetState(workspaceId: string, engineType: EngineType)
             AND cp.verification_status NOT IN ('unverified', 'invalid', 'bounced')
             AND se.id IS NULL
         )`,
-        gte(campaignMemberships.updatedAt, startOfToday((await getAutopilotSettings(workspaceId)).timezone)),
+        gte(campaignMemberships.updatedAt, dayStart),
         sql`${campaignMemberships.stage} IN ('qualified', 'ready')`
       ),
     );
     
     const [qualifiedRow] = await db
-    .select({ total: count() })
+    .select({ total: sql<number>`count(distinct ${campaignMemberships.accountId})` })
     .from(campaignMemberships)
     .innerJoin(campaigns, eq(campaignMemberships.campaignId, campaigns.id))
     .where(
       and(
         eq(campaigns.workspaceId, workspaceId),
         eq(campaigns.engineType, engineType),
-        gte(campaignMemberships.qualifiedAt, startOfToday((await getAutopilotSettings(workspaceId)).timezone)),
+        gte(campaignMemberships.qualifiedAt, dayStart),
       ),
     );
 
@@ -381,7 +433,7 @@ async function getEngineTargetState(workspaceId: string, engineType: EngineType)
         eq(campaigns.workspaceId, workspaceId),
         eq(campaigns.engineType, engineType),
         sql`${campaignMemberships.stage} IN ('qualified', 'ready')`,
-        gte(campaignMemberships.updatedAt, startOfToday((await getAutopilotSettings(workspaceId)).timezone)),
+        gte(campaignMemberships.updatedAt, dayStart),
         sql`EXISTS (
           SELECT 1 FROM prospect_analyses pa
           WHERE pa.campaign_id = ${campaignMemberships.campaignId}
@@ -404,9 +456,31 @@ async function getEngineTargetState(workspaceId: string, engineType: EngineType)
     .innerJoin(campaigns, eq(searchSeeds.campaignId, campaigns.id))
     .where(and(eq(campaigns.workspaceId, workspaceId), eq(campaigns.engineType, engineType)));
 
-  const targetMetric = (await getAutopilotSettings(workspaceId)).targetMetric;
+  const errorResult = await db.execute(sql`
+    SELECT last_error FROM (
+      SELECT dj.last_error, dj.updated_at FROM discovery_jobs dj
+      INNER JOIN campaigns c ON c.id = dj.campaign_id
+      WHERE c.workspace_id = ${workspaceId}::uuid AND c.engine_type = ${engineType} AND dj.last_error IS NOT NULL
+      UNION ALL
+      SELECT pj.last_error, pj.updated_at FROM processing_jobs pj
+      INNER JOIN campaigns c ON c.id = pj.campaign_id
+      WHERE c.workspace_id = ${workspaceId}::uuid AND c.engine_type = ${engineType} AND pj.last_error IS NOT NULL
+      UNION ALL
+      SELECT pr.error AS last_error, pr.started_at AS updated_at FROM provider_runs pr
+      INNER JOIN campaigns c ON c.id = pr.campaign_id
+      WHERE c.workspace_id = ${workspaceId}::uuid AND pr.metadata->>'engineType' = ${engineType} AND pr.error IS NOT NULL
+    ) errors
+    ORDER BY updated_at DESC
+    LIMIT 1
+  `);
+  const errorRow = errorResult.rows[0] as { last_error?: string | null } | undefined;
+
+  const targetMetric = settings.targetMetric;
   return {
     engineType,
+    providerConfigured,
+    campaignActive: (campaignStateRow?.activeCount ?? 0) > 0,
+    autopilotEnabled: (campaignStateRow?.autopilotCount ?? 0) > 0,
     softTarget: targetRow?.total ?? 0,
     readyToday: readyRow?.total ?? 0,
     targetAchievedToday: targetMetric === "outreach_ready" 
@@ -415,11 +489,14 @@ async function getEngineTargetState(workspaceId: string, engineType: EngineType)
         ? (analyzedQualifiedRow?.total ?? 0)
         : (qualifiedRow?.total ?? 0),
     qualifiedToday: qualifiedRow?.total ?? 0,
+    rawToday: rawTodayRow?.total ?? 0,
+    accountsToday: accountsTodayRow?.total ?? 0,
     rawQueueDepth: rawDepthRow?.total ?? 0,
     processingQueueDepth: processingDepthRow?.total ?? 0,
     currentYield: yieldRow?.avgYield ?? 0,
     providerHealth: await getEngineProviderHealth(workspaceId, engineType),
     lastRunAt: yieldRow?.lastRunAt ? new Date(yieldRow.lastRunAt).toISOString() : null,
+    lastError: errorRow?.last_error ?? null,
     nextPlannedAction: null,
   };
 }

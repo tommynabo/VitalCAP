@@ -1,5 +1,6 @@
 import type { DiscoveryEngine, RawCandidate, SearchSeed } from "@/domain/discovery/types";
 import type { SerpDiscoveryProvider } from "@/domain/providers/types";
+import { ProviderBudgetExceededError } from "@/domain/providers/errors";
 import { selectNextSeeds } from "./geography-planner";
 import type { LinkedInRawPayload } from "./candidate-processor";
 
@@ -42,7 +43,8 @@ export class LinkedInOwnerEngine implements DiscoveryEngine {
       const output = await this.provider.search({ query: `${input.seed.query} ${input.seed.geography}`, maxResults: 10 });
       providerCalls += 1;
       profileResults = output.results.filter((result) => result.domain === "linkedin.com");
-    } catch {
+    } catch (error) {
+      if (error instanceof ProviderBudgetExceededError) throw error;
       return { rawCandidates: [], providerCalls: 1, providerErrors: 1, latencyMs: Date.now() - start };
     }
 
@@ -53,7 +55,8 @@ export class LinkedInOwnerEngine implements DiscoveryEngine {
         const employerLookup = await this.provider.search({ query: `${profile.title} sitio web oficial`, maxResults: 3 });
         providerCalls += 1;
         resolvedEmployerDomain = employerLookup.results.find((r) => r.domain && r.domain !== "linkedin.com")?.domain ?? null;
-      } catch {
+      } catch (error) {
+        if (error instanceof ProviderBudgetExceededError) throw error;
         providerErrors += 1;
       }
 

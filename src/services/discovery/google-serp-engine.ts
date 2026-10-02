@@ -1,5 +1,6 @@
 import type { DiscoveryEngine, RawCandidate, SearchSeed } from "@/domain/discovery/types";
 import type { SerpDiscoveryProvider } from "@/domain/providers/types";
+import { ProviderBudgetExceededError } from "@/domain/providers/errors";
 import { selectNextSeeds } from "./geography-planner";
 import type { SerpRawPayload } from "./candidate-processor";
 
@@ -45,7 +46,8 @@ export class GoogleSerpEngine implements DiscoveryEngine {
         discoveredAt: new Date().toISOString(),
       }));
       return { rawCandidates, providerCalls: 1, providerErrors: 0, latencyMs: Date.now() - start };
-    } catch {
+    } catch (error) {
+      if (error instanceof ProviderBudgetExceededError) throw error;
       return { rawCandidates: [], providerCalls: 1, providerErrors: 1, latencyMs: Date.now() - start };
     }
   }
