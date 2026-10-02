@@ -11,7 +11,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
 import { globalProgressPct, sumSoftTargets } from "@/lib/autopilot/targets";
 import type { DeadLetterSample, ProviderRowStatus, QueueHealthSnapshot } from "@/lib/data/repository";
-import type { AutopilotSettings, GlobalAutopilotState, RebalanceDecision } from "@/domain/autopilot/types";
+import { getEffectiveAutopilotState, type AutopilotSettings, type GlobalAutopilotState, type RebalanceDecision } from "@/domain/autopilot/types";
 
 interface ProviderRow {
   name: string;
@@ -42,7 +42,7 @@ export function AutopilotClient({
   const softTargetTotal = sumSoftTargets(state.engines);
   const [pendingAction, setPendingAction] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const effectiveState = settings.emergencyStopped ? "emergency_stopped" : settings.enabled ? "running" : "paused";
+  const effectiveState = getEffectiveAutopilotState(settings);
   const pacing = state.pacing;
   const [targetInput, setTargetInput] = useState(String(settings.globalDailyTarget));
 
@@ -65,14 +65,14 @@ export function AutopilotClient({
 
   return (
     <div className="space-y-6">
-      <Card className={effectiveState !== "running" ? "border-warning" : undefined}>
+      <Card className={effectiveState === "system_paused" ? "border-danger bg-danger/5" : effectiveState !== "running" ? "border-warning" : undefined}>
         <CardContent className="flex flex-wrap items-center justify-between gap-4 py-4">
           <div>
             <p className="text-sm font-semibold text-text">
-              Autopilot is {effectiveState === "running" ? "running" : effectiveState === "paused" ? "paused" : "emergency stopped"}
+              {effectiveState === "system_paused" ? "SYSTEM PAUSED" : `Autopilot is ${effectiveState === "running" ? "running" : effectiveState === "paused" ? "paused" : "emergency stopped"}`}
             </p>
             <p className="text-xs text-text-muted">
-              {effectiveState === "running" ? `Targeting ${settings.globalDailyTarget} qualified prospects/day across ${state.engines.length} engines · metric ${settings.targetMetric}` : effectiveState === "paused" ? "New discovery is paused; existing processing jobs may drain safely." : "Emergency stop blocks new discovery, processing claims, and outreach scheduling."}
+              {effectiveState === "running" ? `Targeting ${settings.globalDailyTarget} qualified prospects/day across ${state.engines.length} engines · metric ${settings.targetMetric}` : effectiveState === "system_paused" ? (settings.systemPauseReason ?? "Recovery required before new discovery can run.") : effectiveState === "paused" ? "New discovery is paused; existing processing jobs may drain safely." : "Emergency stop blocks new discovery, processing claims, and outreach scheduling."}
             </p>
           </div>
           <div className="flex gap-2">
@@ -82,7 +82,7 @@ export function AutopilotClient({
                 Pause
               </Button>
             ) : (
-              <Button size="sm" disabled={pendingAction !== null || effectiveState === "emergency_stopped"} onClick={() => control({ action: "resume" })}>
+              <Button size="sm" disabled={pendingAction !== null || effectiveState === "emergency_stopped" || effectiveState === "system_paused"} onClick={() => control({ action: "resume" })}>
                 <Play className="h-4 w-4" aria-hidden="true" />
                 Resume
               </Button>
