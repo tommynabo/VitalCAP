@@ -40,14 +40,14 @@ export class MapsFastEngine implements DiscoveryEngine {
     providerRun?: import("@/domain/providers/types").AsyncMapsRun;
   }> {
     const start = Date.now();
-    let providerErrors = 0;
-
+    const searchInput = { query: input.seed.query, geography: input.seed.geography, pageToken: null, requestKey: input.requestKey, maxResults: input.maxResults };
+    // A failed async start is not a valid zero-result discovery. The runner
+    // owns the durable reservation and will mark it failed/retryable.
+    if (this.provider.startAsync) {
+      const providerRun = await this.provider.startAsync(searchInput);
+      return { rawCandidates: [], providerCalls: 1, providerErrors: 0, latencyMs: Date.now() - start, providerRun };
+    }
     try {
-      const searchInput = { query: input.seed.query, geography: input.seed.geography, pageToken: null, requestKey: input.requestKey, maxResults: input.maxResults };
-      if (this.provider.startAsync) {
-        const providerRun = await this.provider.startAsync(searchInput);
-        return { rawCandidates: [], providerCalls: 1, providerErrors: 0, latencyMs: Date.now() - start, providerRun };
-      }
       const output = await this.provider.search(searchInput);
       const rawCandidates: RawCandidate[] = output.results.map((place) => ({
         id: `raw_${input.seed.id}_${place.externalPlaceId ?? place.name}`,
@@ -58,11 +58,10 @@ export class MapsFastEngine implements DiscoveryEngine {
         rawPayload: { kind: "maps", place } satisfies MapsRawPayload,
         discoveredAt: new Date().toISOString(),
       }));
-      return { rawCandidates, providerCalls: 1, providerErrors, latencyMs: Date.now() - start };
+      return { rawCandidates, providerCalls: 1, providerErrors: 0, latencyMs: Date.now() - start };
     } catch (err) {
       console.error("executeDiscovery caught error:", err);
-      providerErrors = 1;
-      return { rawCandidates: [], providerCalls: 1, providerErrors, latencyMs: Date.now() - start };
+      return { rawCandidates: [], providerCalls: 1, providerErrors: 1, latencyMs: Date.now() - start };
     }
   }
 }
