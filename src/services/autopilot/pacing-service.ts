@@ -121,6 +121,8 @@ export interface PacingComputationInput {
   apifySpendToday: number;
   apifyDailyBudgetRemaining: number;
   providerHealth: AutopilotPacingState["providerHealth"];
+  /** True if at least one configured, eligible engine can accept discovery. */
+  availableDiscoveryCapacity?: boolean;
   estimatedYield: number;
   yieldSampleSize: number;
   now: Date;
@@ -144,7 +146,8 @@ export function computeAutopilotPacing(input: PacingComputationInput): Autopilot
   const minimumYieldFloor = 0.1;
   const boundedYield = Math.max(minimumYieldFloor, Math.min(1, input.estimatedYield || 0));
   const windowClosed = nowMinutes < startMinutes || nowMinutes >= endMinutes;
-  const qualifiedNeededToPlan = windowClosed || input.providerHealth === "paused" || input.apifyDailyBudgetRemaining <= 0
+  const hasCapacity = input.availableDiscoveryCapacity ?? (input.providerHealth !== "paused" && input.apifyDailyBudgetRemaining > 0);
+  const qualifiedNeededToPlan = windowClosed || !hasCapacity
     ? 0
     : Math.min(remainingTarget, Math.ceil(paceDeficit * 1.1));
   
@@ -162,10 +165,8 @@ export function computeAutopilotPacing(input: PacingComputationInput): Autopilot
     ? "before_window"
     : nowMinutes >= endMinutes
       ? "after_window"
-      : input.apifyDailyBudgetRemaining <= 0
-        ? "budget_paused"
-        : input.providerHealth === "paused"
-          ? "provider_paused"
+      : !hasCapacity
+          ? (input.apifyDailyBudgetRemaining <= 0 && input.providerHealth !== "paused" ? "budget_paused" : "provider_paused")
           : paceDeficit > 0
             ? "behind_pace"
             : "on_pace";
@@ -173,10 +174,10 @@ export function computeAutopilotPacing(input: PacingComputationInput): Autopilot
     ? `Behind pace by ${Math.ceil(paceDeficit)} qualified prospects. Estimated Maps Fast yield ${Math.round(boundedYield * 100)}%.`
     : status === "on_pace"
       ? "On pace. Existing progress and in-flight work are sufficient for the current checkpoint."
-      : status === "budget_paused"
-        ? "Apify daily budget is exhausted; no new paid discovery is scheduled."
+    : status === "budget_paused"
+        ? "All available discovery budgets are exhausted; no new paid discovery is scheduled."
         : status === "provider_paused"
-          ? "Maps Fast provider health is paused; no new paid discovery is scheduled."
+          ? "No configured discovery engine is currently eligible; no new discovery is scheduled."
           : status === "before_window"
             ? "Before the operating window; no new paid discovery is scheduled."
             : "After the operating window; existing processing and provider polling may continue.";
