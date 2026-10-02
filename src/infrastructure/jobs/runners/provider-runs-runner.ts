@@ -1,6 +1,5 @@
 import { listWorkspaceIds } from "@/infrastructure/neon/repositories/workspace";
 import { getTodaySpendUsd, listApifyRunsForPolling, updateProviderRun, claimProviderRunForIngestion } from "@/infrastructure/neon/repositories/provider-runs";
-import crypto from "crypto";
 import { getMapsEnv } from "@/lib/config/env";
 import { getAutopilotSettings } from "@/infrastructure/neon/repositories/autopilot";
 import { ApifyClient } from "@/infrastructure/providers/maps/apify-client";
@@ -54,7 +53,12 @@ export async function runProviderRunsCronTick(maxRuns = MAX_RUNS_PER_TICK): Prom
     let token = "";
     try {
       if (!providerRun.externalRunId) {
-        warnings.push(`provider_run ${providerRun.id}: starting reservation has no external run ID; automatic retry skipped.`);
+        await updateProviderRun(providerRun.id, {
+          status: "failed",
+          finishedAt: new Date(),
+          error: "Provider startup did not produce an external run ID; recovered as retryable failure.",
+        });
+        warnings.push(`provider_run ${providerRun.id}: recovered missing external run ID as failed.`);
         continue;
       }
       const run = await client.getActorRun(providerRun.externalRunId!);
@@ -89,8 +93,10 @@ export async function runProviderRunsCronTick(maxRuns = MAX_RUNS_PER_TICK): Prom
       const datasetId = run.defaultDatasetId ?? providerRun.externalDatasetId;
       if (!datasetId) throw new Error(`Apify run ${run.id} succeeded without a dataset ID.`);
       const metadata = (providerRun.metadata ?? {}) as Record<string, unknown>;
+      const engineType = typeof metadata.engineType === "string" ? metadata.engineType : null;
       const discoveryJobId = typeof metadata.discoveryJobId === "string" ? metadata.discoveryJobId : null;
       if (!discoveryJobId) throw new Error(`Provider run ${providerRun.id} has no discovery job metadata.`);
+      if (!engineType) throw new Error(`Provider run ${providerRun.id} has no engine type metadata.`);
       
       token = require("node:crypto").randomUUID();
       const claimed = await claimProviderRunForIngestion(providerRun.id, token);
@@ -119,7 +125,7 @@ export async function runProviderRunsCronTick(maxRuns = MAX_RUNS_PER_TICK): Prom
           return {
             discoveryJobId,
             campaignId: providerRun.campaignId!,
-            engineType: "maps_fast" as const,
+            engineType: engineType as import("@/domain/campaigns/types").EngineType,
             sourceExternalId: place.externalPlaceId,
             sourceUrl: place.sourceUrl,
             sourceFingerprint: fingerprint,
