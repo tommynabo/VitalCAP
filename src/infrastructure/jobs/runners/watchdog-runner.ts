@@ -38,14 +38,25 @@ export async function runWatchdogCronTick(): Promise<WatchdogCronResult> {
   `);
   const healedProcessingJobs = healedProcessing.rows.length;
 
-  // 3. Provider Runs Watchdog
+  // 3. Old startup failures were historically escalated to manual
+  // reconciliation. A missing external ID is a known, retryable startup
+  // failure, so recover it without deleting the original audit/error data.
+  await db.execute(sql`
+    UPDATE provider_runs
+    SET status = 'failed', finished_at = COALESCE(finished_at, NOW()),
+        error = COALESCE(error || ' | ', '') || 'Recovered known startup failure (watchdog)'
+    WHERE status = 'manual_reconciliation_required'
+      AND external_run_id IS NULL
+  `);
+
+  // 4. Provider Runs Watchdog
   const providerRunsHeal = await db.execute(sql`
     UPDATE provider_runs 
     SET 
       status = CASE 
-        WHEN status = 'starting' AND external_run_id IS NULL THEN 'manual_reconciliation_required'
+        WHEN status = 'starting' AND external_run_id IS NULL THEN 'failed'
         WHEN status = 'succeeded' THEN 'succeeded'
-        WHEN status = 'ingesting' AND ingestion_attempt_count >= 5 THEN 'manual_reconciliation_required'
+        WHEN status = 'ingesting' AND ingestion_attempt_count >= 5 THEN 'failed'
         WHEN status = 'ingesting' AND ingestion_attempt_count < 5 THEN 'succeeded'
         ELSE status
       END,
@@ -58,9 +69,9 @@ export async function runWatchdogCronTick(): Promise<WatchdogCronResult> {
         ELSE ingestion_started_at
       END,
       error = CASE 
-        WHEN status = 'starting' AND external_run_id IS NULL THEN 'Stuck in starting without external ID (watchdog)'
+        WHEN status = 'starting' AND external_run_id IS NULL THEN 'Provider startup failed without external ID (watchdog recovery)'
         WHEN status = 'succeeded' THEN 'Max ingestion attempts exceeded (watchdog)'
-        WHEN status = 'ingesting' AND ingestion_attempt_count >= 5 THEN 'Max ingestion attempts exceeded (watchdog)'
+        WHEN status = 'ingesting' AND ingestion_attempt_count >= 5 THEN 'Max ingestion attempts exceeded (watchdog recovery)'
         WHEN status = 'ingesting' AND ingestion_attempt_count < 5 THEN 'Stale ingestion lease (watchdog)'
         ELSE error
       END
@@ -74,7 +85,7 @@ export async function runWatchdogCronTick(): Promise<WatchdogCronResult> {
   `);
   const stuckProviderRuns = providerRunsHeal.rows.length;
 
-  // 4. Provider terminal states -> search seed run
+  // 5. Provider terminal states -> search seed run
   const orphanedSeeds = await db.execute(sql`
     UPDATE search_seed_runs ssr
     SET finished_at = NOW(), error = 'Closed via watchdog due to provider run terminal state'
@@ -86,7 +97,7 @@ export async function runWatchdogCronTick(): Promise<WatchdogCronResult> {
   `);
   const orphanedSeedRuns = orphanedSeeds.rows.length;
 
-  // 5. Autopilot System Pause Check (Queue Health) - Workspace Scoped
+  // 6. Autopilot System Pause Check (Queue Health) - Workspace Scoped
   await db.execute(sql`
     WITH workspace_health AS (
       SELECT 
