@@ -101,52 +101,62 @@ export async function reserveApifyProviderRun(input: ReserveApifyProviderRunInpu
   const { start } = getDayBounds(settings.timezone);
   const expectedCostUsd = input.itemsRequested * 0.005; // conservative
 
-  // 2. Atomic Insertion with Guard Conditions
-  return db.transaction(async (tx) => {
-    await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${input.workspaceId}::text || ${start.toISOString()}::text))`);
-
-    const safetyCheck = await tx.execute(sql`
+  // 2. Atomic insertion with guard conditions in one Neon HTTP statement.
+  const result = await db.execute(sql`
+    WITH safety AS (
       SELECT
         (SELECT COUNT(*) FROM provider_runs WHERE workspace_id = ${input.workspaceId}::uuid AND status = 'manual_reconciliation_required')::int as unreconciled_count,
         (SELECT COALESCE(SUM(items_requested), 0) FROM provider_runs WHERE workspace_id = ${input.workspaceId}::uuid AND provider = 'apify' AND started_at >= ${start.toISOString()}::timestamptz)::int as requested_today,
         (SELECT COALESCE(SUM(cost_usd), 0) FROM provider_runs WHERE workspace_id = ${input.workspaceId}::uuid AND provider = 'apify' AND started_at >= ${start.toISOString()}::timestamptz)::numeric as cost_today
-    `);
-
-    const row = safetyCheck.rows[0] as { unreconciled_count: number; requested_today: number; cost_today: number } | undefined;
-    if (!row) throw new Error("Safety check failed");
-
-    if (row.unreconciled_count > 0) {
-      throw new Error(`Provider run reservation rejected: unresolved manual reconciliation required for workspace ${input.workspaceId}`);
-    }
-    if (row.requested_today + input.itemsRequested > maxRequests) {
-      throw new Error(`Provider run reservation rejected: max daily requests exceeded for workspace ${input.workspaceId}`);
-    }
-    if (row.cost_today + expectedCostUsd > maxCost) {
-      throw new Error(`Provider run reservation rejected: daily cost limit exceeded for workspace ${input.workspaceId}`);
-    }
-
-    const result = await tx.execute(sql`
+    ),
+    inserted AS (
       INSERT INTO provider_runs (
         workspace_id, campaign_id, provider, operation, request_key, actor_id, seed_id, status, items_requested, items_returned, cost_usd, metadata, started_at
-      ) VALUES (
+      )
+      SELECT
         ${input.workspaceId}::uuid, ${input.campaignId}::uuid, 'apify', ${input.operation}, ${input.requestKey}, 
         ${input.actorId ?? null}, ${input.seedId}::uuid, 'starting', ${input.itemsRequested}, 0, ${expectedCostUsd}, 
         ${JSON.stringify(input.metadata ?? {})}::jsonb, NOW()
-      )
+      FROM safety
+      WHERE safety.unreconciled_count = 0
+        AND safety.requested_today + ${input.itemsRequested} <= ${maxRequests}
+        AND safety.cost_today + ${expectedCostUsd} <= ${maxCost}
       ON CONFLICT (request_key) DO NOTHING
       RETURNING *
-    `);
+    )
+    SELECT
+      (SELECT row_to_json(inserted.*) FROM inserted) AS inserted_row,
+      (SELECT row_to_json(safety.*) FROM safety) AS safety_row,
+      (SELECT row_to_json(existing.*) FROM provider_runs existing WHERE existing.request_key = ${input.requestKey}) AS existing_row
+  `);
 
-    if (result.rows.length > 0) {
-      const insertedRow = await getProviderRunByRequestKey(input.requestKey);
-      return { providerRun: insertedRow!, created: true };
-    }
-
+  const row = result.rows[0] as {
+    inserted_row: unknown;
+    safety_row: { unreconciled_count: number; requested_today: number; cost_today: number } | null;
+    existing_row: unknown;
+  } | undefined;
+  if (row?.inserted_row) {
+    const insertedRow = await getProviderRunByRequestKey(input.requestKey);
+    if (!insertedRow) throw new Error("Created provider run reservation could not be loaded.");
+    return { providerRun: insertedRow, created: true };
+  }
+  if (row?.existing_row) {
     const existing = await getProviderRunByRequestKey(input.requestKey);
-    if (existing) return { providerRun: existing, created: false };
-    
-    throw new Error(`Unable to resolve provider run reservation for workspace ${input.workspaceId}`);
-  });
+    if (!existing) throw new Error("Existing provider run reservation could not be loaded.");
+    return { providerRun: existing, created: false };
+  }
+
+  const safety = row?.safety_row;
+  if (safety?.unreconciled_count) {
+    throw new Error(`Provider run reservation rejected: unresolved manual reconciliation required for workspace ${input.workspaceId}`);
+  }
+  if (safety && safety.requested_today + input.itemsRequested > maxRequests) {
+    throw new Error(`Provider run reservation rejected: max daily requests exceeded for workspace ${input.workspaceId}`);
+  }
+  if (safety && safety.cost_today + expectedCostUsd > maxCost) {
+    throw new Error(`Provider run reservation rejected: daily cost limit exceeded for workspace ${input.workspaceId}`);
+  }
+  throw new Error(`Unable to resolve provider run reservation for workspace ${input.workspaceId}`);
 }
 
 export async function createProviderRun(input: CreateProviderRunInput): Promise<string> {
