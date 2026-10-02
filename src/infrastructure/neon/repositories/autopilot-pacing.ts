@@ -52,7 +52,6 @@ export async function getAutopilotPacingMetrics(workspaceId: string, timeZone: s
       SELECT coalesce(sum(items_requested), 0)::int AS total
       FROM provider_runs
       WHERE workspace_id = ${workspaceId}::uuid
-        AND provider = 'apify'
         AND started_at >= ${start.toISOString()}::timestamptz
         AND started_at < ${end.toISOString()}::timestamptz
     `),
@@ -74,8 +73,6 @@ export async function getAutopilotPacingMetrics(workspaceId: string, timeZone: s
         WHERE rc.provider_run_id = pr.id
       ) raw ON true
       WHERE pr.workspace_id = ${workspaceId}::uuid
-        AND pr.provider = 'apify'
-        AND pr.operation = 'maps_search'
         AND pr.status IN ('starting', 'queued', 'running', 'succeeded', 'ingesting')
     `),
     db.execute(sql`
