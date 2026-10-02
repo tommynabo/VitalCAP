@@ -180,6 +180,15 @@ export function deriveIncomingIdentitySignals(payload: CandidateRawPayload): Omi
   return identitySignalsFor(payload).incoming;
 }
 
+export function hasLinkedInEmployerAccount(
+  payload: CandidateRawPayload,
+  existingAccounts: readonly AccountIdentitySignals[],
+): boolean {
+  if (payload.kind !== "linkedin") return true;
+  const employerDomain = normalizeDomain(payload.resolvedEmployerDomain);
+  return Boolean(employerDomain && existingAccounts.some((account) => account.normalizedDomain === employerDomain));
+}
+
 function accountKeyFor(incoming: Omit<AccountIdentitySignals, "accountId">, businessNameGuess: string, geography: string): string {
   if (incoming.googlePlaceId) return `place:${incoming.googlePlaceId}`;
   if (incoming.normalizedDomain) return `domain:${incoming.normalizedDomain}`;

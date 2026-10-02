@@ -41,15 +41,21 @@ export function getEffectiveAutopilotState(settings: Pick<AutopilotSettings, "en
 
 export interface EngineTargetState {
   engineType: EngineType;
+  providerConfigured?: boolean;
+  campaignActive?: boolean;
+  autopilotEnabled?: boolean;
   softTarget: number;
   readyToday: number;
   targetAchievedToday?: number;
   qualifiedToday?: number;
+  rawToday?: number;
+  accountsToday?: number;
   rawQueueDepth: number;
   processingQueueDepth: number;
   currentYield: number;
   providerHealth: ProviderHealthStatus;
   lastRunAt: string | null;
+  lastError?: string | null;
   nextPlannedAction: string | null;
 }
 

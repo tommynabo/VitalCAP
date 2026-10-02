@@ -1,12 +1,15 @@
 import { randomUUID } from "node:crypto";
 import type { AccountStatus } from "@/domain/accounts/types";
+import { ProviderBudgetExceededError } from "@/domain/providers/errors";
 import type { CampaignMembershipStage } from "@/domain/campaigns/types";
 import { getCampaignById } from "@/infrastructure/neon/repositories/campaigns";
 import { upsertCampaignMembership } from "@/infrastructure/neon/repositories/campaigns";
 import {
   claimProcessingJobs,
   completeProcessingJob,
+  deferProcessingJob,
   failProcessingJob,
+  enqueueProcessingJob,
 } from "@/infrastructure/neon/repositories/job-queue";
 import { getRawCandidateById, markRawCandidateProcessed, refreshSearchSeedQualification, updateRawCandidateAccountId } from "@/infrastructure/neon/repositories/discovery";
 import {
@@ -17,15 +20,16 @@ import {
   insertContactPoint,
   updateAccountFields,
 } from "@/infrastructure/neon/repositories/accounts";
-import { createEmailVerificationProvider } from "@/infrastructure/providers/provider-factory";
+import { createEmailVerificationProvider, createSerpDiscoveryProvider } from "@/infrastructure/providers/provider-factory";
 import { createInMemoryVerificationCacheStore } from "@/services/verification/email-verification-cache";
 import type { EmailVerificationProvider, WebsiteFetcher } from "@/domain/providers/types";
-import { processRawCandidate, deriveIncomingIdentitySignals, type CandidateRawPayload, type ProcessedCandidateResult } from "@/services/discovery/candidate-processor";
+import { processRawCandidate, deriveIncomingIdentitySignals, hasLinkedInEmployerAccount, type CandidateRawPayload, type ProcessedCandidateResult } from "@/services/discovery/candidate-processor";
 import { mergeMissingAccountFields, type IncomingAccountFields } from "@/services/accounts/account-enrichment-merge";
 import { realWebsiteFetcher, providerLabelForEngine } from "./engine-factory";
 import { WebsiteEnrichmentService } from "@/services/enrichment/website-enrichment-service";
 import { getWebsiteEnrichmentStatus, upsertWebsiteEnrichmentStatus, insertWebsiteEvidence } from "@/infrastructure/neon/repositories/enrichment";
 import { DomainFetchCache } from "@/lib/security/safe-fetch";
+import { normalizeDomain } from "@/lib/normalization";
 
 interface ProcessingJobPayload {
   rawCandidateId: string;
@@ -138,9 +142,36 @@ function extractAccountFields(payload: CandidateRawPayload): {
 }
 
 async function executeProcessingJob(
-  job: { id: string; campaignId: string; payload: ProcessingJobPayload },
+  job: { id: string; campaignId: string; type: string; payload: ProcessingJobPayload },
   options: ProcessingRunnerOptions,
 ): Promise<void> {
+  if (job.type === "maps_deep_owner_enrichment") {
+    const raw = await getRawCandidateById(job.payload.rawCandidateId);
+    if (!raw || raw.rawPayload === undefined || !raw.accountId) throw new Error(`Maps Deep owner enrichment has no processed account for raw_candidate ${job.payload.rawCandidateId}`);
+    const campaign = await getCampaignById(job.campaignId);
+    if (!campaign) throw new Error(`Campaign not found: ${job.campaignId}`);
+    const payload = raw.rawPayload as unknown as CandidateRawPayload;
+    if (payload.kind !== "maps") throw new Error(`Maps Deep owner enrichment requires a Maps payload for raw_candidate ${raw.id}`);
+    const domain = normalizeDomain(payload.place.websiteUrl);
+    if (!domain) return;
+
+    const query = `site:${domain} (titular OR propietario OR gerente OR "responsable de compras" OR "farmacéutico titular")`;
+    const provider = createSerpDiscoveryProvider(campaign.workspaceId, "maps_deep", campaign.id);
+    const output = await provider.search({ query, maxResults: 5 });
+    for (const result of output.results) {
+      if (normalizeDomain(result.domain) !== domain) continue;
+      await insertAccountSource({
+        accountId: raw.accountId,
+        sourceType: "maps_deep",
+        sourceProvider: "serper",
+        sourceExternalId: result.url,
+        sourceUrl: result.url,
+        rawSnapshot: { kind: "maps_deep_owner_enrichment", query, result, googlePlaceId: payload.place.externalPlaceId },
+      });
+    }
+    return;
+  }
+
   const raw = await getRawCandidateById(job.payload.rawCandidateId);
   if (!raw || raw.rawPayload === undefined) throw new Error(`raw_candidate not found: ${job.payload.rawCandidateId}`);
 
@@ -150,6 +181,10 @@ async function executeProcessingJob(
   const payload = raw.rawPayload as unknown as CandidateRawPayload;
   const incoming = deriveIncomingIdentitySignals(payload);
   const existingAccounts = await findCandidateAccountMatches(campaign.workspaceId, incoming);
+  if (!hasLinkedInEmployerAccount(payload, existingAccounts)) {
+    await markRawCandidateProcessed(raw.id);
+    return;
+  }
 
   const fetchCache = new DomainFetchCache();
   const cachedFetcher = {
@@ -389,6 +424,14 @@ async function executeProcessingJob(
 
   await updateRawCandidateAccountId(raw.id, accountId);
   await markRawCandidateProcessed(raw.id);
+  if (raw.engineType === "maps_deep" && payload.kind === "maps" && incoming.normalizedDomain) {
+    await enqueueProcessingJob({
+      campaignId: campaign.id,
+      type: "maps_deep_owner_enrichment",
+      payload: { rawCandidateId: raw.id },
+      idempotencyKey: `maps_deep_owner:${raw.id}`,
+    });
+  }
 }
 
 export interface ProcessingRunnerResult {
@@ -419,7 +462,11 @@ export async function runProcessingCronTick(
       const raw = await getRawCandidateById(job.payload.rawCandidateId);
       if (raw?.searchSeedRunId) await refreshSearchSeedQualification(raw.searchSeedRunId);
     } catch (error) {
-      await failProcessingJob({ workerId, job, error, now });
+      if (error instanceof ProviderBudgetExceededError) {
+        await deferProcessingJob({ jobId: job.id, workerId, nextAttemptAt: error.retryAt, reason: error.message });
+      } else {
+        await failProcessingJob({ workerId, job, error, now });
+      }
       const raw = await getRawCandidateById(job.payload.rawCandidateId);
       if (raw?.searchSeedRunId) await refreshSearchSeedQualification(raw.searchSeedRunId);
     }

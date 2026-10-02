@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { Campaign } from "@/domain/campaigns/types";
-import { allocateEngineWork, allocateMapsFastRawNeed, MAX_RAW_PER_PLANNING_WINDOW, planningWindowKey } from "./target-planner";
+import { allocateEngineWork, allocateMapsFastRawNeed, MAX_RAW_PER_PLANNING_WINDOW, planningWindowKey, rerouteEngineOrders } from "./target-planner";
 
 function campaign(id: string, target: number, overrides: Partial<Campaign> = {}): Campaign {
   return {
@@ -85,5 +85,47 @@ describe("target planner", () => {
     });
     expect(orders).toHaveLength(1);
     expect(orders[0]).toMatchObject({ campaignId: "active", engineType: "maps_deep", desiredRawCount: MAX_RAW_PER_PLANNING_WINDOW });
+  });
+
+  it("routes underperforming Maps Fast allocation to SERP without increasing the global order", () => {
+    const campaigns = [
+      campaign("maps", 100),
+      campaign("serp", 100, { engineType: "google_serp" }),
+      campaign("owner", 100, { engineType: "linkedin_owner" }),
+    ];
+    const capabilities = ["maps_fast", "google_serp", "linkedin_owner"].map((engineType) => ({
+      engineType: engineType as Campaign["engineType"],
+      available: true,
+      providerConfigured: true,
+      providerHealthy: true,
+      providerUntested: false,
+      costAllowed: true,
+      campaignCount: 1,
+      reasonUnavailable: null,
+      reason: null,
+    }));
+    const performances = [
+      { campaignId: "maps", yield: 0.02, queueDepth: 0, seedExhaustion: 0 },
+      { campaignId: "serp", yield: 0.3, queueDepth: 0, seedExhaustion: 0 },
+      { campaignId: "owner", yield: 0.1, queueDepth: 0, seedExhaustion: 0 },
+    ];
+    const input = {
+      workspaceId: "workspace-1",
+      campaigns,
+      capabilities,
+      performances,
+      rawNeeded: 100,
+      reason: "behind pace",
+      now: new Date("2025-01-01T13:00:00Z"),
+      timeZone: "Europe/Madrid",
+    };
+    const original = allocateEngineWork(input);
+    const rerouted = rerouteEngineOrders({ ...input, orders: original, fromEngine: "maps_fast", reason: "Maps Fast underperformed" });
+
+    expect(rerouted.some((order) => order.engineType === "maps_fast")).toBe(false);
+    expect(rerouted.find((order) => order.engineType === "google_serp")?.desiredRawCount)
+      .toBeGreaterThan(original.find((order) => order.engineType === "google_serp")?.desiredRawCount ?? 0);
+    expect(rerouted.reduce((total, order) => total + order.desiredRawCount, 0)).toBe(100);
+    expect(rerouted.some((order) => order.origin === "hybrid_fill")).toBe(true);
   });
 });

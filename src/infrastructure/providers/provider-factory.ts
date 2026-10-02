@@ -1,14 +1,17 @@
 import type { EmailVerificationProvider, MapsDiscoveryProvider, SerpDiscoveryProvider } from "@/domain/providers/types";
+import type { EngineType } from "@/domain/campaigns/types";
+import { ProviderBudgetExceededError } from "@/domain/providers/errors";
 import { getMapsEnv, getSerperEnv, getVerificationEnv } from "@/lib/config/env";
 import { MockMapsDiscoveryProvider } from "./maps/mock-provider";
 import { ApifyMapsDiscoveryProvider } from "./maps/apify-provider";
 import { MockSerpDiscoveryProvider } from "./serp/mock-provider";
-import { SerperDiscoveryProvider } from "./serp/serper-provider";
+import { SerperDiscoveryProvider, SERPER_ESTIMATED_COST_PER_QUERY_USD } from "./serp/serper-provider";
 import { MockEmailVerificationProvider } from "./email-verification/mock-provider";
 import { MillionVerifierEmailVerificationProvider } from "./email-verification/millionverifier-provider";
 import { getTodaySpendUsd, recordProviderRun } from "@/infrastructure/neon/repositories/provider-runs";
 import { getAutopilotSettings } from "@/infrastructure/neon/repositories/autopilot";
 import { getEffectiveAutopilotState } from "@/domain/autopilot/types";
+import { getDayBounds } from "@/lib/time/day-bounds";
 
 export type MapsEngineRole = "maps_fast" | "maps_deep" | "hybrid_fill";
 
@@ -73,7 +76,7 @@ export function createMapsDiscoveryProvider(workspaceId: string, role: MapsEngin
   });
 }
 
-export function createSerpDiscoveryProvider(workspaceId: string): SerpDiscoveryProvider {
+export function createSerpDiscoveryProvider(workspaceId: string, engineType: EngineType, campaignId: string): SerpDiscoveryProvider {
   const env = getSerperEnv();
   if (env.SERP_PROVIDER === "disabled") throw new ProviderDisabledError("SERP_PROVIDER");
   if (env.SERP_PROVIDER === "mock") return new MockSerpDiscoveryProvider();
@@ -88,23 +91,58 @@ export function createSerpDiscoveryProvider(workspaceId: string): SerpDiscoveryP
     language: env.SERPER_LANGUAGE,
   });
 
-  // Serper's cost is deterministic per call (flat per-query credit), so
-  // usage is recorded fire-and-forget after the fact rather than gating the
-  // call itself the way Apify's pre-run cost guard does.
   const originalSearch = provider.search.bind(provider);
   provider.search = async (input) => {
-    const output = await originalSearch(input);
-    if (output.usage.calls > 0) {
-      void recordProviderRun({
+    const settings = await getAutopilotSettings(workspaceId);
+    const spendToday = await getTodaySpendUsd(workspaceId, "serper", settings.timezone);
+    if (spendToday + SERPER_ESTIMATED_COST_PER_QUERY_USD > env.SERPER_DAILY_COST_LIMIT_USD) {
+      const { end: retryAt } = getDayBounds(settings.timezone);
+      const message = `Serper daily budget exhausted; retrying after ${retryAt.toISOString()}.`;
+      await recordProviderRun({
         workspaceId,
+        campaignId,
         provider: "serper",
         operation: "search",
-        status: "completed",
-        itemsReturned: output.results.length,
-        costUsd: output.usage.costUsd,
-        metadata: { query: input.query },
+        status: "budget_blocked",
+        itemsRequested: input.maxResults,
+        itemsReturned: 0,
+        costUsd: 0,
+        error: message,
+        metadata: { engineType, query: input.query, budgetBlocked: true, retryAt: retryAt.toISOString() },
       });
+      throw new ProviderBudgetExceededError(message, retryAt);
     }
+
+    let output;
+    try {
+      output = await originalSearch(input);
+    } catch (error) {
+      await recordProviderRun({
+        workspaceId,
+        campaignId,
+        provider: "serper",
+        operation: "search",
+        status: "failed",
+        itemsRequested: input.maxResults,
+        itemsReturned: 0,
+        costUsd: 0,
+        error: error instanceof Error ? error.message : String(error),
+        metadata: { engineType, query: input.query },
+      });
+      throw error;
+    }
+
+    if (output.usage.calls > 0) await recordProviderRun({
+      workspaceId,
+      campaignId,
+      provider: "serper",
+      operation: "search",
+      status: "completed",
+      itemsRequested: input.maxResults,
+      itemsReturned: output.results.length,
+      costUsd: output.usage.costUsd,
+      metadata: { engineType, query: input.query },
+    });
     return output;
   };
   return provider;

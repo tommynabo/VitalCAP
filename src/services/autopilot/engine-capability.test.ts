@@ -73,4 +73,42 @@ describe("engine capabilities", () => {
     const degraded = buildEngineCapabilities({ mapsProvider: "apify", mapsProviderConfigured: true, serpProvider: "serper", serpProviderConfigured: true, mapsFastHealth: "healthy", providerHealth: { google_serp: "degraded" }, costAllowed: true, campaignCounts: { google_serp: 1 } });
     expect(degraded.find((capability) => capability.engineType === "google_serp")).toMatchObject({ available: false, reason: "provider_degraded" });
   });
+
+  it("keeps healthy Serper engines available when Apify is paused or out of budget", () => {
+    const capabilities = buildEngineCapabilities({
+      mapsProvider: "apify",
+      mapsProviderConfigured: true,
+      serpProvider: "serper",
+      serpProviderConfigured: true,
+      mapsFastHealth: "paused",
+      providerHealth: { maps_fast: "paused", maps_deep: "paused", google_serp: "healthy", linkedin_owner: "healthy", hybrid_fill: "healthy" },
+      costAllowed: false,
+      mapsCostAllowed: false,
+      serperCostAllowed: true,
+      campaignCounts: { maps_fast: 1, google_serp: 1, linkedin_owner: 1 },
+    });
+
+    expect(capabilities.find((capability) => capability.engineType === "maps_fast")?.available).toBe(false);
+    expect(capabilities.find((capability) => capability.engineType === "google_serp")?.available).toBe(true);
+    expect(capabilities.find((capability) => capability.engineType === "linkedin_owner")?.available).toBe(true);
+  });
+
+  it("keeps healthy Maps engines available when the Serper budget is exhausted", () => {
+    const capabilities = buildEngineCapabilities({
+      mapsProvider: "apify",
+      mapsProviderConfigured: true,
+      serpProvider: "serper",
+      serpProviderConfigured: true,
+      mapsFastHealth: "healthy",
+      providerHealth: { maps_fast: "healthy", maps_deep: "paused", google_serp: "healthy", linkedin_owner: "healthy" },
+      costAllowed: true,
+      mapsCostAllowed: true,
+      serperCostAllowed: false,
+      campaignCounts: { maps_fast: 1, maps_deep: 1, google_serp: 1 },
+    });
+
+    expect(capabilities.find((capability) => capability.engineType === "maps_fast")?.available).toBe(true);
+    expect(capabilities.find((capability) => capability.engineType === "maps_deep")?.available).toBe(false);
+    expect(capabilities.find((capability) => capability.engineType === "google_serp")?.available).toBe(false);
+  });
 });

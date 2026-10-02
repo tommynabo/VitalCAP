@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { EmailVerificationProvider, WebsiteFetcher } from "@/domain/providers/types";
 import { createInMemoryVerificationCacheStore } from "@/services/verification/email-verification-cache";
-import { processRawCandidate, type CandidateRawPayload } from "./candidate-processor";
+import { hasLinkedInEmployerAccount, processRawCandidate, type CandidateRawPayload } from "./candidate-processor";
 
 function alwaysValidVerifier(): EmailVerificationProvider {
   return {
@@ -226,6 +226,20 @@ describe("processRawCandidate — serp candidates", () => {
 });
 
 describe("processRawCandidate — linkedin candidates", () => {
+  it("links owner profiles only to an existing account with the resolved employer domain", () => {
+    const payload: CandidateRawPayload = {
+      kind: "linkedin",
+      profile: { title: "María García — Titular Farmacéutico", url: "https://www.linkedin.com/in/maria-garcia", snippet: "Titular en Farmacia García", domain: "linkedin.com" },
+      resolvedEmployerDomain: "www.farmacia-garcia.es",
+      geography: "Madrid",
+    };
+    const existing = [{ accountId: "account-1", normalizedName: "farmacia garcia", normalizedDomain: "farmacia-garcia.es" }];
+
+    expect(hasLinkedInEmployerAccount(payload, existing)).toBe(true);
+    expect(hasLinkedInEmployerAccount(payload, [])).toBe(false);
+    expect(hasLinkedInEmployerAccount({ ...payload, resolvedEmployerDomain: null }, existing)).toBe(false);
+  });
+
   it("never fabricates a contact when no resolved employer domain is available", async () => {
     const payload: CandidateRawPayload = {
       kind: "linkedin",

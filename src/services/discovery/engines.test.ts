@@ -1,5 +1,7 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { SearchSeed } from "@/domain/discovery/types";
+import type { MapsDiscoveryProvider, SerpDiscoveryProvider } from "@/domain/providers/types";
+import { ProviderBudgetExceededError } from "@/domain/providers/errors";
 import { MockMapsDiscoveryProvider } from "@/infrastructure/providers/maps/mock-provider";
 import { MockSerpDiscoveryProvider } from "@/infrastructure/providers/serp/mock-provider";
 import { MapsFastEngine } from "./maps-fast-engine";
@@ -47,6 +49,35 @@ describe("MapsFastEngine", () => {
 });
 
 describe("MapsDeepEngine", () => {
+  it("starts async Maps runs without waiting for crawl or owner SERP enrichment", async () => {
+    const asyncRun = {
+      actorId: "compass/crawler-google-places",
+      externalRunId: "run-1",
+      externalDatasetId: "dataset-1",
+      status: "running" as const,
+      itemsRequested: 10,
+      costUsd: 0.02,
+      metadata: {},
+    };
+    const mapsProvider: MapsDiscoveryProvider = {
+      providerName: "apify-maps",
+      search: vi.fn(),
+      startAsync: vi.fn().mockResolvedValue(asyncRun),
+    };
+    const serpProvider: SerpDiscoveryProvider = {
+      providerName: "serper",
+      search: vi.fn(),
+    };
+    const engine = new MapsDeepEngine(mapsProvider, fakeFetcher, serpProvider);
+
+    expect(engine.usesAsyncProvider).toBe(true);
+    await expect(engine.executeDiscovery({ seed: seed({ engineType: "maps_deep" }), dryRun: false }))
+      .resolves.toMatchObject({ rawCandidates: [], providerCalls: 1, providerRun: asyncRun });
+    expect(mapsProvider.startAsync).toHaveBeenCalledOnce();
+    expect(mapsProvider.search).not.toHaveBeenCalled();
+    expect(serpProvider.search).not.toHaveBeenCalled();
+  });
+
   it("attaches crawled pages and owner SERP evidence for candidates with a website", async () => {
     const engine = new MapsDeepEngine(new MockMapsDiscoveryProvider(2), fakeFetcher, new MockSerpDiscoveryProvider());
     const result = await engine.executeDiscovery({ seed: seed({ engineType: "maps_deep" }), dryRun: true });
@@ -67,6 +98,15 @@ describe("GoogleSerpEngine", () => {
       expect(payload.result.domain).not.toBe("linkedin.com");
     }
   });
+
+  it("propagates a Serper budget block so the runner can defer the job", async () => {
+    const budgetError = new ProviderBudgetExceededError("budget exhausted", new Date("2026-01-02T00:00:00Z"));
+    const provider: SerpDiscoveryProvider = { providerName: "serper", search: vi.fn().mockRejectedValue(budgetError) };
+    const engine = new GoogleSerpEngine(provider);
+
+    await expect(engine.executeDiscovery({ seed: seed({ engineType: "google_serp" }), dryRun: false }))
+      .rejects.toBe(budgetError);
+  });
 });
 
 describe("LinkedInOwnerEngine", () => {
@@ -78,6 +118,23 @@ describe("LinkedInOwnerEngine", () => {
       const payload = candidate.rawPayload as unknown as LinkedInRawPayload;
       expect(payload.profile.domain).toBe("linkedin.com");
     }
+  });
+
+  it("propagates a budget block during employer lookup instead of swallowing it", async () => {
+    const budgetError = new ProviderBudgetExceededError("budget exhausted", new Date("2026-01-02T00:00:00Z"));
+    const provider: SerpDiscoveryProvider = {
+      providerName: "serper",
+      search: vi.fn()
+        .mockResolvedValueOnce({
+          results: [{ title: "Titular Farmacia", url: "https://linkedin.com/in/example", snippet: "", domain: "linkedin.com" }],
+          usage: { calls: 1, items: 1, errors: 0, totalLatencyMs: 1, costUsd: 0.001, quotaRemaining: null },
+        })
+        .mockRejectedValueOnce(budgetError),
+    };
+    const engine = new LinkedInOwnerEngine(provider);
+
+    await expect(engine.executeDiscovery({ seed: seed({ engineType: "linkedin_owner" }), dryRun: false }))
+      .rejects.toBe(budgetError);
   });
 });
 

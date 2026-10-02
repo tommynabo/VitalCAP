@@ -8,6 +8,17 @@ import { computeBackoffMs, isPermanentError } from "@/infrastructure/jobs/job-qu
 export const JOB_LEASE_MS = 5 * 60 * 1000;
 const MAX_CLAIM_BATCH_SIZE = 100;
 
+export async function getCampaignQueueDepth(campaignId: string): Promise<number> {
+  const db = getDb();
+  const [discovery, processing] = await Promise.all([
+    db.select({ total: sql<number>`count(*)` }).from(discoveryJobs)
+      .where(and(eq(discoveryJobs.campaignId, campaignId), inArray(discoveryJobs.status, ["pending", "processing"]))),
+    db.select({ total: sql<number>`count(*)` }).from(processingJobs)
+      .where(and(eq(processingJobs.campaignId, campaignId), inArray(processingJobs.status, ["pending", "processing"]))),
+  ]);
+  return Number(discovery[0]?.total ?? 0) + Number(processing[0]?.total ?? 0);
+}
+
 type QueueTable = "discovery_jobs" | "processing_jobs";
 
 export type JobFailureClassification = "transient" | "permanent";
@@ -265,6 +276,53 @@ export async function completeDiscoveryJob(input: CompleteJobInput): Promise<voi
 
 export async function completeProcessingJob(input: CompleteJobInput): Promise<void> {
   return complete("processing_jobs", input);
+}
+
+interface DeferJobInput {
+  jobId: string;
+  workerId: string;
+  nextAttemptAt: Date;
+  reason: string;
+}
+
+async function defer(table: QueueTable, input: DeferJobInput): Promise<void> {
+  const db = getDb();
+  const nextAttemptAt = input.nextAttemptAt.toISOString();
+  const now = new Date().toISOString();
+  const result = table === "discovery_jobs"
+    ? await db.execute(sql`
+        UPDATE discovery_jobs
+        SET status = 'pending',
+            locked_at = NULL,
+            locked_by = NULL,
+            attempt_count = GREATEST(attempt_count - 1, 0),
+            next_attempt_at = ${nextAttemptAt}::timestamptz,
+            last_error = ${input.reason},
+            updated_at = ${now}::timestamptz
+        WHERE id = ${input.jobId}::uuid AND status = 'processing' AND locked_by = ${input.workerId}
+        RETURNING id;
+      `)
+    : await db.execute(sql`
+        UPDATE processing_jobs
+        SET status = 'pending',
+            locked_at = NULL,
+            locked_by = NULL,
+            attempt_count = GREATEST(attempt_count - 1, 0),
+            next_attempt_at = ${nextAttemptAt}::timestamptz,
+            last_error = ${input.reason},
+            updated_at = ${now}::timestamptz
+        WHERE id = ${input.jobId}::uuid AND status = 'processing' AND locked_by = ${input.workerId}
+        RETURNING id;
+      `);
+  if (result.rows.length === 0) throw new LostLeaseError(table, input.jobId, input.workerId);
+}
+
+export async function deferDiscoveryJob(input: DeferJobInput): Promise<void> {
+  return defer("discovery_jobs", input);
+}
+
+export async function deferProcessingJob(input: DeferJobInput): Promise<void> {
+  return defer("processing_jobs", input);
 }
 
 export interface FailJobOptions {

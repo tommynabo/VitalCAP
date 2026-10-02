@@ -19,6 +19,11 @@ interface ProviderRow {
   detail: string;
 }
 
+function formatTimestamp(value: string | null, timeZone: string): string {
+  if (!value) return "N/A";
+  return new Intl.DateTimeFormat("en-GB", { dateStyle: "short", timeStyle: "medium", timeZone }).format(new Date(value));
+}
+
 export function AutopilotClient({
   state,
   settings,
@@ -97,7 +102,7 @@ export function AutopilotClient({
         </CardContent>
       </Card>
 
-      <p className="text-xs text-text-muted">Last Autopilot cron: {lastAutopilotCron ? new Date(lastAutopilotCron).toLocaleString() : "N/A"} · Last discovery cron: {lastDiscoveryCron ? new Date(lastDiscoveryCron).toLocaleString() : "N/A"}</p>
+      <p className="text-xs text-text-muted">Last Autopilot cron: {formatTimestamp(lastAutopilotCron, settings.timezone)} · Last discovery cron: {formatTimestamp(lastDiscoveryCron, settings.timezone)}</p>
 
       <Card>
         <CardHeader><CardTitle>Global daily target</CardTitle></CardHeader>
@@ -178,7 +183,7 @@ export function AutopilotClient({
         <h3 className="mb-3 text-sm font-semibold text-text">Discovery engines</h3>
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
           {state.engines.map((engine) => (
-            <EngineCard key={engine.engineType} engine={engine} />
+            <EngineCard key={engine.engineType} engine={engine} timeZone={settings.timezone} />
           ))}
         </div>
       </div>

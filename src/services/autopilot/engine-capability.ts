@@ -22,6 +22,8 @@ export interface EngineCapabilityInput {
   mapsFastHealth: ProviderHealthStatus;
   providerHealth?: Partial<Record<EngineType, ProviderHealthStatus>>;
   costAllowed: boolean;
+  mapsCostAllowed?: boolean;
+  serperCostAllowed?: boolean;
   campaignCounts: Partial<Record<EngineType, number>>;
 }
 
@@ -30,29 +32,31 @@ export function buildEngineCapabilities(input: EngineCapabilityInput): EngineCap
   const serpConfigured = input.serpProvider === "serper" && (input.serpProviderConfigured ?? true);
   const health = (engineType: EngineType): ProviderHealthStatus => input.providerHealth?.[engineType]
     ?? (engineType === "maps_fast" ? input.mapsFastHealth : engineType === "maps_deep" ? input.mapsFastHealth : serpConfigured ? "untested" : "paused");
-  const definitions: Array<[EngineType, boolean, ProviderHealthStatus]> = [
-    ["maps_fast", mapsConfigured, health("maps_fast")],
+  const mapsCostAllowed = input.mapsCostAllowed ?? input.costAllowed;
+  const serperCostAllowed = input.serperCostAllowed ?? input.costAllowed;
+  const definitions: Array<[EngineType, boolean, ProviderHealthStatus, boolean]> = [
+    ["maps_fast", mapsConfigured, health("maps_fast"), mapsCostAllowed],
     // The existing deep engine calls both the Maps and public SERP adapters.
-    ["maps_deep", mapsConfigured && serpConfigured, health("maps_deep")],
-    ["google_serp", serpConfigured, health("google_serp")],
-    ["linkedin_owner", serpConfigured, health("linkedin_owner")],
+    ["maps_deep", mapsConfigured && serpConfigured, health("maps_deep"), mapsCostAllowed && serperCostAllowed],
+    ["google_serp", serpConfigured, health("google_serp"), serperCostAllowed],
+    ["linkedin_owner", serpConfigured, health("linkedin_owner"), serperCostAllowed],
     // Hybrid Fill is an orchestrator. It is available only if at least one
     // concrete discovery provider can actually execute its selected work.
-    ["hybrid_fill", mapsConfigured || serpConfigured, health("hybrid_fill")],
+    ["hybrid_fill", mapsConfigured || serpConfigured, health("hybrid_fill"), mapsCostAllowed || serperCostAllowed],
   ];
 
-  return definitions.map(([engineType, providerConfigured, providerStatus]) => {
+  return definitions.map(([engineType, providerConfigured, providerStatus, engineCostAllowed]) => {
     const campaignCount = input.campaignCounts[engineType] ?? 0;
     const providerUntested = providerConfigured && providerStatus === "untested";
     const providerHealthy = providerConfigured && (providerStatus === "healthy" || providerUntested);
-    const available = providerConfigured && providerHealthy && input.costAllowed && campaignCount > 0;
+    const available = providerConfigured && providerHealthy && engineCostAllowed && campaignCount > 0;
     const reasonUnavailable = available
       ? null
       : !providerConfigured
         ? "provider_not_configured"
         : !providerHealthy
           ? `provider_${providerStatus}`
-          : !input.costAllowed
+          : !engineCostAllowed
             ? "budget_exhausted"
             : "no_active_campaign";
     return {
@@ -61,7 +65,7 @@ export function buildEngineCapabilities(input: EngineCapabilityInput): EngineCap
       providerConfigured,
       providerHealthy,
       providerUntested,
-      costAllowed: input.costAllowed,
+      costAllowed: engineCostAllowed,
       campaignCount,
       reasonUnavailable,
       reason: reasonUnavailable,

@@ -4,14 +4,15 @@ import { getEffectiveAutopilotState } from "@/domain/autopilot/types";
 import { listAutopilotEnabledCampaigns } from "@/infrastructure/neon/repositories/campaigns";
 import { listWorkspaceIds } from "@/infrastructure/neon/repositories/workspace";
 import { getAutopilotSettings, getAutopilotPacingState, insertRebalanceDecision } from "@/infrastructure/neon/repositories/autopilot";
-import { enqueueDiscoveryJob } from "@/infrastructure/neon/repositories/job-queue";
+import { enqueueDiscoveryJob, getCampaignQueueDepth } from "@/infrastructure/neon/repositories/job-queue";
 import { bootstrapSearchSeeds, listSearchSeedsForCampaignEngine } from "@/infrastructure/neon/repositories/discovery";
-import { getRecentProviderUsage } from "@/infrastructure/neon/repositories/provider-runs";
-import { allocateEngineWork, type EnginePlanningPerformance } from "@/services/autopilot/target-planner";
+import { getRecentProviderUsage, getTodaySpendUsd } from "@/infrastructure/neon/repositories/provider-runs";
+import { allocateEngineWork, rerouteEngineOrders, type EnginePlanningPerformance } from "@/services/autopilot/target-planner";
 import { buildEngineCapabilities } from "@/services/autopilot/engine-capability";
 import { evaluateProviderHealth } from "@/services/discovery/provider-health";
 import { buildMapsSeedCatalog, buildSerpSeedCatalog, ICP_CATEGORY_TERMS, LINKEDIN_OWNER_ROLE_QUERIES } from "@/services/discovery/spain-search-catalog";
 import { getMapsEnv, getSerperEnv } from "@/lib/config/env";
+import { SERPER_ESTIMATED_COST_PER_QUERY_USD } from "@/infrastructure/providers/serp/serper-provider";
 import type { SearchSeed } from "@/domain/discovery/types";
 
 export interface AutopilotRunnerResult {
@@ -49,13 +50,13 @@ function engineHealths(maps: ProviderHealthStatus, serp: ProviderHealthStatus): 
   };
 }
 
-function performance(campaign: Campaign, seeds: readonly SearchSeed[]): EnginePlanningPerformance {
+function performance(campaign: Campaign, seeds: readonly SearchSeed[], queueDepth: number): EnginePlanningPerformance {
   const raw = seeds.reduce((sum, seed) => sum + seed.totalRaw, 0);
   const qualified = seeds.reduce((sum, seed) => sum + seed.totalReady, 0);
   return {
     campaignId: campaign.id,
     yield: raw > 0 ? qualified / raw : 0.25,
-    queueDepth: 0,
+    queueDepth,
     seedExhaustion: seeds.length ? seeds.reduce((sum, seed) => sum + seed.exhaustionScore, 0) / seeds.length : 0,
   };
 }
@@ -96,6 +97,8 @@ export async function runAutopilotCronTick(now: Date = new Date()): Promise<Auto
 
     const mapsEnv = getMapsEnv();
     const serperEnv = getSerperEnv();
+    const serperSpendToday = await getTodaySpendUsd(workspaceId, "serper", settings.timezone, now);
+    const serperBudgetRemaining = Math.max(0, serperEnv.SERPER_DAILY_COST_LIMIT_USD - serperSpendToday);
     const mapsHealth = evaluateProviderHealth(await getRecentProviderUsage(workspaceId, "apify"));
     const serpHealth = evaluateProviderHealth(await getRecentProviderUsage(workspaceId, "serper"));
     const healths = engineHealths(mapsHealth, serpHealth);
@@ -107,13 +110,16 @@ export async function runAutopilotCronTick(now: Date = new Date()): Promise<Auto
       serpProviderConfigured: Boolean(serperEnv.SERPER_API_KEY),
       mapsFastHealth: mapsHealth,
       providerHealth: healths,
-      costAllowed: pacing.apifyDailyBudgetRemaining > 0,
+      costAllowed: pacing.apifyDailyBudgetRemaining > 0 || serperBudgetRemaining >= SERPER_ESTIMATED_COST_PER_QUERY_USD,
+      mapsCostAllowed: pacing.apifyDailyBudgetRemaining > 0,
+      serperCostAllowed: serperBudgetRemaining >= SERPER_ESTIMATED_COST_PER_QUERY_USD,
       campaignCounts: Object.fromEntries(allTypes.map((engineType) => [engineType, campaigns.filter((campaign) => campaign.engineType === engineType).length])),
     });
 
     const concreteCampaigns = campaigns.filter((campaign) => campaign.engineType !== "hybrid_fill");
     const seedSets = await Promise.all(concreteCampaigns.map((campaign) => listSearchSeedsForCampaignEngine(campaign.id, campaign.engineType)));
-    const performances = concreteCampaigns.map((campaign, index) => performance(campaign, seedSets[index] ?? []));
+    const performances = await Promise.all(concreteCampaigns.map(async (campaign, index) =>
+      performance(campaign, seedSets[index] ?? [], await getCampaignQueueDepth(campaign.id))));
     let orders = allocateEngineWork({
       workspaceId, campaigns: concreteCampaigns, capabilities, performances,
       rawNeeded: pacing.rawNeededToPlan, reason: pacing.explanation, now, timeZone: settings.timezone, origin: "normal",
@@ -124,20 +130,16 @@ export async function runAutopilotCronTick(now: Date = new Date()): Promise<Auto
     const hasHybridPolicy = campaigns.some((campaign) => campaign.engineType === "hybrid_fill");
     const mapsPerformance = performances.find((item) => concreteCampaigns.find((campaign) => campaign.id === item.campaignId)?.engineType === "maps_fast");
     const mapsFastAvailable = capabilities.find((capability) => capability.engineType === "maps_fast")?.available ?? false;
-    if (hasHybridPolicy && (
-      !mapsFastAvailable
-      || (mapsPerformance?.yield ?? 0.25) < 0.1
-      || (mapsPerformance?.seedExhaustion ?? 0) >= 0.8
-    )) {
-      const alternatives = concreteCampaigns.filter((campaign) => campaign.engineType !== "maps_fast");
-      const hybridOrders = allocateEngineWork({
-        workspaceId, campaigns: alternatives, capabilities, performances,
-        rawNeeded: Math.min(pacing.rawNeededToPlan, 100),
-        reason: "hybrid_fill: Maps Fast underperformed or exhausted; routing to a healthy configured alternative.",
-        now, timeZone: settings.timezone, origin: "hybrid_fill",
+    if (hasHybridPolicy && !mapsFastAvailable) {
+      const reason = "hybrid_fill: Maps Fast is unavailable; routing the global deficit to healthy configured alternatives.";
+      orders = orders.map((order) => ({ ...order, origin: "hybrid_fill", reason }));
+    } else if (hasHybridPolicy && ((mapsPerformance?.yield ?? 0.25) < 0.1 || (mapsPerformance?.seedExhaustion ?? 0) >= 0.8)) {
+      orders = rerouteEngineOrders({
+        workspaceId, campaigns: concreteCampaigns, capabilities, performances, orders,
+        rawNeeded: pacing.rawNeededToPlan,
+        reason: "hybrid_fill: Maps Fast underperformed or exhausted; routing only its allocation to a healthy configured alternative.",
+        now, timeZone: settings.timezone, fromEngine: "maps_fast",
       });
-      const divertedCampaignIds = new Set(hybridOrders.map((order) => order.campaignId));
-      orders = [...hybridOrders, ...orders.filter((order) => !divertedCampaignIds.has(order.campaignId))];
     }
 
     for (const order of orders) {

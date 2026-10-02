@@ -14,13 +14,16 @@ import type { MapsRawPayload } from "./candidate-processor";
  */
 export class MapsDeepEngine implements DiscoveryEngine {
   readonly engineType = "maps_deep" as const;
+  readonly usesAsyncProvider: boolean;
 
   constructor(
     private readonly mapsProvider: MapsDiscoveryProvider,
     private readonly websiteFetcher: WebsiteFetcher,
     private readonly serpProvider: SerpDiscoveryProvider,
     private readonly maxDeepEnrichPerRun = 5,
-  ) {}
+  ) {
+    this.usesAsyncProvider = Boolean(mapsProvider.startAsync);
+  }
 
   validateConfig(): { valid: boolean; errors: string[] } {
     return { valid: true, errors: [] };
@@ -33,15 +36,27 @@ export class MapsDeepEngine implements DiscoveryEngine {
     return { seeds: selectNextSeeds(this.seeds, catalogSize, new Date()) };
   }
 
-  async executeDiscovery(input: { seed: SearchSeed; dryRun: boolean }): Promise<{
+  async executeDiscovery(input: { seed: SearchSeed; dryRun: boolean; requestKey?: string; maxResults?: number }): Promise<{
     rawCandidates: RawCandidate[];
     providerCalls: number;
     providerErrors: number;
     latencyMs: number;
+    providerRun?: import("@/domain/providers/types").AsyncMapsRun;
   }> {
     const start = Date.now();
     let providerCalls = 0;
     let providerErrors = 0;
+
+    if (this.mapsProvider.startAsync) {
+      const providerRun = await this.mapsProvider.startAsync({
+        query: input.seed.query,
+        geography: input.seed.geography,
+        pageToken: null,
+        requestKey: input.requestKey,
+        maxResults: input.maxResults,
+      });
+      return { rawCandidates: [], providerCalls: 1, providerErrors: 0, latencyMs: Date.now() - start, providerRun };
+    }
 
     let placesResult;
     try {
