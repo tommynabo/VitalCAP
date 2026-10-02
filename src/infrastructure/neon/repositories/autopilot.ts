@@ -123,11 +123,15 @@ export async function getAutopilotPacingState(workspaceId: string, now = new Dat
   const settings = await getAutopilotSettings(workspaceId);
   const metrics = await getAutopilotPacingMetrics(workspaceId, settings.timezone, now);
   const providerHealth = evaluateProviderHealth(await getRecentProviderUsage(workspaceId, "apify"));
+  const serpHealth = evaluateProviderHealth(await getRecentProviderUsage(workspaceId, "serper"));
   const estimatedYield = metrics.historicalRawSampleSize >= 20
     ? Math.min(1, Math.max(0.1, metrics.historicalQualifiedCount / metrics.historicalRawSampleSize))
     : 0.25;
   const env = getMapsEnv();
   const effectiveBudget = Math.min(env.APIFY_DAILY_COST_LIMIT_USD, settings.maxDailyApifySpendUsd ?? Number.POSITIVE_INFINITY);
+  const serpEnv = getSerperEnv();
+  const apifyAvailable = Boolean(env.APIFY_API_TOKEN) && providerHealth !== "paused" && Math.max(0, effectiveBudget - metrics.apifySpendToday) > 0;
+  const serperAvailable = Boolean(serpEnv.SERPER_API_KEY) && serpHealth !== "paused";
   return computeAutopilotPacing({
     workspaceId,
     timeZone: settings.timezone,
@@ -140,6 +144,7 @@ export async function getAutopilotPacingState(workspaceId: string, now = new Dat
     apifySpendToday: metrics.apifySpendToday,
     apifyDailyBudgetRemaining: Math.max(0, effectiveBudget - metrics.apifySpendToday),
     providerHealth,
+    availableDiscoveryCapacity: apifyAvailable || serperAvailable,
     estimatedYield,
     yieldSampleSize: metrics.historicalRawSampleSize,
     now,
