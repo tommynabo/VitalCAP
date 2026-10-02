@@ -40,4 +40,14 @@ describe("MapsFastEngine async provider lifecycle", () => {
     expect(result.rawCandidates).toHaveLength(0);
     expect(result.providerRun?.externalRunId).toBe("run-1");
   });
+
+  it("propagates an async startup failure instead of reporting a successful empty batch", async () => {
+    const provider: MapsDiscoveryProvider = {
+      providerName: "apify-maps",
+      search: vi.fn(),
+      startAsync: vi.fn().mockRejectedValue(new Error("Apify unavailable")),
+    };
+    await expect(new MapsFastEngine(provider).executeDiscovery({ seed, dryRun: false, requestKey: "request-2" }))
+      .rejects.toThrow("Apify unavailable");
+  });
 });
