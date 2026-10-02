@@ -17,6 +17,7 @@ import {
   listSearchSeedsForCampaignEngine,
   refreshSearchSeedQualification,
   getRemainingDiscoveryTarget,
+  updateSearchSeedRun,
 } from "@/infrastructure/neon/repositories/discovery";
 import { getProviderRunByRequestKey, getRecentProviderUsage, reserveApifyProviderRun, updateProviderRun } from "@/infrastructure/neon/repositories/provider-runs";
 import { getAutopilotSettings } from "@/infrastructure/neon/repositories/autopilot";
@@ -118,7 +119,7 @@ async function executeDiscoveryJob(job: { id: string; campaignId: string; payloa
         requestKey,
         seedId: seed.id,
         itemsRequested: requestedItems,
-        metadata: { seedId: seed.id, discoveryJobId: job.id, query: seed.query, geography: seed.geography },
+        metadata: { engineType: job.payload.engineType, seedId: seed.id, discoveryJobId: job.id, query: seed.query, geography: seed.geography },
       });
       if (!reservation.created) continue;
       reservationId = reservation.providerRun.id;
@@ -131,12 +132,22 @@ async function executeDiscoveryJob(job: { id: string; campaignId: string; payloa
         readyCount: 0,
         error: null,
       });
-      await updateProviderRun(reservationId, { metadata: { seedId: seed.id, seedRunId, discoveryJobId: job.id, query: seed.query, geography: seed.geography } });
+      await updateProviderRun(reservationId, { metadata: { engineType: job.payload.engineType, seedId: seed.id, seedRunId, discoveryJobId: job.id, query: seed.query, geography: seed.geography } });
     } else if (await getProviderRunByRequestKey(requestKey)) {
       continue;
     }
 
-    const result = await engine.executeDiscovery({ seed, dryRun: false, requestKey, maxResults: requestedItems });
+    let result;
+    try {
+      result = await engine.executeDiscovery({ seed, dryRun: false, requestKey, maxResults: requestedItems });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (reservationId) {
+        await updateProviderRun(reservationId, { status: "failed", finishedAt: new Date(), error: `Provider startup failed: ${message}` });
+      }
+      if (seedRunId) await updateSearchSeedRun(seedRunId, { finishedAt: new Date().toISOString(), error: `Provider startup failed: ${message}` });
+      throw error;
+    }
     const finishedAt = new Date();
 
     if (result.providerRun) {
@@ -147,15 +158,19 @@ async function executeDiscoveryJob(job: { id: string; campaignId: string; payloa
         externalDatasetId: result.providerRun.externalDatasetId,
         status: result.providerRun.status,
         costUsd: result.providerRun.costUsd,
-        metadata: { ...result.providerRun.metadata, seedId: seed.id, seedRunId, discoveryJobId: job.id, query: seed.query, geography: seed.geography },
+        metadata: { ...result.providerRun.metadata, engineType: job.payload.engineType, seedId: seed.id, seedRunId, discoveryJobId: job.id, query: seed.query, geography: seed.geography },
       });
       continue;
     }
 
     if (reservationId) {
-      await updateProviderRun(reservationId, { error: "Async provider did not return a run; operator reconciliation required." });
-      continue;
+      const message = "Async provider completed without an external run identifier.";
+      await updateProviderRun(reservationId, { status: "failed", finishedAt, error: message });
+      if (seedRunId) await updateSearchSeedRun(seedRunId, { finishedAt: finishedAt.toISOString(), error: message });
+      throw new Error(message);
     }
+
+    if (result.providerErrors > 0) throw new Error(`${result.providerErrors} provider error(s) while executing discovery.`);
 
     const completedSeedRunId = await insertSearchSeedRun({
       seedId: seed.id,
