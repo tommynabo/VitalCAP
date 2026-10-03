@@ -37,12 +37,24 @@ export const ProspectContextSchema = z.object({
     primaryCta: z.string(),
     approvedClaims: z.array(z.string()),
     forbiddenClaims: z.array(z.string()),
+    icpCriteria: z.object({
+      targetBusinessTypes: z.array(z.string()),
+      inclusionCriteria: z.array(z.string()),
+      exclusionCriteria: z.array(z.string()),
+    }),
   }),
   campaign: z.object({
     name: z.string(),
     description: z.string().nullable(),
+    minimumFitScore: z.number().nullable(),
   }),
   evidence: z.array(EvidenceFactSchema),
+  contacts: z.array(z.object({
+    name: z.string().nullable(),
+    title: z.string().nullable(),
+    roleType: z.string(),
+    isDecisionMaker: z.boolean(),
+  })),
   contactPoints: z.array(z.object({
     id: z.string(),
     channel: z.string(),
@@ -65,10 +77,14 @@ export const PersonalizationFactSchema = z.object({
 export const ProspectAnalysisOutputSchema = z.object({
   businessType: z.string(),
   fitScore: z.number().min(0).max(100),
-  fitTier: z.string(),
+  fitTier: z.enum(["high", "medium", "low"]),
   confidence: z.number().min(0).max(1),
   qualified: z.boolean(),
+  qualificationRecommendation: z.enum(["qualify", "review", "disqualify"]),
   qualificationReason: z.string(),
+  reasonSummary: z.string().max(280),
+  supportingEvidenceIds: z.array(z.string()),
+  contradictingEvidenceIds: z.array(z.string()),
   positiveSignals: z.array(z.string()),
   negativeSignals: z.array(z.string()),
   supplementSignals: z.array(z.string()),
@@ -83,3 +99,13 @@ export const ProspectAnalysisOutputSchema = z.object({
 });
 
 export type ProspectAnalysisOutput = z.infer<typeof ProspectAnalysisOutputSchema>;
+
+export function fitTierForScore(score: number): ProspectAnalysisOutput["fitTier"] {
+  if (score >= 80) return "high";
+  if (score >= 60) return "medium";
+  return "low";
+}
+
+export function normalizeProspectAnalysis(output: ProspectAnalysisOutput): ProspectAnalysisOutput {
+  return { ...output, fitTier: fitTierForScore(output.fitScore) };
+}

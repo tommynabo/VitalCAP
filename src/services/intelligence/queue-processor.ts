@@ -2,12 +2,21 @@ import { getDb, schema } from "@/infrastructure/neon/db";
 import { eq, sql } from "drizzle-orm";
 import { ProspectContextBuilder } from "./prospect-context-builder";
 import { OpenAIProspectAnalyzer } from "./openai-prospect-analyzer";
+import { deferExhaustedBudget, deferUnavailableProvider, retryFailedJob } from "./queue-policy";
+import { getDayBounds } from "@/lib/time/day-bounds";
 
 const BATCH_SIZE = 50;
 const LOCK_TIMEOUT_MINUTES = 15;
 
+export interface IntelligenceBatchResult {
+  claimed: number;
+  completed: number;
+  deferred: number;
+  failed: number;
+}
+
 export class IntelligenceQueueProcessor {
-  async processBatch(): Promise<number> {
+  async processBatch(): Promise<IntelligenceBatchResult> {
     const db = getDb();
     const now = new Date();
     const lockExpiry = new Date(now.getTime() - LOCK_TIMEOUT_MINUTES * 60000);
@@ -19,7 +28,7 @@ export class IntelligenceQueueProcessor {
         SELECT id FROM intelligence_jobs
         WHERE (locked_at IS NULL OR locked_at < ${lockExpiry.toISOString()})
           AND (next_attempt_at IS NULL OR next_attempt_at <= ${now.toISOString()})
-          AND status IN ('pending', 'failed', 'processing') -- processing means lock expired
+          AND status IN ('pending', 'failed', 'processing', 'budget_paused', 'provider_disabled') -- processing means lock expired
           AND attempt_count < max_attempts
         ORDER BY created_at ASC
         LIMIT ${BATCH_SIZE}
@@ -35,30 +44,33 @@ export class IntelligenceQueueProcessor {
       RETURNING intelligence_jobs.*
     `);
 
-    if (leased.rows.length === 0) return 0;
+    if (leased.rows.length === 0) return { claimed: 0, completed: 0, deferred: 0, failed: 0 };
 
     const { getIntelligenceEnv } = await import("@/lib/config/env");
     const env = getIntelligenceEnv();
-    if (env.LLM_PROVIDER === "disabled" || (env.LLM_PROVIDER === "openai" && (!env.LLM_PROVIDER_API_KEY || !env.PROSPECT_LLM_MODEL))) {
-      // Mark all leased jobs as provider_disabled
+    if (env.LLM_PROVIDER !== "openai" || !env.LLM_PROVIDER_API_KEY || !env.PROSPECT_LLM_MODEL) {
       for (const job of leased.rows as any[]) {
+        const deferred = deferUnavailableProvider(job.attempt_count, now);
         await db.update(schema.intelligenceJobs)
           .set({
             lockedAt: null,
             lockedBy: null,
-            status: "provider_disabled",
-            lastError: env.LLM_PROVIDER === "disabled" ? "Provider intentionally disabled" : "Missing LLM API key or explicitly configured model",
-            nextAttemptAt: null,
+            status: deferred.status,
+            attemptCount: deferred.attemptCount,
+            lastError: env.LLM_PROVIDER !== "openai" ? "Prospect Intelligence OpenAI provider is unavailable" : "Missing LLM API key or PROSPECT_LLM_MODEL",
+            nextAttemptAt: deferred.nextAttemptAt,
           })
           .where(eq(schema.intelligenceJobs.id, job.id));
       }
-      return 0;
+      return { claimed: leased.rows.length, completed: 0, deferred: leased.rows.length, failed: 0 };
     }
 
     const contextBuilder = new ProspectContextBuilder();
     const analyzer = new OpenAIProspectAnalyzer();
 
     let processedCount = 0;
+    let deferredCount = 0;
+    let failedCount = 0;
 
     for (const job of leased.rows as any[]) {
       try {
@@ -100,16 +112,38 @@ export class IntelligenceQueueProcessor {
         if (!analysis) throw new Error("No analysis returned.");
         
         if (analysis.status === "budget_paused") {
-          // Pause queue job
+          const settings = await import("@/infrastructure/neon/repositories/autopilot");
+          const autopilotSettings = await settings.getAutopilotSettings(job.workspace_id);
+          const nextBudgetWindow = getDayBounds(autopilotSettings.timezone, now).end;
+          const deferred = deferExhaustedBudget(job.attempt_count, nextBudgetWindow);
           await db.update(schema.intelligenceJobs)
             .set({
               lockedAt: null,
               lockedBy: null,
-              status: "budget_paused",
-              lastError: "Budget exhausted",
+              status: deferred.status,
+              attemptCount: deferred.attemptCount,
+              lastError: String(analysis.error || "Intelligence budget exhausted"),
+              nextAttemptAt: deferred.nextAttemptAt,
             })
             .where(eq(schema.intelligenceJobs.id, job.id));
-          continue; // Move to next but this might happen for all
+          deferredCount += 1;
+          continue;
+        }
+
+        if (analysis.status !== "completed" && analysis.status !== "failed") {
+          const deferred = deferUnavailableProvider(job.attempt_count, now);
+          await db.update(schema.intelligenceJobs)
+            .set({
+              lockedAt: null,
+              lockedBy: null,
+              status: deferred.status,
+              attemptCount: deferred.attemptCount,
+              lastError: `Analysis is ${String(analysis.status || "not ready")}`,
+              nextAttemptAt: deferred.nextAttemptAt,
+            })
+            .where(eq(schema.intelligenceJobs.id, job.id));
+          deferredCount += 1;
+          continue;
         }
 
         if (analysis.status === "failed") {
@@ -137,23 +171,21 @@ export class IntelligenceQueueProcessor {
         processedCount++;
 
       } catch (error: any) {
-        // Handle failure
-        const isDeadLetter = job.attempt_count >= job.max_attempts;
-        const nextAttempt = isDeadLetter ? null : new Date(now.getTime() + Math.pow(2, job.attempt_count) * 60000);
-        const newStatus = isDeadLetter ? "dead_letter" : "failed";
+        const retry = retryFailedJob(job.attempt_count, job.max_attempts, now);
 
         await db.update(schema.intelligenceJobs)
           .set({
             lockedAt: null,
             lockedBy: null,
-            lastError: error.message,
-            nextAttemptAt: nextAttempt,
-            status: newStatus,
+            lastError: error instanceof Error ? error.message.slice(0, 1_000) : "Unknown intelligence job error",
+            nextAttemptAt: retry.nextAttemptAt,
+            status: retry.status,
           })
           .where(eq(schema.intelligenceJobs.id, job.id));
+        failedCount += 1;
       }
     }
 
-    return processedCount;
+    return { claimed: leased.rows.length, completed: processedCount, deferred: deferredCount, failed: failedCount };
   }
 }
