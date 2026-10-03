@@ -14,7 +14,8 @@ import { getCurrentWorkspaceId } from "@/lib/auth/workspace";
 
 import * as seed from "@/lib/seed/dev-seed";
 
-import { getPrimaryOffer } from "@/infrastructure/neon/repositories/offers";
+import { getPrimaryOffer, listOffers } from "@/infrastructure/neon/repositories/offers";
+import { listSetterWebhookEvents, type SetterWebhookEventSummary } from "@/infrastructure/neon/repositories/setter-runtime";
 import { listCampaigns } from "@/infrastructure/neon/repositories/campaigns";
 import { listAccountBundles, type AccountBundle } from "@/infrastructure/neon/repositories/accounts";
 import {
@@ -73,6 +74,16 @@ export async function getOffer(): Promise<Offer | null> {
   if (isDevSeedMode()) return seed.seedOffer;
   const workspaceId = await getCurrentWorkspaceId();
   return getPrimaryOffer(workspaceId);
+}
+
+export async function getOffers(): Promise<Offer[]> {
+  if (isDevSeedMode()) return [seed.seedOffer];
+  return listOffers(await getCurrentWorkspaceId());
+}
+
+export async function getSetterWebhookEvents(): Promise<SetterWebhookEventSummary[]> {
+  if (isDevSeedMode()) return [];
+  return listSetterWebhookEvents(await getCurrentWorkspaceId());
 }
 
 export async function getCampaigns(): Promise<Campaign[]> {
