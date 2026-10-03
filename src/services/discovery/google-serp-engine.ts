@@ -26,7 +26,7 @@ export class GoogleSerpEngine implements DiscoveryEngine {
     return { seeds: selectNextSeeds(this.seeds, catalogSize, new Date()) };
   }
 
-  async executeDiscovery(input: { seed: SearchSeed; dryRun: boolean }): Promise<{
+  async executeDiscovery(input: { seed: SearchSeed; dryRun: boolean; planningWindow?: string }): Promise<{
     rawCandidates: RawCandidate[];
     providerCalls: number;
     providerErrors: number;
@@ -34,12 +34,18 @@ export class GoogleSerpEngine implements DiscoveryEngine {
   }> {
     const start = Date.now();
     try {
-      const output = await this.provider.search({ query: `${input.seed.query} ${input.seed.geography}`, maxResults: 10 });
+      const output = await this.provider.search({
+        query: `${input.seed.query} ${input.seed.geography}`,
+        maxResults: 10,
+        seedId: input.seed.id,
+        planningWindow: input.planningWindow,
+      });
       const businessResults = output.results.filter((result) => result.domain !== "linkedin.com");
       const rawCandidates: RawCandidate[] = businessResults.map((result, index) => ({
         id: `raw_${input.seed.id}_${index}_${result.domain ?? "unknown"}`,
         campaignId: input.seed.campaignId,
         engineType: this.engineType,
+        providerRunId: output.providerRunId,
         sourceExternalId: result.domain,
         sourceUrl: result.url,
         rawPayload: { kind: "serp", result, geography: input.seed.geography } satisfies SerpRawPayload,

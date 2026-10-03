@@ -10,6 +10,7 @@ export interface DiscoveryOrder {
   planningWindow: string;
   idempotencyKey: string;
   origin: "normal" | "rebalance" | "hybrid_fill";
+  rebalanceAmount?: number;
 }
 
 export interface MapsFastAllocationInput {
@@ -57,6 +58,11 @@ export function planningWindowKey(now: Date, timeZone: string, windowMinutes = 1
   const values = Object.fromEntries(parts.filter((part) => part.type !== "literal").map((part) => [part.type, part.value]));
   const minute = Math.floor(Number(values.minute ?? 0) / windowMinutes) * windowMinutes;
   return `${values.year}-${values.month}-${values.day}T${values.hour}:${String(minute).padStart(2, "0")}`;
+}
+
+export function resolvePlanningWindow(plannedWindow: string | undefined, now: Date, timeZone: string): string {
+  const currentWindow = planningWindowKey(now, timeZone);
+  return plannedWindow && plannedWindow > currentWindow ? plannedWindow : currentWindow;
 }
 
 export function allocateMapsFastRawNeed(input: MapsFastAllocationInput): DiscoveryOrder[] {
@@ -129,7 +135,10 @@ export function rerouteEngineOrders(input: EngineWorkAllocationInput & {
     origin: "hybrid_fill",
   });
   const combined = new Map<string, DiscoveryOrder>();
-  for (const order of [...input.orders.filter((item) => item.engineType !== input.fromEngine), ...alternatives]) {
+  for (const order of [
+    ...input.orders.filter((item) => item.engineType !== input.fromEngine),
+    ...alternatives.map((item) => ({ ...item, rebalanceAmount: item.desiredRawCount })),
+  ]) {
     const existing = combined.get(order.campaignId);
     if (!existing) {
       combined.set(order.campaignId, order);
@@ -140,6 +149,7 @@ export function rerouteEngineOrders(input: EngineWorkAllocationInput & {
       desiredRawCount: existing.desiredRawCount + order.desiredRawCount,
       reason: order.origin === "hybrid_fill" ? order.reason : existing.reason,
       origin: existing.origin === "hybrid_fill" || order.origin === "hybrid_fill" ? "hybrid_fill" : existing.origin,
+      rebalanceAmount: (existing.rebalanceAmount ?? 0) + (order.rebalanceAmount ?? 0),
     });
   }
   return [...combined.values()];

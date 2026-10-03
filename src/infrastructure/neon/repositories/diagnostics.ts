@@ -3,12 +3,30 @@ import { getDb } from "../db";
 import { discoveryJobs, processingJobs } from "../schema/discovery";
 import { outreachQueue, outreachEvents, deadLetterJobs } from "../schema/outreach";
 import { campaigns } from "../schema/campaigns";
+import { autopilotSettings } from "../schema/autopilot";
 import { providerRuns } from "../schema/providers";
 import { cronRuns } from "../schema/jobs-meta";
 import { getMapsEnv, getSerperEnv, getVerificationEnv, getDeliveryEnv, getIntelligenceEnv } from "@/lib/config/env";
 import type { ProviderUsageStats } from "@/domain/providers/types";
+import type { EngineType } from "@/domain/campaigns/types";
 
 export type ProviderRowStatus = "connected" | "degraded" | "paused" | "missing_configuration" | "unknown";
+
+export async function getActiveAutopilotDiscoveryEngineTypes(): Promise<EngineType[]> {
+  const db = getDb();
+  const rows = await db
+    .select({ engineType: campaigns.engineType })
+    .from(campaigns)
+    .innerJoin(autopilotSettings, eq(autopilotSettings.workspaceId, campaigns.workspaceId))
+    .where(and(
+      eq(campaigns.status, "active"),
+      eq(campaigns.autopilotEnabled, true),
+      eq(autopilotSettings.enabled, true),
+      eq(autopilotSettings.emergencyStopped, false),
+      eq(autopilotSettings.systemPaused, false),
+    ));
+  return rows.map((row) => row.engineType as EngineType);
+}
 
 /**
  * Configuration-derived status only (Prompt 7 §26: never claim "connected"

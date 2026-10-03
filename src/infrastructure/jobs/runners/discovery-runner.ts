@@ -21,14 +21,15 @@ import {
   getRemainingDiscoveryTarget,
   updateSearchSeedRun,
 } from "@/infrastructure/neon/repositories/discovery";
-import { getProviderRunByRequestKey, getRecentProviderUsage, reserveApifyProviderRun, updateProviderRun } from "@/infrastructure/neon/repositories/provider-runs";
+import { getRecentProviderUsage, reserveApifyProviderRun, updateProviderRun } from "@/infrastructure/neon/repositories/provider-runs";
 import { getAutopilotSettings } from "@/infrastructure/neon/repositories/autopilot";
 import { getEffectiveAutopilotState } from "@/domain/autopilot/types";
-import { getDayBounds } from "@/lib/time/day-bounds";
 import { buildMapsSeedCatalog, buildSerpSeedCatalog, LINKEDIN_OWNER_ROLE_QUERIES, ICP_CATEGORY_TERMS } from "@/services/discovery/spain-search-catalog";
 import { createDiscoveryEngine } from "./engine-factory";
 import type { SearchSeed } from "@/domain/discovery/types";
 import { evaluateProviderHealth } from "@/services/discovery/provider-health";
+import { createProviderRequestKey, normalizeProviderQuery } from "@/services/discovery/provider-request-key";
+import { resolvePlanningWindow } from "@/services/autopilot/target-planner";
 
 const DISCOVERY_JOB_TYPE = "run_engine_batch";
 const MAX_SEEDS_PER_JOB = 5;
@@ -110,7 +111,16 @@ async function executeDiscoveryJob(job: { id: string; campaignId: string; payloa
   for (const [seedIndex, seed] of boundedSeeds.entries()) {
     const requestedItems = Math.min(MAX_RAW_PER_SEED, Math.max(1, Math.ceil(remainingRaw / (boundedSeeds.length - seedIndex))));
     const startedAt = new Date();
-    const requestKey = `${provider}:${campaign.id}:${seed.id}:${getDayBounds(campaign.timeZone, startedAt).start.toISOString()}`;
+    const planningWindow = resolvePlanningWindow(job.payload.planningWindow, startedAt, campaign.timeZone);
+    const normalizedQuery = normalizeProviderQuery(`${seed.query} ${seed.geography}`);
+    const requestKey = createProviderRequestKey({
+      workspaceId: campaign.workspaceId,
+      campaignId: campaign.id,
+      engineType: job.payload.engineType,
+      provider,
+      query: normalizedQuery,
+      planningWindow,
+    });
     let seedRunId: string | null = null;
     let reservationId: string | null = null;
     if (engine.usesAsyncProvider) {
@@ -121,7 +131,7 @@ async function executeDiscoveryJob(job: { id: string; campaignId: string; payloa
         requestKey,
         seedId: seed.id,
         itemsRequested: requestedItems,
-        metadata: { engineType: job.payload.engineType, seedId: seed.id, discoveryJobId: job.id, query: seed.query, geography: seed.geography },
+        metadata: { engineType: job.payload.engineType, seedId: seed.id, discoveryJobId: job.id, query: seed.query, normalizedQuery, geography: seed.geography, planningWindow },
       });
       if (!reservation.created) continue;
       reservationId = reservation.providerRun.id;
@@ -134,14 +144,12 @@ async function executeDiscoveryJob(job: { id: string; campaignId: string; payloa
         readyCount: 0,
         error: null,
       });
-      await updateProviderRun(reservationId, { metadata: { engineType: job.payload.engineType, seedId: seed.id, seedRunId, discoveryJobId: job.id, query: seed.query, geography: seed.geography } });
-    } else if (await getProviderRunByRequestKey(requestKey)) {
-      continue;
+      await updateProviderRun(reservationId, { metadata: { engineType: job.payload.engineType, seedId: seed.id, seedRunId, discoveryJobId: job.id, query: seed.query, normalizedQuery, geography: seed.geography, planningWindow } });
     }
 
     let result;
     try {
-      result = await engine.executeDiscovery({ seed, dryRun: false, requestKey, maxResults: requestedItems });
+      result = await engine.executeDiscovery({ seed, dryRun: false, requestKey, maxResults: requestedItems, planningWindow });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       if (reservationId) {
@@ -196,6 +204,7 @@ async function executeDiscoveryJob(job: { id: string; campaignId: string; payloa
               sourceFingerprint: candidate.sourceExternalId || candidate.sourceUrl || randomUUID(),
               rawPayload: candidate.rawPayload,
               searchSeedRunId: completedSeedRunId,
+              providerRunId: candidate.providerRunId,
             })),
           )
         : [];

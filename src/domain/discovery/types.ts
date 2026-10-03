@@ -92,7 +92,7 @@ export interface DiscoveryEngine {
     campaignId: string;
     remainingTarget: number;
   }): Promise<{ seeds: SearchSeed[] }>;
-  executeDiscovery(input: { seed: SearchSeed; dryRun: boolean; requestKey?: string; maxResults?: number }): Promise<{
+  executeDiscovery(input: { seed: SearchSeed; dryRun: boolean; requestKey?: string; maxResults?: number; planningWindow?: string }): Promise<{
     rawCandidates: RawCandidate[];
     providerCalls: number;
     providerErrors: number;

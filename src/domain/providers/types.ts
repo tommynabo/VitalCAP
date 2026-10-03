@@ -77,11 +77,14 @@ export interface SerpResult {
 export interface SerpSearchInput {
   query: string;
   maxResults: number;
+  seedId?: string;
+  planningWindow?: string;
 }
 
 export interface SerpSearchOutput {
   results: SerpResult[];
   usage: ProviderUsageStats;
+  providerRunId?: string;
 }
 
 export interface SerpDiscoveryProvider {

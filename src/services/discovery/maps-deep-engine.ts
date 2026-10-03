@@ -36,7 +36,7 @@ export class MapsDeepEngine implements DiscoveryEngine {
     return { seeds: selectNextSeeds(this.seeds, catalogSize, new Date()) };
   }
 
-  async executeDiscovery(input: { seed: SearchSeed; dryRun: boolean; requestKey?: string; maxResults?: number }): Promise<{
+  async executeDiscovery(input: { seed: SearchSeed; dryRun: boolean; requestKey?: string; maxResults?: number; planningWindow?: string }): Promise<{
     rawCandidates: RawCandidate[];
     providerCalls: number;
     providerErrors: number;
@@ -84,7 +84,12 @@ export class MapsDeepEngine implements DiscoveryEngine {
 
         try {
           const ownerQuery = `${place.name} titular OR propietario ${input.seed.geography}`;
-          const serpOutput = await this.serpProvider.search({ query: ownerQuery, maxResults: 5 });
+          const serpOutput = await this.serpProvider.search({
+            query: ownerQuery,
+            maxResults: 5,
+            seedId: input.seed.id,
+            planningWindow: input.planningWindow,
+          });
           payload.ownerSerpEvidence = serpOutput.results;
           providerCalls += 1;
         } catch {

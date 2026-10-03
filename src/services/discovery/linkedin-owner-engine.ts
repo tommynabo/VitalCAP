@@ -4,6 +4,15 @@ import { ProviderBudgetExceededError } from "@/domain/providers/errors";
 import { selectNextSeeds } from "./geography-planner";
 import type { LinkedInRawPayload } from "./candidate-processor";
 
+function isPublicLinkedInProfile(result: { url: string; domain: string | null }): boolean {
+  try {
+    const url = new URL(result.url);
+    return (url.hostname === "linkedin.com" || url.hostname === "www.linkedin.com") && url.pathname.startsWith("/in/");
+  } catch {
+    return false;
+  }
+}
+
 /**
  * LinkedIn Owner engine (Prompt 2 §2.9): public SERP discovery only, never
  * authenticated scraping. For each profile-shaped result found under a
@@ -28,7 +37,7 @@ export class LinkedInOwnerEngine implements DiscoveryEngine {
     return { seeds: selectNextSeeds(this.seeds, catalogSize, new Date()) };
   }
 
-  async executeDiscovery(input: { seed: SearchSeed; dryRun: boolean }): Promise<{
+  async executeDiscovery(input: { seed: SearchSeed; dryRun: boolean; planningWindow?: string }): Promise<{
     rawCandidates: RawCandidate[];
     providerCalls: number;
     providerErrors: number;
@@ -39,10 +48,17 @@ export class LinkedInOwnerEngine implements DiscoveryEngine {
     let providerErrors = 0;
 
     let profileResults;
+    let profileProviderRunId: string | undefined;
     try {
-      const output = await this.provider.search({ query: `${input.seed.query} ${input.seed.geography}`, maxResults: 10 });
+      const output = await this.provider.search({
+        query: `site:linkedin.com/in ${input.seed.query} ${input.seed.geography}`,
+        maxResults: 10,
+        seedId: input.seed.id,
+        planningWindow: input.planningWindow,
+      });
       providerCalls += 1;
-      profileResults = output.results.filter((result) => result.domain === "linkedin.com");
+      profileProviderRunId = output.providerRunId;
+      profileResults = output.results.filter(isPublicLinkedInProfile);
     } catch (error) {
       if (error instanceof ProviderBudgetExceededError) throw error;
       return { rawCandidates: [], providerCalls: 1, providerErrors: 1, latencyMs: Date.now() - start };
@@ -52,7 +68,12 @@ export class LinkedInOwnerEngine implements DiscoveryEngine {
     for (const [index, profile] of profileResults.entries()) {
       let resolvedEmployerDomain: string | null = null;
       try {
-        const employerLookup = await this.provider.search({ query: `${profile.title} sitio web oficial`, maxResults: 3 });
+        const employerLookup = await this.provider.search({
+          query: `${profile.title} sitio web oficial`,
+          maxResults: 3,
+          seedId: input.seed.id,
+          planningWindow: input.planningWindow,
+        });
         providerCalls += 1;
         resolvedEmployerDomain = employerLookup.results.find((r) => r.domain && r.domain !== "linkedin.com")?.domain ?? null;
       } catch (error) {
@@ -64,6 +85,7 @@ export class LinkedInOwnerEngine implements DiscoveryEngine {
         id: `raw_${input.seed.id}_${index}`,
         campaignId: input.seed.campaignId,
         engineType: this.engineType,
+        providerRunId: profileProviderRunId,
         sourceExternalId: profile.url,
         sourceUrl: profile.url,
         rawPayload: { kind: "linkedin", profile, resolvedEmployerDomain, geography: input.seed.geography } satisfies LinkedInRawPayload,

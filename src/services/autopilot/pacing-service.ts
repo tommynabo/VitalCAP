@@ -49,6 +49,18 @@ export interface AutopilotPacingState {
   explanation: string;
 }
 
+export type AutopilotTargetRisk = "on_track" | "recoverable" | "target_at_risk_budget" | "target_at_risk_provider" | "target_at_risk_time";
+
+export function classifyAutopilotTargetRisk(
+  pacing: Pick<AutopilotPacingState, "status" | "hoursRemaining" | "remainingTarget">,
+): AutopilotTargetRisk {
+  if (pacing.status === "on_pace" || pacing.status === "before_window") return "on_track";
+  if (pacing.status === "budget_paused") return "target_at_risk_budget";
+  if (pacing.status === "provider_paused") return "target_at_risk_provider";
+  if (pacing.hoursRemaining <= 2 && pacing.remainingTarget > 0) return "target_at_risk_time";
+  return "recoverable";
+}
+
 export interface PacingResult {
   status: LegacyPacingStatus;
   madridHour: number;
