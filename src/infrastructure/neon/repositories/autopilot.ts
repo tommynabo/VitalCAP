@@ -12,10 +12,11 @@ import type { EngineType } from "@/domain/campaigns/types";
 import type { AutopilotSettings, EngineTargetState, GlobalAutopilotState, ProviderHealthStatus, RebalanceDecision } from "@/domain/autopilot/types";
 import { getDayBounds } from "@/lib/time/day-bounds";
 import { getAutopilotPacingMetrics } from "./autopilot-pacing";
-import { getRecentProviderUsage } from "./provider-runs";
+import { getRecentProviderUsage, getTodaySpendUsd } from "./provider-runs";
 import { getMapsEnv, getSerperEnv } from "@/lib/config/env";
-import { evaluateProviderHealth } from "@/services/discovery/provider-health";
-import { computeAutopilotPacing } from "@/services/autopilot/pacing-service";
+import { evaluateProviderHealth, isProviderAvailableForDiscovery } from "@/services/discovery/provider-health";
+import { classifyAutopilotTargetRisk, computeAutopilotPacing } from "@/services/autopilot/pacing-service";
+import { SERPER_ESTIMATED_COST_PER_QUERY_USD } from "@/infrastructure/providers/serp/serper-provider";
 
 const DEFAULT_AUTOPILOT_SETTINGS = {
   enabled: false,
@@ -131,8 +132,18 @@ export async function getAutopilotPacingState(workspaceId: string, now = new Dat
   const env = getMapsEnv();
   const effectiveBudget = Math.min(env.APIFY_DAILY_COST_LIMIT_USD, settings.maxDailyApifySpendUsd ?? Number.POSITIVE_INFINITY);
   const serpEnv = getSerperEnv();
-  const apifyAvailable = Boolean(env.APIFY_API_TOKEN) && providerHealth !== "paused" && Math.max(0, effectiveBudget - metrics.apifySpendToday) > 0;
-  const serperAvailable = Boolean(serpEnv.SERPER_API_KEY) && serpHealth !== "paused";
+  const serperSpendToday = await getTodaySpendUsd(workspaceId, "serper", settings.timezone, now);
+  const apifyAvailable = isProviderAvailableForDiscovery(
+    env.MAPS_PROVIDER === "apify" && Boolean(env.APIFY_API_TOKEN),
+    providerHealth,
+    effectiveBudget - metrics.apifySpendToday,
+  );
+  const serperAvailable = isProviderAvailableForDiscovery(
+    serpEnv.SERP_PROVIDER === "serper" && Boolean(serpEnv.SERPER_API_KEY),
+    serpHealth,
+    serpEnv.SERPER_DAILY_COST_LIMIT_USD - serperSpendToday,
+    SERPER_ESTIMATED_COST_PER_QUERY_USD,
+  );
   return computeAutopilotPacing({
     workspaceId,
     timeZone: settings.timezone,
@@ -279,15 +290,7 @@ export async function getGlobalAutopilotState(workspaceId: string): Promise<Glob
         ? "degraded"
         : "paused";
   const pacing = await getAutopilotPacingState(workspaceId);
-  const targetRisk = pacing.status === "on_pace" || pacing.status === "before_window"
-    ? "on_track"
-    : pacing.apifyDailyBudgetRemaining <= 0
-      ? "target_at_risk_budget"
-      : pacing.providerHealth === "paused"
-        ? "target_at_risk_provider"
-        : pacing.hoursRemaining <= 2 && pacing.remainingTarget > 0
-          ? "target_at_risk_time"
-          : "recoverable";
+  const targetRisk = classifyAutopilotTargetRisk(pacing);
 
   return {
     dailyTarget: settings.globalDailyTarget,

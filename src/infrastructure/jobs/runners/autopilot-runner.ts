@@ -129,11 +129,7 @@ export async function runAutopilotCronTick(now: Date = new Date()): Promise<Auto
     // keeps that engine's real source/metrics, avoiding duplicate accounts.
     const hasHybridPolicy = campaigns.some((campaign) => campaign.engineType === "hybrid_fill");
     const mapsPerformance = performances.find((item) => concreteCampaigns.find((campaign) => campaign.id === item.campaignId)?.engineType === "maps_fast");
-    const mapsFastAvailable = capabilities.find((capability) => capability.engineType === "maps_fast")?.available ?? false;
-    if (hasHybridPolicy && !mapsFastAvailable) {
-      const reason = "hybrid_fill: Maps Fast is unavailable; routing the global deficit to healthy configured alternatives.";
-      orders = orders.map((order) => ({ ...order, origin: "hybrid_fill", reason }));
-    } else if (hasHybridPolicy && ((mapsPerformance?.yield ?? 0.25) < 0.1 || (mapsPerformance?.seedExhaustion ?? 0) >= 0.8)) {
+    if (hasHybridPolicy && ((mapsPerformance?.yield ?? 0.25) < 0.1 || (mapsPerformance?.seedExhaustion ?? 0) >= 0.8)) {
       orders = rerouteEngineOrders({
         workspaceId, campaigns: concreteCampaigns, capabilities, performances, orders,
         rawNeeded: pacing.rawNeededToPlan,
@@ -152,7 +148,7 @@ export async function runAutopilotCronTick(now: Date = new Date()): Promise<Auto
       ordersScheduled += order.desiredRawCount;
       if (order.origin === "hybrid_fill") {
         await insertRebalanceDecision(workspaceId, {
-          fromEngine: "maps_fast", toEngine: order.engineType, amount: order.desiredRawCount, reason: order.reason,
+          fromEngine: "maps_fast", toEngine: order.engineType, amount: order.rebalanceAmount ?? order.desiredRawCount, reason: order.reason,
           fromCampaignId: null, toCampaignId: order.campaignId,
           metricSnapshot: { remainingTarget: pacing.remainingTarget, healths },
           idempotencyKey: `hybrid:${workspaceId}:${order.engineType}:${order.campaignId}:${order.planningWindow}`,

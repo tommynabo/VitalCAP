@@ -66,6 +66,6 @@ export const contactPoints = pgTable(
     index("idx_contact_points_workspace").on(table.workspaceId),
     index("idx_contact_points_account").on(table.accountId),
     index("idx_contact_points_contact").on(table.contactId),
-    uniqueIndex("uq_contact_points_normalized_value").on(table.workspaceId, table.type, table.normalizedValue),
+    uniqueIndex("uq_contact_points_account_normalized_value").on(table.workspaceId, table.accountId, table.type, table.normalizedValue),
   ],
 );

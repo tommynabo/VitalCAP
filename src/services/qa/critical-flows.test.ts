@@ -286,10 +286,10 @@ describe("Flow G — Reply: idempotent ingestion -> AI draft -> review -> send i
       { draft: fullDraft, conversation: result.conversation, decision: "approve", finalText: null, correctionReason: null, correctedBranch: null, reviewerId: "reviewer-1", reviewedAt: "2024-01-02T01:00:00.000Z" },
       () => "id_g",
     );
-    expect(review.conversation.state).toBe("sent");
+    expect(review.conversation.state).toBe("approved");
     // Same-thread invariant: the reply always resolves within the conversation's original thread.
     expect(review.conversation.id).toBe(conversation.id);
-    expect(review.outgoingMessage?.conversationId).toBe(conversation.id);
+    expect(review.outgoingMessage).toBeNull();
   });
 });
 

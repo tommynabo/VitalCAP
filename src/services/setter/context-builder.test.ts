@@ -171,4 +171,28 @@ describe("buildSetterContext", () => {
     expect(context.recentFeedbackNotes.length).toBe(5);
     expect(context.recentFeedbackNotes).not.toContain(null);
   });
+
+  it("bounds message, offer, FAQ, and feedback text before sending context to an LLM", () => {
+    const context = buildSetterContext({
+      offer: {
+        ...offerFixture(),
+        description: "d".repeat(5_000),
+        faq: [{ question: "q".repeat(2_000), answer: "a".repeat(5_000) }],
+      },
+      account: accountFixture(),
+      contact: null,
+      discoverySource: null,
+      conversationMessages: [{ ...messageFixture(1), body: "m".repeat(3_000) }],
+      recentFeedback: [feedbackFixture("f".repeat(3_000))],
+      latestIncomingMessage: "i".repeat(3_000),
+      language: "es",
+    });
+
+    expect(context.offer.description).toHaveLength(2_000);
+    expect(context.offer.faq[0]?.question).toHaveLength(1_200);
+    expect(context.offer.faq[0]?.answer).toHaveLength(2_000);
+    expect(context.recentMessages[0]?.body).toHaveLength(2_000);
+    expect(context.recentFeedbackNotes[0]).toHaveLength(1_200);
+    expect(context.latestIncomingMessage).toHaveLength(2_000);
+  });
 });

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { Campaign } from "@/domain/campaigns/types";
-import { allocateEngineWork, allocateMapsFastRawNeed, MAX_RAW_PER_PLANNING_WINDOW, planningWindowKey, rerouteEngineOrders } from "./target-planner";
+import { allocateEngineWork, allocateMapsFastRawNeed, MAX_RAW_PER_PLANNING_WINDOW, planningWindowKey, rerouteEngineOrders, resolvePlanningWindow } from "./target-planner";
 
 function campaign(id: string, target: number, overrides: Partial<Campaign> = {}): Campaign {
   return {
@@ -37,6 +37,12 @@ describe("target planner", () => {
     expect(orders[0]?.desiredRawCount).toBe(10);
     expect(orders[0]?.idempotencyKey).toContain("autopilot:workspace-1:a:");
     expect(planningWindowKey(new Date("2025-01-01T13:14:00Z"), "Europe/Madrid")).toBe(planningWindowKey(new Date("2025-01-01T13:14:59Z"), "Europe/Madrid"));
+  });
+
+  it("advances retried work to the current window without extending a stale idempotency key", () => {
+    const now = new Date("2025-01-01T13:30:00Z");
+    expect(resolvePlanningWindow("2025-01-01T14:45", now, "Europe/Madrid")).toBe("2025-01-01T14:45");
+    expect(resolvePlanningWindow("2025-01-01T13:00", now, "Europe/Madrid")).toBe("2025-01-01T14:30");
   });
 
   it("supports a 250-qualified target without a legacy 100-raw planning ceiling", () => {
@@ -87,6 +93,24 @@ describe("target planner", () => {
     expect(orders[0]).toMatchObject({ campaignId: "active", engineType: "maps_deep", desiredRawCount: MAX_RAW_PER_PLANNING_WINDOW });
   });
 
+  it("keeps ordinary alternative capacity distinct from Hybrid Fill reroutes", () => {
+    const orders = allocateEngineWork({
+      workspaceId: "workspace-1",
+      campaigns: [campaign("maps", 100), campaign("serp", 100, { engineType: "google_serp" })],
+      capabilities: [
+        { engineType: "maps_fast", available: false, providerConfigured: false, providerHealthy: false, providerUntested: false, costAllowed: false, campaignCount: 1, reasonUnavailable: "provider_not_configured", reason: "provider_not_configured" },
+        { engineType: "google_serp", available: true, providerConfigured: true, providerHealthy: true, providerUntested: false, costAllowed: true, campaignCount: 1, reasonUnavailable: null, reason: null },
+      ],
+      rawNeeded: 60,
+      reason: "Apify unavailable; Serper remains available",
+      now: new Date("2025-01-01T13:00:00Z"),
+      timeZone: "Europe/Madrid",
+    });
+
+    expect(orders).toHaveLength(1);
+    expect(orders[0]).toMatchObject({ engineType: "google_serp", desiredRawCount: 60, origin: "normal" });
+  });
+
   it("routes underperforming Maps Fast allocation to SERP without increasing the global order", () => {
     const campaigns = [
       campaign("maps", 100),
@@ -126,6 +150,8 @@ describe("target planner", () => {
     expect(rerouted.find((order) => order.engineType === "google_serp")?.desiredRawCount)
       .toBeGreaterThan(original.find((order) => order.engineType === "google_serp")?.desiredRawCount ?? 0);
     expect(rerouted.reduce((total, order) => total + order.desiredRawCount, 0)).toBe(100);
+    expect(rerouted.reduce((total, order) => total + (order.rebalanceAmount ?? 0), 0))
+      .toBe(original.find((order) => order.engineType === "maps_fast")?.desiredRawCount);
     expect(rerouted.some((order) => order.origin === "hybrid_fill")).toBe(true);
   });
 });

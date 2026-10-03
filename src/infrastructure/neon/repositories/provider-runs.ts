@@ -25,6 +25,38 @@ export interface RecordProviderRunInput {
 
 export type ProviderRunStatus = "starting" | "queued" | "running" | "succeeded" | "ingesting" | "failed" | "aborted" | "timed_out" | "ingested" | "completed" | "budget_blocked" | "manual_reconciliation_required";
 
+export interface ReserveSerperProviderRunInput {
+  workspaceId: string;
+  campaignId: string;
+  requestKey: string;
+  seedId?: string | null;
+  itemsRequested: number;
+  costUsd: number;
+  metadata: Record<string, unknown>;
+}
+
+export async function reserveSerperProviderRun(input: ReserveSerperProviderRunInput): Promise<{ providerRun: typeof providerRuns.$inferSelect; created: boolean }> {
+  const db = getDb();
+  const [inserted] = await db.insert(providerRuns).values({
+    workspaceId: input.workspaceId,
+    campaignId: input.campaignId,
+    provider: "serper",
+    operation: "search",
+    requestKey: input.requestKey,
+    seedId: input.seedId ?? null,
+    status: "starting",
+    itemsRequested: input.itemsRequested,
+    itemsReturned: 0,
+    costUsd: input.costUsd,
+    metadata: input.metadata,
+  }).onConflictDoNothing({ target: providerRuns.requestKey }).returning();
+  if (inserted) return { providerRun: inserted, created: true };
+
+  const [existing] = await db.select().from(providerRuns).where(eq(providerRuns.requestKey, input.requestKey)).limit(1);
+  if (!existing) throw new Error(`Unable to resolve Serper provider run ${input.requestKey}.`);
+  return { providerRun: existing, created: false };
+}
+
 /**
  * Persists one provider-run event (Prompt 7 §14 cost-guard audit trail —
  * actor ID, run ID, dataset ID, status, item count, cost). Used by the real

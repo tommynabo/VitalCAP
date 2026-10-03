@@ -58,19 +58,27 @@ function baseInput(overrides: Partial<ReviewActionInput> = {}): ReviewActionInpu
 }
 
 describe("applyReviewDecision", () => {
-  it("approve: sends the AI draft as-is and transitions to sent", () => {
+  it("approve: records the AI draft as final without creating an outbound message", () => {
     const result = applyReviewDecision(baseInput(), nextId);
-    expect(result.conversation.state).toBe("sent");
-    expect(result.outgoingMessage?.body).toBe(draftFixture().draft);
+    expect(result.conversation.state).toBe("approved");
+    expect(result.outgoingMessage).toBeNull();
     expect(result.feedback.decision).toBe("approve");
     expect(result.feedback.correctedText).toBeNull();
+    expect(result.feedback.finalText).toBe(draftFixture().draft);
   });
 
-  it("edit_and_send: sends the human's final text, not the AI draft", () => {
+  it("edit_and_send: records the human's final text without creating an outbound message", () => {
     const result = applyReviewDecision(baseInput({ decision: "edit_and_send", finalText: "Texto corregido por humano." }), nextId);
-    expect(result.conversation.state).toBe("sent");
-    expect(result.outgoingMessage?.body).toBe("Texto corregido por humano.");
+    expect(result.conversation.state).toBe("edited");
+    expect(result.outgoingMessage).toBeNull();
     expect(result.feedback.correctedText).toBe("Texto corregido por humano.");
+    expect(result.feedback.finalText).toBe("Texto corregido por humano.");
+  });
+
+  it("take_over assigns the existing human_owned state and creates no outgoing message", () => {
+    const result = applyReviewDecision(baseInput({ decision: "take_over" }), nextId);
+    expect(result.conversation.state).toBe("human_owned");
+    expect(result.outgoingMessage).toBeNull();
   });
 
   it("edit_and_send without finalText throws", () => {

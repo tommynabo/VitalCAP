@@ -15,9 +15,9 @@ import { getRawCandidateById, markRawCandidateProcessed, refreshSearchSeedQualif
 import {
   findCandidateAccountMatches,
   getAccountById,
-  insertAccount,
   insertAccountSource,
   insertContactPoint,
+  resolveCanonicalAccount,
   updateAccountFields,
 } from "@/infrastructure/neon/repositories/accounts";
 import { createEmailVerificationProvider, createSerpDiscoveryProvider } from "@/infrastructure/providers/provider-factory";
@@ -226,24 +226,10 @@ async function executeProcessingJob(
   };
   const providerLabel = providerLabelForEngine(raw.engineType);
 
-  let accountId: string;
-  if (processed.isDuplicate && processed.matchedAccountKey) {
-    accountId = processed.matchedAccountKey;
-    const existingAccount = await getAccountById(accountId);
-    if (existingAccount) {
-      const missingFields = mergeMissingAccountFields(existingAccount, incomingAccountFields);
-      await updateAccountFields(accountId, missingFields);
-    }
-    await insertAccountSource({
-      accountId,
-      sourceType: raw.engineType,
-      sourceProvider: providerLabel,
-      sourceExternalId: raw.sourceExternalId,
-      sourceUrl: raw.sourceUrl,
-      rawSnapshot: raw.rawPayload,
-    });
-  } else {
-    accountId = await insertAccount({
+  const canonicalResolution = await resolveCanonicalAccount(
+    campaign.workspaceId,
+    incoming,
+    {
       workspaceId: campaign.workspaceId,
       canonicalName: accountFields.canonicalName,
       normalizedName: incoming.normalizedName,
@@ -266,7 +252,33 @@ async function executeProcessingJob(
       rating: accountFields.rating,
       reviewCount: accountFields.reviewCount,
       status: resolveAccountStatus(processed),
+    },
+    { allowCreate: raw.engineType !== "linkedin_owner" },
+  );
+
+  if (canonicalResolution.kind === "needsReview") {
+    await markRawCandidateProcessed(raw.id);
+    return;
+  }
+
+  let accountId: string;
+  if (canonicalResolution.kind === "existingAccount") {
+    accountId = canonicalResolution.existingAccountId;
+    const existingAccount = await getAccountById(accountId);
+    if (existingAccount) {
+      const missingFields = mergeMissingAccountFields(existingAccount, incomingAccountFields);
+      await updateAccountFields(accountId, missingFields);
+    }
+    await insertAccountSource({
+      accountId,
+      sourceType: raw.engineType,
+      sourceProvider: providerLabel,
+      sourceExternalId: raw.sourceExternalId,
+      sourceUrl: raw.sourceUrl,
+      rawSnapshot: raw.rawPayload,
     });
+  } else {
+    accountId = canonicalResolution.accountId;
     await insertAccountSource({
       accountId,
       sourceType: raw.engineType,

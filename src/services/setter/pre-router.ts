@@ -38,7 +38,7 @@ interface PreRouterPattern {
 }
 
 const PATTERNS: readonly PreRouterPattern[] = [
-  { category: "unsubscribe", branch: "UNSUBSCRIBE", suppress: true, regex: /\b(unsubscribe|(dad|dar)me\s*de\s*baja|de\s*baja\b|no\s*deseo\s*recibir|quitar(me)?\s*de\s*la\s*lista)\b/i },
+  { category: "unsubscribe", branch: "UNSUBSCRIBE", suppress: true, regex: /\b(unsubscribe|stop|opt[\s-]?out|(dad|dar)me\s*de\s*baja|de\s*baja\b|no\s*deseo\s*recibir|quitar(me)?\s*de\s*la\s*lista)\b/i },
   { category: "do_not_contact", branch: "UNSUBSCRIBE", suppress: true, regex: /\b(no\s*(me\s*)?contact(e|en|ar|arme)\w*|do\s*not\s*contact|no\s*(vuelva(n)?|vuelvas?|volver)\s*a\s*escribir\w*)\b/i },
   { category: "bounce_system_message", branch: "UNKNOWN", suppress: false, regex: /\b(mail\s*delivery\s*failed|undeliverable|mailer-daemon|delivery\s*status\s*notification)\b/i },
   { category: "out_of_office", branch: "UNKNOWN", suppress: false, regex: /\b(out\s*of\s*office|fuera\s*de\s*la\s*oficina|de\s*vacaciones|ausente\s*hasta)\b/i },
