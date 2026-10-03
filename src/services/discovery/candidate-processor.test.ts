@@ -185,6 +185,114 @@ describe("processRawCandidate — maps candidates", () => {
     expect(result.rejectionReason).toBeNull();
   });
 
+  it("reuses a Maps Fast account when Maps Deep finds the same Place ID", async () => {
+    const payload: CandidateRawPayload = {
+      kind: "maps",
+      place: {
+        externalPlaceId: "shared_place",
+        name: "Farmacia Central",
+        category: "farmacia",
+        address: "Calle Mayor 1",
+        postalCode: "28001",
+        province: "Madrid",
+        city: "Madrid",
+        countryCode: "ES",
+        websiteUrl: "https://central.example.es",
+        phone: "+34911111111",
+        latitude: null,
+        longitude: null,
+        rating: null,
+        reviewCount: null,
+        sourceUrl: null,
+      },
+      crawledPages: [],
+    };
+    const result = await processRawCandidate(
+      payload,
+      "maps_deep",
+      baseContext({ existingAccounts: [{ accountId: "acc_maps_fast", normalizedName: "farmacia central", googlePlaceId: "shared_place" }] }),
+    );
+    expect(result).toMatchObject({ isDuplicate: true, matchedAccountKey: "acc_maps_fast" });
+  });
+
+  it("reuses a Maps account when Google SERP discovers the same domain", async () => {
+    const result = await processRawCandidate(
+      {
+        kind: "serp",
+        result: { title: "Farmacia Central", url: "https://central.example.es/", snippet: "Farmacia en Madrid", domain: "central.example.es" },
+        geography: "Madrid",
+      },
+      "google_serp",
+      baseContext({ existingAccounts: [{ accountId: "acc_maps", normalizedName: "farmacia central", normalizedDomain: "central.example.es" }] }),
+    );
+    expect(result).toMatchObject({ isDuplicate: true, matchedAccountKey: "acc_maps" });
+  });
+
+  it("reuses the same company on exact normalized phone", async () => {
+    const payload: CandidateRawPayload = {
+      kind: "maps",
+      place: {
+        externalPlaceId: "phone_place",
+        name: "Farmacia Central",
+        category: "farmacia",
+        address: null,
+        postalCode: "28001",
+        province: "Madrid",
+        city: "Madrid",
+        countryCode: "ES",
+        websiteUrl: null,
+        phone: "+34911111111",
+        latitude: null,
+        longitude: null,
+        rating: null,
+        reviewCount: null,
+        sourceUrl: null,
+      },
+    };
+    const result = await processRawCandidate(
+      payload,
+      "maps_fast",
+      baseContext({ existingAccounts: [{ accountId: "acc_phone", normalizedName: "farmacia central", normalizedPhone: "+34911111111" }] }),
+    );
+    expect(result).toMatchObject({ isDuplicate: true, matchedAccountKey: "acc_phone" });
+  });
+
+  it("does not merge a similar name when address and domain differ", async () => {
+    const payload: CandidateRawPayload = {
+      kind: "maps",
+      place: {
+        externalPlaceId: "different_place",
+        name: "Farmacia Central",
+        category: "farmacia",
+        address: "Calle Nueva 8",
+        postalCode: "28080",
+        province: "Madrid",
+        city: "Madrid",
+        countryCode: "ES",
+        websiteUrl: "https://central-sur.example.es",
+        phone: null,
+        latitude: null,
+        longitude: null,
+        rating: null,
+        reviewCount: null,
+        sourceUrl: null,
+      },
+    };
+    const result = await processRawCandidate(
+      payload,
+      "maps_fast",
+      baseContext({ existingAccounts: [{
+        accountId: "acc_other",
+        normalizedName: "farmacia central",
+        normalizedDomain: "central.example.es",
+        normalizedAddress: "calle mayor 1",
+        postalCode: "28001",
+      }] }),
+    );
+    expect(result.isDuplicate).toBe(false);
+    expect(result.matchedAccountKey).toBeNull();
+  });
+
   it("uses already-crawled pages for a maps_deep candidate instead of re-fetching", async () => {
     const payload: CandidateRawPayload = {
       kind: "maps",

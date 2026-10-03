@@ -2,7 +2,7 @@ import type { EngineType } from "@/domain/campaigns/types";
 import type { BusinessType } from "@/domain/accounts/types";
 import type { RoleType, VerificationStatus } from "@/domain/contacts/types";
 import type { MapsPlaceResult, SerpResult, WebsiteFetcher, EmailVerificationProvider } from "@/domain/providers/types";
-import { normalizeBusinessName, normalizeDomain, normalizePhoneES } from "@/lib/normalization";
+import { normalizeAddress, normalizeBusinessName, normalizeDomain, normalizePhoneES } from "@/lib/normalization";
 import { evaluateSpainEligibility, type SpainEligibilityVerdict } from "@/lib/geography/spain-eligibility";
 import { evaluateAccountDedup, type AccountIdentitySignals } from "@/services/deduplication/account-dedup";
 import { classifyBusinessType, isAcceptedIcpBusinessType } from "./business-type";
@@ -115,6 +115,7 @@ function identitySignalsFor(payload: CandidateRawPayload): {
         normalizedDomain,
         normalizedPhone: normalizePhoneES(place.phone),
         postalCode: place.postalCode,
+        normalizedAddress: normalizeAddress(place.address) || null,
         latitude: place.latitude,
         longitude: place.longitude,
       },

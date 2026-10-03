@@ -7,6 +7,9 @@ export interface OutreachAttemptContext {
   campaignId: string;
   channel: ContactPointType;
   now: string;
+  normalizedEmail?: string | null;
+  hasActiveConversation?: boolean;
+  hasMeetingBooked?: boolean;
 }
 
 export interface RecentOutreachEvent {
@@ -16,25 +19,36 @@ export interface RecentOutreachEvent {
   channel: ContactPointType;
   createdAt: string;
   state: OutreachEventState;
+  normalizedEmail?: string | null;
 }
 
 export interface SuppressionCheckEntry {
   contactPointId: string | null;
   accountId: string | null;
+  normalizedEmail?: string | null;
 }
 
 export interface OutreachDedupOptions {
   cooldownHours: number;
   /** Non-negotiable #11: never contact several endpoints at the same account simultaneously by default. */
   allowSimultaneousAccountContacts: boolean;
+  /** Recontact is opt-in; absent policy means any prior cold outreach blocks re-entry. */
+  recontactPolicy: { eligibleAfter?: string; cooldownHours?: number; neverContactAgain?: boolean } | null;
 }
 
 export const DEFAULT_OUTREACH_DEDUP_OPTIONS: OutreachDedupOptions = {
   cooldownHours: 24 * 14,
   allowSimultaneousAccountContacts: false,
+  recontactPolicy: null,
 };
 
-export type OutreachDedupReason = "suppressed" | "cooldown_active" | "account_concurrency_lock";
+export type OutreachDedupReason =
+  | "suppressed"
+  | "cooldown_active"
+  | "account_concurrency_lock"
+  | "existing_outreach"
+  | "active_conversation"
+  | "meeting_booked";
 
 export interface OutreachDedupDecision {
   allowed: boolean;
@@ -50,7 +64,7 @@ const IN_FLIGHT_STATES: readonly OutreachEventState[] = ["queued", "scheduled", 
  * cooldown, then account-level concurrency (contact the highest-priority
  * eligible endpoint first and wait for an outcome before trying a fallback).
  */
-export function evaluateOutreachAttempt(
+export function canEnterColdOutreach(
   context: OutreachAttemptContext,
   recentEvents: readonly RecentOutreachEvent[],
   suppressionEntries: readonly SuppressionCheckEntry[],
@@ -59,32 +73,46 @@ export function evaluateOutreachAttempt(
   const opts = { ...DEFAULT_OUTREACH_DEDUP_OPTIONS, ...options };
 
   const isSuppressed = suppressionEntries.some(
-    (entry) => entry.contactPointId === context.contactPointId || entry.accountId === context.accountId,
+    (entry) => entry.contactPointId === context.contactPointId
+      || entry.accountId === context.accountId
+      || (!!context.normalizedEmail && entry.normalizedEmail === context.normalizedEmail),
   );
   if (isSuppressed) return { allowed: false, reason: "suppressed" };
-
-  const cooldownMs = opts.cooldownHours * 60 * 60 * 1000;
-  const nowMs = new Date(context.now).getTime();
-
-  const sameEndpointEvents = recentEvents.filter(
-    (event) =>
-      event.contactPointId === context.contactPointId &&
-      event.campaignId === context.campaignId &&
-      event.channel === context.channel,
-  );
-  const withinCooldown = sameEndpointEvents.some((event) => nowMs - new Date(event.createdAt).getTime() < cooldownMs);
-  if (withinCooldown) return { allowed: false, reason: "cooldown_active" };
+  if (context.hasActiveConversation) return { allowed: false, reason: "active_conversation" };
+  if (context.hasMeetingBooked) return { allowed: false, reason: "meeting_booked" };
 
   if (!opts.allowSimultaneousAccountContacts) {
     const otherEndpointInFlight = recentEvents.some(
       (event) =>
         event.accountId === context.accountId &&
-        event.campaignId === context.campaignId &&
         event.contactPointId !== context.contactPointId &&
         IN_FLIGHT_STATES.includes(event.state),
     );
     if (otherEndpointInFlight) return { allowed: false, reason: "account_concurrency_lock" };
   }
 
+  const cooldownMs = opts.cooldownHours * 60 * 60 * 1000;
+  const nowMs = new Date(context.now).getTime();
+
+  const sameEndpointEvents = recentEvents.filter(
+    (event) =>
+      event.contactPointId === context.contactPointId ||
+      event.accountId === context.accountId ||
+      (!!context.normalizedEmail && event.normalizedEmail === context.normalizedEmail),
+  );
+  if (sameEndpointEvents.length > 0) {
+    const policy = opts.recontactPolicy;
+    if (!policy || policy.neverContactAgain) return { allowed: false, reason: "existing_outreach" };
+    const latestEventMs = Math.max(...sameEndpointEvents.map((event) => new Date(event.createdAt).getTime()));
+    const eligibleAfterMs = policy.eligibleAfter ? new Date(policy.eligibleAfter).getTime() : Number.NEGATIVE_INFINITY;
+    const policyCooldownMs = (policy.cooldownHours ?? opts.cooldownHours) * 60 * 60 * 1000;
+    if (nowMs < eligibleAfterMs || nowMs - latestEventMs < policyCooldownMs) {
+      return { allowed: false, reason: "cooldown_active" };
+    }
+  }
+
   return { allowed: true, reason: null };
 }
+
+/** Backward-compatible name; all new cold-lead admission should use the explicit central policy. */
+export const evaluateOutreachAttempt = canEnterColdOutreach;

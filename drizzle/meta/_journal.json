@@ -71,6 +71,13 @@
       "when": 1790607965247,
       "tag": "0011_phase8o2_final_reliability",
       "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1791000000000,
+      "tag": "0013_global_deduplication",
+      "breakpoints": true
     }
   ]
 }
