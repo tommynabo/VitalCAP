@@ -3,7 +3,7 @@ import { getDb } from "../db";
 import { conversations, conversationMessages, setterDrafts, setterFeedback, meetings } from "../schema/conversations";
 import type { Conversation, ConversationMessage, SetterDraft, SetterFeedback, Meeting } from "@/domain/conversations/types";
 
-function toConversation(row: typeof conversations.$inferSelect): Conversation {
+export function toConversation(row: typeof conversations.$inferSelect): Conversation {
   return {
     id: row.id,
     workspaceId: row.workspaceId,
@@ -20,7 +20,7 @@ function toConversation(row: typeof conversations.$inferSelect): Conversation {
   };
 }
 
-function toMessage(row: typeof conversationMessages.$inferSelect): ConversationMessage {
+export function toMessage(row: typeof conversationMessages.$inferSelect): ConversationMessage {
   return {
     id: row.id,
     conversationId: row.conversationId,
@@ -33,7 +33,7 @@ function toMessage(row: typeof conversationMessages.$inferSelect): ConversationM
   };
 }
 
-function toDraft(row: typeof setterDrafts.$inferSelect): SetterDraft {
+export function toDraft(row: typeof setterDrafts.$inferSelect): SetterDraft {
   return {
     id: row.id,
     conversationMessageId: row.conversationMessageId,
@@ -47,11 +47,12 @@ function toDraft(row: typeof setterDrafts.$inferSelect): SetterDraft {
     detectedFactsRequested: row.detectedFactsRequested as string[],
     riskFlags: row.riskFlags as string[],
     suggestedNextAction: row.suggestedNextAction,
+    providerMetadata: row.providerMetadata as Record<string, unknown>,
     createdAt: row.createdAt.toISOString(),
   };
 }
 
-function toFeedback(row: typeof setterFeedback.$inferSelect): SetterFeedback {
+export function toFeedback(row: typeof setterFeedback.$inferSelect): SetterFeedback {
   return {
     id: row.id,
     conversationMessageId: row.conversationMessageId,
@@ -59,6 +60,7 @@ function toFeedback(row: typeof setterFeedback.$inferSelect): SetterFeedback {
     correctedBranch: row.correctedBranch as SetterFeedback["correctedBranch"],
     aiDraft: row.aiDraft,
     correctedText: row.correctedText,
+    finalText: row.finalText,
     decision: row.decision as SetterFeedback["decision"],
     reasonCategory: row.reasonCategory,
     note: row.note,

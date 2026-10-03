@@ -83,6 +83,7 @@ export interface SetterDraft {
   detectedFactsRequested: string[];
   riskFlags: string[];
   suggestedNextAction: string;
+  providerMetadata?: Record<string, unknown>;
   createdAt: string;
 }
 
@@ -92,7 +93,8 @@ export type ReviewDecision =
   | "reject"
   | "no_reply_needed"
   | "escalate"
-  | "suppress";
+  | "suppress"
+  | "take_over";
 
 export interface SetterFeedback {
   id: string;
@@ -101,6 +103,7 @@ export interface SetterFeedback {
   correctedBranch: SetterBranch | null;
   aiDraft: string;
   correctedText: string | null;
+  finalText?: string | null;
   decision: ReviewDecision;
   reasonCategory: string | null;
   note: string | null;

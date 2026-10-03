@@ -9,6 +9,13 @@ SET workspace_id = campaign.workspace_id,
 FROM campaigns AS campaign, contact_points AS contact_point
 WHERE campaign.id = queue.campaign_id AND contact_point.id = queue.contact_point_id;
 --> statement-breakpoint
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM outreach_queue WHERE workspace_id IS NULL) THEN
+    RAISE EXCEPTION '0013_global_deduplication: outreach_queue.workspace_id backfill left NULL rows; reconcile campaign/contact-point references before retrying';
+  END IF;
+END $$;
+--> statement-breakpoint
 ALTER TABLE outreach_queue ALTER COLUMN workspace_id SET NOT NULL;
 --> statement-breakpoint
 

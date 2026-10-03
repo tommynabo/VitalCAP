@@ -10,6 +10,11 @@ describe("detectDeterministicCase", () => {
     expect(result.suppress).toBe(true);
   });
 
+  it("treats a standalone STOP or opt-out as a deterministic suppression", () => {
+    expect(detectDeterministicCase("STOP").suppress).toBe(true);
+    expect(detectDeterministicCase("Please opt out").suppress).toBe(true);
+  });
+
   it("detects an explicit do-not-contact request and flags suppress", () => {
     const result = detectDeterministicCase("No vuelvan a escribirme, gracias.");
     expect(result.matched).toBe(true);

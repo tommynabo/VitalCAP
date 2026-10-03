@@ -205,7 +205,7 @@ describe("simulate a day of AI Setter activity", () => {
     expect(result.conversation.state).toBe("suppressed");
   });
 
-  it("runs the full classify -> draft -> review -> approve flow and enters warm follow-up", async () => {
+  it("runs the full classify -> draft -> review -> approve flow without sending", async () => {
     const result = await processIncomingReply({
       workspaceId: "ws-1",
       conversation: conversation(),
@@ -240,11 +240,8 @@ describe("simulate a day of AI Setter activity", () => {
       },
       nextId,
     );
-    expect(review.conversation.state).toBe("sent");
-    expect(review.outgoingMessage).not.toBeNull();
-
-    const warmItem = enterWarmFollowupQueue(review.conversation.id, fullDraft.branch, false, "2024-01-02T01:00:00.000Z", nextId);
-    expect(warmItem?.status).toBe("active");
+    expect(review.conversation.state).toBe("approved");
+    expect(review.outgoingMessage).toBeNull();
   });
 
   it("escalates a guardrail-triggered draft to human review instead of auto-approving", async () => {

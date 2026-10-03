@@ -1,4 +1,5 @@
-import { pgTable, text, timestamp, uuid, numeric, boolean, jsonb, index } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
+import { pgTable, text, timestamp, uuid, numeric, boolean, jsonb, index, uniqueIndex } from "drizzle-orm/pg-core";
 import { workspaces } from "./workspaces";
 import { accounts } from "./accounts";
 import { contacts } from "./contacts";
@@ -41,6 +42,9 @@ export const conversations = pgTable(
     index("idx_conversations_account").on(table.accountId),
     index("idx_conversations_campaign").on(table.campaignId),
     index("idx_conversations_state").on(table.workspaceId, table.state),
+    uniqueIndex("uq_conversations_workspace_provider_thread")
+      .on(table.workspaceId, table.providerThreadId)
+      .where(sql`${table.providerThreadId} is not null`),
   ],
 );
 
@@ -58,7 +62,12 @@ export const conversationMessages = pgTable(
     metadata: jsonb("metadata").notNull().default({}),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
-  (table) => [index("idx_conversation_messages_conversation").on(table.conversationId, table.createdAt)],
+  (table) => [
+    index("idx_conversation_messages_conversation").on(table.conversationId, table.createdAt),
+    uniqueIndex("uq_conversation_messages_provider_message")
+      .on(table.providerMessageId)
+      .where(sql`${table.providerMessageId} is not null`),
+  ],
 );
 
 export const setterDrafts = pgTable(
@@ -78,9 +87,13 @@ export const setterDrafts = pgTable(
     detectedFactsRequested: jsonb("detected_facts_requested").notNull().default([]),
     riskFlags: jsonb("risk_flags").notNull().default([]),
     suggestedNextAction: text("suggested_next_action").notNull(),
+    providerMetadata: jsonb("provider_metadata").notNull().default({}),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
-  (table) => [index("idx_setter_drafts_conversation_message").on(table.conversationMessageId)],
+  (table) => [
+    index("idx_setter_drafts_conversation_message").on(table.conversationMessageId),
+    uniqueIndex("uq_setter_drafts_conversation_message").on(table.conversationMessageId),
+  ],
 );
 
 export const setterFeedback = pgTable(
@@ -94,6 +107,7 @@ export const setterFeedback = pgTable(
     correctedBranch: text("corrected_branch"),
     aiDraft: text("ai_draft").notNull(),
     correctedText: text("corrected_text"),
+    finalText: text("final_text"),
     decision: text("decision").notNull(),
     reasonCategory: text("reason_category"),
     note: text("note"),
@@ -103,7 +117,32 @@ export const setterFeedback = pgTable(
     reviewedAt: timestamp("reviewed_at", { withTimezone: true }).notNull().defaultNow(),
     reviewerId: text("reviewer_id").notNull(),
   },
-  (table) => [index("idx_setter_feedback_conversation_message").on(table.conversationMessageId)],
+  (table) => [
+    index("idx_setter_feedback_conversation_message").on(table.conversationMessageId),
+    uniqueIndex("uq_setter_feedback_conversation_message").on(table.conversationMessageId),
+  ],
+);
+
+export const setterWebhookEvents = pgTable(
+  "setter_webhook_events",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    workspaceId: uuid("workspace_id").references(() => workspaces.id, { onDelete: "cascade" }),
+    provider: text("provider").notNull(),
+    providerEventId: text("provider_event_id").notNull(),
+    providerMessageId: text("provider_message_id").notNull(),
+    payloadHash: text("payload_hash").notNull(),
+    status: text("status").notNull().default("received"),
+    errorCode: text("error_code"),
+    metadata: jsonb("metadata").notNull().default({}),
+    receivedAt: timestamp("received_at", { withTimezone: true }).notNull().defaultNow(),
+    processedAt: timestamp("processed_at", { withTimezone: true }),
+  },
+  (table) => [
+    uniqueIndex("uq_setter_webhook_events_provider_event").on(table.provider, table.providerEventId),
+    index("idx_setter_webhook_events_provider_message").on(table.provider, table.providerMessageId),
+    index("idx_setter_webhook_events_status").on(table.status, table.receivedAt),
+  ],
 );
 
 export const meetings = pgTable(

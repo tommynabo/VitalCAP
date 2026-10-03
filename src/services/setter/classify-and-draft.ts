@@ -19,35 +19,115 @@ export interface ClassifyAndDraftResult {
   validationFailed: boolean;
 }
 
-function humanRequiredFallback(context: SetterPromptContext, reason: string): DraftFields {
+function humanRequiredFallback(
+  context: SetterPromptContext,
+  reason: string,
+  riskFlag = "invalid_llm_output",
+  providerMetadata: Record<string, unknown> = {},
+): DraftFields {
   return {
     language: context.language,
     branch: "HUMAN_REQUIRED" satisfies SetterBranch,
-    intentSummary: "LLM output failed structured validation.",
+    intentSummary: riskFlag === "invalid_llm_output" ? "LLM output failed structured validation." : "LLM classification is unavailable.",
     confidence: 0,
     draft: "",
     needsHuman: true,
     reasonForHuman: reason,
     detectedFactsRequested: [],
-    riskFlags: ["invalid_llm_output"],
+    riskFlags: [riskFlag],
     suggestedNextAction: "manual_human_draft",
+    providerMetadata,
+  };
+}
+
+function failureCode(error: unknown): string {
+  const details = error as { name?: string; code?: string; status?: number; message?: string };
+  if (details.status === 429 || details.code === "rate_limit_exceeded") return "rate_limit";
+  if (details.name === "AbortError" || /timeout/i.test(details.name ?? "") || details.code === "ETIMEDOUT") return "timeout";
+  if (/budget/i.test(details.message ?? "")) return "budget_limit";
+  if (/configuration|api key/i.test(details.message ?? "")) return "configuration_error";
+  return "provider_failure";
+}
+
+function safeErrorMessage(error: unknown): string {
+  const message = error instanceof Error ? error.message : "Unknown provider error";
+  return message.replace(/sk-[A-Za-z0-9_-]{12,}/g, "[redacted]").slice(0, 500);
+}
+
+function providerMetadata(
+  provider: LLMProvider,
+  results: Array<Awaited<ReturnType<LLMProvider["classifyAndDraft"]>>>,
+  errorCode: string | null = null,
+): Record<string, unknown> {
+  const usage = results.map((result) => result.usage);
+  const sum = (key: "calls" | "errors" | "inputTokens" | "outputTokens" | "totalTokens" | "totalLatencyMs") =>
+    usage.reduce((total, entry) => total + (entry[key] ?? 0), 0);
+  return {
+    provider: provider.providerName,
+    model: usage.find((entry) => entry.model)?.model ?? null,
+    calls: sum("calls"),
+    errors: sum("errors") + (errorCode ? 1 : 0),
+    inputTokens: sum("inputTokens"),
+    outputTokens: sum("outputTokens"),
+    totalTokens: sum("totalTokens"),
+    totalLatencyMs: sum("totalLatencyMs"),
+    costUsd: usage.some((entry) => entry.costUsd > 0) ? usage.reduce((total, entry) => total + entry.costUsd, 0) : null,
+    failureCode: errorCode,
   };
 }
 
 export async function classifyAndDraft(provider: LLMProvider, context: SetterPromptContext): Promise<ClassifyAndDraftResult> {
   let retried = false;
-  const first = await provider.classifyAndDraft(context);
+  const results: Array<Awaited<ReturnType<LLMProvider["classifyAndDraft"]>>> = [];
+  let first: Awaited<ReturnType<LLMProvider["classifyAndDraft"]>>;
+  try {
+    first = await provider.classifyAndDraft(context);
+    results.push(first);
+  } catch (error) {
+    const code = failureCode(error);
+    return {
+      draft: humanRequiredFallback(
+        context,
+        `LLM request failed (${code}): ${safeErrorMessage(error)}`,
+        code,
+        providerMetadata(provider, results, code),
+      ),
+      retried,
+      validationFailed: false,
+    };
+  }
   let validation = validateSetterOutput(first.output);
 
   if (!validation.success) {
     retried = true;
-    const retry = await provider.classifyAndDraft({ ...context, isRepairAttempt: true });
+    let retry: Awaited<ReturnType<LLMProvider["classifyAndDraft"]>>;
+    try {
+      retry = await provider.classifyAndDraft({ ...context, isRepairAttempt: true });
+      results.push(retry);
+    } catch (error) {
+      const code = failureCode(error);
+      return {
+        draft: humanRequiredFallback(
+          context,
+          `LLM repair failed (${code}): ${safeErrorMessage(error)}`,
+          code,
+          providerMetadata(provider, results, code),
+        ),
+        retried,
+        validationFailed: false,
+      };
+    }
     validation = validateSetterOutput(retry.output);
   }
 
   if (!validation.success || !validation.data) {
     return {
-      draft: humanRequiredFallback(context, `Invalid LLM output after retry: ${validation.errorSummary ?? "unknown error"}`),
+      draft: humanRequiredFallback(
+        context,
+        `Invalid LLM output after retry: ${validation.errorSummary ?? "unknown error"}`,
+        "invalid_llm_output",
+        providerMetadata(provider, results, "invalid_llm_output"),
+      ),
       retried,
       validationFailed: true,
     };
@@ -67,6 +147,7 @@ export async function classifyAndDraft(provider: LLMProvider, context: SetterPro
       detectedFactsRequested: guarded.output.detectedFactsRequested,
       riskFlags: guarded.output.riskFlags,
       suggestedNextAction: guarded.output.suggestedNextAction,
+      providerMetadata: providerMetadata(provider, results),
     },
     retried,
     validationFailed: false,

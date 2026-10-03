@@ -236,7 +236,26 @@ export interface SetterClassificationOutput {
   suggestedNextAction: string;
 }
 
+export interface InboundEmailReply {
+  providerEventId: string;
+  providerMessageId: string;
+  providerThreadId: string;
+  providerCampaignId: string;
+  email: string;
+  subject: string;
+  body: string;
+  occurredAt: string;
+}
+
 export interface LLMProvider {
   readonly providerName: string;
-  classifyAndDraft(context: SetterPromptContext): Promise<{ output: SetterClassificationOutput; usage: ProviderUsageStats }>;
+  classifyAndDraft(context: SetterPromptContext): Promise<{
+    output: SetterClassificationOutput;
+    usage: ProviderUsageStats & {
+      model?: string;
+      inputTokens?: number;
+      outputTokens?: number;
+      totalTokens?: number;
+    };
+  }>;
 }
