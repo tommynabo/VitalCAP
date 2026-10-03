@@ -1,4 +1,4 @@
-import { and, eq, gte } from "drizzle-orm";
+import { and, eq, gte, or } from "drizzle-orm";
 import { getDb } from "../db";
 import {
   outreachQueue,
@@ -12,10 +12,12 @@ import { accounts } from "../schema/accounts";
 import { contactPoints } from "../schema/contacts";
 import { toContactPoint } from "./accounts";
 import { complianceDecisions } from "../schema/compliance";
-import type { OutreachQueueItem, OutreachEvent, SendingDomain, Mailbox, SuppressionEntry } from "@/domain/outreach/types";
+import { conversations, meetings } from "../schema/conversations";
+import type { OutreachQueueItem, OutreachEvent, OutreachEventState, SendingDomain, Mailbox, SuppressionEntry } from "@/domain/outreach/types";
 import type { ContactPoint } from "@/domain/contacts/types";
 import type { OutreachCandidate } from "@/services/outreach/outreach-orchestrator";
 import type { MixChannel } from "@/services/outreach/channel-mix-planner";
+import { canEnterColdOutreach as evaluateColdOutreach } from "@/services/deduplication/outreach-dedup";
 
 function toQueueItem(row: typeof outreachQueue.$inferSelect): OutreachQueueItem {
   return {
@@ -120,20 +122,121 @@ export async function listSuppressionEntries(workspaceId: string): Promise<Suppr
   return rows.map(toSuppressionEntry);
 }
 
-export async function insertOutreachQueueItem(item: OutreachQueueItem): Promise<void> {
+export async function canEnqueueColdOutreach(workspaceId: string, item: OutreachQueueItem, now: Date): Promise<boolean> {
   const db = getDb();
-  await db.insert(outreachQueue).values({
+  const [contactPoint] = await db
+    .select({ normalizedValue: contactPoints.normalizedValue })
+    .from(contactPoints)
+    .where(and(eq(contactPoints.id, item.contactPointId), eq(contactPoints.workspaceId, workspaceId)))
+    .limit(1);
+  if (!contactPoint) return false;
+
+  const [suppressionRows, outreachRows, conversationRows, meetingRows] = await Promise.all([
+    db.select({
+      contactPointId: suppressionEntries.contactPointId,
+      accountId: suppressionEntries.accountId,
+      normalizedEmail: contactPoints.normalizedValue,
+    })
+      .from(suppressionEntries)
+      .leftJoin(contactPoints, eq(suppressionEntries.contactPointId, contactPoints.id))
+      .where(and(
+        eq(suppressionEntries.workspaceId, workspaceId),
+        or(
+          eq(suppressionEntries.accountId, item.accountId),
+          eq(suppressionEntries.contactPointId, item.contactPointId),
+          and(eq(contactPoints.type, "email"), eq(contactPoints.normalizedValue, contactPoint.normalizedValue.toLowerCase())),
+        ),
+      )),
+    db.select({
+      contactPointId: outreachQueue.contactPointId,
+      accountId: outreachQueue.accountId,
+      campaignId: outreachQueue.campaignId,
+      channel: outreachQueue.channel,
+      createdAt: outreachQueue.createdAt,
+      queueState: outreachQueue.state,
+      eventState: outreachEvents.state,
+      normalizedValue: contactPoints.normalizedValue,
+    })
+      .from(outreachQueue)
+      .innerJoin(campaigns, eq(outreachQueue.campaignId, campaigns.id))
+      .innerJoin(contactPoints, eq(outreachQueue.contactPointId, contactPoints.id))
+      .leftJoin(outreachEvents, eq(outreachEvents.outreachQueueItemId, outreachQueue.id))
+      .where(and(
+        eq(campaigns.workspaceId, workspaceId),
+        or(
+          eq(outreachQueue.accountId, item.accountId),
+          eq(outreachQueue.contactPointId, item.contactPointId),
+          and(eq(outreachQueue.channel, "email"), eq(contactPoints.normalizedValue, contactPoint.normalizedValue.toLowerCase())),
+        ),
+      )),
+    db.select({ state: conversations.state })
+      .from(conversations)
+      .where(and(eq(conversations.workspaceId, workspaceId), eq(conversations.accountId, item.accountId))),
+    db.select({ id: meetings.id })
+      .from(meetings)
+      .innerJoin(conversations, eq(meetings.conversationId, conversations.id))
+      .where(and(eq(conversations.workspaceId, workspaceId), eq(conversations.accountId, item.accountId)))
+      .limit(1),
+  ]);
+
+  const hasActiveConversation = conversationRows.some(({ state }) => !["rejected", "no_reply_needed", "suppressed"].includes(state));
+  return evaluateColdOutreach(
+    {
+      contactPointId: item.contactPointId,
+      accountId: item.accountId,
+      campaignId: item.campaignId,
+      channel: item.channel,
+      normalizedEmail: item.channel === "email" ? contactPoint.normalizedValue.toLowerCase() : null,
+      hasActiveConversation,
+      hasMeetingBooked: meetingRows.length > 0,
+      now: now.toISOString(),
+    },
+    outreachRows.map((row) => ({
+      contactPointId: row.contactPointId,
+      accountId: row.accountId,
+      campaignId: row.campaignId,
+      channel: row.channel as OutreachQueueItem["channel"],
+      createdAt: row.createdAt.toISOString(),
+      state: (row.eventState ?? row.queueState) as OutreachEventState,
+      normalizedEmail: row.normalizedValue.toLowerCase(),
+    })),
+    suppressionRows.map((row) => ({
+      ...row,
+      normalizedEmail: row.normalizedEmail?.toLowerCase() ?? null,
+    })),
+  ).allowed;
+}
+
+export async function insertOutreachQueueItem(workspaceId: string, item: OutreachQueueItem): Promise<boolean> {
+  const db = getDb();
+  const [contactPoint] = await db
+    .select({ normalizedValue: contactPoints.normalizedValue, type: contactPoints.type })
+    .from(contactPoints)
+    .where(and(
+      eq(contactPoints.id, item.contactPointId),
+      eq(contactPoints.workspaceId, workspaceId),
+      eq(contactPoints.accountId, item.accountId),
+    ))
+    .limit(1);
+  if (!contactPoint) return false;
+
+  const [inserted] = await db.insert(outreachQueue).values({
+    workspaceId,
     id: item.id,
     campaignId: item.campaignId,
     accountId: item.accountId,
     contactId: item.contactId,
     contactPointId: item.contactPointId,
+    normalizedEmail: item.channel === "email" && contactPoint.type === "email"
+      ? contactPoint.normalizedValue.toLowerCase()
+      : null,
     channel: item.channel,
     priority: item.priority,
     scheduledFor: item.scheduledFor ? new Date(item.scheduledFor) : null,
     state: item.state,
     deliveryMode: item.deliveryMode,
-  });
+  }).onConflictDoNothing().returning({ id: outreachQueue.id });
+  return Boolean(inserted);
 }
 
 export async function insertOutreachEvent(event: OutreachEvent): Promise<void> {

@@ -12,9 +12,10 @@ import * as schema from "./schema";
  * directly anywhere else — always go through this module or `getServerEnv()`.
  */
 let cachedDb: ReturnType<typeof drizzle<typeof schema>> | undefined;
+let cachedSql: ReturnType<typeof neon<false, false>> | undefined;
 
-export function getDb() {
-  if (cachedDb) return cachedDb;
+export function getNeonSql(): ReturnType<typeof neon<false, false>> {
+  if (cachedSql) return cachedSql;
   const env = getDatabaseEnv();
   if (!env.DATABASE_URL) {
     throw new Error(
@@ -22,13 +23,21 @@ export function getDb() {
         "Vitalcap_DATABASE_URL) before calling getDb().",
     );
   }
-  const sql = neon(env.DATABASE_URL);
-  cachedDb = drizzle({ client: sql, schema });
-  return cachedDb;
+  const sqlClient = neon(env.DATABASE_URL);
+  cachedSql = sqlClient;
+  return sqlClient;
+}
+
+export function getDb(): ReturnType<typeof drizzle<typeof schema>> {
+  if (cachedDb) return cachedDb;
+  const db = drizzle({ client: getNeonSql(), schema });
+  cachedDb = db;
+  return db;
 }
 
 export function resetDbCacheForTests() {
   cachedDb = undefined;
+  cachedSql = undefined;
 }
 
 export { schema };

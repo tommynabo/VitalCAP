@@ -1,10 +1,11 @@
-import { and, eq, gte, isNull, lte, or } from "drizzle-orm";
-import { getDb } from "../db";
+import { and, eq, gte, lte, or } from "drizzle-orm";
+import { getDb, getNeonSql } from "../db";
 import { accounts, accountSources } from "../schema/accounts";
 import { contacts, contactPoints } from "../schema/contacts";
 import type { Account, AccountSource, AccountStatus, BusinessType } from "@/domain/accounts/types";
 import type { Contact, ContactPoint, ContactPointType, VerificationStatus } from "@/domain/contacts/types";
 import type { AccountIdentitySignals } from "@/services/deduplication/account-dedup";
+import { evaluateAccountDedup } from "@/services/deduplication/account-dedup";
 
 export interface AccountBundle {
   account: Account;
@@ -244,12 +245,136 @@ export interface InsertAccountInput {
   status: AccountStatus;
 }
 
-/** Inserts a brand-new account row. Callers must have already confirmed via `findCandidateAccountMatches` + `evaluateAccountDedup` that no existing account matches. */
-export async function insertAccount(input: InsertAccountInput): Promise<string> {
-  const db = getDb();
-  const [row] = await db.insert(accounts).values(input).returning({ id: accounts.id });
-  if (!row) throw new Error("Failed to insert account.");
-  return row.id;
+export type CanonicalAccountResolution =
+  | { kind: "existingAccount"; existingAccountId: string; matchedSignal: string }
+  | { kind: "createNewAccount"; accountId: string }
+  | { kind: "needsReview"; matchedAccountId: string | null; matchedSignal: string };
+
+/**
+ * Resolves and, when safe, creates an account in one transaction. The
+ * transaction-scoped workspace lock serializes the read/insert decision even
+ * with Neon HTTP, where interactive Drizzle transactions are unavailable.
+ */
+export async function resolveCanonicalAccount(
+  workspaceId: string,
+  incoming: Omit<AccountIdentitySignals, "accountId">,
+  account: InsertAccountInput,
+  options: { allowCreate?: boolean } = {},
+): Promise<CanonicalAccountResolution> {
+  if (account.workspaceId !== workspaceId) throw new Error("Canonical account workspace does not match the resolver scope.");
+  const sqlClient = getNeonSql();
+  const transactionResults = await sqlClient.transaction([
+    sqlClient`SELECT pg_advisory_xact_lock(hashtextextended(${workspaceId}, 0))`,
+    sqlClient`
+    WITH match_candidates AS MATERIALIZED (
+      SELECT
+        a.id,
+        CASE
+          WHEN ${incoming.googlePlaceId ?? null}::text IS NOT NULL AND a.google_place_id = ${incoming.googlePlaceId ?? null} THEN 'google_place_id'
+          WHEN ${incoming.normalizedDomain ?? null}::text IS NOT NULL AND a.normalized_domain = ${incoming.normalizedDomain ?? null} THEN 'normalized_domain'
+          WHEN ${incoming.normalizedPhone ?? null}::text IS NOT NULL AND a.normalized_phone = ${incoming.normalizedPhone ?? null} THEN 'normalized_phone'
+          WHEN ${incoming.normalizedName}::text IS NOT NULL AND ${incoming.normalizedAddress ?? null}::text IS NOT NULL
+            AND a.normalized_name = ${incoming.normalizedName} AND a.normalized_address = ${incoming.normalizedAddress ?? null} THEN 'name_address'
+          WHEN ${incoming.normalizedName}::text IS NOT NULL AND ${incoming.postalCode ?? null}::text IS NOT NULL
+            AND a.normalized_name = ${incoming.normalizedName} AND a.postal_code = ${incoming.postalCode ?? null} THEN 'name_postal_code'
+          ELSE 'name_geo_proximity'
+        END AS matched_signal
+      FROM accounts a
+      WHERE a.workspace_id = ${workspaceId}::uuid
+        AND (
+          (${incoming.googlePlaceId ?? null}::text IS NOT NULL AND a.google_place_id = ${incoming.googlePlaceId ?? null})
+          OR (${incoming.normalizedDomain ?? null}::text IS NOT NULL AND a.normalized_domain = ${incoming.normalizedDomain ?? null})
+          OR (${incoming.normalizedPhone ?? null}::text IS NOT NULL AND a.normalized_phone = ${incoming.normalizedPhone ?? null})
+          OR (${incoming.normalizedName}::text IS NOT NULL AND ${incoming.normalizedAddress ?? null}::text IS NOT NULL
+            AND a.normalized_name = ${incoming.normalizedName} AND a.normalized_address = ${incoming.normalizedAddress ?? null})
+          OR (${incoming.normalizedName}::text IS NOT NULL AND ${incoming.postalCode ?? null}::text IS NOT NULL
+            AND a.normalized_name = ${incoming.normalizedName} AND a.postal_code = ${incoming.postalCode ?? null})
+          OR (
+            ${incoming.normalizedName}::text IS NOT NULL
+            AND ${incoming.latitude ?? null}::double precision IS NOT NULL
+            AND ${incoming.longitude ?? null}::double precision IS NOT NULL
+            AND a.normalized_name = ${incoming.normalizedName}
+            AND a.latitude IS NOT NULL AND a.longitude IS NOT NULL
+            AND 6371000 * 2 * asin(sqrt(least(1,
+              sin(radians(a.latitude - ${incoming.latitude ?? null}::double precision) / 2)^2
+              + cos(radians(${incoming.latitude ?? null}::double precision)) * cos(radians(a.latitude))
+              * sin(radians(a.longitude - ${incoming.longitude ?? null}::double precision) / 2)^2
+            ))) <= 150
+          )
+        )
+    ),
+    matched AS MATERIALIZED (
+      SELECT
+        id,
+        matched_signal,
+        count(*) OVER (PARTITION BY matched_signal) AS signal_match_count
+      FROM match_candidates
+      ORDER BY CASE
+        WHEN matched_signal = 'google_place_id' THEN 1
+        WHEN matched_signal = 'normalized_domain' THEN 2
+        WHEN matched_signal = 'normalized_phone' THEN 3
+        WHEN matched_signal = 'name_address' THEN 4
+        WHEN matched_signal = 'name_postal_code' THEN 5
+        ELSE 6
+      END
+      LIMIT 1
+    ),
+    inserted AS (
+      INSERT INTO accounts (
+        workspace_id, canonical_name, normalized_name, business_type, country_code,
+        region, province, city, postal_code, address_line, normalized_address,
+        latitude, longitude, phone, normalized_phone, website_url, normalized_domain,
+        google_place_id, maps_url, rating, review_count, status
+      )
+      SELECT
+        ${account.workspaceId}::uuid, ${account.canonicalName}, ${account.normalizedName}, ${account.businessType}, ${account.countryCode},
+        ${account.region}, ${account.province}, ${account.city}, ${account.postalCode}, ${account.addressLine}, ${account.normalizedAddress},
+        ${account.latitude}, ${account.longitude}, ${account.phone}, ${account.normalizedPhone}, ${account.websiteUrl}, ${account.normalizedDomain},
+        ${account.googlePlaceId}, ${account.mapsUrl}, ${account.rating}, ${account.reviewCount}, ${account.status}
+      WHERE NOT EXISTS (SELECT 1 FROM matched)
+        AND ${options.allowCreate !== false}
+      ON CONFLICT DO NOTHING
+      RETURNING id
+    )
+    SELECT
+      CASE WHEN matched_signal = 'name_geo_proximity' OR signal_match_count > 1 THEN 'needsReview' ELSE 'existingAccount' END AS resolution,
+      id AS account_id,
+      matched_signal
+    FROM matched
+    UNION ALL
+    SELECT 'createNewAccount' AS resolution, id AS account_id, NULL AS matched_signal FROM inserted
+    UNION ALL
+    SELECT 'needsReview' AS resolution, NULL::uuid AS account_id, 'unmatched_linkedin_profile' AS matched_signal
+    WHERE ${options.allowCreate !== false} = false
+      AND NOT EXISTS (SELECT 1 FROM matched)
+      AND NOT EXISTS (SELECT 1 FROM inserted)
+  `,
+  ], { isolationLevel: "ReadCommitted" });
+  const row = transactionResults[1]?.[0] as { resolution: string; account_id: string; matched_signal: string | null } | undefined;
+  if (!row) {
+    const concurrentCandidates = await findCandidateAccountMatches(workspaceId, incoming);
+    const concurrentDecision = evaluateAccountDedup(incoming, concurrentCandidates);
+    if (concurrentDecision.action === "merge" && concurrentDecision.matches[0]) {
+      return {
+        kind: "existingAccount",
+        existingAccountId: concurrentDecision.matches[0].accountId,
+        matchedSignal: concurrentDecision.matches[0].signal,
+      };
+    }
+    if (concurrentDecision.action === "flag_for_review" && concurrentDecision.matches[0]) {
+      return {
+        kind: "needsReview",
+        matchedAccountId: concurrentDecision.matches[0].accountId,
+        matchedSignal: concurrentDecision.matches[0].signal,
+      };
+    }
+    throw new Error("Canonical account insert conflicted but no matching account could be resolved; retry processing.");
+  }
+  if (row.resolution === "createNewAccount") return { kind: "createNewAccount", accountId: row.account_id };
+  if (row.resolution === "needsReview") {
+    return { kind: "needsReview", matchedAccountId: row.account_id, matchedSignal: row.matched_signal ?? "name_geo_proximity" };
+  }
+  return { kind: "existingAccount", existingAccountId: row.account_id, matchedSignal: row.matched_signal ?? "unknown" };
 }
 
 export async function getAccountById(accountId: string): Promise<Account | null> {
@@ -275,18 +400,6 @@ export interface InsertAccountSourceInput {
 
 export async function insertAccountSource(input: InsertAccountSourceInput): Promise<void> {
   const db = getDb();
-  const sourceIdentity = input.sourceExternalId
-    ? and(eq(accountSources.sourceProvider, input.sourceProvider), eq(accountSources.sourceExternalId, input.sourceExternalId))
-    : and(
-        eq(accountSources.sourceProvider, input.sourceProvider),
-        input.sourceUrl ? eq(accountSources.sourceUrl, input.sourceUrl) : isNull(accountSources.sourceUrl),
-      );
-  const [existing] = await db
-    .select({ id: accountSources.id })
-    .from(accountSources)
-    .where(and(eq(accountSources.accountId, input.accountId), sourceIdentity))
-    .limit(1);
-  if (existing) return;
   await db.insert(accountSources).values(input).onConflictDoNothing();
 }
 
@@ -362,7 +475,7 @@ export async function insertContactPoint(input: InsertContactPointInput): Promis
       sourceType: input.sourceType,
       status: verificationToContactPointStatus(input.verificationStatus),
     })
-    .onConflictDoNothing({ target: [contactPoints.workspaceId, contactPoints.type, contactPoints.normalizedValue] })
+    .onConflictDoNothing({ target: [contactPoints.workspaceId, contactPoints.accountId, contactPoints.type, contactPoints.normalizedValue] })
     .returning({ id: contactPoints.id });
   return row?.id ?? "";
 }

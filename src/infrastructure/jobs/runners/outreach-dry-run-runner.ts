@@ -4,6 +4,7 @@ import { listWorkspaceIds } from "@/infrastructure/neon/repositories/workspace";
 import { getPrimaryOffer } from "@/infrastructure/neon/repositories/offers";
 import {
   getSentTodayByChannel,
+  canEnqueueColdOutreach,
   insertOutreachEvent,
   insertOutreachQueueItem,
   listMailboxes,
@@ -87,11 +88,24 @@ export async function runOutreachDryRunCronTick(now: Date = new Date()): Promise
       const { OutreachReadinessService } = await import("@/services/compliance/outreach-readiness-service");
       const readinessService = new OutreachReadinessService();
 
+      const admittedQueueItemIds = new Set<string>();
       for (const item of cycle.newQueueItems) {
         if (!item.contactPointId) continue;
+        const canEnter = await canEnqueueColdOutreach(workspaceId, item, now);
+        if (!canEnter) {
+          cycle.results = cycle.results.map((result) => result.accountId === item.accountId
+            ? { ...result, outcome: "skipped", reason: "cold_outreach_deduplicated" }
+            : result);
+          continue;
+        }
         const isReady = await readinessService.evaluateCandidate(workspaceId, item.campaignId, item.accountId, item.contactPointId);
         if (isReady) {
-          await insertOutreachQueueItem(item);
+          if (await insertOutreachQueueItem(workspaceId, item)) admittedQueueItemIds.add(item.id);
+          else {
+            cycle.results = cycle.results.map((result) => result.accountId === item.accountId
+              ? { ...result, outcome: "skipped", reason: "cold_outreach_enqueue_conflict" }
+              : result);
+          }
         } else {
           cycle.results = cycle.results.map(r => r.accountId === item.accountId ? { ...r, outcome: "skipped", reason: "not_ready_at_insertion" } : r);
         }
@@ -99,7 +113,7 @@ export async function runOutreachDryRunCronTick(now: Date = new Date()): Promise
       
       for (const event of cycle.newEvents) {
         const item = cycle.newQueueItems.find(i => i.id === event.outreachQueueItemId);
-        if (!item || !item.contactPointId) continue;
+        if (!item || !item.contactPointId || !admittedQueueItemIds.has(item.id)) continue;
         const isReady = await readinessService.evaluateCandidate(workspaceId, item.campaignId, item.accountId, item.contactPointId);
         if (isReady) {
           await insertOutreachEvent(event);

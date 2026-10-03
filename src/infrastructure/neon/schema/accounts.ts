@@ -1,4 +1,5 @@
 import { pgTable, text, timestamp, uuid, doublePrecision, numeric, integer, jsonb, uniqueIndex, index } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
 import { workspaces } from "./workspaces";
 
 /**
@@ -67,7 +68,12 @@ export const accountSources = pgTable(
   },
   (table) => [
     index("idx_account_sources_account").on(table.accountId),
-    uniqueIndex("uq_account_sources_external").on(table.accountId, table.sourceProvider, table.sourceExternalId),
+    uniqueIndex("uq_account_sources_identity").on(
+      table.accountId,
+      table.sourceType,
+      table.sourceProvider,
+      sql`COALESCE(${table.sourceExternalId}, ${table.sourceUrl}, '')`,
+    ),
   ],
 );
 

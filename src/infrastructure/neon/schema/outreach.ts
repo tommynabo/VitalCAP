@@ -14,6 +14,9 @@ export const outreachQueue = pgTable(
   "outreach_queue",
   {
     id: uuid("id").defaultRandom().primaryKey(),
+    workspaceId: uuid("workspace_id")
+      .notNull()
+      .references(() => workspaces.id, { onDelete: "cascade" }),
     campaignId: uuid("campaign_id")
       .notNull()
       .references(() => campaigns.id, { onDelete: "cascade" }),
@@ -34,6 +37,7 @@ export const outreachQueue = pgTable(
     contactPointId: uuid("contact_point_id")
       .notNull()
       .references(() => contactPoints.id, { onDelete: "cascade" }),
+    normalizedEmail: text("normalized_email"),
     channel: text("channel").notNull(),
     priority: numeric("priority", { mode: "number" }).notNull().default(0),
     scheduledFor: timestamp("scheduled_for", { withTimezone: true }),
@@ -47,6 +51,12 @@ export const outreachQueue = pgTable(
     index("idx_outreach_queue_dispatch").on(table.status, table.nextAttemptAt),
     index("idx_outreach_queue_account").on(table.accountId),
     index("idx_outreach_queue_dedup_key").on(table.contactPointId, table.campaignId, table.channel),
+    uniqueIndex("uq_outreach_active_account")
+      .on(table.accountId)
+      .where(sql`${table.state} in ('queued', 'scheduled', 'provider_submitted')`),
+    uniqueIndex("uq_outreach_active_workspace_email")
+      .on(table.workspaceId, table.normalizedEmail)
+      .where(sql`${table.normalizedEmail} is not null and ${table.state} in ('queued', 'scheduled', 'provider_submitted')`),
     uniqueIndex("uq_outreach_queue_idempotency_inflight")
       .on(table.idempotencyKey)
       .where(sql`${table.idempotencyKey} is not null and ${table.status} in ('pending', 'processing')`),
