@@ -1,6 +1,9 @@
 import { getDb, schema } from "@/infrastructure/neon/db";
 import { and, eq, isNull } from "drizzle-orm";
 import { checkSuppression } from "./suppression";
+import { createVerificationAcceptancePolicy, isContactPointAcceptable } from "@/services/verification/acceptance-policy";
+import { evaluateContactEligibility } from "@/services/verification/contact-eligibility";
+import { getVerificationEnv } from "@/lib/config/env";
 
 export class OutreachReadinessService {
   async evaluateCandidate(
@@ -38,12 +41,16 @@ export class OutreachReadinessService {
     if (!membership || (membership.stage !== "qualified" && membership.stage !== "ready")) return false;
 
     // 5. Verification status
-    const [cp] = await db.select({ verificationStatus: schema.contactPoints.verificationStatus })
+    const [cp] = await db.select({ type: schema.contactPoints.type, verificationStatus: schema.contactPoints.verificationStatus, channelEligibility: schema.contactPoints.channelEligibility })
       .from(schema.contactPoints)
       .where(eq(schema.contactPoints.id, contactPointId))
       .limit(1);
     
-    if (!cp || (cp.verificationStatus === "unverified" || cp.verificationStatus === "invalid" || cp.verificationStatus === "bounced")) return false;
+    const acceptancePolicy = createVerificationAcceptancePolicy(getVerificationEnv().EMAIL_VERIFICATION_ALLOW_CATCH_ALL);
+    if (!cp
+      || !isContactPointAcceptable(cp.verificationStatus as any, acceptancePolicy)
+      || !evaluateContactEligibility({ hasEmail: cp.type === "email", verificationStatus: cp.verificationStatus as any, allowCatchAll: acceptancePolicy.acceptedStatuses.includes("catch_all") }).eligible
+      || !["eligible_email", "consented_email", "prior_relationship"].includes(cp.channelEligibility)) return false;
 
     // 6. Current Compliance decision
     const [decision] = await db.select({ eligibilityAfter: schema.complianceDecisions.eligibilityAfter })

@@ -14,7 +14,8 @@ import { getCurrentWorkspaceId } from "@/lib/auth/workspace";
 
 import * as seed from "@/lib/seed/dev-seed";
 
-import { getPrimaryOffer } from "@/infrastructure/neon/repositories/offers";
+import { getPrimaryOffer, listOffers } from "@/infrastructure/neon/repositories/offers";
+import { listSetterWebhookEvents, type SetterWebhookEventSummary } from "@/infrastructure/neon/repositories/setter-runtime";
 import { listCampaigns } from "@/infrastructure/neon/repositories/campaigns";
 import { listAccountBundles, type AccountBundle } from "@/infrastructure/neon/repositories/accounts";
 import {
@@ -42,6 +43,8 @@ import { getAutopilotPacingMetrics } from "@/infrastructure/neon/repositories/au
 import {
   getProviderRows,
   getEmailVerificationUsage,
+  getEmailVerificationMetrics,
+  type EmailVerificationMetrics,
   getQueueHealth,
   getDeadLetterSamples,
   getCronLastRunAt,
@@ -73,6 +76,16 @@ export async function getOffer(): Promise<Offer | null> {
   if (isDevSeedMode()) return seed.seedOffer;
   const workspaceId = await getCurrentWorkspaceId();
   return getPrimaryOffer(workspaceId);
+}
+
+export async function getOffers(): Promise<Offer[]> {
+  if (isDevSeedMode()) return [seed.seedOffer];
+  return listOffers(await getCurrentWorkspaceId());
+}
+
+export async function getSetterWebhookEvents(): Promise<SetterWebhookEventSummary[]> {
+  if (isDevSeedMode()) return [];
+  return listSetterWebhookEvents(await getCurrentWorkspaceId());
 }
 
 export async function getCampaigns(): Promise<Campaign[]> {
@@ -202,6 +215,23 @@ export async function getEmailVerificationUsageData(): Promise<ProviderUsageStat
   if (isDevSeedMode()) return seed.seedEmailVerificationUsage;
   const workspaceId = await getCurrentWorkspaceId();
   return getEmailVerificationUsage(workspaceId);
+}
+
+export async function getEmailVerificationMetricsData(): Promise<EmailVerificationMetrics> {
+  if (isDevSeedMode()) {
+    const contactPoints = seed.seedAccountBundles.flatMap((bundle) => bundle.contactPoints).filter((point) => point.type === "email");
+    const count = (statuses: readonly string[]) => contactPoints.filter((point) => statuses.includes(point.verificationStatus)).length;
+    return {
+      unverified: count(["unverified", "unknown"]),
+      valid: count(["valid"]),
+      catchAll: count(["catch_all"]),
+      risky: count(["risky"]),
+      invalid: count(["invalid", "disposable", "bounced"]),
+      blocked: contactPoints.filter((point) => ["invalid", "disposable", "bounced"].includes(point.verificationStatus) || ["opted_out", "blocked"].includes(point.channelEligibility)).length,
+      ready: seed.seedAccountBundles.filter((bundle) => bundle.account.status === "outreach_ready").length,
+    };
+  }
+  return getEmailVerificationMetrics(await getCurrentWorkspaceId());
 }
 
 export async function getSearchSeeds(): Promise<SearchSeed[]> {

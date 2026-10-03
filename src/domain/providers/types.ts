@@ -100,6 +100,7 @@ export interface EmailVerificationOutcome {
   providerRawCode: string;
   costUsd: number;
   checkedAt: string;
+  retryable?: boolean;
 }
 
 export interface EmailVerificationProvider {

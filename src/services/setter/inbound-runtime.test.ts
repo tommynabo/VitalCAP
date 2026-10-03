@@ -44,7 +44,7 @@ function persistedReply(): PersistedInboundReply {
   return { conversation, message, conversationMessages: [message] };
 }
 
-function storeFixture(): SetterInboundRuntimeStore & { claimCount: number; persistCount: number; drafts: unknown[]; statuses: string[] } {
+function storeFixture(): SetterInboundRuntimeStore & { claimCount: number; persistCount: number; drafts: unknown[]; statuses: string[]; workspaceIds: Array<string | null> } {
   const claimed = new Set<string>();
   const persisted = persistedReply();
   return {
@@ -52,6 +52,7 @@ function storeFixture(): SetterInboundRuntimeStore & { claimCount: number; persi
     persistCount: 0,
     drafts: [],
     statuses: [],
+    workspaceIds: [],
     async claimWebhookEvent(incomingEvent, _hash) {
       this.claimCount += 1;
       if (claimed.has(incomingEvent.providerMessageId)) return false;
@@ -89,8 +90,9 @@ function storeFixture(): SetterInboundRuntimeStore & { claimCount: number; persi
     async persistFailure(_persisted, failureCode) {
       this.drafts.push({ branch: "HUMAN_REQUIRED", riskFlags: [failureCode] });
     },
-    async completeWebhookEvent(_event, status) {
+    async completeWebhookEvent(_event, status, workspaceId) {
       this.statuses.push(status);
+      this.workspaceIds.push(workspaceId);
     },
   };
 }
@@ -113,6 +115,26 @@ describe("processInstantlyInboundReply", () => {
     expect(store.persistCount).toBe(1);
     expect(store.drafts).toHaveLength(1);
     expect(llmProvider.classifyAndDraft).toHaveBeenCalledTimes(1);
+  });
+
+  it("skips a duplicate provider message without persisting another draft", async () => {
+    const store = storeFixture();
+    const persisted = persistedReply();
+    store.persistIncomingReply = async () => ({ ...persisted, duplicate: true });
+    const providerFactory = vi.fn(() => new MockLLMProvider());
+
+    const result = await processInstantlyInboundReply(
+      { ...event, providerEventId: "event-retry", providerMessageId: "message-duplicate" },
+      "hash-retry",
+      store,
+      new Date(event.occurredAt),
+      providerFactory,
+    );
+
+    expect(result.outcome).toBe("duplicate_skipped");
+    expect(store.drafts).toHaveLength(0);
+    expect(store.statuses).toContain("duplicate_skipped");
+    expect(providerFactory).not.toHaveBeenCalled();
   });
 
   it("unsubscribe is suppressed before the provider factory or LLM is used", async () => {
@@ -143,6 +165,17 @@ describe("processInstantlyInboundReply", () => {
     expect(result.outcome).toBe("processed");
     expect(store.persistCount).toBe(1);
     expect(store.drafts).toHaveLength(1);
-    expect(store.statuses).toContain("pending_review");
+    expect(store.statuses).toContain("human_required");
+  });
+
+  it("keeps post-persistence failures visible inside the resolved workspace", async () => {
+    const store = storeFixture();
+    store.loadContext = async () => { throw new Error("context unavailable"); };
+
+    const result = await processInstantlyInboundReply(event, "hash", store);
+
+    expect(result.outcome).toBe("human_required");
+    expect(store.statuses).toContain("human_required");
+    expect(store.workspaceIds).toContain("ws_demo");
   });
 });

@@ -1,4 +1,4 @@
-import { and, eq, gte, or } from "drizzle-orm";
+import { and, eq, gte, or, sql } from "drizzle-orm";
 import { getDb } from "../db";
 import {
   outreachQueue,
@@ -262,7 +262,7 @@ export async function insertOutreachEvent(event: OutreachEvent): Promise<void> {
 export async function listOutreachCandidatesForCampaign(campaignId: string, limit: number): Promise<OutreachCandidate[]> {
   const db = getDb();
   const memberships = await db
-    .select({ accountId: campaignMemberships.accountId, accountName: accounts.canonicalName, contactId: campaignMemberships.contactId })
+    .select({ accountId: campaignMemberships.accountId, accountName: accounts.canonicalName, contactId: campaignMemberships.contactId, selectedContactPointId: campaignMemberships.selectedContactPointId })
     .from(campaignMemberships)
     .innerJoin(accounts, eq(campaignMemberships.accountId, accounts.id))
     .innerJoin(campaigns, eq(campaignMemberships.campaignId, campaigns.id))
@@ -279,7 +279,8 @@ export async function listOutreachCandidatesForCampaign(campaignId: string, limi
 
   const candidates: OutreachCandidate[] = [];
   for (const membership of memberships) {
-    const points = await db.select().from(contactPoints).where(eq(contactPoints.accountId, membership.accountId));
+    if (!membership.selectedContactPointId) continue;
+    const points = await db.select().from(contactPoints).where(eq(contactPoints.id, membership.selectedContactPointId));
     
     // Check if at least one contact point has an "allowed" compliance decision
     const allowedDecisions = await db
@@ -289,7 +290,9 @@ export async function listOutreachCandidatesForCampaign(campaignId: string, limi
         and(
           eq(complianceDecisions.accountId, membership.accountId),
           eq(complianceDecisions.campaignId, campaignId),
-          eq(complianceDecisions.decision, "allowed")
+          eq(complianceDecisions.contactPointId, membership.selectedContactPointId),
+          eq(complianceDecisions.decision, "allowed"),
+          sql`superseded_at IS NULL`
         )
       );
 

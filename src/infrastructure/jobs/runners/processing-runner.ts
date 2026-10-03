@@ -20,9 +20,11 @@ import {
   resolveCanonicalAccount,
   updateAccountFields,
 } from "@/infrastructure/neon/repositories/accounts";
-import { createEmailVerificationProvider, createSerpDiscoveryProvider } from "@/infrastructure/providers/provider-factory";
+import { createSerpDiscoveryProvider } from "@/infrastructure/providers/provider-factory";
 import { createInMemoryVerificationCacheStore } from "@/services/verification/email-verification-cache";
 import type { EmailVerificationProvider, WebsiteFetcher } from "@/domain/providers/types";
+import { enqueueVerificationJob } from "@/infrastructure/neon/repositories/verification-queue";
+import { getVerificationEnv } from "@/lib/config/env";
 import { processRawCandidate, deriveIncomingIdentitySignals, hasLinkedInEmployerAccount, type CandidateRawPayload, type ProcessedCandidateResult } from "@/services/discovery/candidate-processor";
 import { mergeMissingAccountFields, type IncomingAccountFields } from "@/services/accounts/account-enrichment-merge";
 import { realWebsiteFetcher, providerLabelForEngine } from "./engine-factory";
@@ -200,9 +202,10 @@ async function executeProcessingJob(
   const processed = await processRawCandidate(payload, raw.engineType, {
     existingAccounts,
     websiteFetcher: options.enrichContacts === false ? smokeWebsiteFetcher : cachedFetcher,
-    verificationProvider: options.enrichContacts === false ? smokeVerificationProvider : createEmailVerificationProvider(campaign.workspaceId),
+    verificationProvider: smokeVerificationProvider,
     verificationCacheStore: createInMemoryVerificationCacheStore(),
     now: new Date(),
+    deferVerification: true,
   });
 
   const accountFields = extractAccountFields(payload);
@@ -345,7 +348,7 @@ async function executeProcessingJob(
         if (fact.evidenceType === "email") {
           const emailLower = fact.value.toLowerCase();
           if (!processed.contactPoints.some((cp) => cp.email.toLowerCase() === emailLower)) {
-            await insertContactPoint({
+            const contactPointId = await insertContactPoint({
               workspaceId: campaign.workspaceId,
               accountId,
               type: "email",
@@ -360,6 +363,14 @@ async function executeProcessingJob(
               sourceUrl: fact.sourceUrl,
               sourceType: "website_enrichment",
             });
+            if (contactPointId) {
+              await enqueueVerificationJob({
+                workspaceId: campaign.workspaceId,
+                contactPointId,
+                normalizedEmail: emailLower,
+                provider: getVerificationEnv().EMAIL_VERIFICATION_PROVIDER,
+              });
+            }
           }
         }
         
@@ -388,7 +399,7 @@ async function executeProcessingJob(
   }
 
   for (const contactPoint of processed.contactPoints) {
-    await insertContactPoint({
+    const contactPointId = await insertContactPoint({
       workspaceId: campaign.workspaceId,
       accountId,
       type: "email",
@@ -403,6 +414,14 @@ async function executeProcessingJob(
       sourceUrl: contactPoint.sourceUrl,
       sourceType: raw.engineType,
     });
+    if (options.enrichContacts !== false && contactPointId) {
+      await enqueueVerificationJob({
+        workspaceId: campaign.workspaceId,
+        contactPointId,
+        normalizedEmail: contactPoint.email.toLowerCase(),
+        provider: getVerificationEnv().EMAIL_VERIFICATION_PROVIDER,
+      });
+    }
   }
 
   const membership = resolveMembershipStage(processed);

@@ -1,25 +1,25 @@
 import { getDb, schema } from "@/infrastructure/neon/db";
-import { sql } from "drizzle-orm";
+import { createVerificationIdempotencyKey } from "@/domain/providers/email-verification-idempotency";
 
 export async function enqueueVerificationJob(params: {
   workspaceId: string;
   contactPointId: string;
+  normalizedEmail: string;
   provider: string;
 }) {
   const db = getDb();
+  const normalizedEmail = params.normalizedEmail.trim().toLowerCase();
   
-  await db.insert(schema.verificationJobs)
+  const [job] = await db.insert(schema.verificationJobs)
     .values({
       workspaceId: params.workspaceId,
       contactPointId: params.contactPointId,
       provider: params.provider,
+      normalizedEmail,
+      idempotencyKey: createVerificationIdempotencyKey({ ...params, normalizedEmail }),
       status: "pending",
     })
-    .onConflictDoNothing({
-      target: [
-        schema.verificationJobs.contactPointId,
-        schema.verificationJobs.provider,
-      ],
-      where: sql`status IN ('pending', 'processing')`,
-    });
+    .onConflictDoNothing()
+    .returning({ id: schema.verificationJobs.id });
+  return Boolean(job);
 }

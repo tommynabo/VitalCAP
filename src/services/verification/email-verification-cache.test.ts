@@ -60,6 +60,30 @@ describe("verifyEmailsWithCache", () => {
     expect(result.outcomes).toHaveLength(2);
   });
 
+  it("does not cache retryable provider failures and retries the same email", async () => {
+    const provider: EmailVerificationProvider = {
+      providerName: "fake",
+      verifyBatch: vi.fn()
+        .mockResolvedValueOnce({
+          outcomes: [{ email: "retry@example.com", code: "unknown", providerRawCode: "http_503", costUsd: 0, checkedAt: "2025-01-01T00:00:00.000Z", retryable: true }],
+          usage: { calls: 1, items: 1, errors: 1, totalLatencyMs: 10, costUsd: 0, quotaRemaining: null },
+        })
+        .mockResolvedValueOnce({
+          outcomes: [{ email: "retry@example.com", code: "valid", providerRawCode: "OK", costUsd: 0.01, checkedAt: "2025-01-01T00:01:00.000Z" }],
+          usage: { calls: 1, items: 1, errors: 0, totalLatencyMs: 10, costUsd: 0.01, quotaRemaining: null },
+        }),
+    };
+    const store = createInMemoryVerificationCacheStore();
+    const now = new Date("2025-01-01T00:00:00Z");
+
+    const failed = await verifyEmailsWithCache(provider, ["retry@example.com"], store, now);
+    const recovered = await verifyEmailsWithCache(provider, ["retry@example.com"], store, new Date(now.getTime() + 60_000));
+
+    expect(failed.outcomes[0]?.retryable).toBe(true);
+    expect(recovered.outcomes[0]?.code).toBe("valid");
+    expect(provider.verifyBatch).toHaveBeenCalledTimes(2);
+  });
+
   it("tracks cost/result/provider-raw-code/checked_at/expires_at on every cached entry", async () => {
     const provider = makeProvider();
     const store = createInMemoryVerificationCacheStore();

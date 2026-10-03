@@ -2,6 +2,7 @@ import { getDb, schema } from "@/infrastructure/neon/db";
 import { eq, and, sql } from "drizzle-orm";
 import type { EmailVerificationCacheStore, CachedVerification } from "./email-verification-cache";
 import type { EmailVerificationCode } from "@/domain/providers/types";
+import { EMAIL_VERIFICATION_PIPELINE_VERSION } from "@/domain/providers/email-verification-idempotency";
 
 export class DbVerificationCacheStore implements EmailVerificationCacheStore {
   constructor(private workspaceId: string, private providerName: string) {}
@@ -14,7 +15,8 @@ export class DbVerificationCacheStore implements EmailVerificationCacheStore {
         and(
           eq(schema.emailVerifications.workspaceId, this.workspaceId),
           eq(schema.emailVerifications.normalizedEmail, email),
-          eq(schema.emailVerifications.provider, this.providerName)
+          eq(schema.emailVerifications.provider, this.providerName),
+          eq(schema.emailVerifications.pipelineVersion, EMAIL_VERIFICATION_PIPELINE_VERSION),
         )
       )
       .limit(1);
@@ -38,6 +40,7 @@ export class DbVerificationCacheStore implements EmailVerificationCacheStore {
         workspaceId: this.workspaceId,
         normalizedEmail: email,
         provider: this.providerName,
+        pipelineVersion: EMAIL_VERIFICATION_PIPELINE_VERSION,
         status: value.code,
         providerRawCode: value.providerRawCode,
         checkedAt: new Date(value.checkedAt),
@@ -49,6 +52,7 @@ export class DbVerificationCacheStore implements EmailVerificationCacheStore {
           schema.emailVerifications.workspaceId,
           schema.emailVerifications.normalizedEmail,
           schema.emailVerifications.provider,
+          schema.emailVerifications.pipelineVersion,
         ],
         set: {
           status: value.code,

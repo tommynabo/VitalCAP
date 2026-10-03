@@ -74,6 +74,7 @@ export async function processInstantlyInboundReply(
   let workspaceId: string | null = null;
   try {
     persisted = await store.persistIncomingReply(event, payloadHash);
+    workspaceId = persisted.conversation.workspaceId;
     if (persisted.duplicate) {
       await store.completeWebhookEvent(event, "duplicate_skipped", persisted.conversation.workspaceId);
       return { outcome: "duplicate_skipped" };
@@ -91,7 +92,13 @@ export async function processInstantlyInboundReply(
     });
 
     await store.persistResult(persisted, result);
-    const eventStatus = result.draft ? "pending_review" : result.conversation.state;
+    const requiresIntervention = result.draft && (
+      result.draft.branch === "HUMAN_REQUIRED"
+      || Boolean(result.draft.reasonForHuman)
+      || result.draft.riskFlags.length > 0
+      || result.draft.confidence < 0.6
+    );
+    const eventStatus = requiresIntervention ? "human_required" : result.draft ? "pending_review" : result.conversation.state;
     await store.completeWebhookEvent(event, eventStatus, workspaceId);
     return { outcome: "processed", result };
   } catch (error) {

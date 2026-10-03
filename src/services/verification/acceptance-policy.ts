@@ -6,8 +6,14 @@ export interface VerificationAcceptancePolicy {
 
 /** Conservative default: only clearly-deliverable statuses are acceptable unless a campaign opts into more. */
 export const DEFAULT_VERIFICATION_ACCEPTANCE_POLICY: VerificationAcceptancePolicy = {
-  acceptedStatuses: ["valid", "catch_all"],
+  acceptedStatuses: ["valid"],
 };
+
+export function createVerificationAcceptancePolicy(allowCatchAll: boolean): VerificationAcceptancePolicy {
+  return allowCatchAll
+    ? { acceptedStatuses: ["valid", "catch_all"] }
+    : DEFAULT_VERIFICATION_ACCEPTANCE_POLICY;
+}
 
 /**
  * Campaign-configurable acceptance check (Prompt 1 §1.6). Deliberately

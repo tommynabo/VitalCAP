@@ -51,6 +51,7 @@ export const emailVerifications = pgTable(
       .references(() => workspaces.id, { onDelete: "cascade" }),
     normalizedEmail: text("normalized_email").notNull(),
     provider: text("provider").notNull(),
+    pipelineVersion: text("pipeline_version").notNull().default("v1"),
     status: text("status").notNull(),
     providerRawCode: text("provider_raw_code"),
     checkedAt: timestamp("checked_at", { withTimezone: true }).notNull().defaultNow(),
@@ -59,9 +60,30 @@ export const emailVerifications = pgTable(
     metadata: jsonb("metadata").notNull().default({}),
   },
   (table) => [
-    uniqueIndex("uq_email_verifications_cache").on(table.workspaceId, table.normalizedEmail, table.provider),
+    uniqueIndex("uq_email_verifications_cache").on(table.workspaceId, table.normalizedEmail, table.provider, table.pipelineVersion),
     index("idx_email_verifications_email").on(table.normalizedEmail),
   ]
+);
+
+export const emailVerificationEvents = pgTable(
+  "email_verification_events",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    workspaceId: uuid("workspace_id").notNull().references(() => workspaces.id, { onDelete: "cascade" }),
+    contactPointId: uuid("contact_point_id").notNull().references(() => contactPoints.id, { onDelete: "cascade" }),
+    normalizedEmail: text("normalized_email").notNull(),
+    provider: text("provider").notNull(),
+    pipelineVersion: text("pipeline_version").notNull(),
+    status: text("status").notNull(),
+    providerRawCode: text("provider_raw_code"),
+    checkedAt: timestamp("checked_at", { withTimezone: true }).notNull(),
+    costUsd: numeric("cost_usd", { mode: "number" }).notNull().default(0),
+    metadata: jsonb("metadata").notNull().default({}),
+  },
+  (table) => [
+    index("idx_email_verification_events_contact").on(table.workspaceId, table.contactPointId, table.checkedAt),
+    index("idx_email_verification_events_email").on(table.workspaceId, table.normalizedEmail, table.checkedAt),
+  ],
 );
 
 export const verificationJobs = pgTable(
@@ -91,7 +113,7 @@ export const verificationJobs = pgTable(
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [
-    uniqueIndex("uq_verification_jobs_unique").on(table.contactPointId, table.provider).where(sql`status IN ('pending', 'processing')`),
+    uniqueIndex("uq_verification_jobs_unique").on(table.workspaceId, table.idempotencyKey).where(sql`idempotency_key IS NOT NULL AND status IN ('pending', 'processing')`),
     index("idx_verification_jobs_unlocked").on(table.workspaceId).where(sql`locked_at IS NULL AND status = 'pending'`),
   ]
 );

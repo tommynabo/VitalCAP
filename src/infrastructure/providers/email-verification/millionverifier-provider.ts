@@ -2,7 +2,7 @@ import type { EmailVerificationCode, EmailVerificationOutcome, EmailVerification
 
 const MILLIONVERIFIER_BASE_URL = "https://api.millionverifier.com/api/v3/";
 /** Approximate per-email cost; adjust to your actual MillionVerifier plan rate. Not a billed-truth figure. */
-const ESTIMATED_COST_PER_EMAIL_USD = 0.004;
+export const MILLIONVERIFIER_ESTIMATED_COST_PER_EMAIL_USD = 0.004;
 const DEFAULT_TIMEOUT_SECS = 10;
 /** Bounded concurrency for the real-time single-email endpoint (no true batch endpoint exists for real-time verification). */
 const CONCURRENCY = 5;
@@ -57,24 +57,27 @@ async function verifyOne(email: string, config: MillionVerifierProviderConfig): 
   const checkedAt = new Date().toISOString();
 
   try {
-    const response = await fetchImpl(url.toString(), { method: "GET" });
+    const response = await fetchImpl(url.toString(), {
+      method: "GET",
+      signal: AbortSignal.timeout((config.timeoutSecs ?? DEFAULT_TIMEOUT_SECS) * 1000),
+    });
     if (!response.ok) {
-      return { email, code: "unknown", providerRawCode: `http_${response.status}`, costUsd: 0, checkedAt };
+      return { email, code: "unknown", providerRawCode: `http_${response.status}`, costUsd: 0, checkedAt, retryable: true };
     }
     const data = (await response.json()) as MillionVerifierResponse;
     if (data.error) {
       // Provider-reported error (e.g. insufficient credits, invalid key) must never resolve to "valid".
-      return { email, code: "unknown", providerRawCode: data.error, costUsd: 0, checkedAt };
+      return { email, code: "unknown", providerRawCode: data.error, costUsd: 0, checkedAt, retryable: true };
     }
     return {
       email,
       code: mapToCode(data),
       providerRawCode: String(data.resultcode ?? data.result ?? "unknown"),
-      costUsd: ESTIMATED_COST_PER_EMAIL_USD,
+      costUsd: MILLIONVERIFIER_ESTIMATED_COST_PER_EMAIL_USD,
       checkedAt,
     };
   } catch {
-    return { email, code: "unknown", providerRawCode: "network_error", costUsd: 0, checkedAt };
+    return { email, code: "unknown", providerRawCode: "network_error", costUsd: 0, checkedAt, retryable: true };
   }
 }
 
@@ -112,7 +115,7 @@ export class MillionVerifierEmailVerificationProvider implements EmailVerificati
   async verifyBatch(emails: readonly string[]): Promise<{ outcomes: EmailVerificationOutcome[]; usage: ProviderUsageStats }> {
     const start = Date.now();
     const outcomes = await runWithConcurrency(emails, CONCURRENCY, (email) => verifyOne(email, this.config));
-    const errors = outcomes.filter((o) => o.costUsd === 0).length; // costUsd stays 0 only on HTTP/network/provider-error paths, never on a real verdict
+    const errors = outcomes.filter((outcome) => outcome.retryable).length;
 
     return {
       outcomes,

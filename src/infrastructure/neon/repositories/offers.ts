@@ -30,6 +30,12 @@ export async function getPrimaryOffer(workspaceId: string): Promise<Offer | null
   return row ? toOffer(row) : null;
 }
 
+export async function listOffers(workspaceId: string): Promise<Offer[]> {
+  const db = getDb();
+  const rows = await db.select().from(offers).where(eq(offers.workspaceId, workspaceId));
+  return rows.map(toOffer);
+}
+
 /**
  * A new workspace should be able to configure discovery before commercial
  * details are entered. This placeholder carries no claims and remains
