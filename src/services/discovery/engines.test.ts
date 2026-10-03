@@ -90,6 +90,27 @@ describe("MapsDeepEngine", () => {
 });
 
 describe("GoogleSerpEngine", () => {
+  it("links emitted candidates to the successful provider run", async () => {
+    const provider: SerpDiscoveryProvider = {
+      providerName: "serper",
+      search: vi.fn().mockResolvedValue({
+        results: [{ title: "Farmacia", url: "https://farmacia.es", snippet: "", domain: "farmacia.es" }],
+        usage: { calls: 1, items: 1, errors: 0, totalLatencyMs: 1, costUsd: 0.001, quotaRemaining: null },
+        providerRunId: "serper-run-1",
+      }),
+    };
+    const engine = new GoogleSerpEngine(provider);
+
+    const result = await engine.executeDiscovery({
+      seed: seed({ engineType: "google_serp", query: "farmacia" }),
+      dryRun: false,
+      planningWindow: "2026-10-03T11:00",
+    });
+
+    expect(result.rawCandidates[0]?.providerRunId).toBe("serper-run-1");
+    expect(provider.search).toHaveBeenCalledWith(expect.objectContaining({ seedId: "seed_1", planningWindow: "2026-10-03T11:00" }));
+  });
+
   it("excludes linkedin.com domains from its results", async () => {
     const engine = new GoogleSerpEngine(new MockSerpDiscoveryProvider());
     const result = await engine.executeDiscovery({ seed: seed({ engineType: "google_serp", query: "titular farmacéutico" }), dryRun: true });
@@ -111,12 +132,16 @@ describe("GoogleSerpEngine", () => {
 
 describe("LinkedInOwnerEngine", () => {
   it("only emits linkedin.com profile results and attempts employer domain resolution", async () => {
-    const engine = new LinkedInOwnerEngine(new MockSerpDiscoveryProvider());
+    const provider = new MockSerpDiscoveryProvider();
+    const search = vi.spyOn(provider, "search");
+    const engine = new LinkedInOwnerEngine(provider);
     const result = await engine.executeDiscovery({ seed: seed({ engineType: "linkedin_owner", query: "titular farmacéutico" }), dryRun: true });
     expect(result.rawCandidates.length).toBeGreaterThan(0);
+    expect(search).toHaveBeenCalledWith(expect.objectContaining({ query: "site:linkedin.com/in titular farmacéutico Madrid" }));
     for (const candidate of result.rawCandidates) {
       const payload = candidate.rawPayload as unknown as LinkedInRawPayload;
       expect(payload.profile.domain).toBe("linkedin.com");
+      expect(new URL(payload.profile.url).pathname).toMatch(/^\/in\//);
     }
   });
 

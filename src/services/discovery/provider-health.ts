@@ -50,7 +50,32 @@ export function accumulateUsage(base: ProviderUsageStats, next: ProviderUsageSta
   };
 }
 
+export function isProviderAvailableForDiscovery(
+  configured: boolean,
+  health: ProviderHealthStatus,
+  budgetRemaining: number,
+  minimumBudgetUsd = 0,
+): boolean {
+  return configured
+    && (health === "healthy" || health === "untested")
+    && budgetRemaining > 0
+    && budgetRemaining >= minimumBudgetUsd;
+}
+
 export interface EngineProviderUsage {
   engineType: EngineType;
   usage: ProviderUsageStats;
+}
+
+export function hasUnavailableRequiredDiscoveryProvider(
+  engineTypes: readonly EngineType[],
+  mapsConfigured: boolean,
+  serpConfigured: boolean,
+): boolean {
+  return engineTypes.some((engineType) => {
+    if (engineType === "maps_fast") return !mapsConfigured;
+    if (engineType === "maps_deep") return !mapsConfigured || !serpConfigured;
+    if (engineType === "google_serp" || engineType === "linkedin_owner") return !serpConfigured;
+    return !mapsConfigured && !serpConfigured;
+  });
 }

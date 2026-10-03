@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { computeAutopilotPacing, computePacing, madridHourOf } from "./pacing-service";
+import { classifyAutopilotTargetRisk, computeAutopilotPacing, computePacing, madridHourOf } from "./pacing-service";
 
 describe("madridHourOf", () => {
   it("extracts the Europe/Madrid local hour from a UTC instant", () => {
@@ -114,6 +114,19 @@ describe("computeAutopilotPacing", () => {
   it("pauses scheduling for exhausted budget or unhealthy provider", () => {
     expect(computeAutopilotPacing({ ...base, apifyDailyBudgetRemaining: 0, now: new Date("2025-06-15T12:00:00Z") }).status).toBe("budget_paused");
     expect(computeAutopilotPacing({ ...base, providerHealth: "paused", now: new Date("2025-06-15T12:00:00Z") }).status).toBe("provider_paused");
+  });
+
+  it("continues scheduling when Apify is unavailable but another discovery provider has capacity", () => {
+    const result = computeAutopilotPacing({
+      ...base,
+      providerHealth: "paused",
+      apifyDailyBudgetRemaining: 0,
+      availableDiscoveryCapacity: true,
+      now: new Date("2025-06-15T12:00:00Z"),
+    });
+    expect(result.status).toBe("behind_pace");
+    expect(result.rawNeededToPlan).toBeGreaterThan(0);
+    expect(classifyAutopilotTargetRisk(result)).toBe("recoverable");
   });
 
   it("uses the workspace timezone across DST boundaries", () => {

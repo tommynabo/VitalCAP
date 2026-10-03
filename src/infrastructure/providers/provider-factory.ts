@@ -8,10 +8,11 @@ import { MockSerpDiscoveryProvider } from "./serp/mock-provider";
 import { SerperDiscoveryProvider, SERPER_ESTIMATED_COST_PER_QUERY_USD } from "./serp/serper-provider";
 import { MockEmailVerificationProvider } from "./email-verification/mock-provider";
 import { MillionVerifierEmailVerificationProvider } from "./email-verification/millionverifier-provider";
-import { getTodaySpendUsd, recordProviderRun } from "@/infrastructure/neon/repositories/provider-runs";
+import { getProviderRunByRequestKey, getTodaySpendUsd, recordProviderRun, reserveSerperProviderRun, updateProviderRun } from "@/infrastructure/neon/repositories/provider-runs";
 import { getAutopilotSettings } from "@/infrastructure/neon/repositories/autopilot";
 import { getEffectiveAutopilotState } from "@/domain/autopilot/types";
 import { getDayBounds } from "@/lib/time/day-bounds";
+import { createProviderRequestKey, currentProviderPlanningWindow, nextProviderPlanningWindowAt, normalizeProviderQuery } from "@/services/discovery/provider-request-key";
 
 export type MapsEngineRole = "maps_fast" | "maps_deep" | "hybrid_fill";
 
@@ -94,21 +95,49 @@ export function createSerpDiscoveryProvider(workspaceId: string, engineType: Eng
   const originalSearch = provider.search.bind(provider);
   provider.search = async (input) => {
     const settings = await getAutopilotSettings(workspaceId);
+    const planningWindow = input.planningWindow ?? currentProviderPlanningWindow();
+    const normalizedQuery = normalizeProviderQuery(input.query);
+    const requestKey = createProviderRequestKey({ workspaceId, campaignId, engineType, provider: "serper", query: normalizedQuery, planningWindow });
+    const existing = await getProviderRunByRequestKey(requestKey);
+    if (existing) {
+      if (existing.status === "budget_blocked") {
+        const retryAt = new Date(String((existing.metadata as Record<string, unknown>).retryAt));
+        throw new ProviderBudgetExceededError(existing.error ?? "Serper daily budget exhausted.", retryAt);
+      }
+      if (existing.status === "failed") throw new ProviderBudgetExceededError(existing.error ?? "Serper request failed in this planning window.", nextProviderPlanningWindowAt());
+      if (existing.status === "starting") throw new ProviderBudgetExceededError("Serper request is already in progress for this planning window.", nextProviderPlanningWindowAt());
+      return { results: [], usage: { calls: 0, items: 0, errors: 0, totalLatencyMs: 0, costUsd: 0, quotaRemaining: null }, providerRunId: existing.id };
+    }
+
+    const reservation = await reserveSerperProviderRun({
+      workspaceId,
+      campaignId,
+      requestKey,
+      seedId: input.seedId,
+      itemsRequested: input.maxResults,
+      costUsd: SERPER_ESTIMATED_COST_PER_QUERY_USD,
+      metadata: { engineType, query: input.query, normalizedQuery, planningWindow },
+    });
+    if (!reservation.created) {
+      if (reservation.providerRun.status === "budget_blocked") {
+        const retryAt = new Date(String((reservation.providerRun.metadata as Record<string, unknown>).retryAt));
+        throw new ProviderBudgetExceededError(reservation.providerRun.error ?? "Serper daily budget exhausted.", retryAt);
+      }
+      if (reservation.providerRun.status === "failed") throw new ProviderBudgetExceededError(reservation.providerRun.error ?? "Serper request failed in this planning window.", nextProviderPlanningWindowAt());
+      if (reservation.providerRun.status === "starting") throw new ProviderBudgetExceededError("Serper request is already in progress for this planning window.", nextProviderPlanningWindowAt());
+      return { results: [], usage: { calls: 0, items: 0, errors: 0, totalLatencyMs: 0, costUsd: 0, quotaRemaining: null }, providerRunId: reservation.providerRun.id };
+    }
+
     const spendToday = await getTodaySpendUsd(workspaceId, "serper", settings.timezone);
-    if (spendToday + SERPER_ESTIMATED_COST_PER_QUERY_USD > env.SERPER_DAILY_COST_LIMIT_USD) {
+    if (spendToday > env.SERPER_DAILY_COST_LIMIT_USD) {
       const { end: retryAt } = getDayBounds(settings.timezone);
       const message = `Serper daily budget exhausted; retrying after ${retryAt.toISOString()}.`;
-      await recordProviderRun({
-        workspaceId,
-        campaignId,
-        provider: "serper",
-        operation: "search",
+      await updateProviderRun(reservation.providerRun.id, {
         status: "budget_blocked",
-        itemsRequested: input.maxResults,
-        itemsReturned: 0,
         costUsd: 0,
+        finishedAt: new Date(),
         error: message,
-        metadata: { engineType, query: input.query, budgetBlocked: true, retryAt: retryAt.toISOString() },
+        metadata: { engineType, query: input.query, normalizedQuery, planningWindow, retryAt: retryAt.toISOString(), budgetBlocked: true },
       });
       throw new ProviderBudgetExceededError(message, retryAt);
     }
@@ -117,33 +146,25 @@ export function createSerpDiscoveryProvider(workspaceId: string, engineType: Eng
     try {
       output = await originalSearch(input);
     } catch (error) {
-      await recordProviderRun({
-        workspaceId,
-        campaignId,
-        provider: "serper",
-        operation: "search",
+      await updateProviderRun(reservation.providerRun.id, {
         status: "failed",
-        itemsRequested: input.maxResults,
         itemsReturned: 0,
         costUsd: 0,
+        finishedAt: new Date(),
         error: error instanceof Error ? error.message : String(error),
-        metadata: { engineType, query: input.query },
+        metadata: { engineType, query: input.query, normalizedQuery, planningWindow },
       });
       throw error;
     }
 
-    if (output.usage.calls > 0) await recordProviderRun({
-      workspaceId,
-      campaignId,
-      provider: "serper",
-      operation: "search",
+    await updateProviderRun(reservation.providerRun.id, {
       status: "completed",
-      itemsRequested: input.maxResults,
       itemsReturned: output.results.length,
       costUsd: output.usage.costUsd,
-      metadata: { engineType, query: input.query },
+      finishedAt: new Date(),
+      metadata: { engineType, query: input.query, normalizedQuery, planningWindow },
     });
-    return output;
+    return { ...output, providerRunId: reservation.providerRun.id };
   };
   return provider;
 }

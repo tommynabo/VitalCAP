@@ -53,6 +53,10 @@ export async function runWatchdogCronTick(): Promise<WatchdogCronResult> {
   const providerRunsHeal = await db.execute(sql`
     UPDATE provider_runs 
     SET 
+      finished_at = CASE
+        WHEN status = 'starting' AND external_run_id IS NULL THEN COALESCE(finished_at, NOW())
+        ELSE finished_at
+      END,
       status = CASE 
         WHEN status = 'starting' AND external_run_id IS NULL THEN 'failed'
         WHEN status = 'succeeded' THEN 'succeeded'
