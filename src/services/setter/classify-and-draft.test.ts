@@ -87,6 +87,35 @@ describe("classifyAndDraft", () => {
     expect(result.draft.riskFlags).toContain("invalid_llm_output");
   });
 
+  it("preserves the reply for human review when the provider fails", async () => {
+    const provider: LLMProvider = {
+      providerName: "failed",
+      classifyAndDraft: async () => {
+        throw new Error("provider unavailable");
+      },
+    };
+    const result = await classifyAndDraft(provider, contextFixture());
+    expect(result.draft.branch).toBe("HUMAN_REQUIRED");
+    expect(result.draft.needsHuman).toBe(true);
+    expect(result.draft.riskFlags).toContain("provider_failure");
+    expect(result.draft.reasonForHuman).toContain("provider unavailable");
+  });
+
+  it.each([
+    { failureCode: "rate_limit", error: Object.assign(new Error("rate limited"), { status: 429 }) },
+    { failureCode: "timeout", error: Object.assign(new Error("timed out"), { name: "APIConnectionTimeoutError" }) },
+    { failureCode: "budget_limit", error: new Error("Daily budget limit reached") },
+  ])("routes $failureCode failures to human review", async ({ failureCode, error }) => {
+    const provider: LLMProvider = {
+      providerName: "failed",
+      classifyAndDraft: async () => { throw error; },
+    };
+    const result = await classifyAndDraft(provider, contextFixture());
+    expect(result.draft.branch).toBe("HUMAN_REQUIRED");
+    expect(result.draft.riskFlags).toContain(failureCode);
+    expect(result.draft.providerMetadata?.failureCode).toBe(failureCode);
+  });
+
   it("applies guardrails to a valid but risky draft", async () => {
     const risky: SetterClassificationOutput = { ...validOutput(), draft: "Este producto cura la fatiga crónica." };
     const provider = new QueuedFakeProvider([risky]);

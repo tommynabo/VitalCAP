@@ -13,6 +13,23 @@ import type { SetterPromptContext } from "@/domain/providers/types";
  */
 const MAX_RECENT_MESSAGES = 10;
 const MAX_RECENT_FEEDBACK_NOTES = 5;
+const MAX_MESSAGE_CHARS = 2_000;
+const MAX_FIELD_CHARS = 1_200;
+
+function limitValue(value: unknown, depth = 0): unknown {
+  if (typeof value === "string") return value.slice(0, MAX_FIELD_CHARS);
+  if (Array.isArray(value)) return value.slice(0, 10).map((item) => limitValue(item, depth + 1));
+  if (!value || typeof value !== "object" || depth >= 2) return value;
+  return Object.fromEntries(Object.entries(value).slice(0, 20).map(([key, item]) => [key.slice(0, 80), limitValue(item, depth + 1)]));
+}
+
+function limitStringRecord(value: Record<string, unknown>): Record<string, unknown> {
+  return limitValue(value) as Record<string, unknown>;
+}
+
+function limitStringMap(value: Record<string, string>): Record<string, string> {
+  return Object.fromEntries(Object.entries(value).slice(0, 20).map(([key, item]) => [key.slice(0, 80), item.slice(0, MAX_FIELD_CHARS)]));
+}
 
 export interface BuildSetterContextInput {
   offer: Offer;
@@ -29,34 +46,34 @@ export interface BuildSetterContextInput {
 export function buildSetterContext(input: BuildSetterContextInput): SetterPromptContext {
   const recentMessages = input.conversationMessages
     .slice(-MAX_RECENT_MESSAGES)
-    .map((message) => ({ direction: message.direction, body: message.body }));
+    .map((message) => ({ direction: message.direction, body: message.body.slice(0, MAX_MESSAGE_CHARS) }));
 
   const recentFeedbackNotes = input.recentFeedback
     .slice(-MAX_RECENT_FEEDBACK_NOTES)
-    .map((feedback) => feedback.note)
+    .map((feedback) => feedback.note?.slice(0, MAX_FIELD_CHARS))
     .filter((note): note is string => Boolean(note));
 
   return {
     language: input.language,
     offer: {
-      company: input.offer.company,
-      description: input.offer.description,
-      primaryCta: input.offer.primaryCta,
-      bookingUrl: input.offer.bookingUrl,
-      approvedCommercialFacts: input.offer.approvedCommercialFacts,
-      approvedProductFacts: input.offer.approvedProductFacts,
-      approvedClaims: input.offer.approvedClaims,
-      forbiddenClaims: input.offer.forbiddenClaims,
-      faq: input.offer.faq,
-      objectionGuidance: input.offer.objectionGuidance,
-      toneConfig: input.offer.toneConfig,
+      company: input.offer.company.slice(0, MAX_FIELD_CHARS),
+      description: input.offer.description.slice(0, MAX_MESSAGE_CHARS),
+      primaryCta: input.offer.primaryCta.slice(0, MAX_FIELD_CHARS),
+      bookingUrl: input.offer.bookingUrl.slice(0, MAX_FIELD_CHARS),
+      approvedCommercialFacts: limitStringRecord(input.offer.approvedCommercialFacts),
+      approvedProductFacts: limitStringRecord(input.offer.approvedProductFacts),
+      approvedClaims: input.offer.approvedClaims.slice(0, 20).map((claim) => claim.slice(0, MAX_FIELD_CHARS)),
+      forbiddenClaims: input.offer.forbiddenClaims.slice(0, 20).map((claim) => claim.slice(0, MAX_FIELD_CHARS)),
+      faq: input.offer.faq.slice(0, 10).map((item) => ({ question: item.question.slice(0, MAX_FIELD_CHARS), answer: item.answer.slice(0, MAX_MESSAGE_CHARS) })),
+      objectionGuidance: limitStringMap(input.offer.objectionGuidance),
+      toneConfig: limitStringRecord(input.offer.toneConfig),
     },
-    account: { name: input.account.canonicalName, businessType: input.account.businessType },
-    contact: input.contact ? { roleType: input.contact.roleType, firstName: input.contact.firstName } : null,
-    discoverySource: input.discoverySource,
+    account: { name: input.account.canonicalName.slice(0, MAX_FIELD_CHARS), businessType: input.account.businessType },
+    contact: input.contact ? { roleType: input.contact.roleType, firstName: input.contact.firstName?.slice(0, MAX_FIELD_CHARS) ?? null } : null,
+    discoverySource: input.discoverySource?.slice(0, MAX_FIELD_CHARS) ?? null,
     recentMessages,
     recentFeedbackNotes,
-    latestIncomingMessage: input.latestIncomingMessage,
+    latestIncomingMessage: input.latestIncomingMessage.slice(0, MAX_MESSAGE_CHARS),
     isRepairAttempt: input.isRepairAttempt ?? false,
   };
 }
