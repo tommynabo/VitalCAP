@@ -43,6 +43,8 @@ import { getAutopilotPacingMetrics } from "@/infrastructure/neon/repositories/au
 import {
   getProviderRows,
   getEmailVerificationUsage,
+  getEmailVerificationMetrics,
+  type EmailVerificationMetrics,
   getQueueHealth,
   getDeadLetterSamples,
   getCronLastRunAt,
@@ -213,6 +215,23 @@ export async function getEmailVerificationUsageData(): Promise<ProviderUsageStat
   if (isDevSeedMode()) return seed.seedEmailVerificationUsage;
   const workspaceId = await getCurrentWorkspaceId();
   return getEmailVerificationUsage(workspaceId);
+}
+
+export async function getEmailVerificationMetricsData(): Promise<EmailVerificationMetrics> {
+  if (isDevSeedMode()) {
+    const contactPoints = seed.seedAccountBundles.flatMap((bundle) => bundle.contactPoints).filter((point) => point.type === "email");
+    const count = (statuses: readonly string[]) => contactPoints.filter((point) => statuses.includes(point.verificationStatus)).length;
+    return {
+      unverified: count(["unverified", "unknown"]),
+      valid: count(["valid"]),
+      catchAll: count(["catch_all"]),
+      risky: count(["risky"]),
+      invalid: count(["invalid", "disposable", "bounced"]),
+      blocked: contactPoints.filter((point) => ["invalid", "disposable", "bounced"].includes(point.verificationStatus) || ["opted_out", "blocked"].includes(point.channelEligibility)).length,
+      ready: seed.seedAccountBundles.filter((bundle) => bundle.account.status === "outreach_ready").length,
+    };
+  }
+  return getEmailVerificationMetrics(await getCurrentWorkspaceId());
 }
 
 export async function getSearchSeeds(): Promise<SearchSeed[]> {

@@ -80,6 +80,7 @@ export interface ProcessingContext {
   verificationCacheStore: EmailVerificationCacheStore;
   now: Date;
   verificationPolicy?: VerificationAcceptancePolicy;
+  deferVerification?: boolean;
   /** Default off (§2.9) — LinkedIn never guesses a personal email pattern unless a campaign explicitly opts in, and even then this pipeline still only reports it, never invents a source. */
   allowExperimentalEmailGuessing?: boolean;
 }
@@ -270,12 +271,14 @@ export async function processRawCandidate(
   // degrades to `unverified` (unacceptable under the default policy) so the
   // candidate is simply not marked ready, never lost and never guessed valid.
   let outcomes: Awaited<ReturnType<typeof verifyEmailsWithCache>>["outcomes"] = [];
-  try {
-    outcomes = (
-      await verifyEmailsWithCache(context.verificationProvider, uniqueEmails.map((e) => e.email), context.verificationCacheStore, context.now)
-    ).outcomes;
-  } catch {
-    outcomes = [];
+  if (!context.deferVerification) {
+    try {
+      outcomes = (
+        await verifyEmailsWithCache(context.verificationProvider, uniqueEmails.map((e) => e.email), context.verificationCacheStore, context.now)
+      ).outcomes;
+    } catch {
+      outcomes = [];
+    }
   }
   const verificationByEmail = new Map(outcomes.map((o) => [o.email, o]));
 
@@ -308,7 +311,12 @@ export async function processRawCandidate(
 
   let rejectionReason: string | null = null;
   if (spainResult.verdict === "needs_review") rejectionReason = "Awaiting Spain eligibility review";
-  else if (!hasAcceptableContact) rejectionReason = "No acceptable contact point found";
+  else if (!hasAcceptableContact) {
+    if (contactPoints.length === 0) rejectionReason = "no_email";
+    else if (contactPoints.every((cp) => cp.verificationStatus === "unverified" || cp.verificationStatus === "unknown")) rejectionReason = "unverified";
+    else if (contactPoints.every((cp) => cp.verificationStatus === "invalid" || cp.verificationStatus === "disposable" || cp.verificationStatus === "bounced")) rejectionReason = "invalid";
+    else rejectionReason = "risky";
+  }
 
   return {
     engineType,

@@ -78,12 +78,26 @@
       "when": 1791000000000,
       "tag": "0013_global_deduplication",
       "breakpoints": true
-        },
-        {
+    },
+    {
       "idx": 11,
       "version": "7",
       "when": 1791018958798,
       "tag": "0014_setter_runtime",
+      "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "7",
+      "when": 1791030948409,
+      "tag": "0015_email_verification_pipeline",
+      "breakpoints": true
+    },
+    {
+      "idx": 13,
+      "version": "7",
+      "when": 1791031588268,
+      "tag": "0016_email_verification_cache_version",
       "breakpoints": true
     }
   ]

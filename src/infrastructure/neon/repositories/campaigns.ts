@@ -171,7 +171,10 @@ export async function upsertCampaignMembership(input: UpsertCampaignMembershipIn
       contact_id = coalesce(EXCLUDED.contact_id, campaign_memberships.contact_id),
       selected_contact_point_id = coalesce(EXCLUDED.selected_contact_point_id, campaign_memberships.selected_contact_point_id),
       ready_at = coalesce(EXCLUDED.ready_at, campaign_memberships.ready_at),
-      rejection_reason = CASE WHEN ${input.stage} = 'rejected' THEN EXCLUDED.rejection_reason ELSE campaign_memberships.rejection_reason END,
+      rejection_reason = CASE
+        WHEN campaign_memberships.stage = 'ready' AND ${input.stage} IN ('qualified', 'contact_selected') THEN campaign_memberships.rejection_reason
+        ELSE EXCLUDED.rejection_reason
+      END,
       qualified_at = CASE
         WHEN campaign_memberships.qualified_at IS NOT NULL THEN campaign_memberships.qualified_at
         WHEN ${isQualifiedOrLater} THEN NOW()

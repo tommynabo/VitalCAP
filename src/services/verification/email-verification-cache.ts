@@ -64,7 +64,7 @@ export async function verifyEmailsWithCache(
   }
 
   const { outcomes, usage } = await provider.verifyBatch(toVerify);
-  const newlyCached: CachedVerification[] = outcomes.map((outcome) => ({
+  const newlyCached: CachedVerification[] = outcomes.filter((outcome) => !outcome.retryable).map((outcome) => ({
     ...outcome,
     expiresAt: new Date(now.getTime() + ttlMs).toISOString(),
   }));
@@ -72,5 +72,8 @@ export async function verifyEmailsWithCache(
     await store.set(entry.email, entry);
   }
 
-  return { outcomes: [...fresh, ...newlyCached], usage, cacheHits: fresh.length };
+  const retryableOutcomes: CachedVerification[] = outcomes
+    .filter((outcome) => outcome.retryable)
+    .map((outcome) => ({ ...outcome, expiresAt: now.toISOString() }));
+  return { outcomes: [...fresh, ...retryableOutcomes, ...newlyCached], usage, cacheHits: fresh.length };
 }

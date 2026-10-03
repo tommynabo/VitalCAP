@@ -107,7 +107,7 @@ export default async function InfrastructurePage() {
             <div>
               <p className="text-sm font-medium text-text">Email verification quota</p>
               <p className="text-xs text-text-muted">
-                {seedEmailVerificationUsage.items} verified this month · {seedEmailVerificationUsage.errors} errors
+                {seedEmailVerificationUsage.calls} calls · {seedEmailVerificationUsage.items} items · {seedEmailVerificationUsage.errors} errors · ${seedEmailVerificationUsage.costUsd.toFixed(2)} estimated · {Math.round(seedEmailVerificationUsage.totalLatencyMs)} ms aggregate latency
               </p>
             </div>
             <Badge
