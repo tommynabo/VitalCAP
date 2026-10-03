@@ -1,8 +1,14 @@
 # services/verification
 
-`acceptance-policy.ts` implemented in Phase 1 (Prompt 1 §1.6):
-campaign-configurable `isContactPointAcceptable` check against the abstract
-`VerificationStatus` set — no provider-specific assumptions.
+Candidate processing persists discovered contact points and enqueues durable
+verification jobs; it does not wait on provider requests. The verification
+cron claims jobs, uses the workspace/provider/version-scoped cache, persists
+the current verdict and append-only evidence, then reevaluates compliance.
+Transient provider failures are deferred with backoff; `unknown` stays
+ineligible and is rechecked after its short cache window.
 
-The email verification **provider adapter** itself (batching, TTL caching,
-cost/result tracking) is Phase 2 (Prompt 2 §2.7) and is not implemented yet.
+`evaluateContactEligibility` is the central endpoint policy. Only `valid` is
+eligible by default. `catch_all` requires `EMAIL_VERIFICATION_ALLOW_CATCH_ALL=true`;
+`risky`, invalid, disposable, bounced, unknown, and unverified endpoints are
+not ready. Compliance, suppression, and account-level outreach dedup remain
+separate additional gates.

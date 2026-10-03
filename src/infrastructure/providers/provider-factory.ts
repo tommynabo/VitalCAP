@@ -7,7 +7,7 @@ import { ApifyMapsDiscoveryProvider } from "./maps/apify-provider";
 import { MockSerpDiscoveryProvider } from "./serp/mock-provider";
 import { SerperDiscoveryProvider, SERPER_ESTIMATED_COST_PER_QUERY_USD } from "./serp/serper-provider";
 import { MockEmailVerificationProvider } from "./email-verification/mock-provider";
-import { MillionVerifierEmailVerificationProvider } from "./email-verification/millionverifier-provider";
+import { MillionVerifierEmailVerificationProvider, MILLIONVERIFIER_ESTIMATED_COST_PER_EMAIL_USD } from "./email-verification/millionverifier-provider";
 import { getProviderRunByRequestKey, getTodaySpendUsd, recordProviderRun, reserveSerperProviderRun, updateProviderRun } from "@/infrastructure/neon/repositories/provider-runs";
 import { getAutopilotSettings } from "@/infrastructure/neon/repositories/autopilot";
 import { getEffectiveAutopilotState } from "@/domain/autopilot/types";
@@ -181,16 +181,48 @@ export function createEmailVerificationProvider(workspaceId: string): EmailVerif
   const provider = new MillionVerifierEmailVerificationProvider({ apiKey: env.MILLIONVERIFIER_API_KEY });
   const originalVerifyBatch = provider.verifyBatch.bind(provider);
   provider.verifyBatch = async (emails) => {
+    const settings = await getAutopilotSettings(workspaceId);
+    const spendToday = await getTodaySpendUsd(workspaceId, "email_verification", settings.timezone);
+    const estimatedCost = emails.length * MILLIONVERIFIER_ESTIMATED_COST_PER_EMAIL_USD;
+    if (spendToday + estimatedCost > env.EMAIL_VERIFICATION_DAILY_COST_LIMIT_USD) {
+      const { end: retryAt } = getDayBounds(settings.timezone);
+      const message = `Email verification daily cost limit reached; retrying after ${retryAt.toISOString()}.`;
+      await recordProviderRun({
+        workspaceId,
+        provider: "email_verification",
+        operation: "verifyBatch",
+        status: "budget_blocked",
+        itemsRequested: emails.length,
+        itemsReturned: 0,
+        costUsd: 0,
+        error: message,
+        metadata: { errors: 0, estimatedCostUsd: estimatedCost, dailyCostLimitUsd: env.EMAIL_VERIFICATION_DAILY_COST_LIMIT_USD },
+      });
+      throw new ProviderBudgetExceededError(message, retryAt);
+    }
+
     const output = await originalVerifyBatch(emails);
-    void recordProviderRun({
-      workspaceId,
-      provider: "email_verification",
-      operation: "verifyBatch",
-      status: "completed",
-      itemsRequested: emails.length,
-      itemsReturned: output.outcomes.length,
-      costUsd: output.usage.costUsd,
-    });
+    try {
+      await recordProviderRun({
+        workspaceId,
+        provider: "email_verification",
+        operation: "verifyBatch",
+        status: output.usage.errors > 0 ? "failed" : "completed",
+        itemsRequested: emails.length,
+        itemsReturned: output.outcomes.length,
+        costUsd: output.usage.costUsd,
+        error: output.usage.errors > 0 ? `${output.usage.errors} verification request(s) failed.` : null,
+        metadata: {
+          calls: output.usage.calls,
+          items: output.usage.items,
+          errors: output.usage.errors,
+          totalLatencyMs: output.usage.totalLatencyMs,
+          quotaRemaining: output.usage.quotaRemaining,
+        },
+      });
+    } catch {
+      // Metrics persistence must not cause a successful paid verification to be retried.
+    }
     return output;
   };
   return provider;

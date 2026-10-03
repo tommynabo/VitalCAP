@@ -1,32 +1,17 @@
-import { NextResponse } from "next/server";
-import { getCoreEnv } from "@/lib/config/env";
+import type { NextRequest } from "next/server";
 import { runVerificationCronTick, enqueueVerificationJobs } from "@/infrastructure/jobs/runners/verification-runner";
+import { isAuthorizedCronRequest, unauthorizedCronResponse, runCronRoute } from "../_lib/cron-http";
 
-export async function GET(request: Request) {
-  try {
-    const env = getCoreEnv();
-    const url = new URL(request.url);
-    const secret = url.searchParams.get("secret");
+export const dynamic = "force-dynamic";
 
-    if (env.APP_ENV === "production" && secret !== env.CRON_SECRET) {
-      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-    }
-
-    // 1. Enqueue new jobs for analyzed-qualified accounts
+export async function GET(request: NextRequest) {
+  if (!isAuthorizedCronRequest(request)) return unauthorizedCronResponse();
+  return runCronRoute("verification", async () => {
     const enqueued = await enqueueVerificationJobs();
-
-    // 2. Process pending jobs
-    // We pass 50 as a bounded batch size per tick
     const result = await runVerificationCronTick(50);
-
-    return NextResponse.json({
-      success: true,
-      enqueued,
-      jobsClaimed: result.jobsClaimed,
-      emailsVerified: result.emailsVerified,
-    });
-  } catch (error) {
-    console.error("Verification cron error:", error);
-    return NextResponse.json({ error: "Internal Server Error" }, { status: 500 });
-  }
+    return {
+      itemsProcessed: result.jobsClaimed,
+      metadata: { enqueued, jobsClaimed: result.jobsClaimed, emailsVerified: result.emailsVerified },
+    };
+  });
 }

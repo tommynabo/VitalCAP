@@ -131,6 +131,8 @@ export function getSerperEnv() {
 const verificationEnvSchema = z.object({
   EMAIL_VERIFICATION_PROVIDER: z.enum(["millionverifier", "disabled", "mock"]).default("disabled"),
   MILLIONVERIFIER_API_KEY: z.string().optional(),
+  EMAIL_VERIFICATION_ALLOW_CATCH_ALL: z.enum(["true", "false"]).default("false").transform((value) => value === "true"),
+  EMAIL_VERIFICATION_DAILY_COST_LIMIT_USD: z.coerce.number().nonnegative().default(1),
 });
 let cachedVerificationEnv: z.infer<typeof verificationEnvSchema> | null = null;
 export function getVerificationEnv() {
@@ -138,6 +140,8 @@ export function getVerificationEnv() {
   cachedVerificationEnv = verificationEnvSchema.parse({
     EMAIL_VERIFICATION_PROVIDER: process.env.EMAIL_VERIFICATION_PROVIDER,
     MILLIONVERIFIER_API_KEY: optionalEnvValue(process.env.MILLIONVERIFIER_API_KEY),
+    EMAIL_VERIFICATION_ALLOW_CATCH_ALL: optionalEnvValue(process.env.EMAIL_VERIFICATION_ALLOW_CATCH_ALL),
+    EMAIL_VERIFICATION_DAILY_COST_LIMIT_USD: optionalEnvValue(process.env.EMAIL_VERIFICATION_DAILY_COST_LIMIT_USD),
   });
   return cachedVerificationEnv;
 }

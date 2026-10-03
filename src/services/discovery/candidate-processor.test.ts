@@ -84,6 +84,47 @@ describe("processRawCandidate — maps candidates", () => {
     expect(result.readyForOutreach).toBe(true);
   });
 
+  it("defers email verification without blocking processing or marking the candidate ready", async () => {
+    let verificationCalls = 0;
+    const result = await processRawCandidate(
+      {
+        kind: "maps",
+        place: {
+          externalPlaceId: "deferred-verification",
+          name: "Farmacia Deferred",
+          category: "farmacia",
+          address: "Calle Mayor 1",
+          postalCode: "28001",
+          province: "Madrid",
+          city: "Madrid",
+          countryCode: "ES",
+          websiteUrl: "https://farmaciadeferred.es",
+          phone: null,
+          latitude: null,
+          longitude: null,
+          rating: null,
+          reviewCount: null,
+          sourceUrl: null,
+        },
+      },
+      "maps_fast",
+      baseContext({
+        deferVerification: true,
+        verificationProvider: {
+          providerName: "fake",
+          verifyBatch: async () => {
+            verificationCalls += 1;
+            return { outcomes: [], usage: { calls: 1, items: 1, errors: 0, totalLatencyMs: 0, costUsd: 0, quotaRemaining: null } };
+          },
+        },
+      }),
+    );
+
+    expect(verificationCalls).toBe(0);
+    expect(result.contactPoints[0]?.verificationStatus).toBe("unverified");
+    expect(result.readyForOutreach).toBe(false);
+  });
+
   it.each([
     ["Farmacia del Pueblo", "farmacia", "09314", "Burgos"],
     ["Herbolaria Sierra Verde", "herbolaria", "10849", "Cáceres"],
@@ -431,6 +472,6 @@ describe("processRawCandidate — verification provider outage (Prompt 6 §6.1 F
     const result = await processRawCandidate(payload, "maps_fast", baseContext({ verificationProvider: outage }));
     expect(result.readyForOutreach).toBe(false);
     expect(result.contactPoints.every((cp) => cp.verificationStatus === "unverified" && !cp.acceptable)).toBe(true);
-    expect(result.rejectionReason).toBe("No acceptable contact point found");
+    expect(result.rejectionReason).toBe("unverified");
   });
 });

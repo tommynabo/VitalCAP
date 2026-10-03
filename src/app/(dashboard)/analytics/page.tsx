@@ -7,6 +7,7 @@ import {
   getConversations,
   getMeetings,
   getOutreachQueueItems,
+  getEmailVerificationMetricsData,
 } from "@/lib/data/repository";
 
 const ENGINE_LABELS: Record<string, string> = {
@@ -59,12 +60,13 @@ function BreakdownTable({ title, rows }: { title: string; rows: Array<{ label: s
 }
 
 export default async function AnalyticsPage() {
-  const [seedAccountBundles, seedCampaigns, seedConversations, seedMeetings, seedOutreachQueueItems] = await Promise.all([
+  const [seedAccountBundles, seedCampaigns, seedConversations, seedMeetings, seedOutreachQueueItems, verificationMetrics] = await Promise.all([
     getAccountBundles(),
     getCampaigns(),
     getConversations(),
     getMeetings(),
     getOutreachQueueItems(),
+    getEmailVerificationMetricsData(),
   ]);
 
   const accounts = seedAccountBundles.map((b) => b.account);
@@ -130,6 +132,28 @@ export default async function AnalyticsPage() {
         <Badge variant="neutral">Enrichment yield {enrichmentYield}%</Badge>
         <Badge variant="neutral">Verification yield {verificationYield}%</Badge>
       </div>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>Email verification</CardTitle>
+        </CardHeader>
+        <CardContent className="grid grid-cols-2 gap-4 text-sm sm:grid-cols-4 lg:grid-cols-7">
+          {[
+            ["Unverified", verificationMetrics.unverified],
+            ["Valid", verificationMetrics.valid],
+            ["Catch-all", verificationMetrics.catchAll],
+            ["Risky", verificationMetrics.risky],
+            ["Invalid", verificationMetrics.invalid],
+            ["Blocked", verificationMetrics.blocked],
+            ["Ready", verificationMetrics.ready],
+          ].map(([label, value]) => (
+            <div key={label}>
+              <p className="text-xs text-text-muted">{label}</p>
+              <p className="text-lg font-semibold text-text">{value}</p>
+            </div>
+          ))}
+        </CardContent>
+      </Card>
 
       <Card>
         <CardHeader>

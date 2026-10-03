@@ -420,6 +420,7 @@ export interface InsertContactPointInput {
   priorityScore: number;
   verificationStatus: VerificationStatus;
   verificationProvider: string | null;
+  verificationCheckedAt?: Date | null;
   sourceUrl: string | null;
   sourceType: string | null;
 }
@@ -469,7 +470,7 @@ export async function insertContactPoint(input: InsertContactPointInput): Promis
       priorityScore: input.priorityScore,
       verificationStatus: input.verificationStatus,
       verificationProvider: input.verificationProvider,
-      verificationCheckedAt: new Date(),
+      verificationCheckedAt: input.verificationCheckedAt ?? (input.verificationStatus === "unverified" ? null : new Date()),
       channelEligibility: "unknown",
       sourceUrl: input.sourceUrl,
       sourceType: input.sourceType,
@@ -477,5 +478,16 @@ export async function insertContactPoint(input: InsertContactPointInput): Promis
     })
     .onConflictDoNothing({ target: [contactPoints.workspaceId, contactPoints.accountId, contactPoints.type, contactPoints.normalizedValue] })
     .returning({ id: contactPoints.id });
-  return row?.id ?? "";
+  if (row) return row.id;
+
+  const [existing] = await db.select({ id: contactPoints.id })
+    .from(contactPoints)
+    .where(and(
+      eq(contactPoints.workspaceId, input.workspaceId),
+      eq(contactPoints.accountId, input.accountId),
+      eq(contactPoints.type, input.type),
+      eq(contactPoints.normalizedValue, input.normalizedValue),
+    ))
+    .limit(1);
+  return existing?.id ?? "";
 }

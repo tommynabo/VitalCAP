@@ -2,7 +2,9 @@ import { and, desc, eq, sql, isNotNull } from "drizzle-orm";
 import { getDb } from "../db";
 import { discoveryJobs, processingJobs } from "../schema/discovery";
 import { outreachQueue, outreachEvents, deadLetterJobs } from "../schema/outreach";
-import { campaigns } from "../schema/campaigns";
+import { campaignMemberships, campaigns } from "../schema/campaigns";
+import { contactPoints } from "../schema/contacts";
+import { complianceDecisions } from "../schema/compliance";
 import { autopilotSettings } from "../schema/autopilot";
 import { providerRuns } from "../schema/providers";
 import { cronRuns } from "../schema/jobs-meta";
@@ -83,9 +85,10 @@ export async function getEmailVerificationUsage(workspaceId: string): Promise<Pr
   const db = getDb();
   const [row] = await db
     .select({
-      calls: sql<number>`coalesce(sum(${providerRuns.itemsRequested}), 0)`,
-      items: sql<number>`coalesce(sum(${providerRuns.itemsReturned}), 0)`,
-      errors: sql<number>`coalesce(count(*) filter (where ${providerRuns.status} = 'failed'), 0)`,
+      calls: sql<number>`coalesce(sum(coalesce((${providerRuns.metadata} ->> 'calls')::int, ${providerRuns.itemsRequested})), 0)`,
+      items: sql<number>`coalesce(sum(coalesce((${providerRuns.metadata} ->> 'items')::int, ${providerRuns.itemsReturned})), 0)`,
+      errors: sql<number>`coalesce(sum(coalesce((${providerRuns.metadata} ->> 'errors')::int, 0)), 0)`,
+      totalLatencyMs: sql<number>`coalesce(sum(coalesce((${providerRuns.metadata} ->> 'totalLatencyMs')::int, 0)), 0)`,
       costUsd: sql<number>`coalesce(sum(${providerRuns.costUsd}), 0)`,
     })
     .from(providerRuns)
@@ -95,9 +98,52 @@ export async function getEmailVerificationUsage(workspaceId: string): Promise<Pr
     calls: row?.calls ?? 0,
     items: row?.items ?? 0,
     errors: row?.errors ?? 0,
-    totalLatencyMs: 0,
+    totalLatencyMs: row?.totalLatencyMs ?? 0,
     costUsd: row?.costUsd ?? 0,
     quotaRemaining: null,
+  };
+}
+
+export interface EmailVerificationMetrics {
+  unverified: number;
+  valid: number;
+  catchAll: number;
+  risky: number;
+  invalid: number;
+  blocked: number;
+  ready: number;
+}
+
+export async function getEmailVerificationMetrics(workspaceId: string): Promise<EmailVerificationMetrics> {
+  const db = getDb();
+  const [contactCounts, readyCount] = await Promise.all([
+    db.select({
+      unverified: sql<number>`count(*) filter (where ${contactPoints.type} = 'email' and ${contactPoints.verificationStatus} in ('unverified', 'unknown'))`,
+      valid: sql<number>`count(*) filter (where ${contactPoints.type} = 'email' and ${contactPoints.verificationStatus} = 'valid')`,
+      catchAll: sql<number>`count(*) filter (where ${contactPoints.type} = 'email' and ${contactPoints.verificationStatus} = 'catch_all')`,
+      risky: sql<number>`count(*) filter (where ${contactPoints.type} = 'email' and ${contactPoints.verificationStatus} = 'risky')`,
+      invalid: sql<number>`count(*) filter (where ${contactPoints.type} = 'email' and ${contactPoints.verificationStatus} in ('invalid', 'disposable', 'bounced'))`,
+      blocked: sql<number>`count(distinct ${contactPoints.id}) filter (where ${contactPoints.type} = 'email' and (${contactPoints.verificationStatus} in ('invalid', 'disposable', 'bounced') or ${contactPoints.channelEligibility} in ('opted_out', 'blocked') or ${complianceDecisions.decision} = 'blocked'))`,
+    }).from(contactPoints)
+      .leftJoin(complianceDecisions, and(
+        eq(complianceDecisions.contactPointId, contactPoints.id),
+        sql`superseded_at IS NULL`,
+      ))
+      .where(eq(contactPoints.workspaceId, workspaceId)),
+    db.select({ count: sql<number>`count(distinct ${campaignMemberships.accountId})` })
+      .from(campaignMemberships)
+      .innerJoin(campaigns, eq(campaignMemberships.campaignId, campaigns.id))
+      .where(and(eq(campaigns.workspaceId, workspaceId), eq(campaignMemberships.stage, "ready"))),
+  ]);
+
+  return {
+    unverified: contactCounts[0]?.unverified ?? 0,
+    valid: contactCounts[0]?.valid ?? 0,
+    catchAll: contactCounts[0]?.catchAll ?? 0,
+    risky: contactCounts[0]?.risky ?? 0,
+    invalid: contactCounts[0]?.invalid ?? 0,
+    blocked: contactCounts[0]?.blocked ?? 0,
+    ready: readyCount[0]?.count ?? 0,
   };
 }
 
