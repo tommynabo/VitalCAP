@@ -18,6 +18,15 @@ export interface SetterReviewItem {
   draft: SetterDraft;
 }
 
+export interface SetterWebhookEventSummary {
+  id: string;
+  status: string;
+  duplicateAttempts: number;
+  errorCode: string | null;
+  receivedAt: string;
+  processedAt: string | null;
+}
+
 async function resolveInboundContext(event: InboundEmailReply): Promise<{
   context: SetterInboundContext;
   campaignId: string;
@@ -230,7 +239,20 @@ export const neonSetterInboundRuntimeStore: SetterInboundRuntimeStore = {
       payloadHash,
       metadata: { eventType: "email_replied", providerCampaignId: event.providerCampaignId },
     }).onConflictDoNothing().returning({ id: schema.setterWebhookEvents.id });
-    return Boolean(claimed);
+    if (claimed) return true;
+
+    await db.update(schema.setterWebhookEvents).set({
+      metadata: sql`jsonb_set(
+        ${schema.setterWebhookEvents.metadata},
+        '{duplicateAttempts}',
+        to_jsonb(coalesce((${schema.setterWebhookEvents.metadata}->>'duplicateAttempts')::int, 0) + 1),
+        true
+      )`,
+    }).where(and(
+      eq(schema.setterWebhookEvents.provider, "instantly"),
+      eq(schema.setterWebhookEvents.providerEventId, event.providerEventId),
+    ));
+    return false;
   },
 
   async persistIncomingReply(event, payloadHash) {
@@ -353,6 +375,27 @@ export async function getSetterReviewItem(workspaceId: string, draftId: string):
     .limit(1);
   if (!row) return null;
   return { draft: toDraft(row.draft), message: toMessage(row.message), conversation: toConversation(row.conversation) };
+}
+
+export async function listSetterWebhookEvents(workspaceId: string): Promise<SetterWebhookEventSummary[]> {
+  const db = getDb();
+  const rows = await db
+    .select({
+      id: schema.setterWebhookEvents.id,
+      status: schema.setterWebhookEvents.status,
+      duplicateAttempts: sql<number>`coalesce((${schema.setterWebhookEvents.metadata}->>'duplicateAttempts')::int, 0)`,
+      errorCode: schema.setterWebhookEvents.errorCode,
+      receivedAt: schema.setterWebhookEvents.receivedAt,
+      processedAt: schema.setterWebhookEvents.processedAt,
+    })
+    .from(schema.setterWebhookEvents)
+    .where(eq(schema.setterWebhookEvents.workspaceId, workspaceId))
+    .orderBy(desc(schema.setterWebhookEvents.receivedAt));
+  return rows.map((row) => ({
+    ...row,
+    receivedAt: row.receivedAt.toISOString(),
+    processedAt: row.processedAt?.toISOString() ?? null,
+  }));
 }
 
 export async function persistSetterReviewDecision(
