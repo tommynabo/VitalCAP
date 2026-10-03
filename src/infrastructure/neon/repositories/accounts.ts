@@ -1,4 +1,4 @@
-import { and, eq, gte, lte, or } from "drizzle-orm";
+import { and, eq, gte, lte, or, sql } from "drizzle-orm";
 import { getDb, getNeonSql } from "../db";
 import { accounts, accountSources } from "../schema/accounts";
 import { contacts, contactPoints } from "../schema/contacts";
@@ -12,6 +12,67 @@ export interface AccountBundle {
   sources: AccountSource[];
   contacts: Contact[];
   contactPoints: ContactPoint[];
+  intelligence?: AccountIntelligence | null;
+}
+
+export interface AccountIntelligence {
+  fitScore: number | null;
+  fitTier: string | null;
+  confidence: number | null;
+  lastAnalyzedAt: string | null;
+  reasonSummary: string | null;
+  positiveSignals: string[];
+  negativeSignals: string[];
+  missingInformation: string[];
+  riskFlags: string[];
+  evidence: Array<{ id: string; type: string; value: string; sourceUrl: string | null }>;
+}
+
+function safeNumeric(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string" && value.trim() && Number.isFinite(Number(value))) return Number(value);
+  return null;
+}
+
+function safeStringList(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === "string").slice(0, 8)
+    : [];
+}
+
+function mapIntelligence(row: Record<string, unknown>): AccountIntelligence {
+  const analysis = row.analysis_json && typeof row.analysis_json === "object" && !Array.isArray(row.analysis_json)
+    ? row.analysis_json as Record<string, unknown>
+    : {};
+  const evidence = Array.isArray(analysis.evidence)
+    ? analysis.evidence.flatMap((item) => {
+        if (!item || typeof item !== "object" || Array.isArray(item)) return [];
+        const fact = item as Record<string, unknown>;
+        if (typeof fact.id !== "string" || typeof fact.type !== "string" || typeof fact.value !== "string") return [];
+        return [{
+          id: fact.id,
+          type: fact.type,
+          value: fact.value.slice(0, 280),
+          sourceUrl: typeof fact.sourceUrl === "string" ? fact.sourceUrl : null,
+        }];
+      }).slice(0, 12)
+    : [];
+  const completedAt = row.completed_at instanceof Date
+    ? row.completed_at.toISOString()
+    : typeof row.completed_at === "string" ? row.completed_at : null;
+
+  return {
+    fitScore: safeNumeric(row.fit_score),
+    fitTier: typeof row.fit_tier === "string" ? row.fit_tier : null,
+    confidence: safeNumeric(row.confidence),
+    lastAnalyzedAt: completedAt,
+    reasonSummary: typeof analysis.reasonSummary === "string" ? analysis.reasonSummary.slice(0, 280) : null,
+    positiveSignals: safeStringList(analysis.positiveSignals),
+    negativeSignals: safeStringList(analysis.negativeSignals),
+    missingInformation: safeStringList(analysis.missingInformation),
+    riskFlags: safeStringList(analysis.riskFlags),
+    evidence,
+  };
 }
 
 function toAccount(row: typeof accounts.$inferSelect): Account {
@@ -113,7 +174,7 @@ export function toContactPoint(row: typeof contactPoints.$inferSelect): ContactP
  */
 export async function listAccountBundles(workspaceId: string): Promise<AccountBundle[]> {
   const db = getDb();
-  const [accountRows, sourceRows, contactRows, contactPointRows] = await Promise.all([
+  const [accountRows, sourceRows, contactRows, contactPointRows, intelligenceRows] = await Promise.all([
     db.select().from(accounts).where(eq(accounts.workspaceId, workspaceId)),
     db
       .select({ source: accountSources })
@@ -122,7 +183,19 @@ export async function listAccountBundles(workspaceId: string): Promise<AccountBu
       .where(eq(accounts.workspaceId, workspaceId)),
     db.select().from(contacts).where(eq(contacts.workspaceId, workspaceId)),
     db.select().from(contactPoints).where(eq(contactPoints.workspaceId, workspaceId)),
+    db.execute(sql`
+      SELECT DISTINCT ON (account_id)
+        account_id, fit_score, fit_tier, confidence, analysis_json, completed_at
+      FROM prospect_analyses
+      WHERE workspace_id = ${workspaceId}::uuid AND status = 'completed'
+      ORDER BY account_id, completed_at DESC, created_at DESC
+    `),
   ]);
+
+  const intelligenceByAccount = new Map<string, AccountIntelligence>();
+  for (const row of intelligenceRows.rows as Array<Record<string, unknown>>) {
+    if (typeof row.account_id === "string") intelligenceByAccount.set(row.account_id, mapIntelligence(row));
+  }
 
   const sourcesByAccount = new Map<string, AccountSource[]>();
   for (const { source } of sourceRows) {
@@ -155,6 +228,7 @@ export async function listAccountBundles(workspaceId: string): Promise<AccountBu
       sources: sourcesByAccount.get(account.id) ?? [],
       contacts: contactsByAccount.get(account.id) ?? [],
       contactPoints: contactPointsByAccount.get(account.id) ?? [],
+      intelligence: intelligenceByAccount.get(account.id) ?? null,
     };
   });
 }

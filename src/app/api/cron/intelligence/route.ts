@@ -27,19 +27,22 @@ export async function GET(request: NextRequest) {
   if (!cronRun) return NextResponse.json({ error: "Failed to start cron run" }, { status: 500 });
 
   try {
-    const processedCount = await processor.processBatch();
+    const batch = await processor.processBatch();
 
     await db.update(schema.cronRuns)
       .set({
         status: "success",
-        itemsProcessed: processedCount,
+        itemsProcessed: batch.completed,
         finishedAt: new Date(),
       })
       .where(eq(schema.cronRuns.id, cronRun.id));
 
     return NextResponse.json({
       success: true,
-      processed: processedCount,
+      processed: batch.completed,
+      claimed: batch.claimed,
+      deferred: batch.deferred,
+      failed: batch.failed,
     });
   } catch (error: any) {
     await db.update(schema.cronRuns)
