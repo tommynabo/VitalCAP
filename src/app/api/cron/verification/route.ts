@@ -9,10 +9,11 @@ export async function GET(request: NextRequest) {
   return runCronRoute("verification", async () => {
     const backfillMode = request.nextUrl.searchParams.get("backfill");
     const backfillAll = backfillMode === "all";
+    const instantlyBackfillAll = backfillMode !== "48h";
     const createdSince = new Date(Date.now() - 48 * 60 * 60_000);
     const enqueued = await enqueueVerificationJobs(backfillAll ? {} : { createdSince });
     const result = await runVerificationCronTick(50, {
-      ...(backfillAll ? { backfillAll: true } : { createdSince }),
+      ...(instantlyBackfillAll ? { backfillAll: true } : { createdSince }),
     });
     return {
       itemsProcessed: result.jobsClaimed,
@@ -30,7 +31,7 @@ export async function GET(request: NextRequest) {
             }
           : backfillMode === "48h"
             ? { backfillMode: "48h", backfillWindowHours: 48 }
-            : {}),
+            : { instantlyBackfillMode: "all", instantlyBackfillBatchLimit: 500 }),
       },
     };
   });

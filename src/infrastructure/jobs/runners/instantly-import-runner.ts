@@ -314,7 +314,7 @@ export async function runInstantlyImportTick(options: {
     result.leadsQueued = await enqueueCandidates(candidates, env.INSTANTLY_CAMPAIGN_ID, now);
   }
   result.metrics = await readPipelineMetrics();
-  if (!env.INSTANTLY_API_KEY) return result;
+  if (env.EMAIL_DELIVERY_PROVIDER !== "instantly" || !env.INSTANTLY_API_KEY) return result;
 
   const lockToken = randomUUID();
   const lockAcquired = await acquireInstantlyImportLock(
