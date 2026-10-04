@@ -8,6 +8,7 @@ import { verifyEmailsWithCache } from "@/services/verification/email-verificatio
 import { getVerificationEnv } from "@/lib/config/env";
 import { enqueueVerificationJob } from "@/infrastructure/neon/repositories/verification-queue";
 import { EMAIL_VERIFICATION_PIPELINE_VERSION } from "@/domain/providers/email-verification-idempotency";
+import { runInstantlyImportTick, type InstantlyImportTickResult } from "@/infrastructure/jobs/runners/instantly-import-runner";
 
 const BATCH_SIZE = 50;
 const LOCK_TIMEOUT_MINUTES = 15;
@@ -15,6 +16,19 @@ const LOCK_TIMEOUT_MINUTES = 15;
 export interface VerificationRunnerResult {
   jobsClaimed: number;
   emailsVerified: number;
+  millionVerifierStatus: "ready" | "missing_configuration" | "unhealthy" | "disabled" | "not_selected";
+  instantly?: InstantlyImportTickResult;
+}
+
+function getMillionVerifierStatus(
+  providerName: string,
+  configured: boolean,
+  failures = 0,
+): VerificationRunnerResult["millionVerifierStatus"] {
+  if (providerName === "disabled") return "disabled";
+  if (providerName !== "millionverifier") return "not_selected";
+  if (!configured) return "missing_configuration";
+  return failures > 0 ? "unhealthy" : "ready";
 }
 
 type LeasedVerificationJob = {
@@ -46,23 +60,54 @@ async function deferVerificationJobs(
   }
 }
 
-export async function enqueueVerificationJobs(): Promise<number> {
+export async function enqueueVerificationJobs(options: { createdSince?: Date } = {}): Promise<number> {
   const db = getDb();
+  const createdFilter = options.createdSince
+    ? sql`AND cp.created_at >= ${options.createdSince.toISOString()}`
+    : sql``;
   
   // Requeue unverified contacts and unknown results after their short cache window expires.
   // Limit to 500 per tick to avoid blowing up the query
   const query = sql`
     WITH eligible_accounts AS (
-      SELECT DISTINCT cm.account_id, cm.workspace_id
+      SELECT DISTINCT cm.account_id, cm.workspace_id, cm.selected_contact_point_id
       FROM campaign_memberships cm
       JOIN campaigns c ON cm.campaign_id = c.id
       WHERE cm.stage IN ('qualified', 'ready')
         AND c.status = 'active'
+        AND cm.selected_contact_point_id IS NOT NULL
+        AND cm.contacted_at IS NULL
+        AND NOT EXISTS (
+          SELECT 1 FROM suppression_entries se
+          WHERE se.workspace_id = cm.workspace_id AND se.account_id = cm.account_id
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM outreach_queue oq
+          WHERE oq.workspace_id = cm.workspace_id AND oq.account_id = cm.account_id AND oq.channel = 'email'
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM conversations conv
+          WHERE conv.workspace_id = cm.workspace_id
+            AND conv.account_id = cm.account_id
+            AND conv.state NOT IN ('rejected', 'no_reply_needed', 'suppressed')
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM meetings m
+          JOIN conversations conv ON conv.id = m.conversation_id
+          WHERE conv.workspace_id = cm.workspace_id AND conv.account_id = cm.account_id
+        )
     )
     SELECT cp.id as contact_point_id, ea.workspace_id, cp.normalized_value
     FROM contact_points cp
-    JOIN eligible_accounts ea ON cp.account_id = ea.account_id
+    JOIN eligible_accounts ea ON cp.account_id = ea.account_id AND cp.id = ea.selected_contact_point_id
     WHERE cp.type = 'email'
+      AND BTRIM(cp.normalized_value) <> ''
+      AND cp.last_contacted_at IS NULL
+      AND NOT EXISTS (
+        SELECT 1 FROM suppression_entries se
+        WHERE se.workspace_id = ea.workspace_id
+          AND (se.account_id = cp.account_id OR se.contact_point_id = cp.id)
+      )
       AND (
         cp.verification_status = 'unverified'
         OR (cp.verification_status = 'unknown' AND (cp.verification_checked_at IS NULL OR cp.verification_checked_at <= NOW() - INTERVAL '3 days'))
@@ -72,6 +117,7 @@ export async function enqueueVerificationJobs(): Promise<number> {
         WHERE vj.contact_point_id = cp.id
           AND vj.status IN ('pending', 'processing')
       )
+      ${createdFilter}
     LIMIT 500
   `;
 
@@ -92,7 +138,10 @@ export async function enqueueVerificationJobs(): Promise<number> {
   return count;
 }
 
-export async function runVerificationCronTick(maxJobs: number = BATCH_SIZE): Promise<VerificationRunnerResult> {
+export async function runVerificationCronTick(
+  maxJobs: number = BATCH_SIZE,
+  options: { createdSince?: Date; backfillAll?: boolean } = {},
+): Promise<VerificationRunnerResult> {
   const db = getDb();
   const now = new Date();
   const lockExpiry = new Date(now.getTime() - LOCK_TIMEOUT_MINUTES * 60000);
@@ -124,7 +173,21 @@ export async function runVerificationCronTick(maxJobs: number = BATCH_SIZE): Pro
     RETURNING verification_jobs.*
   `);
 
-  if (leased.rows.length === 0) return { jobsClaimed: 0, emailsVerified: 0 };
+  if (leased.rows.length === 0) {
+    return {
+      jobsClaimed: 0,
+      emailsVerified: 0,
+      millionVerifierStatus: getMillionVerifierStatus(providerName, Boolean(env.MILLION_VERIFIER ?? env.MILLIONVERIFIER_API_KEY)),
+      instantly: await runInstantlyImportTick({
+        ...(options.backfillAll
+          ? { backfillAll: true }
+          : options.createdSince
+            ? { createdSince: options.createdSince }
+            : { processQueueOnly: true }),
+        now,
+      }),
+    };
+  }
 
   // 2. Handle provider disabled
   if (providerName === "disabled") {
@@ -139,7 +202,19 @@ export async function runVerificationCronTick(maxJobs: number = BATCH_SIZE): Pro
         })
         .where(eq(schema.verificationJobs.id, job.id));
     }
-    return { jobsClaimed: leased.rows.length, emailsVerified: 0 };
+    return {
+      jobsClaimed: leased.rows.length,
+      emailsVerified: 0,
+      millionVerifierStatus: "disabled",
+      instantly: await runInstantlyImportTick({
+        ...(options.backfillAll
+          ? { backfillAll: true }
+          : options.createdSince
+            ? { createdSince: options.createdSince }
+            : { processQueueOnly: true }),
+        now,
+      }),
+    };
   }
 
   // 3. Group by workspace (since provider and cache are per workspace)
@@ -152,21 +227,79 @@ export async function runVerificationCronTick(maxJobs: number = BATCH_SIZE): Pro
   }
 
   let totalEmailsVerified = 0;
+  let verificationProviderFailures = 0;
+  const verifiedContactPointIds = new Set<string>();
 
   for (const [workspaceId, workspaceJobs] of jobsByWorkspace.entries()) {
+    const workspaceJobIds = workspaceJobs.map((job) => job.id);
+    const blockedRows = await db.execute(sql`
+      SELECT vj.id
+      FROM verification_jobs vj
+      JOIN contact_points cp ON cp.id = vj.contact_point_id
+      WHERE vj.id IN ${workspaceJobIds}
+        AND vj.workspace_id = ${workspaceId}
+        AND (
+          cp.last_contacted_at IS NOT NULL
+          OR EXISTS (
+            SELECT 1 FROM suppression_entries se
+            WHERE se.workspace_id = ${workspaceId}
+              AND (se.account_id = cp.account_id OR se.contact_point_id = cp.id)
+          )
+          OR EXISTS (
+            SELECT 1 FROM campaign_memberships cm
+            JOIN campaigns c ON c.id = cm.campaign_id
+            WHERE c.workspace_id = ${workspaceId}
+              AND cm.account_id = cp.account_id
+              AND cm.contacted_at IS NOT NULL
+          )
+          OR EXISTS (
+            SELECT 1 FROM outreach_queue oq
+            WHERE oq.workspace_id = ${workspaceId}
+              AND oq.account_id = cp.account_id
+              AND oq.channel = 'email'
+          )
+          OR EXISTS (
+            SELECT 1 FROM conversations conv
+            WHERE conv.workspace_id = ${workspaceId}
+              AND conv.account_id = cp.account_id
+              AND conv.state NOT IN ('rejected', 'no_reply_needed', 'suppressed')
+          )
+          OR EXISTS (
+            SELECT 1 FROM meetings m
+            JOIN conversations conv ON conv.id = m.conversation_id
+            WHERE conv.workspace_id = ${workspaceId} AND conv.account_id = cp.account_id
+          )
+        )
+    `);
+    const blockedJobIds = new Set(blockedRows.rows.map((row) => String((row as { id: string }).id)));
+    for (const job of workspaceJobs) {
+      if (!blockedJobIds.has(job.id)) continue;
+      await db.update(schema.verificationJobs)
+        .set({
+          status: "suppressed",
+          lastError: "Account suppressed or prior cold outreach exists.",
+          lockedAt: null,
+          lockedBy: null,
+          nextAttemptAt: null,
+        })
+        .where(eq(schema.verificationJobs.id, job.id));
+    }
+    const safeWorkspaceJobs = workspaceJobs.filter((job) => !blockedJobIds.has(job.id));
+    if (safeWorkspaceJobs.length === 0) continue;
+
     let provider;
     try {
       provider = createEmailVerificationProvider(workspaceId);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      await deferVerificationJobs(workspaceJobs, message, now);
+      await deferVerificationJobs(safeWorkspaceJobs, message, now);
       throw error;
     }
 
     const cacheStore = new DbVerificationCacheStore(workspaceId, provider.providerName);
     
     // Map jobs to contact points
-    const contactPointIds = workspaceJobs.map(j => j.contact_point_id);
+    const contactPointIds = safeWorkspaceJobs.map(j => j.contact_point_id);
     const cpRows = await db.select({
       id: schema.contactPoints.id,
       accountId: schema.contactPoints.accountId,
@@ -183,29 +316,33 @@ export async function runVerificationCronTick(maxJobs: number = BATCH_SIZE): Pro
       result = await verifyEmailsWithCache(provider, emailsToVerify, cacheStore, now);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      verificationProviderFailures += workspaceJobs.length;
       if (error instanceof ProviderBudgetExceededError) {
-        await deferVerificationJobs(workspaceJobs, message, now, error.retryAt);
+        await deferVerificationJobs(safeWorkspaceJobs, message, now, error.retryAt);
         continue;
       }
-      await deferVerificationJobs(workspaceJobs, message, now);
+        await deferVerificationJobs(safeWorkspaceJobs, message, now);
       continue;
     }
     
     // Process results
-    for (const job of workspaceJobs) {
+    for (const job of safeWorkspaceJobs) {
       const cp = cpMap.get(job.contact_point_id);
       if (!cp) {
+        verificationProviderFailures++;
         await deferVerificationJobs([job], "Contact point not found", now);
         continue;
       }
 
       const outcome = result.outcomes.find(o => o.email === cp.normalizedValue);
       if (!outcome) {
+        verificationProviderFailures++;
         await deferVerificationJobs([job], "No outcome from provider", now);
         continue;
       }
 
       if (outcome.retryable) {
+        verificationProviderFailures++;
         await deferVerificationJobs([job], outcome.providerRawCode || "Provider verification failed", now);
         continue;
       }
@@ -254,8 +391,29 @@ export async function runVerificationCronTick(maxJobs: number = BATCH_SIZE): Pro
       
       const { evaluateComplianceForAccount } = await import("@/services/compliance/compliance-evaluator");
       await evaluateComplianceForAccount(workspaceId, cp.accountId);
+      if (outcome.code === "valid") verifiedContactPointIds.add(cp.id);
     }
   }
 
-  return { jobsClaimed: leased.rows.length, emailsVerified: totalEmailsVerified };
+  const instantly = await runInstantlyImportTick({
+    ...(verifiedContactPointIds.size > 0 ? { contactPointIds: Array.from(verifiedContactPointIds) } : {}),
+    ...(options.backfillAll
+      ? { backfillAll: true }
+      : options.createdSince
+        ? { createdSince: options.createdSince }
+        : verifiedContactPointIds.size === 0
+          ? { processQueueOnly: true }
+          : {}),
+    now,
+  });
+  return {
+    jobsClaimed: leased.rows.length,
+    emailsVerified: totalEmailsVerified,
+    millionVerifierStatus: getMillionVerifierStatus(
+      providerName,
+      Boolean(env.MILLION_VERIFIER ?? env.MILLIONVERIFIER_API_KEY),
+      verificationProviderFailures,
+    ),
+    instantly,
+  };
 }

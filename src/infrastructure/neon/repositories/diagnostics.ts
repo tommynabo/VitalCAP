@@ -51,11 +51,16 @@ export function getProviderRows(): Array<{ name: string; status: ProviderRowStat
       ? { name: "Email delivery (Instantly)", status: "unknown", detail: "Configured — health not yet probed" }
       : { name: "Email delivery (Instantly)", status: "missing_configuration", detail: "INSTANTLY_API_KEY not set" },
   );
+  rows.push(
+    deliveryEnv.INSTANTLY_API_KEY
+      ? { name: "Instantly campaign imports", status: "unknown", detail: `Configured for campaign ${deliveryEnv.INSTANTLY_CAMPAIGN_ID}` }
+      : { name: "Instantly campaign imports", status: "missing_configuration", detail: "INSTANTLY_API_KEY not set" },
+  );
   rows.push({ name: "SMS delivery", status: "paused", detail: "SMS is disabled by product policy" });
   rows.push(
-    verifyEnv.EMAIL_VERIFICATION_PROVIDER === "millionverifier" && verifyEnv.MILLIONVERIFIER_API_KEY
+    verifyEnv.EMAIL_VERIFICATION_PROVIDER === "millionverifier" && (verifyEnv.MILLION_VERIFIER || verifyEnv.MILLIONVERIFIER_API_KEY)
       ? { name: "Email verification", status: "unknown", detail: "Configured — health not yet probed" }
-      : { name: "Email verification", status: "missing_configuration", detail: "MILLIONVERIFIER_API_KEY not set" },
+      : { name: "Email verification", status: "missing_configuration", detail: "MILLION_VERIFIER not set" },
   );
   rows.push(
     mapsEnv.MAPS_PROVIDER === "apify" && mapsEnv.APIFY_API_TOKEN

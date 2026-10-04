@@ -130,6 +130,7 @@ export function getSerperEnv() {
 // ── Verification Env ───────────────────────────────────────────────────────────
 const verificationEnvSchema = z.object({
   EMAIL_VERIFICATION_PROVIDER: z.enum(["millionverifier", "disabled", "mock"]).default("disabled"),
+  MILLION_VERIFIER: z.string().optional(),
   MILLIONVERIFIER_API_KEY: z.string().optional(),
   EMAIL_VERIFICATION_ALLOW_CATCH_ALL: z.enum(["true", "false"]).default("false").transform((value) => value === "true"),
   EMAIL_VERIFICATION_DAILY_COST_LIMIT_USD: z.coerce.number().nonnegative().default(1),
@@ -139,6 +140,7 @@ export function getVerificationEnv() {
   if (cachedVerificationEnv) return cachedVerificationEnv;
   cachedVerificationEnv = verificationEnvSchema.parse({
     EMAIL_VERIFICATION_PROVIDER: process.env.EMAIL_VERIFICATION_PROVIDER,
+    MILLION_VERIFIER: optionalEnvValue(process.env.MILLION_VERIFIER),
     MILLIONVERIFIER_API_KEY: optionalEnvValue(process.env.MILLIONVERIFIER_API_KEY),
     EMAIL_VERIFICATION_ALLOW_CATCH_ALL: optionalEnvValue(process.env.EMAIL_VERIFICATION_ALLOW_CATCH_ALL),
     EMAIL_VERIFICATION_DAILY_COST_LIMIT_USD: optionalEnvValue(process.env.EMAIL_VERIFICATION_DAILY_COST_LIMIT_USD),
@@ -150,6 +152,11 @@ export function getVerificationEnv() {
 const deliveryEnvSchema = z.object({
   EMAIL_DELIVERY_PROVIDER: z.enum(["instantly", "disabled", "mock"]).default("disabled"),
   INSTANTLY_API_KEY: z.string().optional(),
+  INSTANTLY_CAMPAIGN_ID: z.string().uuid().default("055534c5-c3e3-414f-b140-f4770b293c00"),
+  INSTANTLY_MAX_UPLOADED_CONTACTS: z.coerce.number().int().positive().default(1000),
+  INSTANTLY_CONTACT_USAGE_WARNING_THRESHOLD: z.coerce.number().int().nonnegative().default(900),
+  INSTANTLY_MAX_MONTHLY_EMAILS: z.coerce.number().int().positive().default(5000),
+  INSTANTLY_MONTHLY_EMAIL_WARNING_THRESHOLD: z.coerce.number().int().nonnegative().default(4500),
   INSTANTLY_WEBHOOK_SECRET: z.string().optional(),
   SMS_PROVIDER: z.literal("disabled").default("disabled"),
 });
@@ -159,6 +166,11 @@ export function getDeliveryEnv() {
   cachedDeliveryEnv = deliveryEnvSchema.parse({
     EMAIL_DELIVERY_PROVIDER: process.env.EMAIL_DELIVERY_PROVIDER,
     INSTANTLY_API_KEY: optionalEnvValue(process.env.INSTANTLY_API_KEY),
+    INSTANTLY_CAMPAIGN_ID: optionalEnvValue(process.env.INSTANTLY_CAMPAIGN_ID),
+    INSTANTLY_MAX_UPLOADED_CONTACTS: optionalEnvValue(process.env.INSTANTLY_MAX_UPLOADED_CONTACTS),
+    INSTANTLY_CONTACT_USAGE_WARNING_THRESHOLD: optionalEnvValue(process.env.INSTANTLY_CONTACT_USAGE_WARNING_THRESHOLD),
+    INSTANTLY_MAX_MONTHLY_EMAILS: optionalEnvValue(process.env.INSTANTLY_MAX_MONTHLY_EMAILS),
+    INSTANTLY_MONTHLY_EMAIL_WARNING_THRESHOLD: optionalEnvValue(process.env.INSTANTLY_MONTHLY_EMAIL_WARNING_THRESHOLD),
     INSTANTLY_WEBHOOK_SECRET: optionalEnvValue(process.env.INSTANTLY_WEBHOOK_SECRET),
     SMS_PROVIDER: process.env.SMS_PROVIDER as any,
   });
