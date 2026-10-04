@@ -35,7 +35,7 @@ export async function claimInstantlyLeadImports(limit: number, now: Date): Promi
     WITH available AS (
       SELECT id
       FROM instantly_lead_imports
-      WHERE status IN ('eligible', 'failed', 'deferred', 'instantly_queued')
+      WHERE status IN ('eligible', 'failed', 'deferred', 'deferred_due_to_plan_limit', 'instantly_queued')
         AND (locked_at IS NULL OR locked_at < ${lockExpiry.toISOString()})
         AND (next_attempt_at IS NULL OR next_attempt_at <= ${now.toISOString()})
         AND attempt_count < max_attempts
@@ -85,6 +85,26 @@ export async function getInstantlyLeadImportCounts(): Promise<Record<string, num
     GROUP BY status
   `);
   return Object.fromEntries(result.rows.map((row) => [String(row.status), Number(row.count)]));
+}
+
+export async function deferInstantlyLeadImportsForPlanLimit(
+  providerCampaignId: string,
+  now: Date,
+): Promise<number> {
+  const db = getDb();
+  const deferred = await db.execute(sql`
+    UPDATE instantly_lead_imports
+    SET status = 'deferred_due_to_plan_limit',
+        locked_at = NULL,
+        next_attempt_at = ${now.toISOString()},
+        last_error = 'Instantly plan limit reached; retry after capacity is available.',
+        updated_at = ${now.toISOString()}
+    WHERE provider_campaign_id = ${providerCampaignId}
+      AND status IN ('eligible', 'failed', 'deferred', 'instantly_queued')
+      AND attempt_count < max_attempts
+    RETURNING id
+  `);
+  return deferred.rows.length;
 }
 
 export async function acquireInstantlyImportLock(

@@ -60,18 +60,22 @@ async function deferVerificationJobs(
   }
 }
 
-export async function enqueueVerificationJobs(): Promise<number> {
+export async function enqueueVerificationJobs(options: { createdSince?: Date } = {}): Promise<number> {
   const db = getDb();
+  const createdFilter = options.createdSince
+    ? sql`AND cp.created_at >= ${options.createdSince.toISOString()}`
+    : sql``;
   
   // Requeue unverified contacts and unknown results after their short cache window expires.
   // Limit to 500 per tick to avoid blowing up the query
   const query = sql`
     WITH eligible_accounts AS (
-      SELECT DISTINCT cm.account_id, cm.workspace_id
+      SELECT DISTINCT cm.account_id, cm.workspace_id, cm.selected_contact_point_id
       FROM campaign_memberships cm
       JOIN campaigns c ON cm.campaign_id = c.id
       WHERE cm.stage IN ('qualified', 'ready')
         AND c.status = 'active'
+        AND cm.selected_contact_point_id IS NOT NULL
         AND cm.contacted_at IS NULL
         AND NOT EXISTS (
           SELECT 1 FROM suppression_entries se
@@ -95,7 +99,7 @@ export async function enqueueVerificationJobs(): Promise<number> {
     )
     SELECT cp.id as contact_point_id, ea.workspace_id, cp.normalized_value
     FROM contact_points cp
-    JOIN eligible_accounts ea ON cp.account_id = ea.account_id
+    JOIN eligible_accounts ea ON cp.account_id = ea.account_id AND cp.id = ea.selected_contact_point_id
     WHERE cp.type = 'email'
       AND BTRIM(cp.normalized_value) <> ''
       AND cp.last_contacted_at IS NULL
@@ -113,6 +117,7 @@ export async function enqueueVerificationJobs(): Promise<number> {
         WHERE vj.contact_point_id = cp.id
           AND vj.status IN ('pending', 'processing')
       )
+      ${createdFilter}
     LIMIT 500
   `;
 
@@ -135,7 +140,7 @@ export async function enqueueVerificationJobs(): Promise<number> {
 
 export async function runVerificationCronTick(
   maxJobs: number = BATCH_SIZE,
-  options: { createdSince?: Date } = {},
+  options: { createdSince?: Date; backfillAll?: boolean } = {},
 ): Promise<VerificationRunnerResult> {
   const db = getDb();
   const now = new Date();
@@ -174,7 +179,11 @@ export async function runVerificationCronTick(
       emailsVerified: 0,
       millionVerifierStatus: getMillionVerifierStatus(providerName, Boolean(env.MILLION_VERIFIER ?? env.MILLIONVERIFIER_API_KEY)),
       instantly: await runInstantlyImportTick({
-        ...(options.createdSince ? { createdSince: options.createdSince } : { processQueueOnly: true }),
+        ...(options.backfillAll
+          ? { backfillAll: true }
+          : options.createdSince
+            ? { createdSince: options.createdSince }
+            : { processQueueOnly: true }),
         now,
       }),
     };
@@ -198,7 +207,11 @@ export async function runVerificationCronTick(
       emailsVerified: 0,
       millionVerifierStatus: "disabled",
       instantly: await runInstantlyImportTick({
-        ...(options.createdSince ? { createdSince: options.createdSince } : { processQueueOnly: true }),
+        ...(options.backfillAll
+          ? { backfillAll: true }
+          : options.createdSince
+            ? { createdSince: options.createdSince }
+            : { processQueueOnly: true }),
         now,
       }),
     };
@@ -384,11 +397,13 @@ export async function runVerificationCronTick(
 
   const instantly = await runInstantlyImportTick({
     ...(verifiedContactPointIds.size > 0 ? { contactPointIds: Array.from(verifiedContactPointIds) } : {}),
-    ...(options.createdSince
-      ? { createdSince: options.createdSince }
-      : verifiedContactPointIds.size === 0
-        ? { processQueueOnly: true }
-        : {}),
+    ...(options.backfillAll
+      ? { backfillAll: true }
+      : options.createdSince
+        ? { createdSince: options.createdSince }
+        : verifiedContactPointIds.size === 0
+          ? { processQueueOnly: true }
+          : {}),
     now,
   });
   return {

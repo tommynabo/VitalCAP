@@ -7,11 +7,13 @@ export const dynamic = "force-dynamic";
 export async function GET(request: NextRequest) {
   if (!isAuthorizedCronRequest(request)) return unauthorizedCronResponse();
   return runCronRoute("verification", async () => {
-    const enqueued = await enqueueVerificationJobs();
+    const backfillMode = request.nextUrl.searchParams.get("backfill");
+    const backfillAll = backfillMode === "all";
+    const createdSince = new Date(Date.now() - 48 * 60 * 60_000);
+    const enqueued = await enqueueVerificationJobs(backfillAll ? {} : { createdSince });
     const result = await runVerificationCronTick(50, {
-      createdSince: new Date(Date.now() - 48 * 60 * 60_000),
+      ...(backfillAll ? { backfillAll: true } : { createdSince }),
     });
-    const backfillRequested = request.nextUrl.searchParams.get("backfill") === "48h";
     return {
       itemsProcessed: result.jobsClaimed,
       metadata: {
@@ -20,7 +22,15 @@ export async function GET(request: NextRequest) {
         emailsVerified: result.emailsVerified,
         millionVerifierStatus: result.millionVerifierStatus,
         instantly: result.instantly,
-        ...(backfillRequested ? { backfillWindowHours: 48 } : {}),
+        ...(backfillAll
+          ? {
+              backfillMode: "all",
+              backfillBatchLimit: 500,
+              backfillMayContinue: enqueued === 500 || (result.instantly?.candidatesFound ?? 0) === 500,
+            }
+          : backfillMode === "48h"
+            ? { backfillMode: "48h", backfillWindowHours: 48 }
+            : {}),
       },
     };
   });

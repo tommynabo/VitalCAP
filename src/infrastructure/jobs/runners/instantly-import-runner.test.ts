@@ -6,6 +6,7 @@ const mocks = vi.hoisted(() => ({
   canEnqueueColdOutreach: vi.fn(),
   acquireLock: vi.fn(),
   claimImports: vi.fn(),
+  deferByPlanLimit: vi.fn(),
   enqueueImport: vi.fn(),
   getImportCounts: vi.fn(),
   releaseLock: vi.fn(),
@@ -22,6 +23,7 @@ vi.mock("@/infrastructure/neon/repositories/outreach", () => ({
 vi.mock("@/infrastructure/neon/repositories/instantly-lead-imports", () => ({
   acquireInstantlyImportLock: mocks.acquireLock,
   claimInstantlyLeadImports: mocks.claimImports,
+  deferInstantlyLeadImportsForPlanLimit: mocks.deferByPlanLimit,
   enqueueInstantlyLeadImport: mocks.enqueueImport,
   getInstantlyLeadImportCounts: mocks.getImportCounts,
   releaseInstantlyImportLock: mocks.releaseLock,
@@ -39,6 +41,7 @@ import { runInstantlyImportTick } from "./instantly-import-runner";
 
 const campaignId = "055534c5-c3e3-414f-b140-f4770b293c00";
 const metricRow = { awaiting_verification: 3, verification_valid: 8, verification_blocked: 2 };
+const readySchemaRows = [{ imports_ready: true, locks_ready: true }];
 
 function candidate(overrides: Record<string, unknown> = {}) {
   return {
@@ -72,12 +75,13 @@ function metricReads(): Array<Record<string, unknown>> {
 }
 
 function setupWithoutClaimedJobs(candidateRows: Array<Record<string, unknown>>): void {
-  configureDbResults([metricReads(), candidateRows, metricReads(), metricReads()]);
+  configureDbResults([readySchemaRows, metricReads(), candidateRows, metricReads(), metricReads()]);
   mocks.claimImports.mockResolvedValue([]);
+  mocks.deferByPlanLimit.mockResolvedValue(0);
 }
 
 function setupWithOneClaimedJob(candidateRows: Array<Record<string, unknown>>, recheckRows = candidateRows): void {
-  configureDbResults([metricReads(), candidateRows, metricReads(), recheckRows, metricReads()]);
+  configureDbResults([readySchemaRows, metricReads(), candidateRows, metricReads(), recheckRows, metricReads()]);
   mocks.claimImports.mockResolvedValue([{
     id: "import-1",
     account_id: "account-1",
@@ -120,6 +124,18 @@ afterEach(() => {
 });
 
 describe("runInstantlyImportTick", () => {
+  it("does not start import work until both migration tables exist", async () => {
+    configureDbResults([[{ imports_ready: false, locks_ready: false }]]);
+
+    const result = await runInstantlyImportTick({ backfillAll: true });
+
+    expect(result.providerStatus).toBe("schema_not_ready");
+    expect(result.candidatesFound).toBe(0);
+    expect(mocks.getPlanUsage).not.toHaveBeenCalled();
+    expect(mocks.claimImports).not.toHaveBeenCalled();
+    expect(mocks.addLead).not.toHaveBeenCalled();
+  });
+
   it("imports an eligible verified lead and persists the provider result", async () => {
     setupWithOneClaimedJob([candidate()]);
 
@@ -201,6 +217,7 @@ describe("runInstantlyImportTick", () => {
     setupWithoutClaimedJobs([candidate()]);
     mocks.getPlanUsage.mockResolvedValue({ currentLeadCount: 1000, totalLeadLimit: 5000 });
     mocks.getMonthlyEmailUsage.mockResolvedValue({ emailsSent: 5000 });
+    mocks.deferByPlanLimit.mockResolvedValue(1);
 
     const result = await runInstantlyImportTick({ createdSince: new Date("2026-10-02T00:00:00.000Z") });
 
@@ -210,6 +227,8 @@ describe("runInstantlyImportTick", () => {
       monthlyEmailsSent: 5000,
       monthlyEmailLimit: 5000,
     });
+    expect(result.leadsDeferred).toBe(1);
+    expect(mocks.deferByPlanLimit).toHaveBeenCalledWith(campaignId, expect.any(Date));
     expect(mocks.claimImports).not.toHaveBeenCalled();
     expect(mocks.addLead).not.toHaveBeenCalled();
   });
@@ -225,8 +244,8 @@ describe("runInstantlyImportTick", () => {
 
   it("can rerun the same 48-hour backfill without creating a second import", async () => {
     configureDbResults([
-      metricReads(), [candidate()], metricReads(), metricReads(),
-      metricReads(), [candidate()], metricReads(), metricReads(),
+      readySchemaRows, metricReads(), [candidate()], metricReads(), metricReads(),
+      readySchemaRows, metricReads(), [candidate()], metricReads(), metricReads(),
     ]);
     mocks.claimImports.mockResolvedValue([]);
     mocks.enqueueImport.mockResolvedValueOnce(true).mockResolvedValueOnce(false);
@@ -243,5 +262,44 @@ describe("runInstantlyImportTick", () => {
       providerCampaignId: campaignId,
     }));
     expect(mocks.addLead).not.toHaveBeenCalled();
+  });
+
+  it("imports a historical valid contact in full-backfill mode", async () => {
+    setupWithOneClaimedJob([candidate({ created_at: "2024-01-01T00:00:00.000Z" })]);
+
+    const result = await runInstantlyImportTick({ backfillAll: true });
+
+    expect(result.candidatesFound).toBe(1);
+    expect(result.leadsAdded).toBe(1);
+    expect(mocks.addLead).toHaveBeenCalledOnce();
+  });
+
+  it("continues the full historical scan in a second bounded batch", async () => {
+    const firstBatch = Array.from({ length: 500 }, (_, index) => candidate({
+      account_id: `account-${index}`,
+      contact_id: `contact-${index}`,
+      contact_point_id: `contact-point-${index}`,
+      normalized_email: `person-${index}@example.com`,
+    }));
+    const secondBatch = [candidate({
+      account_id: "account-500",
+      contact_id: "contact-500",
+      contact_point_id: "contact-point-500",
+      normalized_email: "person-500@example.com",
+    })];
+    configureDbResults([
+      readySchemaRows, metricReads(), firstBatch, metricReads(), metricReads(),
+      readySchemaRows, metricReads(), secondBatch, metricReads(), metricReads(),
+    ]);
+    mocks.claimImports.mockResolvedValue([]);
+
+    const first = await runInstantlyImportTick({ backfillAll: true });
+    const second = await runInstantlyImportTick({ backfillAll: true });
+
+    expect(first.candidatesFound).toBe(500);
+    expect(first.leadsQueued).toBe(500);
+    expect(second.candidatesFound).toBe(1);
+    expect(second.leadsQueued).toBe(1);
+    expect(mocks.enqueueImport).toHaveBeenCalledTimes(501);
   });
 });

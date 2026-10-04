@@ -35,6 +35,6 @@ ALTER TABLE "instantly_lead_imports" ADD CONSTRAINT "instantly_lead_imports_cont
 CREATE UNIQUE INDEX "uq_instantly_import_identity" ON "instantly_lead_imports" USING btree ("workspace_id","account_id","contact_point_id","provider_campaign_id");--> statement-breakpoint
 CREATE UNIQUE INDEX "uq_instantly_import_idempotency" ON "instantly_lead_imports" USING btree ("idempotency_key");--> statement-breakpoint
 CREATE UNIQUE INDEX "uq_instantly_import_email" ON "instantly_lead_imports" USING btree ("workspace_id","normalized_email","provider_campaign_id");--> statement-breakpoint
-CREATE UNIQUE INDEX "uq_instantly_import_active_account" ON "instantly_lead_imports" USING btree ("workspace_id","account_id","provider_campaign_id") WHERE "instantly_lead_imports"."status" in ('eligible', 'instantly_queued', 'instantly_added', 'skipped_existing', 'failed', 'deferred');--> statement-breakpoint
+CREATE UNIQUE INDEX "uq_instantly_import_active_account" ON "instantly_lead_imports" USING btree ("workspace_id","account_id","provider_campaign_id") WHERE "instantly_lead_imports"."status" in ('eligible', 'instantly_queued', 'instantly_added', 'skipped_existing', 'failed', 'deferred', 'deferred_due_to_plan_limit');--> statement-breakpoint
 CREATE INDEX "idx_instantly_import_dispatch" ON "instantly_lead_imports" USING btree ("status","next_attempt_at");--> statement-breakpoint
 CREATE INDEX "idx_instantly_import_workspace_status" ON "instantly_lead_imports" USING btree ("workspace_id","status");

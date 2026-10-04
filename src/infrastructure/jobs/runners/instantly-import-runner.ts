@@ -7,6 +7,7 @@ import { getDb } from "@/infrastructure/neon/db";
 import {
   acquireInstantlyImportLock,
   claimInstantlyLeadImports,
+  deferInstantlyLeadImportsForPlanLimit,
   enqueueInstantlyLeadImport,
   getInstantlyLeadImportCounts,
   releaseInstantlyImportLock,
@@ -47,7 +48,7 @@ export interface InstantlyImportTickResult {
   leadsSkipped: number;
   leadsDeferred: number;
   leadsFailed: number;
-  providerStatus: "ready" | "missing_configuration" | "unhealthy" | "busy";
+  providerStatus: "ready" | "missing_configuration" | "unhealthy" | "busy" | "schema_not_ready";
   quota: {
     uploadedContacts: number;
     hardLimit: number;
@@ -63,11 +64,14 @@ async function listEligibleCandidates(options: {
   providerCampaignId: string;
   createdSince?: Date;
   contactPointIds?: readonly string[];
+  backfillAll?: boolean;
   forEnqueue?: boolean;
 }): Promise<CandidateRow[]> {
   if (options.contactPointIds?.length === 0) return [];
   const db = getDb();
-  const candidateScopeFilter = options.contactPointIds && options.createdSince
+  const candidateScopeFilter = options.backfillAll
+    ? sql``
+    : options.contactPointIds && options.createdSince
     ? sql`AND (cp.id IN ${options.contactPointIds} OR cp.created_at >= ${options.createdSince.toISOString()})`
     : options.contactPointIds
       ? sql`AND cp.id IN ${options.contactPointIds}`
@@ -237,13 +241,15 @@ async function readPipelineMetrics(): Promise<Record<string, number>> {
   `).then((result) => result.rows as Array<Record<string, number>>);
   const imports = await getInstantlyLeadImportCounts();
   const eligible = (imports.eligible ?? 0) + (imports.instantly_queued ?? 0) + (imports.instantly_added ?? 0)
-    + (imports.skipped_existing ?? 0) + (imports.failed ?? 0) + (imports.deferred ?? 0);
+    + (imports.skipped_existing ?? 0) + (imports.failed ?? 0) + (imports.deferred ?? 0)
+    + (imports.deferred_due_to_plan_limit ?? 0);
   return {
     awaiting_verification: Number(verification?.awaiting_verification ?? 0),
     verification_valid: Number(verification?.verification_valid ?? 0),
     verification_blocked: Number(verification?.verification_blocked ?? 0),
     eligible,
-    instantly_pending: (imports.eligible ?? 0) + (imports.instantly_queued ?? 0) + (imports.deferred ?? 0),
+    instantly_pending: (imports.eligible ?? 0) + (imports.instantly_queued ?? 0) + (imports.deferred ?? 0)
+      + (imports.deferred_due_to_plan_limit ?? 0),
     instantly_added: imports.instantly_added ?? 0,
     instantly_failed: imports.failed ?? 0,
   };
@@ -252,11 +258,32 @@ async function readPipelineMetrics(): Promise<Record<string, number>> {
 export async function runInstantlyImportTick(options: {
   createdSince?: Date;
   contactPointIds?: readonly string[];
+  backfillAll?: boolean;
   processQueueOnly?: boolean;
   now?: Date;
 } = {}): Promise<InstantlyImportTickResult> {
   const now = options.now ?? new Date();
   const env = getDeliveryEnv();
+  const db = getDb();
+  const schemaStatus = await db.execute(sql`
+    SELECT
+      to_regclass('public.instantly_lead_imports') IS NOT NULL AS imports_ready,
+      to_regclass('public.instantly_import_locks') IS NOT NULL AS locks_ready
+  `);
+  const [schemaRow] = schemaStatus.rows as Array<{ imports_ready: boolean; locks_ready: boolean }>;
+  if (!schemaRow?.imports_ready || !schemaRow.locks_ready) {
+    return {
+      candidatesFound: 0,
+      leadsQueued: 0,
+      leadsAdded: 0,
+      leadsSkipped: 0,
+      leadsDeferred: 0,
+      leadsFailed: 0,
+      providerStatus: "schema_not_ready",
+      quota: null,
+      metrics: {},
+    };
+  }
   const initialMetrics = await readPipelineMetrics();
   const result: InstantlyImportTickResult = {
     candidatesFound: 0,
@@ -280,6 +307,7 @@ export async function runInstantlyImportTick(options: {
       providerCampaignId: env.INSTANTLY_CAMPAIGN_ID,
       createdSince: options.createdSince,
       contactPointIds: options.contactPointIds,
+      backfillAll: options.backfillAll,
       forEnqueue: true,
     });
     result.candidatesFound = candidates.length;
@@ -333,6 +361,7 @@ export async function runInstantlyImportTick(options: {
     };
     result.providerStatus = "ready";
     if (!quotaDecision.allowed || monthlyUsage.emailsSent >= env.INSTANTLY_MAX_MONTHLY_EMAILS) {
+      result.leadsDeferred = await deferInstantlyLeadImportsForPlanLimit(env.INSTANTLY_CAMPAIGN_ID, now);
       result.metrics = await readPipelineMetrics();
       return result;
     }
