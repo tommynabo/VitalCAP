@@ -1,7 +1,9 @@
 import type { NextRequest } from "next/server";
+import { randomUUID } from "node:crypto";
 import { NextResponse } from "next/server";
 import { getNeonSql } from "@/infrastructure/neon/db";
 import { getDatabaseEnv, getDeliveryEnv, getVerificationEnv } from "@/lib/config/env";
+import { logEvent } from "@/lib/observability/structured-logger";
 import { isAuthorizedCronRequest, unauthorizedCronResponse } from "../_lib/cron-http";
 
 export const dynamic = "force-dynamic";
@@ -257,6 +259,7 @@ async function readInstantlyState() {
 export async function GET(request: NextRequest) {
   if (!isAuthorizedCronRequest(request)) return unauthorizedCronResponse();
 
+  const startedAt = Date.now();
   const [database, millionVerifier, instantly] = await Promise.all([
     readDatabaseState(),
     readMillionVerifierState(),
@@ -267,6 +270,33 @@ export async function GET(request: NextRequest) {
     && millionVerifier.healthy
     && millionVerifier.creditsAvailable
     && instantly.healthy;
+
+  logEvent("info", "cron.provider-preflight", {
+    correlationId: randomUUID(),
+    outcome: healthy ? "healthy" : "blocked",
+    durationMs: Date.now() - startedAt,
+    databaseConfigured: database.configured,
+    databaseHealthy: database.healthy,
+    through0016: database.through0016,
+    migration0017Applied: database.migration0017Applied,
+    instantlyTablesExist: database.instantlyTablesExist,
+    requiredIndexesPresent: database.requiredIndexesPresent,
+    databaseErrorCode: database.errorCode,
+    millionVerifierConfigured: millionVerifier.configured,
+    millionVerifierProvider: millionVerifier.provider,
+    millionVerifierHealthy: millionVerifier.healthy,
+    millionVerifierCreditsAvailable: millionVerifier.creditsAvailable,
+    millionVerifierCreditsRemaining: millionVerifier.creditsRemaining,
+    millionVerifierHttpStatus: millionVerifier.httpStatus,
+    millionVerifierErrorCode: millionVerifier.errorCode,
+    instantlyConfigured: instantly.configured,
+    instantlyHealthy: instantly.healthy,
+    instantlyCampaignAccessible: instantly.campaignAccessible,
+    instantlyCampaignId: instantly.campaignId,
+    instantlyHttpStatus: instantly.httpStatus,
+    instantlyPlanUsage: instantly.planUsage,
+    instantlyErrorCode: instantly.errorCode,
+  });
 
   return NextResponse.json({ database, millionVerifier, instantly, healthy }, {
     status: healthy ? 200 : 503,
