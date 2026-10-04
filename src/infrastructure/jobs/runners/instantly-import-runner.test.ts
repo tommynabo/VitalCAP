@@ -95,6 +95,7 @@ beforeEach(() => {
   vi.stubEnv("APP_ENV", "test");
   vi.stubEnv("VERCEL_ENV", "");
   vi.stubEnv("DEV_SEED_MODE", "false");
+  vi.stubEnv("EMAIL_DELIVERY_PROVIDER", "instantly");
   vi.stubEnv("INSTANTLY_API_KEY", "test-key");
   vi.stubEnv("INSTANTLY_CAMPAIGN_ID", campaignId);
   vi.stubEnv("INSTANTLY_MAX_UPLOADED_CONTACTS", "1000");
@@ -133,6 +134,18 @@ describe("runInstantlyImportTick", () => {
     expect(result.candidatesFound).toBe(0);
     expect(mocks.getPlanUsage).not.toHaveBeenCalled();
     expect(mocks.claimImports).not.toHaveBeenCalled();
+    expect(mocks.addLead).not.toHaveBeenCalled();
+  });
+
+  it("queues eligible leads without sending when Instantly delivery is disabled", async () => {
+    vi.stubEnv("EMAIL_DELIVERY_PROVIDER", "disabled");
+    resetServerEnvCacheForTests();
+    setupWithoutClaimedJobs([candidate()]);
+
+    const result = await runInstantlyImportTick({ contactPointIds: ["contact-point-1"] });
+
+    expect(result.leadsQueued).toBe(1);
+    expect(result.providerStatus).toBe("missing_configuration");
     expect(mocks.addLead).not.toHaveBeenCalled();
   });
 
