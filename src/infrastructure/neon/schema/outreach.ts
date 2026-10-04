@@ -103,6 +103,61 @@ export const deadLetterJobs = pgTable(
   ],
 );
 
+export const instantlyLeadImports = pgTable(
+  "instantly_lead_imports",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    workspaceId: uuid("workspace_id")
+      .notNull()
+      .references(() => workspaces.id, { onDelete: "cascade" }),
+    accountId: uuid("account_id")
+      .notNull()
+      .references(() => accounts.id, { onDelete: "cascade" }),
+    sourceCampaignId: uuid("source_campaign_id")
+      .notNull()
+      .references(() => campaigns.id, { onDelete: "cascade" }),
+    contactId: uuid("contact_id").references(() => contacts.id, { onDelete: "set null" }),
+    contactPointId: uuid("contact_point_id")
+      .notNull()
+      .references(() => contactPoints.id, { onDelete: "cascade" }),
+    providerCampaignId: text("provider_campaign_id").notNull(),
+    normalizedEmail: text("normalized_email").notNull(),
+    idempotencyKey: text("idempotency_key").notNull(),
+    status: text("status").notNull().default("eligible"),
+    attemptCount: integer("attempt_count").notNull().default(0),
+    maxAttempts: integer("max_attempts").notNull().default(8),
+    lockedAt: timestamp("locked_at", { withTimezone: true }),
+    nextAttemptAt: timestamp("next_attempt_at", { withTimezone: true }).defaultNow(),
+    lastError: text("last_error"),
+    providerLeadId: text("provider_lead_id"),
+    uploadedAt: timestamp("uploaded_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    uniqueIndex("uq_instantly_import_identity").on(
+      table.workspaceId,
+      table.accountId,
+      table.contactPointId,
+      table.providerCampaignId,
+    ),
+    uniqueIndex("uq_instantly_import_idempotency").on(table.idempotencyKey),
+    uniqueIndex("uq_instantly_import_email").on(table.workspaceId, table.normalizedEmail, table.providerCampaignId),
+    uniqueIndex("uq_instantly_import_active_account")
+      .on(table.workspaceId, table.accountId, table.providerCampaignId)
+      .where(sql`${table.status} in ('eligible', 'instantly_queued', 'instantly_added', 'skipped_existing', 'failed', 'deferred')`),
+    index("idx_instantly_import_dispatch").on(table.status, table.nextAttemptAt),
+    index("idx_instantly_import_workspace_status").on(table.workspaceId, table.status),
+  ],
+);
+
+export const instantlyImportLocks = pgTable("instantly_import_locks", {
+  providerCampaignId: text("provider_campaign_id").primaryKey(),
+  lockToken: text("lock_token").notNull(),
+  lockedUntil: timestamp("locked_until", { withTimezone: true }).notNull(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
 export const sendingDomains = pgTable("sending_domains", {
   id: uuid("id").defaultRandom().primaryKey(),
   workspaceId: uuid("workspace_id")

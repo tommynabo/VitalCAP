@@ -174,11 +174,12 @@ export function createEmailVerificationProvider(workspaceId: string): EmailVerif
   if (env.EMAIL_VERIFICATION_PROVIDER === "disabled") return disabledEmailVerificationProvider;
   if (env.EMAIL_VERIFICATION_PROVIDER === "mock") return new MockEmailVerificationProvider();
 
-  if (!env.MILLIONVERIFIER_API_KEY) {
-    throw new Error("EMAIL_VERIFICATION_PROVIDER=millionverifier requires MILLIONVERIFIER_API_KEY to be set.");
+  const apiKey = env.MILLION_VERIFIER ?? env.MILLIONVERIFIER_API_KEY;
+  if (!apiKey) {
+    throw new Error("EMAIL_VERIFICATION_PROVIDER=millionverifier requires MILLION_VERIFIER to be set.");
   }
 
-  const provider = new MillionVerifierEmailVerificationProvider({ apiKey: env.MILLIONVERIFIER_API_KEY });
+  const provider = new MillionVerifierEmailVerificationProvider({ apiKey });
   const originalVerifyBatch = provider.verifyBatch.bind(provider);
   provider.verifyBatch = async (emails) => {
     const settings = await getAutopilotSettings(workspaceId);
