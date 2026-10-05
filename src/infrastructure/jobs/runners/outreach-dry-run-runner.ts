@@ -15,6 +15,7 @@ import {
 } from "@/infrastructure/neon/repositories/outreach";
 import { runOutreachDryRunCycle } from "@/services/outreach/outreach-orchestrator";
 import { getAutopilotSettings } from "@/infrastructure/neon/repositories/autopilot";
+import { getDeliveryEnv } from "@/lib/config/env";
 
 /**
  * No per-campaign/per-offer message template editor exists yet in this
@@ -44,6 +45,10 @@ export interface OutreachDryRunResult {
  * ever consulted). Called once per `/api/cron/outreach-dry-run` invocation.
  */
 export async function runOutreachDryRunCronTick(now: Date = new Date()): Promise<OutreachDryRunResult> {
+  if (getDeliveryEnv().EMAIL_DELIVERY_PROVIDER === "instantly") {
+    return { campaignsProcessed: 0, scheduled: 0, skipped: 0 };
+  }
+
   const workspaceIds = await listWorkspaceIds();
   let campaignsProcessed = 0;
   let scheduled = 0;

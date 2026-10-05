@@ -6,6 +6,7 @@ const mocks = vi.hoisted(() => ({
   getDatabaseEnv: vi.fn(),
   getDeliveryEnv: vi.fn(),
   getVerificationEnv: vi.fn(),
+  leadWriteProof: vi.fn(),
 }));
 
 vi.mock("@/infrastructure/neon/db", () => ({ getNeonSql: () => mocks.sql }));
@@ -92,8 +93,10 @@ function configureReadyPreflight(
     INSTANTLY_MAX_MONTHLY_EMAILS: 5000,
     INSTANTLY_MONTHLY_EMAIL_WARNING_THRESHOLD: 4500,
   });
+  mocks.leadWriteProof.mockReturnValue([]);
   mocks.sql.mockImplementation((strings: TemplateStringsArray) => {
     const query = strings.join(" ");
+    if (query.includes("provider_lead_id")) return Promise.resolve(mocks.leadWriteProof());
     if (query.includes("to_regclass")) {
       return Promise.resolve([{
         migration_ledger: "vitalcap_migrations",
@@ -135,9 +138,10 @@ describe("GET /api/cron/provider-preflight", () => {
     const response = await GET(new Request("https://vitalcap.test/api/cron/provider-preflight") as never);
     const body = await response.json();
 
-    expect(response.status).toBe(200);
+    expect(response.status).toBe(503);
     expect(body).toMatchObject({
-      healthy: true,
+      healthy: false,
+      instantlyLeadImportReady: false,
       historicalFunnel: emptyHistoricalFunnel,
       database: {
         configured: true,
@@ -157,7 +161,11 @@ describe("GET /api/cron/provider-preflight", () => {
       },
       instantly: {
         configured: true,
-        instantlyLeadImportReady: true,
+        configurationReady: true,
+        schemaReady: true,
+        campaignRead: "PASS",
+        leadsWrite: "NOT_TESTED",
+        instantlyLeadImportReady: false,
         telemetryReady: true,
         campaignAccessible: true,
         campaignId: "055534c5-c3e3-414f-b140-f4770b293c00",
@@ -172,8 +180,32 @@ describe("GET /api/cron/provider-preflight", () => {
     });
     expect(fetchMock.mock.calls.map(([input]) => String(input))).toContain("https://api.millionverifier.com/api/v3/credits?api=million-secret");
     expect(fetchMock.mock.calls.some(([input]) => String(input).includes("email="))).toBe(false);
+    expect(fetchMock.mock.calls.some(([input]) => String(input).endsWith("/leads/add"))).toBe(false);
     expect(JSON.stringify(body)).not.toContain("million-secret");
     expect(JSON.stringify(body)).not.toContain("instantly-secret");
+  });
+
+  it("reports a recent persisted real lead-write proof without creating another lead", async () => {
+    const fetchMock = configureReadyPreflight();
+    mocks.leadWriteProof.mockReturnValue([{
+      uploaded_at: new Date("2026-10-05T10:00:00.000Z"),
+      provider_campaign_id: "055534c5-c3e3-414f-b140-f4770b293c00",
+    }]);
+
+    const response = await GET(new Request("https://vitalcap.test/api/cron/provider-preflight") as never);
+    const body = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(body).toMatchObject({ healthy: true, instantlyLeadImportReady: true });
+    expect(body.instantly).toMatchObject({
+      leadsWrite: "PASS",
+      writeProof: "LEADS_WRITE_RECENTLY_PROVEN",
+      instantlyLeadImportReady: true,
+      lastSuccessfulLeadWriteAt: "2026-10-05T10:00:00.000Z",
+      lastSuccessfulLeadWriteCampaignId: "055534c5-c3e3-414f-b140-f4770b293c00",
+      lastSuccessfulLeadWriteRequestIdSanitized: null,
+    });
+    expect(fetchMock.mock.calls.some(([input]) => String(input).endsWith("/leads/add"))).toBe(false);
   });
 
   it("reports migration 0016 ready independently when 0017 is not applied", async () => {
@@ -191,7 +223,7 @@ describe("GET /api/cron/provider-preflight", () => {
     });
   });
 
-  it.each(["billing", "analytics"])("keeps lead import ready when %s scope is unavailable", async (unavailableScope) => {
+  it.each(["billing", "analytics"])("keeps independent readiness states when %s scope is unavailable", async (unavailableScope) => {
     configureReadyPreflight((url) => {
       if ((unavailableScope === "billing" && url.includes("/workspace-billing/plan-details"))
         || (unavailableScope === "analytics" && url.includes("/campaigns/analytics"))) {
@@ -203,13 +235,17 @@ describe("GET /api/cron/provider-preflight", () => {
     const response = await GET(new Request("https://vitalcap.test/api/cron/provider-preflight") as never);
     const body = await response.json();
 
-    expect(response.status).toBe(200);
+    expect(response.status).toBe(503);
     expect(body).toMatchObject({
-      healthy: true,
-      instantlyLeadImportReady: true,
+      healthy: false,
+      instantlyLeadImportReady: false,
       instantlyTelemetryReady: false,
       instantly: {
-        instantlyLeadImportReady: true,
+        configurationReady: true,
+        schemaReady: true,
+        campaignRead: "PASS",
+        leadsWrite: "NOT_TESTED",
+        instantlyLeadImportReady: false,
         telemetryReady: false,
         auth: {
           leadsWrite: "NOT_TESTED",
@@ -218,6 +254,23 @@ describe("GET /api/cron/provider-preflight", () => {
           billingRead: unavailableScope === "billing" ? "OPTIONAL_FAIL" : "PASS",
         },
       },
+    });
+  });
+
+  it.each([401, 403])("does not mark a campaign readable after HTTP %s", async (status) => {
+    configureReadyPreflight((url) => url.endsWith("/055534c5-c3e3-414f-b140-f4770b293c00")
+      ? Response.json({ error: "unauthorized" }, { status })
+      : createFetchResponse(url));
+
+    const response = await GET(new Request("https://vitalcap.test/api/cron/provider-preflight") as never);
+    const body = await response.json();
+
+    expect(body.instantly).toMatchObject({
+      configurationReady: true,
+      schemaReady: true,
+      campaignRead: "FAIL",
+      leadsWrite: "NOT_TESTED",
+      instantlyLeadImportReady: false,
     });
   });
 

@@ -24,7 +24,7 @@ export class MockInstantlyEmailDeliveryProvider implements EmailDeliveryProvider
   async addLead(input: EmailLeadInput): ReturnType<EmailDeliveryProvider["addLead"]> {
     const providerLeadId = `instantly_lead_${hashString(`${input.providerCampaignId}:${input.email}`)}`;
     const status: EmailLeadAddStatus =
-      input.skipIfExisting && this.knownLeadIds.has(providerLeadId) ? "skipped_existing" : "added";
+      this.knownLeadIds.has(providerLeadId) ? "skipped_existing" : "added";
     this.knownLeadIds.add(providerLeadId);
 
     const result: EmailLeadResult = { providerLeadId, status };

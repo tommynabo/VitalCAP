@@ -19,7 +19,15 @@ export interface RecentOutreachEvent {
   channel: ContactPointType;
   createdAt: string;
   state: OutreachEventState;
+  deliveryMode: "dry_run" | "live";
+  providerConfirmed: boolean;
   normalizedEmail?: string | null;
+}
+
+export interface OutreachDeliveryHistory {
+  deliveryMode: "dry_run" | "live";
+  queueState: OutreachEventState;
+  eventStates: readonly OutreachEventState[];
 }
 
 export interface SuppressionCheckEntry {
@@ -57,6 +65,21 @@ export interface OutreachDedupDecision {
 
 /** States considered "in flight" — awaiting an outcome before a fallback contact point may be tried. */
 const IN_FLIGHT_STATES: readonly OutreachEventState[] = ["queued", "scheduled", "provider_submitted", "sent", "delivered"];
+export const ACTUAL_PRIOR_COLD_OUTREACH_STATES: readonly OutreachEventState[] = [
+  "provider_submitted",
+  "sent",
+  "delivered",
+  "replied",
+];
+
+export function hasActualPriorColdOutreach(history: OutreachDeliveryHistory): boolean {
+  return (history.deliveryMode === "live" && ACTUAL_PRIOR_COLD_OUTREACH_STATES.includes(history.queueState))
+    || history.eventStates.some((state) => ACTUAL_PRIOR_COLD_OUTREACH_STATES.includes(state));
+}
+
+export function isDryRunOnlyOutreach(history: OutreachDeliveryHistory): boolean {
+  return history.deliveryMode === "dry_run" && !hasActualPriorColdOutreach(history);
+}
 
 /**
  * Decides whether a new outreach attempt may be queued (Prompt 1 §1.2
@@ -81,8 +104,13 @@ export function canEnterColdOutreach(
   if (context.hasActiveConversation) return { allowed: false, reason: "active_conversation" };
   if (context.hasMeetingBooked) return { allowed: false, reason: "meeting_booked" };
 
+  const relevantRecentEvents = recentEvents.filter((event) =>
+    event.deliveryMode === "live"
+      || (event.providerConfirmed && ACTUAL_PRIOR_COLD_OUTREACH_STATES.includes(event.state)),
+  );
+
   if (!opts.allowSimultaneousAccountContacts) {
-    const otherEndpointInFlight = recentEvents.some(
+    const otherEndpointInFlight = relevantRecentEvents.some(
       (event) =>
         event.accountId === context.accountId &&
         event.contactPointId !== context.contactPointId &&
@@ -94,7 +122,7 @@ export function canEnterColdOutreach(
   const cooldownMs = opts.cooldownHours * 60 * 60 * 1000;
   const nowMs = new Date(context.now).getTime();
 
-  const sameEndpointEvents = recentEvents.filter(
+  const sameEndpointEvents = relevantRecentEvents.filter(
     (event) =>
       event.contactPointId === context.contactPointId ||
       event.accountId === context.accountId ||

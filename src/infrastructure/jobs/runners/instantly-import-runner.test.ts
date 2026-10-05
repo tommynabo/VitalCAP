@@ -3,7 +3,7 @@ import { resetServerEnvCacheForTests } from "@/lib/config/env";
 
 const mocks = vi.hoisted(() => ({
   execute: vi.fn(),
-  canEnqueueColdOutreach: vi.fn(),
+  hasActualPriorColdOutreach: vi.fn(),
   acquireLock: vi.fn(),
   claimImports: vi.fn(),
   deferByPlanLimit: vi.fn(),
@@ -19,8 +19,9 @@ const mocks = vi.hoisted(() => ({
 }));
 
 vi.mock("@/infrastructure/neon/db", () => ({ getDb: () => ({ execute: mocks.execute }) }));
-vi.mock("@/infrastructure/neon/repositories/outreach", () => ({
-  canEnqueueColdOutreach: mocks.canEnqueueColdOutreach,
+vi.mock("@/infrastructure/neon/repositories/actual-outreach", () => ({
+  actualPriorColdOutreachSql: vi.fn(() => ({ strings: ["TRUE"], values: [] })),
+  hasActualPriorColdOutreach: mocks.hasActualPriorColdOutreach,
 }));
 vi.mock("@/infrastructure/neon/repositories/instantly-lead-imports", () => ({
   acquireInstantlyImportLock: mocks.acquireLock,
@@ -109,7 +110,7 @@ beforeEach(() => {
   resetServerEnvCacheForTests();
   vi.clearAllMocks();
   mocks.execute.mockResolvedValue({ rows: [] });
-  mocks.canEnqueueColdOutreach.mockResolvedValue(true);
+  mocks.hasActualPriorColdOutreach.mockResolvedValue(false);
   mocks.acquireLock.mockResolvedValue(true);
   mocks.enqueueImport.mockResolvedValue(true);
   mocks.getImportCounts.mockResolvedValue({});
@@ -165,7 +166,8 @@ describe("runInstantlyImportTick", () => {
     expect(mocks.addLeads).toHaveBeenCalledWith([expect.objectContaining({
       providerCampaignId: campaignId,
       email: "person@example.com",
-      skipIfExisting: true,
+      skipIfInWorkspace: false,
+      skipIfInCampaign: false,
       allowCampaignImportInDryRun: true,
       customVariables: expect.objectContaining({
         first_name: "Alex",
@@ -197,7 +199,7 @@ describe("runInstantlyImportTick", () => {
 
   it("does not enqueue accounts blocked by the shared cold-outreach deduplicator", async () => {
     setupWithoutClaimedJobs([candidate()]);
-    mocks.canEnqueueColdOutreach.mockResolvedValue(false);
+    mocks.hasActualPriorColdOutreach.mockResolvedValue(true);
 
     const result = await runInstantlyImportTick({ contactPointIds: ["contact-point-1"] });
 

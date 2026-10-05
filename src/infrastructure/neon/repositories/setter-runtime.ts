@@ -542,6 +542,124 @@ export async function processInstantlyComplianceEvent(input: {
   return { outcome: "processed" };
 }
 
+export async function processInstantlySentEvent(input: {
+  providerEventId: string;
+  providerMessageId: string;
+  providerCampaignId: string;
+  email: string;
+  occurredAt: string;
+  payloadHash: string;
+}): Promise<{ outcome: "processed" | "duplicate_skipped" | "ignored_unknown_campaign" | "human_required"; errorCode?: string }> {
+  const db = getDb();
+  return db.transaction(async (tx) => {
+    const [claimed] = await tx.insert(schema.setterWebhookEvents).values({
+      provider: "instantly",
+      providerEventId: input.providerEventId,
+      providerMessageId: input.providerMessageId,
+      payloadHash: input.payloadHash,
+      metadata: { eventType: "email_sent", providerCampaignId: input.providerCampaignId },
+    }).onConflictDoNothing().returning({ id: schema.setterWebhookEvents.id });
+    if (!claimed) {
+      await tx.update(schema.setterWebhookEvents).set({
+        metadata: sql`jsonb_set(
+          ${schema.setterWebhookEvents.metadata},
+          '{duplicateAttempts}',
+          to_jsonb(coalesce((${schema.setterWebhookEvents.metadata}->>'duplicateAttempts')::int, 0) + 1),
+          true
+        )`,
+      }).where(and(
+        eq(schema.setterWebhookEvents.provider, "instantly"),
+        eq(schema.setterWebhookEvents.providerEventId, input.providerEventId),
+      ));
+      return { outcome: "duplicate_skipped" };
+    }
+
+    const campaignRows = await tx.select({ id: schema.campaigns.id, workspaceId: schema.campaigns.workspaceId })
+      .from(schema.campaigns)
+      .where(or(
+        sql`${schema.campaigns.engineConfig} ->> 'instantlyCampaignId' = ${input.providerCampaignId}`,
+        sql`${schema.campaigns.engineConfig} ->> 'providerCampaignId' = ${input.providerCampaignId}`,
+      ))
+      .limit(2);
+    if (campaignRows.length !== 1) {
+      const errorCode = campaignRows.length === 0 ? "UNKNOWN_CAMPAIGN" : "AMBIGUOUS_CAMPAIGN";
+      await tx.update(schema.setterWebhookEvents).set({
+        status: campaignRows.length === 0 ? "ignored" : "human_required",
+        errorCode,
+        processedAt: new Date(input.occurredAt),
+      }).where(eq(schema.setterWebhookEvents.id, claimed.id));
+      return campaignRows.length === 0
+        ? { outcome: "ignored_unknown_campaign" as const }
+        : { outcome: "human_required" as const, errorCode };
+    }
+
+    const campaign = campaignRows[0]!;
+    const contactPointRows = await tx.select({
+      id: schema.contactPoints.id,
+      accountId: schema.contactPoints.accountId,
+      contactId: schema.contactPoints.contactId,
+    }).from(schema.contactPoints).where(and(
+      eq(schema.contactPoints.workspaceId, campaign.workspaceId),
+      eq(schema.contactPoints.type, "email"),
+      eq(schema.contactPoints.normalizedValue, input.email.trim().toLowerCase()),
+    )).limit(2);
+    if (contactPointRows.length !== 1) {
+      const errorCode = contactPointRows.length === 0 ? "CONTACT_NOT_FOUND" : "AMBIGUOUS_CONTACT_MATCH";
+      await tx.update(schema.setterWebhookEvents).set({
+        workspaceId: campaign.workspaceId,
+        status: "human_required",
+        errorCode,
+        processedAt: new Date(input.occurredAt),
+      }).where(eq(schema.setterWebhookEvents.id, claimed.id));
+      return { outcome: "human_required" as const, errorCode };
+    }
+
+    const contactPoint = contactPointRows[0]!;
+    const occurredAt = new Date(input.occurredAt);
+    const [queueItem] = await tx.insert(schema.outreachQueue).values({
+      workspaceId: campaign.workspaceId,
+      campaignId: campaign.id,
+      accountId: contactPoint.accountId,
+      contactId: contactPoint.contactId,
+      contactPointId: contactPoint.id,
+      normalizedEmail: input.email.trim().toLowerCase(),
+      channel: "email",
+      status: "completed",
+      state: "sent",
+      deliveryMode: "live",
+      scheduledFor: occurredAt,
+      nextAttemptAt: null,
+      payload: { provider: "instantly", providerLeadId: input.providerMessageId },
+    }).returning({ id: schema.outreachQueue.id });
+
+    await tx.insert(schema.outreachEvents).values({
+      outreachQueueItemId: queueItem!.id,
+      state: "sent",
+      providerEventId: input.providerEventId,
+      payloadHash: input.payloadHash,
+      occurredAt,
+    });
+    await tx.update(schema.campaignMemberships).set({
+      contactedAt: sql`greatest(coalesce(${schema.campaignMemberships.contactedAt}, '-infinity'::timestamptz), ${occurredAt})`,
+      updatedAt: new Date(),
+    })
+      .where(and(
+        eq(schema.campaignMemberships.campaignId, campaign.id),
+        eq(schema.campaignMemberships.accountId, contactPoint.accountId),
+      ));
+    await tx.update(schema.contactPoints).set({
+      lastContactedAt: sql`greatest(coalesce(${schema.contactPoints.lastContactedAt}, '-infinity'::timestamptz), ${occurredAt})`,
+      updatedAt: new Date(),
+    }).where(eq(schema.contactPoints.id, contactPoint.id));
+    await tx.update(schema.setterWebhookEvents).set({
+      workspaceId: campaign.workspaceId,
+      status: "processed",
+      processedAt: occurredAt,
+    }).where(eq(schema.setterWebhookEvents.id, claimed.id));
+    return { outcome: "processed" as const };
+  });
+}
+
 export async function recordInstantlyIgnoredEvent(input: {
   eventType: string;
   providerEventId: string;
@@ -635,6 +753,7 @@ export type SetterReplyDeliveryResult =
   | { status: "sent"; providerMessageId: string | null }
   | { status: "failed"; errorCode: string }
   | { status: "uncertain"; errorCode: string }
+  | { status: "reconciliation_required"; errorCode: "SEND_UNKNOWN_REQUIRES_RECONCILIATION" }
   | { status: "already_claimed" };
 
 function jsonObject(value: unknown): Record<string, unknown> {
@@ -669,6 +788,12 @@ export async function sendReviewedSetterReply(workspaceId: string, draftId: stri
       .where(and(eq(schema.setterDrafts.id, draftId), eq(schema.conversations.workspaceId, workspaceId)))
       .limit(1);
     if (!item || item.conversation.state !== "approved_pending_send" || !item.feedback.finalText?.trim()) return null;
+    const previousDelivery = jsonObject(item.message.metadata).replyDelivery;
+    if (jsonObject(previousDelivery).status === "send_unknown") {
+      await tx.update(schema.conversations).set({ state: "send_unknown", updatedAt: new Date() })
+        .where(eq(schema.conversations.id, item.conversation.id));
+      return { reconciliationRequired: true as const };
+    }
 
     const now = new Date();
     const [claimed] = await tx.update(schema.conversations).set({ state: "sending", updatedAt: now })
@@ -696,6 +821,9 @@ export async function sendReviewedSetterReply(workspaceId: string, draftId: stri
     return { ...item, messageMetadata: metadata };
   });
   if (!claim) return { status: "already_claimed" };
+  if ("reconciliationRequired" in claim) {
+    return { status: "reconciliation_required", errorCode: "SEND_UNKNOWN_REQUIRES_RECONCILIATION" };
+  }
 
   const provider = new InstantlyReplyProvider(env.INSTANTLY_API_KEY);
   const replyToUuid = typeof claim.messageMetadata.replyToUuid === "string"

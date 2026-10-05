@@ -8,15 +8,15 @@ describe("MockInstantlyEmailDeliveryProvider", () => {
       providerCampaignId: "camp_abc",
       email: "owner@example.es",
       customVariables: {},
-      skipIfExisting: true,
+      skipIfInWorkspace: true,
     });
     expect(result.status).toBe("added");
     expect(result.providerLeadId).toMatch(/^instantly_lead_/);
   });
 
-  it("reports skipped_existing on a second add with skipIfExisting", async () => {
+  it("reports skipped_existing on a second add already in the target campaign", async () => {
     const provider = new MockInstantlyEmailDeliveryProvider();
-    const input = { providerCampaignId: "camp_abc", email: "owner@example.es", customVariables: {}, skipIfExisting: true };
+    const input = { providerCampaignId: "camp_abc", email: "owner@example.es", customVariables: {} };
     await provider.addLead(input);
     const { result } = await provider.addLead(input);
     expect(result.status).toBe("skipped_existing");

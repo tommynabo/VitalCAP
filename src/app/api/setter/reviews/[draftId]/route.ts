@@ -62,6 +62,17 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ dr
       if (sendResult.status === "already_claimed") {
         return NextResponse.json({ state: "sending", delivery: "already_started" }, { status: 409 });
       }
+      if (sendResult.status === "reconciliation_required") {
+        await insertAuditLog({
+          workspaceId: context.workspaceId,
+          actorUserId: context.user.userId,
+          action: `setter.review.${command.decision}`,
+          entityType: "setter_draft",
+          entityId: item.draft.id,
+          metadata: { branch: item.draft.branch, correctedBranch: command.correctedBranch ?? null, delivery: sendResult.status },
+        });
+        return NextResponse.json({ state: "send_unknown", delivery: "reconciliation_required", errorCode: sendResult.errorCode }, { status: 409 });
+      }
       if (sendResult.status === "sent") {
         delivery = "sent";
       } else {

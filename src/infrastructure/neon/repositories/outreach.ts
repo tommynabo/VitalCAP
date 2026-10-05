@@ -154,6 +154,7 @@ export async function canEnqueueColdOutreach(workspaceId: string, item: Outreach
       channel: outreachQueue.channel,
       createdAt: outreachQueue.createdAt,
       queueState: outreachQueue.state,
+      deliveryMode: outreachQueue.deliveryMode,
       eventState: outreachEvents.state,
       normalizedValue: contactPoints.normalizedValue,
     })
@@ -198,6 +199,8 @@ export async function canEnqueueColdOutreach(workspaceId: string, item: Outreach
       channel: row.channel as OutreachQueueItem["channel"],
       createdAt: row.createdAt.toISOString(),
       state: (row.eventState ?? row.queueState) as OutreachEventState,
+      deliveryMode: row.deliveryMode as "dry_run" | "live",
+      providerConfirmed: row.eventState !== null,
       normalizedEmail: row.normalizedValue.toLowerCase(),
     })),
     suppressionRows.map((row) => ({

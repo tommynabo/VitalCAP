@@ -4,11 +4,12 @@ const normalizeInstantlyInboundReply = vi.fn();
 const normalizeInstantlyWebhook = vi.fn();
 const processInstantlyInboundReply = vi.fn();
 const processInstantlyComplianceEvent = vi.fn();
+const processInstantlySentEvent = vi.fn();
 const recordInstantlyIgnoredEvent = vi.fn();
 const getDeliveryEnv = vi.fn();
 
 vi.mock("@/infrastructure/providers/instantly/webhook-normalizer", () => ({ normalizeInstantlyInboundReply, normalizeInstantlyWebhook }));
-vi.mock("@/infrastructure/neon/repositories/setter-runtime", () => ({ neonSetterInboundRuntimeStore: {}, processInstantlyComplianceEvent, recordInstantlyIgnoredEvent }));
+vi.mock("@/infrastructure/neon/repositories/setter-runtime", () => ({ neonSetterInboundRuntimeStore: {}, processInstantlyComplianceEvent, processInstantlySentEvent, recordInstantlyIgnoredEvent }));
 vi.mock("@/lib/config/env", () => ({ getDeliveryEnv }));
 vi.mock("@/services/setter/inbound-runtime", () => ({ processInstantlyInboundReply }));
 
@@ -40,13 +41,14 @@ describe("POST /api/webhooks/instantly", () => {
       return {
         providerLeadId: "lead@example.es",
         providerEventId,
-        code: root.event_type === "email_bounced" ? "bounced" : "unsubscribed",
+        code: root.event_type === "email_sent" ? "sent" : root.event_type === "email_bounced" ? "bounced" : "unsubscribed",
         occurredAt: occurredAt.toISOString(),
         raw: {},
       };
     });
     processInstantlyInboundReply.mockResolvedValue({ outcome: "processed" });
     processInstantlyComplianceEvent.mockResolvedValue({ outcome: "processed" });
+    processInstantlySentEvent.mockResolvedValue({ outcome: "processed" });
     recordInstantlyIgnoredEvent.mockResolvedValue(undefined);
   });
 
@@ -79,13 +81,35 @@ describe("POST /api/webhooks/instantly", () => {
     expect(recordInstantlyIgnoredEvent).toHaveBeenCalledOnce();
   });
 
-  it.each(["email_sent", "email_opened", "email_clicked", "campaign_completed"])("ignores %s without generating a Setter draft", async (eventType) => {
+  it("records email_sent as outreach without invoking Setter", async () => {
+    const payload = {
+      event_type: "email_sent",
+      event_id: "sent-event-1",
+      campaign_id: "campaign-1",
+      lead_email: "lead@example.es",
+      timestamp: "2026-10-05T12:00:00.000Z",
+    };
+    const response = await POST(request(payload, secret));
+
+    expect(response.status).toBe(200);
+    expect(processInstantlySentEvent).toHaveBeenCalledWith(expect.objectContaining({
+      providerEventId: "sent-event-1",
+      providerCampaignId: "campaign-1",
+      email: "lead@example.es",
+      occurredAt: "2026-10-05T12:00:00.000Z",
+    }));
+    expect(processInstantlyInboundReply).not.toHaveBeenCalled();
+    expect(recordInstantlyIgnoredEvent).not.toHaveBeenCalled();
+  });
+
+  it.each(["email_opened", "email_clicked", "campaign_completed"])("ignores %s without generating a Setter draft", async (eventType) => {
     const response = await POST(request({ event_type: eventType }, secret));
 
     expect(response.status).toBe(202);
     expect(await response.json()).toMatchObject({ ok: true, ignored: true, eventType });
     expect(processInstantlyInboundReply).not.toHaveBeenCalled();
     expect(processInstantlyComplianceEvent).not.toHaveBeenCalled();
+    expect(processInstantlySentEvent).not.toHaveBeenCalled();
     expect(recordInstantlyIgnoredEvent).toHaveBeenCalledOnce();
   });
 

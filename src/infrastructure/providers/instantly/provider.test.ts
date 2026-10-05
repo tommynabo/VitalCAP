@@ -40,7 +40,8 @@ describe("InstantlyEmailDeliveryProvider", () => {
         undefined_value: undefined as unknown as string,
         null_value: null as unknown as string,
       },
-      skipIfExisting: true,
+      skipIfInWorkspace: true,
+      skipIfInCampaign: false,
       allowCampaignImportInDryRun: true,
     });
 
@@ -54,6 +55,7 @@ describe("InstantlyEmailDeliveryProvider", () => {
       campaign_id: "campaign-1",
       leads: [{ email: "person@example.com", first_name: "Person", website: "https://example.com" }],
       skip_if_in_workspace: true,
+      skip_if_in_campaign: false,
       verify_leads_on_import: false,
     });
     expect(result.result).toEqual({ providerLeadId: "lead-1", status: "added" });
@@ -67,7 +69,7 @@ describe("InstantlyEmailDeliveryProvider", () => {
       providerCampaignId: "campaign-1",
       email: "person@example.com",
       customVariables: {},
-      skipIfExisting: true,
+      skipIfInWorkspace: true,
     });
 
     expect(fetchImpl).not.toHaveBeenCalled();
@@ -88,7 +90,7 @@ describe("InstantlyEmailDeliveryProvider", () => {
       providerCampaignId: "campaign-1",
       email: "person@example.com",
       customVariables: {},
-      skipIfExisting: true,
+      skipIfInWorkspace: true,
       allowCampaignImportInDryRun: true,
     });
 
@@ -140,7 +142,7 @@ describe("InstantlyEmailDeliveryProvider", () => {
       providerCampaignId: "campaign-1",
       email: "person@example.com",
       customVariables: {},
-      skipIfExisting: true,
+      skipIfInWorkspace: true,
       allowCampaignImportInDryRun: true,
     });
 
@@ -166,7 +168,8 @@ describe("InstantlyEmailDeliveryProvider", () => {
       providerCampaignId: "campaign-1",
       email: `person-${index}@example.com`,
       customVariables: {},
-      skipIfExisting: true,
+      skipIfInWorkspace: false,
+      skipIfInCampaign: false,
       allowCampaignImportInDryRun: true,
     })));
 
@@ -175,7 +178,8 @@ describe("InstantlyEmailDeliveryProvider", () => {
     const payload = JSON.parse(String(request.body));
     expect(payload.leads).toHaveLength(100);
     expect(payload.verify_leads_on_import).toBe(false);
-    expect(payload.skip_if_in_workspace).toBe(true);
+    expect(payload.skip_if_in_workspace).toBe(false);
+    expect(payload.skip_if_in_campaign).toBe(false);
     expect(result.outcomes.every((outcome) => outcome.status === "added")).toBe(true);
     expect(result.usage.items).toBe(100);
   });
@@ -194,7 +198,7 @@ describe("InstantlyEmailDeliveryProvider", () => {
       providerCampaignId: "campaign-1",
       email: `person-${index}@example.com`,
       customVariables: {},
-      skipIfExisting: true,
+      skipIfInWorkspace: true,
       allowCampaignImportInDryRun: true,
     }));
 
@@ -224,11 +228,38 @@ describe("InstantlyEmailDeliveryProvider", () => {
       providerCampaignId: "campaign-1",
       email: "person@example.com",
       customVariables: {},
-      skipIfExisting: true,
+      skipIfInWorkspace: true,
       allowCampaignImportInDryRun: true,
     }]);
 
     expect(result.outcomes[0]).toMatchObject({ status: "skipped_existing", providerLeadId: null });
+  });
+
+  it("does not treat a workspace-wide skip as target-campaign membership", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(jsonResponse({
+      status: "success",
+      total_sent: 1,
+      leads_uploaded: 0,
+      duplicated_leads: 0,
+      skipped_count: 1,
+      created_leads: [],
+    }));
+    const provider = new InstantlyEmailDeliveryProvider({ apiKey: "secret-test-key", fetchImpl });
+
+    const result = await provider.addLeads([{
+      providerCampaignId: "campaign-1",
+      email: "person@example.com",
+      customVariables: {},
+      skipIfInWorkspace: false,
+      skipIfInCampaign: false,
+      allowCampaignImportInDryRun: true,
+    }]);
+
+    expect(result.outcomes[0]).toMatchObject({
+      status: "needs_campaign_move",
+      providerLeadId: null,
+      diagnostic: expect.stringContaining("without confirming target-campaign membership"),
+    });
   });
 
   it("reports a leads/add 401 with sanitized endpoint diagnostics", async () => {
@@ -246,7 +277,7 @@ describe("InstantlyEmailDeliveryProvider", () => {
       providerCampaignId: "campaign-1",
       email: "person@example.com",
       customVariables: {},
-      skipIfExisting: true,
+      skipIfInWorkspace: true,
       allowCampaignImportInDryRun: true,
     }).then(
       () => {

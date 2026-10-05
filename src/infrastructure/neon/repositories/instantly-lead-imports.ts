@@ -58,7 +58,7 @@ export async function claimInstantlyLeadImports(limit: number, now: Date): Promi
 export async function updateInstantlyLeadImport(
   id: string,
   update: {
-    status: "instantly_added" | "skipped_existing" | "failed" | "deferred";
+    status: "instantly_added" | "skipped_existing" | "needs_campaign_move" | "failed" | "deferred";
     now: Date;
     nextAttemptAt?: Date | null;
     lastError?: string | null;
@@ -145,6 +145,80 @@ export async function isInstantlyImportCircuitOpen(providerCampaignId: string): 
     LIMIT 1
   `);
   return result.rows.length > 0;
+}
+
+export async function getInstantlyImportCircuitState(providerCampaignId: string, workspaceId: string): Promise<{
+  open: boolean;
+  trippedAt: string | null;
+}> {
+  const db = getDb();
+  const result = await db.execute(sql`
+    SELECT updated_at
+    FROM instantly_import_locks
+    WHERE provider_campaign_id = ${providerCampaignId}
+      AND lock_token LIKE 'auth-failure:%'
+      AND EXISTS (
+        SELECT 1 FROM campaigns
+        WHERE campaigns.workspace_id = ${workspaceId}
+          AND (
+            campaigns.engine_config ->> 'instantlyCampaignId' = ${providerCampaignId}
+            OR campaigns.engine_config ->> 'providerCampaignId' = ${providerCampaignId}
+            OR EXISTS (
+              SELECT 1 FROM campaign_provider_mappings mappings
+              WHERE mappings.campaign_id = campaigns.id
+                AND mappings.provider = 'instantly'
+                AND mappings.provider_campaign_id = ${providerCampaignId}
+                AND mappings.enabled = true
+            )
+          )
+      )
+    LIMIT 1
+  `);
+  const trippedAt = result.rows[0]?.updated_at;
+  return {
+    open: trippedAt !== undefined,
+    trippedAt: trippedAt instanceof Date ? trippedAt.toISOString() : typeof trippedAt === "string" ? trippedAt : null,
+  };
+}
+
+export async function resetInstantlyImportCircuit(input: {
+  providerCampaignId: string;
+  workspaceId: string;
+  actorUserId: string;
+}): Promise<{ reset: boolean }> {
+  const db = getDb();
+  return db.transaction(async (tx) => {
+    const result = await tx.execute(sql`
+      DELETE FROM instantly_import_locks
+      WHERE provider_campaign_id = ${input.providerCampaignId}
+        AND lock_token LIKE 'auth-failure:%'
+        AND EXISTS (
+          SELECT 1 FROM campaigns
+          WHERE campaigns.workspace_id = ${input.workspaceId}
+            AND (
+              campaigns.engine_config ->> 'instantlyCampaignId' = ${input.providerCampaignId}
+              OR campaigns.engine_config ->> 'providerCampaignId' = ${input.providerCampaignId}
+              OR EXISTS (
+                SELECT 1 FROM campaign_provider_mappings mappings
+                WHERE mappings.campaign_id = campaigns.id
+                  AND mappings.provider = 'instantly'
+                  AND mappings.provider_campaign_id = ${input.providerCampaignId}
+                  AND mappings.enabled = true
+              )
+            )
+        )
+      RETURNING provider_campaign_id
+    `);
+    await tx.insert(schema.auditLog).values({
+      workspaceId: input.workspaceId,
+      actorUserId: input.actorUserId,
+      action: "instantly.import_circuit.reset",
+      entityType: "instantly_import_circuit",
+      entityId: input.providerCampaignId,
+      metadata: { reset: result.rows.length > 0 },
+    });
+    return { reset: result.rows.length > 0 };
+  });
 }
 
 export async function tripInstantlyImportCircuitBreaker(

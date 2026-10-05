@@ -22,7 +22,7 @@ async function main() {
   
   // Find up to 3 qualified prospects that don't have a completed intelligence job
   const qualifiedMemberships = await db.execute(sql`
-    SELECT cm.campaign_id, cm.account_id, cm.workspace_id
+    SELECT cm.campaign_id, cm.account_id, c.workspace_id AS workspace_id
     FROM campaign_memberships cm
     JOIN campaigns c ON cm.campaign_id = c.id
     WHERE cm.stage = 'qualified'

@@ -6,6 +6,7 @@ import {
   getQueueHealthData,
   getRebalanceDecisions,
   getLastCronRouteRunAtData,
+  getInstantlyPipelineDiagnosticsData,
 } from "@/lib/data/repository";
 import { AutopilotClient } from "./autopilot-client";
 
@@ -15,7 +16,7 @@ export const dynamic = "force-dynamic";
 export const revalidate = 0;
 
 export default async function AutopilotPage() {
-  const [state, settings, deadLetterSamples, providerRows, queueHealth, rebalanceDecisions, lastAutopilotCron, lastDiscoveryCron] = await Promise.all([
+  const [state, settings, deadLetterSamples, providerRows, queueHealth, rebalanceDecisions, lastAutopilotCron, lastDiscoveryCron, instantlyPipeline] = await Promise.all([
     getGlobalAutopilotStateData(),
     getAutopilotSettingsData(),
     getDeadLetterSamplesData(),
@@ -24,6 +25,7 @@ export default async function AutopilotPage() {
     getRebalanceDecisions(),
     getLastCronRouteRunAtData("autopilot"),
     getLastCronRouteRunAtData("discovery"),
+    getInstantlyPipelineDiagnosticsData(),
   ]);
 
   return (
@@ -36,6 +38,7 @@ export default async function AutopilotPage() {
       providerRows={providerRows}
       queueHealth={queueHealth}
       rebalanceDecisions={rebalanceDecisions}
+      instantlyPipeline={instantlyPipeline}
     />
   );
 }
