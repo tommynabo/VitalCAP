@@ -15,8 +15,7 @@ import {
   tripInstantlyImportCircuitBreaker,
   updateInstantlyLeadImport,
 } from "@/infrastructure/neon/repositories/instantly-lead-imports";
-import { canEnqueueColdOutreach } from "@/infrastructure/neon/repositories/outreach";
-import type { OutreachQueueItem } from "@/domain/outreach/types";
+import { actualPriorColdOutreachSql, hasActualPriorColdOutreach } from "@/infrastructure/neon/repositories/actual-outreach";
 import { evaluateInstantlyLeadEligibility } from "@/services/verification/instantly-lead-eligibility";
 import { logEvent } from "@/lib/observability/structured-logger";
 
@@ -137,13 +136,12 @@ async function listEligibleCandidates(options: {
         WHERE se.workspace_id = a.workspace_id
           AND (se.account_id = a.id OR se.contact_point_id = cp.id)
       )
-      AND NOT EXISTS (
-        SELECT 1 FROM outreach_queue oq
-        JOIN campaigns oqc ON oqc.id = oq.campaign_id
-        WHERE oq.workspace_id = a.workspace_id
-          AND oq.account_id = a.id
-          AND oq.channel = 'email'
-      )
+      AND NOT ${actualPriorColdOutreachSql({
+        workspaceId: "a.workspace_id",
+        accountId: "a.id",
+        contactPointId: "cp.id",
+        normalizedEmail: "cp.normalized_value",
+      })}
       AND NOT EXISTS (
         SELECT 1 FROM conversations conv
         WHERE conv.workspace_id = a.workspace_id
@@ -164,36 +162,25 @@ async function listEligibleCandidates(options: {
   return result.rows as unknown as CandidateRow[];
 }
 
-function createDedupCandidate(row: CandidateRow): OutreachQueueItem {
-  return {
-    id: "instantly-import-check",
-    campaignId: row.source_campaign_id,
-    accountId: row.account_id,
-    contactId: row.contact_id,
-    contactPointId: row.contact_point_id,
-    channel: "email",
-    priority: 0,
-    scheduledFor: null,
-    state: "queued",
-    deliveryMode: "dry_run",
-  };
-}
-
 async function enqueueCandidates(
   rows: readonly CandidateRow[],
   providerCampaignId: string,
-  now: Date,
 ): Promise<number> {
   let enqueued = 0;
   for (const row of rows) {
-    const coldOutreachAllowed = await canEnqueueColdOutreach(row.workspace_id, createDedupCandidate(row), now);
+    const hasPriorOutreach = await hasActualPriorColdOutreach({
+      workspaceId: row.workspace_id,
+      accountId: row.account_id,
+      contactPointId: row.contact_point_id,
+      normalizedEmail: row.normalized_email,
+    });
     const eligibility = evaluateInstantlyLeadEligibility({
       hasEmail: row.normalized_email.length > 0,
       verificationStatus: row.verification_status as CandidateRow["verification_status"] & "valid",
       contactEligibility: "eligible",
       complianceAllowed: true,
       isSuppressed: false,
-      hasPriorColdOutreach: !coldOutreachAllowed,
+      hasPriorColdOutreach: hasPriorOutreach,
       isInFlight: false,
       alreadyInCampaign: false,
     });
@@ -323,7 +310,7 @@ export async function runInstantlyImportTick(options: {
       forEnqueue: true,
     });
     result.candidatesFound = candidates.length;
-    result.leadsQueued = await enqueueCandidates(candidates, env.INSTANTLY_CAMPAIGN_ID, now);
+    result.leadsQueued = await enqueueCandidates(candidates, env.INSTANTLY_CAMPAIGN_ID);
   }
   result.metrics = await readPipelineMetrics();
   if (env.EMAIL_DELIVERY_PROVIDER !== "instantly" || !env.INSTANTLY_API_KEY) return result;
@@ -433,7 +420,8 @@ export async function runInstantlyImportTick(options: {
           providerCampaignId: env.INSTANTLY_CAMPAIGN_ID,
           email: candidate.normalized_email,
           customVariables: buildLeadVariables(candidate),
-          skipIfExisting: true,
+          skipIfInWorkspace: false,
+          skipIfInCampaign: false,
           allowCampaignImportInDryRun: true,
         })));
         result.instantlyLeadImportReady = true;
@@ -455,6 +443,13 @@ export async function runInstantlyImportTick(options: {
             providerLeadId: outcome.providerLeadId,
           });
           result.leadsSkipped++;
+          } else if (outcome.status === "needs_campaign_move") {
+            await updateInstantlyLeadImport(jobId, {
+              status: "needs_campaign_move",
+              now,
+              lastError: outcome.diagnostic ?? "Instantly did not confirm target-campaign membership.",
+            });
+            result.leadsDeferred++;
           } else {
             await updateInstantlyLeadImport(jobId, {
               status: "failed",

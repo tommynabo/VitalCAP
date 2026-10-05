@@ -81,14 +81,14 @@ describe("normalizeInstantlyInboundReply", () => {
 });
 
 describe("normalizeInstantlyWebhook", () => {
-  it.each(["email_bounced", "lead_unsubscribed"])("normalizes nested %s status events", (eventType) => {
+  it.each(["email_sent", "email_bounced", "lead_unsubscribed"])("normalizes nested %s status events", (eventType) => {
     expect(normalizeInstantlyWebhook({
       event_type: eventType,
       data: { lead_email: "Lead@Example.es" },
     }, "event-1", new Date("2026-10-04T12:30:00.000Z"))).toMatchObject({
       providerLeadId: "Lead@Example.es",
       providerEventId: "event-1",
-      code: eventType === "email_bounced" ? "bounced" : "unsubscribed",
+      code: eventType === "email_sent" ? "sent" : eventType === "email_bounced" ? "bounced" : "unsubscribed",
     });
   });
 

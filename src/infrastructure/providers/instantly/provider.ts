@@ -27,7 +27,7 @@ interface InstantlyAddLeadsResponse {
   created_leads?: Array<{ id?: string; index?: number }>;
 }
 
-export type InstantlyLeadImportStatus = "added" | "skipped_existing" | "failed";
+export type InstantlyLeadImportStatus = "added" | "skipped_existing" | "needs_campaign_move" | "failed";
 
 export interface InstantlyLeadImportOutcome {
   index: number;
@@ -305,7 +305,8 @@ export class InstantlyEmailDeliveryProvider implements EmailDeliveryProvider {
           },
           body: JSON.stringify({
             campaign_id: providerCampaignId,
-            skip_if_in_workspace: inputs.every((input) => input.skipIfExisting),
+            skip_if_in_workspace: inputs.every((input) => input.skipIfInWorkspace ?? false),
+            skip_if_in_campaign: inputs.every((input) => input.skipIfInCampaign ?? false),
             verify_leads_on_import: false,
             leads: inputs.map(leadPayload),
           }),
@@ -346,12 +347,18 @@ export class InstantlyEmailDeliveryProvider implements EmailDeliveryProvider {
         : { index, status: "failed", providerLeadId: null, diagnostic: null };
     });
     const uncreated = outcomes.filter((outcome) => outcome.status === "failed");
-    const skippedCount = (data.duplicated_leads ?? 0) + (data.skipped_count ?? 0);
+    const targetDuplicateCount = data.duplicated_leads ?? 0;
+    const skippedCount = data.skipped_count ?? 0;
     const rejectedCount = (data.in_blocklist ?? 0) + (data.invalid_email_count ?? 0) + (data.incomplete_count ?? 0);
     const duplicateRequestCount = data.duplicate_email_count ?? 0;
     const aggregateRejectedCount = rejectedCount + duplicateRequestCount;
-    if (uncreated.length > 0 && skippedCount === uncreated.length && aggregateRejectedCount === 0) {
+    if (uncreated.length > 0 && targetDuplicateCount === uncreated.length && skippedCount === 0 && aggregateRejectedCount === 0) {
       for (const outcome of uncreated) outcome.status = "skipped_existing";
+    } else if (uncreated.length > 0 && skippedCount === uncreated.length && targetDuplicateCount === 0 && aggregateRejectedCount === 0) {
+      for (const outcome of uncreated) {
+        outcome.status = "needs_campaign_move";
+        outcome.diagnostic = "Instantly skipped a workspace lead without confirming target-campaign membership.";
+      }
     } else if (uncreated.length > 0 && rejectedCount === uncreated.length && skippedCount === 0 && duplicateRequestCount === 0) {
       for (const outcome of uncreated) {
         outcome.diagnostic = `Instantly leads/add rejected a lead (blocklist=${data.in_blocklist ?? 0}, invalid=${data.invalid_email_count ?? 0}, incomplete=${data.incomplete_count ?? 0}).`;

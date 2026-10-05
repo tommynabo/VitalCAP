@@ -146,4 +146,25 @@ describe("PATCH /api/setter/reviews/[draftId]", () => {
     expect(response.status).toBe(502);
     expect(body).toMatchObject({ state: "send_failed", delivery: "failed", errorCode: "INSTANTLY_REPLY_401" });
   });
+
+  it("keeps an uncertain prior send held for reconciliation", async () => {
+    sendReviewedSetterReply.mockResolvedValue({
+      status: "reconciliation_required",
+      errorCode: "SEND_UNKNOWN_REQUIRES_RECONCILIATION",
+    });
+
+    const response = await review("approve");
+    const body = await response.json();
+
+    expect(response.status).toBe(409);
+    expect(body).toMatchObject({
+      state: "send_unknown",
+      delivery: "reconciliation_required",
+      errorCode: "SEND_UNKNOWN_REQUIRES_RECONCILIATION",
+    });
+    expect(insertAuditLog).toHaveBeenCalledWith(expect.objectContaining({
+      action: "setter.review.approve",
+      metadata: expect.objectContaining({ delivery: "reconciliation_required" }),
+    }));
+  });
 });

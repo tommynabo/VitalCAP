@@ -7,6 +7,7 @@ import { DbVerificationCacheStore } from "@/services/verification/db-verificatio
 import { verifyEmailsWithCache } from "@/services/verification/email-verification-cache";
 import { getDeliveryEnv, getVerificationEnv } from "@/lib/config/env";
 import { enqueueVerificationJob } from "@/infrastructure/neon/repositories/verification-queue";
+import { actualPriorColdOutreachSql } from "@/infrastructure/neon/repositories/actual-outreach";
 import { upsertCampaignMembership } from "@/infrastructure/neon/repositories/campaigns";
 import { EMAIL_VERIFICATION_PIPELINE_VERSION } from "@/domain/providers/email-verification-idempotency";
 import { runInstantlyImportTick, type InstantlyImportTickResult } from "@/infrastructure/jobs/runners/instantly-import-runner";
@@ -140,7 +141,7 @@ export async function enqueueVerificationJobs(options: { createdSince?: Date } =
   // Pick one verification candidate per qualified canonical account.
   const query = sql`
     WITH eligible_accounts AS (
-      SELECT DISTINCT cm.account_id, cm.workspace_id, cm.campaign_id, cm.selected_contact_point_id
+      SELECT DISTINCT cm.account_id, c.workspace_id, cm.campaign_id, cm.selected_contact_point_id
       FROM campaign_memberships cm
       JOIN campaigns c ON cm.campaign_id = c.id
       WHERE cm.stage IN ('qualified', 'contact_selected', 'ready')
@@ -148,22 +149,19 @@ export async function enqueueVerificationJobs(options: { createdSince?: Date } =
         AND cm.contacted_at IS NULL
         AND NOT EXISTS (
           SELECT 1 FROM suppression_entries se
-          WHERE se.workspace_id = cm.workspace_id AND se.account_id = cm.account_id
+          WHERE se.workspace_id = c.workspace_id AND se.account_id = cm.account_id
         )
-        AND NOT EXISTS (
-          SELECT 1 FROM outreach_queue oq
-          WHERE oq.workspace_id = cm.workspace_id AND oq.account_id = cm.account_id AND oq.channel = 'email'
-        )
+        AND NOT ${actualPriorColdOutreachSql({ workspaceId: "c.workspace_id", accountId: "cm.account_id" })}
         AND NOT EXISTS (
           SELECT 1 FROM conversations conv
-          WHERE conv.workspace_id = cm.workspace_id
+          WHERE conv.workspace_id = c.workspace_id
             AND conv.account_id = cm.account_id
             AND conv.state NOT IN ('rejected', 'no_reply_needed', 'suppressed')
         )
         AND NOT EXISTS (
           SELECT 1 FROM meetings m
           JOIN conversations conv ON conv.id = m.conversation_id
-          WHERE conv.workspace_id = cm.workspace_id AND conv.account_id = cm.account_id
+          WHERE conv.workspace_id = c.workspace_id AND conv.account_id = cm.account_id
         )
     ), ranked_candidates AS (
       SELECT DISTINCT ON (ea.campaign_id, ea.account_id)
@@ -192,10 +190,7 @@ export async function enqueueVerificationJobs(options: { createdSince?: Date } =
           WHERE vj.contact_point_id = cp.id
             AND (vj.status IN ('pending', 'processing') OR (vj.status = 'failed' AND vj.attempt_count < vj.max_attempts))
         )
-        AND NOT EXISTS (
-          SELECT 1 FROM outreach_queue oq
-          WHERE oq.workspace_id = ea.workspace_id AND oq.account_id = ea.account_id AND oq.channel = 'email'
-        )
+        AND NOT ${actualPriorColdOutreachSql({ workspaceId: "ea.workspace_id", accountId: "ea.account_id" })}
         AND NOT EXISTS (
           SELECT 1 FROM conversations conv
           WHERE conv.workspace_id = ea.workspace_id
@@ -275,10 +270,10 @@ export async function getHistoricalBackfillProgress(): Promise<HistoricalBackfil
             WHERE vj.contact_point_id = cp.id
               AND (vj.status IN ('pending', 'processing') OR (vj.status = 'failed' AND vj.attempt_count < vj.max_attempts))
           )
-          AND NOT EXISTS (SELECT 1 FROM suppression_entries se WHERE se.workspace_id = cm.workspace_id AND (se.account_id = cm.account_id OR se.contact_point_id = cp.id))
-          AND NOT EXISTS (SELECT 1 FROM outreach_queue oq WHERE oq.workspace_id = cm.workspace_id AND oq.account_id = cm.account_id AND oq.channel = 'email')
-          AND NOT EXISTS (SELECT 1 FROM conversations conv WHERE conv.workspace_id = cm.workspace_id AND conv.account_id = cm.account_id AND conv.state NOT IN ('rejected', 'no_reply_needed', 'suppressed'))
-          AND NOT EXISTS (SELECT 1 FROM meetings m JOIN conversations conv ON conv.id = m.conversation_id WHERE conv.workspace_id = cm.workspace_id AND conv.account_id = cm.account_id)
+          AND NOT EXISTS (SELECT 1 FROM suppression_entries se WHERE se.workspace_id = c.workspace_id AND (se.account_id = cm.account_id OR se.contact_point_id = cp.id))
+          AND NOT ${actualPriorColdOutreachSql({ workspaceId: "c.workspace_id", accountId: "cm.account_id" })}
+          AND NOT EXISTS (SELECT 1 FROM conversations conv WHERE conv.workspace_id = c.workspace_id AND conv.account_id = cm.account_id AND conv.state NOT IN ('rejected', 'no_reply_needed', 'suppressed'))
+          AND NOT EXISTS (SELECT 1 FROM meetings m JOIN conversations conv ON conv.id = m.conversation_id WHERE conv.workspace_id = c.workspace_id AND conv.account_id = cm.account_id)
       ) AS verification_candidates_remaining,
       (
         SELECT COUNT(*)::int
@@ -299,13 +294,13 @@ export async function getHistoricalBackfillProgress(): Promise<HistoricalBackfil
           AND cp.verification_status = 'valid'
           AND cp.channel_eligibility IN ('eligible_email', 'consented_email', 'prior_relationship')
           AND cp.last_contacted_at IS NULL AND cm.contacted_at IS NULL
-          AND NOT EXISTS (SELECT 1 FROM suppression_entries se WHERE se.workspace_id = cm.workspace_id AND (se.account_id = cm.account_id OR se.contact_point_id = cp.id))
-          AND NOT EXISTS (SELECT 1 FROM outreach_queue oq WHERE oq.workspace_id = cm.workspace_id AND oq.account_id = cm.account_id AND oq.channel = 'email')
-          AND NOT EXISTS (SELECT 1 FROM conversations conv WHERE conv.workspace_id = cm.workspace_id AND conv.account_id = cm.account_id AND conv.state NOT IN ('rejected', 'no_reply_needed', 'suppressed'))
-          AND NOT EXISTS (SELECT 1 FROM meetings m JOIN conversations conv ON conv.id = m.conversation_id WHERE conv.workspace_id = cm.workspace_id AND conv.account_id = cm.account_id)
+          AND NOT EXISTS (SELECT 1 FROM suppression_entries se WHERE se.workspace_id = c.workspace_id AND (se.account_id = cm.account_id OR se.contact_point_id = cp.id))
+          AND NOT ${actualPriorColdOutreachSql({ workspaceId: "c.workspace_id", accountId: "cm.account_id" })}
+          AND NOT EXISTS (SELECT 1 FROM conversations conv WHERE conv.workspace_id = c.workspace_id AND conv.account_id = cm.account_id AND conv.state NOT IN ('rejected', 'no_reply_needed', 'suppressed'))
+          AND NOT EXISTS (SELECT 1 FROM meetings m JOIN conversations conv ON conv.id = m.conversation_id WHERE conv.workspace_id = c.workspace_id AND conv.account_id = cm.account_id)
           AND NOT EXISTS (
             SELECT 1 FROM instantly_lead_imports ili
-            WHERE ili.workspace_id = cm.workspace_id AND ili.account_id = cm.account_id
+            WHERE ili.workspace_id = c.workspace_id AND ili.account_id = cm.account_id
               AND ili.contact_point_id = cp.id AND ili.provider_campaign_id = ${providerCampaignId}
               AND ili.status IN ('instantly_added', 'skipped_existing', 'deferred_due_to_plan_limit')
           )
@@ -446,12 +441,12 @@ export async function runVerificationCronTick(
               AND cm.account_id = cp.account_id
               AND cm.contacted_at IS NOT NULL
           )
-          OR EXISTS (
-            SELECT 1 FROM outreach_queue oq
-            WHERE oq.workspace_id = ${workspaceId}
-              AND oq.account_id = cp.account_id
-              AND oq.channel = 'email'
-          )
+          OR ${actualPriorColdOutreachSql({
+            workspaceId: sql`${workspaceId}`,
+            accountId: "cp.account_id",
+            contactPointId: "cp.id",
+            normalizedEmail: "cp.normalized_value",
+          })}
           OR EXISTS (
             SELECT 1 FROM conversations conv
             WHERE conv.workspace_id = ${workspaceId}

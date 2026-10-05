@@ -9,7 +9,7 @@
  * identical from the UI's point of view.
  */
 
-import { isDevSeedMode } from "@/lib/config/env";
+import { getDeliveryEnv, isDevSeedMode } from "@/lib/config/env";
 import { getCurrentWorkspaceId } from "@/lib/auth/workspace";
 
 import * as seed from "@/lib/seed/dev-seed";
@@ -54,6 +54,8 @@ import {
   type ProviderRowStatus,
   type QueueHealthSnapshot,
   type DeadLetterSample,
+  getInstantlyPipelineDiagnostics,
+  type InstantlyPipelineDiagnostics,
 } from "@/infrastructure/neon/repositories/diagnostics";
 import { getWeeklyTrend, type WeeklyTrendPoint } from "@/infrastructure/neon/repositories/analytics";
 
@@ -71,6 +73,7 @@ import type { SearchSeed } from "@/domain/discovery/types";
 import type { ProviderUsageStats } from "@/domain/providers/types";
 
 export type { AccountBundle, ProviderRowStatus, QueueHealthSnapshot, DeadLetterSample, WeeklyTrendPoint };
+export type { InstantlyPipelineDiagnostics };
 
 export async function getOffer(): Promise<Offer | null> {
   if (isDevSeedMode()) return seed.seedOffer;
@@ -215,6 +218,12 @@ export async function getEmailVerificationUsageData(): Promise<ProviderUsageStat
   if (isDevSeedMode()) return seed.seedEmailVerificationUsage;
   const workspaceId = await getCurrentWorkspaceId();
   return getEmailVerificationUsage(workspaceId);
+}
+
+export async function getInstantlyPipelineDiagnosticsData(): Promise<InstantlyPipelineDiagnostics | null> {
+  if (isDevSeedMode()) return null;
+  const workspaceId = await getCurrentWorkspaceId();
+  return getInstantlyPipelineDiagnostics(workspaceId, getDeliveryEnv().INSTANTLY_CAMPAIGN_ID);
 }
 
 export async function getEmailVerificationMetricsData(): Promise<EmailVerificationMetrics> {

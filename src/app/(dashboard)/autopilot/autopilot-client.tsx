@@ -10,7 +10,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
 import { globalProgressPct, sumSoftTargets } from "@/lib/autopilot/targets";
-import type { DeadLetterSample, ProviderRowStatus, QueueHealthSnapshot } from "@/lib/data/repository";
+import type { DeadLetterSample, InstantlyPipelineDiagnostics, ProviderRowStatus, QueueHealthSnapshot } from "@/lib/data/repository";
 import { getEffectiveAutopilotState, type AutopilotSettings, type GlobalAutopilotState, type RebalanceDecision } from "@/domain/autopilot/types";
 
 interface ProviderRow {
@@ -33,6 +33,7 @@ export function AutopilotClient({
   providerRows,
   queueHealth,
   rebalanceDecisions,
+  instantlyPipeline,
 }: {
   state: GlobalAutopilotState;
   settings: AutopilotSettings;
@@ -42,6 +43,7 @@ export function AutopilotClient({
   providerRows: ProviderRow[];
   queueHealth: QueueHealthSnapshot;
   rebalanceDecisions: RebalanceDecision[];
+  instantlyPipeline: InstantlyPipelineDiagnostics | null;
 }) {
   const progressPct = globalProgressPct(state.dailyTarget, state.engines);
   const softTargetTotal = sumSoftTargets(state.engines);
@@ -154,6 +156,40 @@ export function AutopilotClient({
             <p className="text-sm text-text-muted">Pacing metrics are unavailable in seed mode.</p>
           )}
         </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>Historical Instantly funnel</CardTitle>
+          {instantlyPipeline && <Badge variant={instantlyPipeline.circuitOpen ? "danger" : "success"}>{instantlyPipeline.circuitOpen ? "Auth circuit open" : "Auth circuit closed"}</Badge>}
+        </CardHeader>
+        {instantlyPipeline ? (
+          <CardContent className="space-y-4">
+            <div className="grid grid-cols-2 gap-3 sm:grid-cols-4 lg:grid-cols-6">
+              <KpiStat label="Raw candidates" value={String(instantlyPipeline.rawCandidates)} />
+              <KpiStat label="Processed raw" value={String(instantlyPipeline.processedCandidates)} />
+              <KpiStat label="Qualified" value={String(instantlyPipeline.membershipStages.qualified ?? 0)} />
+              <KpiStat label="Contact selected" value={String(instantlyPipeline.membershipStages.contact_selected ?? 0)} />
+              <KpiStat label="Ready" value={String(instantlyPipeline.membershipStages.ready ?? 0)} />
+              <KpiStat label="Verification pending" value={String(instantlyPipeline.verificationJobs.pending ?? 0)} />
+            </div>
+            <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+              <p className="text-xs text-text-muted">Email verification: {instantlyPipeline.emailVerification.valid ?? 0} valid · {instantlyPipeline.emailVerification.unverified ?? 0} unverified · {instantlyPipeline.emailVerification.unknown ?? 0} unknown</p>
+              <p className="text-xs text-text-muted">Channel eligibility: {instantlyPipeline.emailEligibility.allowed ?? 0} allowed · {instantlyPipeline.emailEligibility.unknown ?? 0} unknown · {instantlyPipeline.emailEligibility.review_required ?? 0} review required</p>
+              <p className="text-xs text-text-muted">Instantly imports: {Object.entries(instantlyPipeline.importStatuses).map(([status, count]) => `${status} ${count}`).join(" · ") || "none"}</p>
+              <p className="text-xs text-text-muted">Outreach: {instantlyPipeline.actualOutreach} actual · {instantlyPipeline.scheduledDryRun} dry-run scheduled · {instantlyPipeline.instantlySent} Instantly sent</p>
+            </div>
+            <div className="flex flex-wrap gap-x-5 gap-y-1 border-t border-border pt-3 text-xs text-text-muted">
+              <span>Enabled campaign mappings: {instantlyPipeline.campaignMappingCount}</span>
+              <span>Setter send unknown: {instantlyPipeline.setterSendUnknown}</span>
+              <span>Import circuit: {instantlyPipeline.circuitOpen ? "open" : "closed"}</span>
+              <span>Last successful lead write: {instantlyPipeline.lastSuccessfulLeadWriteAt ? new Date(instantlyPipeline.lastSuccessfulLeadWriteAt).toLocaleString() : "none recorded"}</span>
+              {instantlyPipeline.lastSuccessfulLeadWriteCampaignId && <span>Write campaign: {instantlyPipeline.lastSuccessfulLeadWriteCampaignId}</span>}
+            </div>
+          </CardContent>
+        ) : (
+          <CardContent><p className="text-sm text-text-muted">Live Neon funnel metrics are unavailable in seed mode.</p></CardContent>
+        )}
       </Card>
 
       <Card>

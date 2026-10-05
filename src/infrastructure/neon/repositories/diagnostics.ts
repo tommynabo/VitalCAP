@@ -1,18 +1,127 @@
 import { and, desc, eq, sql, isNotNull } from "drizzle-orm";
 import { getDb } from "../db";
-import { discoveryJobs, processingJobs } from "../schema/discovery";
-import { outreachQueue, outreachEvents, deadLetterJobs } from "../schema/outreach";
+import { discoveryJobs, processingJobs, rawCandidates } from "../schema/discovery";
+import { outreachQueue, outreachEvents, deadLetterJobs, instantlyLeadImports, instantlyImportLocks } from "../schema/outreach";
 import { campaignMemberships, campaigns } from "../schema/campaigns";
 import { contactPoints } from "../schema/contacts";
-import { complianceDecisions } from "../schema/compliance";
+import { campaignProviderMappings, complianceDecisions, verificationJobs } from "../schema/compliance";
+import { conversations } from "../schema/conversations";
 import { autopilotSettings } from "../schema/autopilot";
 import { providerRuns } from "../schema/providers";
 import { cronRuns } from "../schema/jobs-meta";
 import { getMapsEnv, getSerperEnv, getVerificationEnv, getDeliveryEnv, getIntelligenceEnv } from "@/lib/config/env";
+import { ACTUAL_PRIOR_COLD_OUTREACH_STATES } from "@/services/deduplication/outreach-dedup";
 import type { ProviderUsageStats } from "@/domain/providers/types";
 import type { EngineType } from "@/domain/campaigns/types";
 
 export type ProviderRowStatus = "connected" | "degraded" | "paused" | "missing_configuration" | "unknown";
+
+export interface InstantlyPipelineDiagnostics {
+  rawCandidates: number;
+  processedCandidates: number;
+  membershipStages: Record<string, number>;
+  emailVerification: Record<string, number>;
+  emailEligibility: Record<string, number>;
+  verificationJobs: Record<string, number>;
+  importStatuses: Record<string, number>;
+  actualOutreach: number;
+  scheduledDryRun: number;
+  instantlySent: number;
+  setterSendUnknown: number;
+  campaignMappingCount: number;
+  circuitOpen: boolean;
+  lastSuccessfulLeadWriteAt: string | null;
+  lastSuccessfulLeadWriteCampaignId: string | null;
+}
+
+export async function getInstantlyPipelineDiagnostics(
+  workspaceId: string,
+  providerCampaignId: string,
+): Promise<InstantlyPipelineDiagnostics> {
+  const db = getDb();
+  const actualOutreachStates = sql.raw(ACTUAL_PRIOR_COLD_OUTREACH_STATES.map((state) => `'${state}'`).join(", "));
+  const scopedAutopilotCampaign = and(eq(campaigns.workspaceId, workspaceId), eq(campaigns.autopilotEnabled, true));
+  const [candidateCounts, stages, emailCounts, verificationCounts, imports, outreach, setterUnknown, mappings, circuit, lastSuccessfulLeadWrite] = await Promise.all([
+    db.select({
+      total: sql<number>`count(*)`,
+      processed: sql<number>`count(*) filter (where ${rawCandidates.processed} = true)`,
+    }).from(rawCandidates).innerJoin(campaigns, eq(rawCandidates.campaignId, campaigns.id)).where(scopedAutopilotCampaign),
+    db.select({ stage: campaignMemberships.stage, count: sql<number>`count(*)` })
+      .from(campaignMemberships).innerJoin(campaigns, eq(campaignMemberships.campaignId, campaigns.id))
+      .where(scopedAutopilotCampaign).groupBy(campaignMemberships.stage),
+    db.select({
+      verificationStatus: contactPoints.verificationStatus,
+      channelEligibility: contactPoints.channelEligibility,
+      count: sql<number>`count(distinct ${contactPoints.id})`,
+    }).from(contactPoints)
+      .innerJoin(campaignMemberships, eq(campaignMemberships.accountId, contactPoints.accountId))
+      .innerJoin(campaigns, eq(campaignMemberships.campaignId, campaigns.id))
+      .where(and(scopedAutopilotCampaign, eq(contactPoints.type, "email")))
+      .groupBy(contactPoints.verificationStatus, contactPoints.channelEligibility),
+    db.select({ status: verificationJobs.status, count: sql<number>`count(*)` })
+      .from(verificationJobs).where(eq(verificationJobs.workspaceId, workspaceId)).groupBy(verificationJobs.status),
+    db.select({ status: instantlyLeadImports.status, count: sql<number>`count(*)` })
+      .from(instantlyLeadImports)
+      .innerJoin(campaigns, eq(instantlyLeadImports.sourceCampaignId, campaigns.id))
+      .where(and(eq(instantlyLeadImports.providerCampaignId, providerCampaignId), scopedAutopilotCampaign))
+      .groupBy(instantlyLeadImports.status),
+    db.select({
+      actual: sql<number>`count(*) filter (where
+        (${outreachQueue.deliveryMode} = 'live' and ${outreachQueue.state} in (${actualOutreachStates}))
+        or exists (
+          select 1 from outreach_events oe
+          where oe.outreach_queue_item_id = ${outreachQueue.id}
+            and oe.state in (${actualOutreachStates})
+        )
+      )`,
+      dryRunScheduled: sql<number>`count(*) filter (where ${outreachQueue.deliveryMode} = 'dry_run' and ${outreachQueue.state} = 'scheduled')`,
+      instantlySent: sql<number>`count(*) filter (where ${outreachQueue.deliveryMode} = 'live' and ${outreachQueue.payload}->>'provider' = 'instantly' and ${outreachQueue.state} = 'sent')`,
+    }).from(outreachQueue).innerJoin(campaigns, eq(outreachQueue.campaignId, campaigns.id)).where(scopedAutopilotCampaign),
+    db.select({ count: sql<number>`count(*)` }).from(conversations).innerJoin(campaigns, eq(conversations.campaignId, campaigns.id))
+      .where(and(scopedAutopilotCampaign, eq(conversations.state, "send_unknown"))),
+    db.select({ count: sql<number>`count(*)` }).from(campaignProviderMappings).innerJoin(campaigns, eq(campaignProviderMappings.campaignId, campaigns.id))
+      .where(and(scopedAutopilotCampaign, eq(campaignProviderMappings.provider, "instantly"), eq(campaignProviderMappings.providerCampaignId, providerCampaignId), eq(campaignProviderMappings.enabled, true))),
+    db.select({ count: sql<number>`count(*)` }).from(instantlyImportLocks)
+      .where(and(eq(instantlyImportLocks.providerCampaignId, providerCampaignId), sql`${instantlyImportLocks.lockToken} LIKE 'auth-failure:%'`)),
+    db.select({ uploadedAt: instantlyLeadImports.uploadedAt, providerCampaignId: instantlyLeadImports.providerCampaignId })
+      .from(instantlyLeadImports)
+      .innerJoin(campaigns, eq(instantlyLeadImports.sourceCampaignId, campaigns.id))
+      .where(and(
+        eq(instantlyLeadImports.providerCampaignId, providerCampaignId),
+        scopedAutopilotCampaign,
+        eq(instantlyLeadImports.status, "instantly_added"),
+        isNotNull(instantlyLeadImports.uploadedAt),
+        isNotNull(instantlyLeadImports.providerLeadId),
+        sql`${instantlyLeadImports.providerLeadId} NOT LIKE 'dryrun%'`,
+      ))
+      .orderBy(desc(instantlyLeadImports.uploadedAt))
+      .limit(1),
+  ]);
+
+  const emailVerification: Record<string, number> = {};
+  const emailEligibility: Record<string, number> = {};
+  for (const row of emailCounts) {
+    emailVerification[row.verificationStatus] = (emailVerification[row.verificationStatus] ?? 0) + Number(row.count);
+    emailEligibility[row.channelEligibility] = (emailEligibility[row.channelEligibility] ?? 0) + Number(row.count);
+  }
+  return {
+    rawCandidates: Number(candidateCounts[0]?.total ?? 0),
+    processedCandidates: Number(candidateCounts[0]?.processed ?? 0),
+    membershipStages: Object.fromEntries(stages.map((row) => [row.stage, Number(row.count)])),
+    emailVerification,
+    emailEligibility,
+    verificationJobs: Object.fromEntries(verificationCounts.map((row) => [row.status, Number(row.count)])),
+    importStatuses: Object.fromEntries(imports.map((row) => [row.status, Number(row.count)])),
+    actualOutreach: Number(outreach[0]?.actual ?? 0),
+    scheduledDryRun: Number(outreach[0]?.dryRunScheduled ?? 0),
+    instantlySent: Number(outreach[0]?.instantlySent ?? 0),
+    setterSendUnknown: Number(setterUnknown[0]?.count ?? 0),
+    campaignMappingCount: Number(mappings[0]?.count ?? 0),
+    circuitOpen: Number(circuit[0]?.count ?? 0) > 0,
+    lastSuccessfulLeadWriteAt: lastSuccessfulLeadWrite[0]?.uploadedAt?.toISOString() ?? null,
+    lastSuccessfulLeadWriteCampaignId: lastSuccessfulLeadWrite[0]?.providerCampaignId ?? null,
+  };
+}
 
 export async function getActiveAutopilotDiscoveryEngineTypes(): Promise<EngineType[]> {
   const db = getDb();

@@ -1,9 +1,15 @@
 export {};
 async function main() {
+  const cronSecret = process.env.CRON_SECRET;
+  if (!cronSecret) {
+    console.error("CRON_SECRET is required to trigger protected cron endpoints.");
+    process.exitCode = 1;
+    return;
+  }
   console.log("Triggering /api/cron/process...");
   try {
     const res = await fetch("https://vitalcapproject.vercel.app/api/cron/process", {
-      headers: { Authorization: "Bearer 83e8f87897a1939da5682af02cd0b2686267163226ebe003610c8c745bbcc244" }
+      headers: { Authorization: "Bearer " + cronSecret }
     });
     console.log("Status:", res.status, res.statusText);
     const text = await res.text();

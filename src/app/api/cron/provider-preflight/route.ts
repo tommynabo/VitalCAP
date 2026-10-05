@@ -4,6 +4,7 @@ import { NextResponse } from "next/server";
 import { getNeonSql } from "@/infrastructure/neon/db";
 import { getDatabaseEnv, getDeliveryEnv, getVerificationEnv } from "@/lib/config/env";
 import { logEvent } from "@/lib/observability/structured-logger";
+import { ACTUAL_PRIOR_COLD_OUTREACH_STATES } from "@/services/deduplication/outreach-dedup";
 import { isAuthorizedCronRequest, unauthorizedCronResponse } from "../_lib/cron-http";
 
 export const dynamic = "force-dynamic";
@@ -146,7 +147,16 @@ async function readHistoricalFunnel(): Promise<Record<string, number> | null> {
           cd.decision,
           ev.status AS cached_verification_status,
           (se.id IS NOT NULL) AS suppressed,
-          (oq.id IS NOT NULL OR cp.last_contacted_at IS NOT NULL OR cm.contacted_at IS NOT NULL) AS prior_outreach,
+          (EXISTS (
+            SELECT 1 FROM outreach_queue oq
+            WHERE oq.workspace_id = s.workspace_id AND oq.account_id = s.account_id AND oq.channel = 'email'
+              AND ((oq.delivery_mode = 'live' AND oq.state = ANY(${[...ACTUAL_PRIOR_COLD_OUTREACH_STATES]}::text[]))
+                OR EXISTS (
+                  SELECT 1 FROM outreach_events oe
+                  WHERE oe.outreach_queue_item_id = oq.id
+                    AND oe.state = ANY(${[...ACTUAL_PRIOR_COLD_OUTREACH_STATES]}::text[])
+                ))
+          ) OR cp.last_contacted_at IS NOT NULL OR cm.contacted_at IS NOT NULL) AS prior_outreach,
           (conv.id IS NOT NULL OR meeting.id IS NOT NULL) AS active_conversation
         FROM scope s
         LEFT JOIN campaign_memberships cm ON cm.campaign_id = s.campaign_id AND cm.account_id = s.account_id
@@ -161,8 +171,6 @@ async function readHistoricalFunnel(): Promise<Record<string, number> | null> {
           AND ev.expires_at > NOW()
         LEFT JOIN suppression_entries se ON se.workspace_id = s.workspace_id
           AND (se.account_id = s.account_id OR se.contact_point_id = cp.id)
-        LEFT JOIN outreach_queue oq ON oq.workspace_id = s.workspace_id
-          AND oq.account_id = s.account_id AND oq.channel = 'email'
         LEFT JOIN conversations conv ON conv.workspace_id = s.workspace_id
           AND conv.account_id = s.account_id
           AND conv.state NOT IN ('rejected', 'no_reply_needed', 'suppressed')
@@ -257,6 +265,33 @@ async function readMillionVerifierState() {
   }
 }
 
+async function readRecentLeadWriteProof(providerCampaignId: string): Promise<{
+  occurredAt: string;
+  providerCampaignId: string;
+} | null> {
+  try {
+    const sql = getNeonSql();
+    const [row] = await sql`
+      SELECT uploaded_at, provider_campaign_id
+      FROM public.instantly_lead_imports
+      WHERE provider_campaign_id = ${providerCampaignId}
+        AND status = 'instantly_added'
+        AND uploaded_at >= NOW() - INTERVAL '7 days'
+        AND provider_lead_id IS NOT NULL
+        AND provider_lead_id NOT LIKE 'dryrun%'
+      ORDER BY uploaded_at DESC
+      LIMIT 1
+    `;
+    const occurredAt = row?.uploaded_at instanceof Date
+      ? row.uploaded_at.toISOString()
+      : typeof row?.uploaded_at === "string" ? row.uploaded_at : null;
+    if (!occurredAt || !row?.provider_campaign_id) return null;
+    return { occurredAt, providerCampaignId: String(row.provider_campaign_id) };
+  } catch {
+    return null;
+  }
+}
+
 async function readInstantlyState() {
   const env = getDeliveryEnv();
   const apiKey = env.INSTANTLY_API_KEY?.trim();
@@ -271,7 +306,14 @@ async function readInstantlyState() {
   if (!configured || !apiKey) {
     return {
       configured,
+      configurationReady: false,
+      campaignRead: "FAIL",
+      leadsWrite: "NOT_TESTED",
+      writeProof: "NOT_TESTED",
       instantlyLeadImportReady: false,
+      lastSuccessfulLeadWriteAt: null,
+      lastSuccessfulLeadWriteCampaignId: null,
+      lastSuccessfulLeadWriteRequestIdSanitized: null,
       telemetryReady: false,
       campaignAccessible: false,
       campaignId,
@@ -356,20 +398,29 @@ async function readInstantlyState() {
     const planReadable = planResponse.ok && Number.isFinite(uploadedContacts) && Number.isFinite(providerContactLimit);
     const analyticsReadable = analyticsResponse.ok && monthlyEmailsSent !== null;
     const campaignReadAuth = campaignResponse.ok && campaignAccessible ? "PASS" : "FAIL";
-    const campaignUsable = campaignResponse.ok ? campaignAccessible : campaignResponse.status !== 404;
-    const instantlyLeadImportReady = campaignId === instantlyCampaignId && campaignUsable;
+    const configurationReady = configured && campaignId === instantlyCampaignId;
+    const leadWriteProof = await readRecentLeadWriteProof(campaignId);
+    const leadsWrite = leadWriteProof ? "PASS" : "NOT_TESTED";
+    const instantlyLeadImportReady = configurationReady && campaignReadAuth === "PASS" && leadsWrite === "PASS";
     const telemetryReady = planReadable && analyticsReadable;
     const billingReadAuth = planReadable ? "PASS" : "OPTIONAL_FAIL";
     const analyticsReadAuth = analyticsReadable ? "PASS" : "OPTIONAL_FAIL";
 
     return {
       configured,
+      configurationReady,
+      campaignRead: campaignReadAuth,
+      leadsWrite,
+      writeProof: leadWriteProof ? "LEADS_WRITE_RECENTLY_PROVEN" : "NOT_TESTED",
       instantlyLeadImportReady,
+      lastSuccessfulLeadWriteAt: leadWriteProof?.occurredAt ?? null,
+      lastSuccessfulLeadWriteCampaignId: leadWriteProof?.providerCampaignId ?? null,
+      lastSuccessfulLeadWriteRequestIdSanitized: null,
       telemetryReady,
       campaignAccessible,
       campaignId,
       auth: {
-        leadsWrite: "NOT_TESTED",
+        leadsWrite,
         campaignRead: campaignReadAuth,
         analyticsRead: analyticsReadAuth,
         billingRead: billingReadAuth,
@@ -384,7 +435,11 @@ async function readInstantlyState() {
         contactWarningThreshold: limits.contactWarningThreshold,
         monthlyEmailWarningThreshold: limits.monthlyEmailWarningThreshold,
       },
-      errorCode: instantlyLeadImportReady ? null : campaignId !== instantlyCampaignId ? "CAMPAIGN_ID_MISMATCH" : "CAMPAIGN_UNAVAILABLE",
+      errorCode: !configurationReady
+        ? "CAMPAIGN_ID_MISMATCH"
+        : campaignReadAuth !== "PASS"
+          ? "CAMPAIGN_UNAVAILABLE"
+          : "LEADS_WRITE_NOT_TESTED",
       limits,
     };
 }
@@ -399,11 +454,15 @@ export async function GET(request: NextRequest) {
     readInstantlyState(),
     readHistoricalFunnel(),
   ]);
-  const instantlyLeadImportReady = database.healthy
+  const schemaReady = database.healthy
     && database.through0017
     && database.instantlyTablesExist
-    && database.requiredIndexesPresent
-    && instantly.instantlyLeadImportReady;
+    && database.requiredIndexesPresent;
+  const instantlyLeadImportReady = instantly.configurationReady
+    && schemaReady
+    && instantly.campaignRead === "PASS"
+    && instantly.leadsWrite === "PASS";
+    const instantlyWithSchema = { ...instantly, schemaReady, instantlyLeadImportReady };
   const instantlyTelemetryReady = instantly.telemetryReady;
   const healthy = instantlyLeadImportReady
     && millionVerifier.healthy
@@ -428,7 +487,10 @@ export async function GET(request: NextRequest) {
     millionVerifierCreditsRemaining: millionVerifier.creditsRemaining,
     millionVerifierHttpStatus: millionVerifier.httpStatus,
     millionVerifierErrorCode: millionVerifier.errorCode,
-    instantlyConfigured: instantly.configured,
+    instantlyConfigured: instantly.configurationReady,
+    instantlySchemaReady: schemaReady,
+    instantlyCampaignRead: instantly.campaignRead,
+    instantlyLeadsWrite: instantly.leadsWrite,
     instantlyLeadImportReady,
     instantlyTelemetryReady,
     instantlyCampaignAccessible: instantly.campaignAccessible,
@@ -438,7 +500,7 @@ export async function GET(request: NextRequest) {
     instantlyErrorCode: instantly.errorCode,
   });
 
-  return NextResponse.json({ database, millionVerifier, instantly, instantlyLeadImportReady, instantlyTelemetryReady, historicalFunnel, healthy }, {
+  return NextResponse.json({ database, millionVerifier, instantly: instantlyWithSchema, instantlyLeadImportReady, instantlyTelemetryReady, historicalFunnel, healthy }, {
     status: healthy ? 200 : 503,
     headers: { "Cache-Control": "no-store" },
   });

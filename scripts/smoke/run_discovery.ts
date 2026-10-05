@@ -28,7 +28,7 @@ async function main() {
   
   console.log("Enqueued discovery job:", jobId);
   console.log("Run the following to trigger production:");
-  console.log("curl -X GET -H 'Authorization: Bearer <CRON_SECRET>' https://vitalcapproject.vercel.app/api/cron/discovery");
+  console.log("Trigger the protected cron using its smoke script after setting CRON_SECRET.");
 }
 
 main().catch(console.error);

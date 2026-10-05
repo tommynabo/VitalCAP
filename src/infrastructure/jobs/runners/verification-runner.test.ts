@@ -49,6 +49,7 @@ vi.mock("@/services/compliance/compliance-evaluator", () => ({
   evaluateComplianceForAccount: mocks.evaluateComplianceForAccount,
 }));
 vi.mock("@/lib/config/env", () => ({
+  getDeliveryEnv: () => ({ INSTANTLY_CAMPAIGN_ID: "provider-campaign-1" }),
   getVerificationEnv: () => ({
     EMAIL_VERIFICATION_PROVIDER: "millionverifier",
     MILLION_VERIFIER: "configured",
@@ -58,6 +59,9 @@ vi.mock("@/lib/config/env", () => ({
 vi.mock("@/infrastructure/neon/repositories/verification-queue", () => ({
   enqueueVerificationJob: mocks.enqueueVerificationJob,
 }));
+vi.mock("@/infrastructure/neon/repositories/actual-outreach", () => ({
+  actualPriorColdOutreachSql: vi.fn((scope: { workspaceId: string }) => ({ strings: [`TRUE ${scope.workspaceId}`], values: [] })),
+}));
 vi.mock("@/infrastructure/neon/repositories/campaigns", () => ({
   upsertCampaignMembership: mocks.upsertCampaignMembership,
 }));
@@ -65,7 +69,7 @@ vi.mock("@/infrastructure/jobs/runners/instantly-import-runner", () => ({
   runInstantlyImportTick: mocks.runInstantlyImportTick,
 }));
 
-import { enqueueVerificationJobs, runVerificationCronTick } from "./verification-runner";
+import { enqueueVerificationJobs, getHistoricalBackfillProgress, runVerificationCronTick } from "./verification-runner";
 
 function sqlParts(value: unknown): { text: string; values: unknown[] } {
   if (!value || typeof value !== "object" || !("strings" in value) || !Array.isArray(value.strings)) {
@@ -219,11 +223,14 @@ describe("enqueueVerificationJobs scope", () => {
     }] });
 
     const queued = await enqueueVerificationJobs();
-    const query = mocks.execute.mock.calls[2]?.[0] as { strings: string[] };
+    const query = sqlParts(mocks.execute.mock.calls[2]?.[0]);
 
     expect(queued).toBe(1);
-    expect(query.strings.join(" ")).toContain("DISTINCT ON (ea.campaign_id, ea.account_id)");
-    expect(query.strings.join(" ")).not.toContain("cp.created_at >=");
+    expect(query.text).toContain("DISTINCT ON (ea.campaign_id, ea.account_id)");
+    expect(query.text).toContain("SELECT DISTINCT cm.account_id, c.workspace_id");
+    expect(query.text).toContain("TRUE c.workspace_id");
+    expect(query.text).not.toContain("cm.workspace_id");
+    expect(query.text).not.toContain("cp.created_at >=");
     expect(mocks.enqueueVerificationJob).toHaveBeenCalledWith({
       workspaceId: "workspace-1",
       contactPointId: "selected-contact-point",
@@ -263,5 +270,22 @@ describe("enqueueVerificationJobs scope", () => {
     const preparationQuery = sqlParts(mocks.execute.mock.calls[0]?.[0]);
     expect(preparationQuery.text).toContain("rc.processed = true");
     expect(preparationQuery.text).toContain("a.status IN ('qualified', 'contactable', 'outreach_ready')");
+  });
+
+  it("uses campaigns.workspace_id in historical progress queries", async () => {
+    mocks.execute.mockResolvedValueOnce({ rows: [{
+      verification_candidates_remaining: 0,
+      verification_jobs_pending: 0,
+      eligible_valid_contacts_remaining: 0,
+      instantly_import_jobs_pending: 0,
+      instantly_deferred_due_to_plan_limit: 0,
+    }] });
+
+    await getHistoricalBackfillProgress();
+
+    const query = sqlParts(mocks.execute.mock.calls[0]?.[0]);
+    expect(query.text).toContain("se.workspace_id = c.workspace_id");
+    expect(query.text).toContain("conv.workspace_id = c.workspace_id");
+    expect(query.text).not.toContain("cm.workspace_id");
   });
 });

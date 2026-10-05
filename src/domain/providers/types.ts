@@ -120,13 +120,13 @@ export interface EmailLeadInput {
   providerCampaignId: string;
   email: string;
   customVariables: Record<string, string>;
-  /** Ask the provider to no-op instead of duplicating a lead it already has. */
-  skipIfExisting: boolean;
+  skipIfInWorkspace?: boolean;
+  skipIfInCampaign?: boolean;
   /** Explicitly authorizes adding this lead to a campaign while VitalCAP delivery remains in dry-run. */
   allowCampaignImportInDryRun?: boolean;
 }
 
-export type EmailLeadAddStatus = "added" | "skipped_existing";
+export type EmailLeadAddStatus = "added" | "skipped_existing" | "needs_campaign_move";
 
 export interface EmailLeadResult {
   providerLeadId: string;

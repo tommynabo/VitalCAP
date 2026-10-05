@@ -1,7 +1,7 @@
 import { createHash, timingSafeEqual } from "node:crypto";
 import { NextResponse } from "next/server";
 import { normalizeInstantlyInboundReply, normalizeInstantlyWebhook } from "@/infrastructure/providers/instantly/webhook-normalizer";
-import { neonSetterInboundRuntimeStore, processInstantlyComplianceEvent, recordInstantlyIgnoredEvent } from "@/infrastructure/neon/repositories/setter-runtime";
+import { neonSetterInboundRuntimeStore, processInstantlyComplianceEvent, processInstantlySentEvent, recordInstantlyIgnoredEvent } from "@/infrastructure/neon/repositories/setter-runtime";
 import { getDeliveryEnv } from "@/lib/config/env";
 import { processInstantlyInboundReply } from "@/services/setter/inbound-runtime";
 
@@ -51,6 +51,30 @@ export async function POST(request: Request) {
   const eventType = nested?.event_type ?? root?.event_type;
   if (eventType !== "email_replied" && eventType !== "reply_received") {
     const payloadHash = createHash("sha256").update(rawBody).digest("hex");
+    if (eventType === "email_sent") {
+      const eventData = nested ?? root;
+      const lead = record(eventData?.lead);
+      const timestamp = firstString(eventData?.timestamp, eventData?.created_at, root?.timestamp);
+      const occurredAt = timestamp ? new Date(timestamp) : new Date();
+      const eventId = firstString(eventData?.event_id, root?.event_id, eventData?.webhook_event_id, eventData?.id, root?.id) ?? payloadHash;
+      const statusEvent = normalizeInstantlyWebhook(payload, eventId, occurredAt);
+      const email = firstString(eventData?.lead_email, eventData?.email, lead?.email)?.toLowerCase();
+      const campaignId = firstString(eventData?.campaign_id, eventData?.campaignId);
+      if (!statusEvent || statusEvent.code !== "sent" || !email || !campaignId || Number.isNaN(occurredAt.getTime())) {
+        return NextResponse.json({ ok: true, ignored: true, eventType, errorCode: "INVALID_SENT_PAYLOAD" }, { status: 202 });
+      }
+      const result = await processInstantlySentEvent({
+        providerEventId: statusEvent.providerEventId,
+        providerMessageId: statusEvent.providerLeadId,
+        providerCampaignId: campaignId,
+        email,
+        occurredAt: statusEvent.occurredAt,
+        payloadHash,
+      });
+      return NextResponse.json({ ok: true, outcome: result.outcome, ...(result.errorCode ? { errorCode: result.errorCode } : {}) }, {
+        status: result.outcome === "ignored_unknown_campaign" ? 202 : 200,
+      });
+    }
     if (eventType === "lead_unsubscribed" || eventType === "email_bounced") {
       const eventData = nested ?? root;
       const lead = record(eventData?.lead);
