@@ -4,32 +4,37 @@ import type { EmailDeliveryStatusCode, EmailDeliveryStatusEvent, InboundEmailRep
  * Normalizes Instantly v2 webhooks into standard Domain events.
  */
 export function normalizeInstantlyWebhook(
-  payload: any,
+  payload: unknown,
   providerEventId: string,
   occurredAt: Date
 ): EmailDeliveryStatusEvent | null {
-  
-  if (!payload || !payload.event_type) {
-    return null; // unrecognized
-  }
+  const root = record(payload);
+  const data = record(root?.data) ?? root;
+  const eventType = firstString(data?.event_type, root?.event_type);
+  if (!data || !eventType) return null;
 
   const emailCodeMap: Record<string, EmailDeliveryStatusCode> = {
     "email_sent": "sent",
     "email_opened": "delivered", // Instantly doesn't always have a strict delivered webhook, uses open
     "email_bounced": "bounced",
     "email_replied": "replied",
+    "reply_received": "replied",
     "lead_unsubscribed": "unsubscribed"
   };
 
-  const domainCode = emailCodeMap[payload.event_type];
+  const domainCode = emailCodeMap[eventType];
   if (!domainCode) return null;
 
+  const lead = record(data.lead);
+  const providerLeadId = firstString(data.lead_id, data.lead_email, data.email, lead?.email);
+  if (!providerLeadId) return null;
+
   return {
-    providerLeadId: payload.lead_id || payload.email, // fallback to email if ID missing
+    providerLeadId,
     providerEventId,
     code: domainCode,
     occurredAt: occurredAt.toISOString(),
-    raw: payload
+    raw: data
   };
 }
 
@@ -49,15 +54,16 @@ function firstString(...values: unknown[]): string | null {
 export function normalizeInstantlyInboundReply(payload: unknown, now = new Date()): InboundEmailReply | null {
   const root = record(payload);
   const data = record(root?.data) ?? root;
-  if (!root || !data || firstString(data.event_type, root.event_type) !== "email_replied") return null;
+  const eventType = firstString(data?.event_type, root?.event_type);
+  if (!root || !data || (eventType !== "email_replied" && eventType !== "reply_received")) return null;
 
   const campaign = record(data.campaign);
   const lead = record(data.lead);
   const reply = record(data.reply);
   const providerCampaignId = firstString(data.campaign_id, data.campaignId, campaign?.id);
   const email = firstString(data.lead_email, data.email, lead?.email, data.from_email)?.toLowerCase() ?? null;
-  const providerEventId = firstString(data.event_id, root.event_id, data.webhook_id, root.webhook_id, data.id, root.id);
   const providerMessageId = firstString(data.message_id, data.email_id, data.reply_id, reply?.id);
+  const providerEventId = firstString(data.event_id, root.event_id, data.webhook_event_id, root.webhook_event_id, data.id, root.id, providerMessageId);
   const body = firstString(data.reply_text, data.text, data.body, data.email_body, reply?.text);
   if (!providerCampaignId || !email || !providerEventId || !providerMessageId || !body) return null;
 
@@ -66,13 +72,17 @@ export function normalizeInstantlyInboundReply(payload: unknown, now = new Date(
   const parsedAt = occurredAtValue ? new Date(occurredAtValue) : now;
 
   return {
+    eventType,
     providerEventId,
     providerMessageId,
     providerThreadId: explicitThreadId ?? `${providerCampaignId}:${email}`,
     providerCampaignId,
     email,
-    subject: firstString(data.subject, data.email_subject, reply?.subject) ?? "",
+    subject: firstString(data.reply_subject, data.subject, data.email_subject, reply?.subject) ?? "",
     body,
     occurredAt: Number.isNaN(parsedAt.getTime()) ? now.toISOString() : parsedAt.toISOString(),
+    emailAccount: firstString(data.email_account, data.eaccount),
+    workspace: firstString(data.workspace),
+    campaignName: firstString(data.campaign_name, campaign?.name),
   };
 }

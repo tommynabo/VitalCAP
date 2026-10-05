@@ -1,5 +1,5 @@
 import type { NextRequest } from "next/server";
-import { runVerificationCronTick, enqueueVerificationJobs } from "@/infrastructure/jobs/runners/verification-runner";
+import { runVerificationCronTick, enqueueVerificationJobs, getHistoricalBackfillProgress } from "@/infrastructure/jobs/runners/verification-runner";
 import { isAuthorizedCronRequest, unauthorizedCronResponse, runCronRoute } from "../_lib/cron-http";
 
 export const dynamic = "force-dynamic";
@@ -9,12 +9,12 @@ export async function GET(request: NextRequest) {
   return runCronRoute("verification", async () => {
     const backfillMode = request.nextUrl.searchParams.get("backfill");
     const backfillAll = backfillMode === "all";
-    const instantlyBackfillAll = backfillMode !== "48h";
     const createdSince = new Date(Date.now() - 48 * 60 * 60_000);
     const enqueued = await enqueueVerificationJobs(backfillAll ? {} : { createdSince });
     const result = await runVerificationCronTick(50, {
-      ...(instantlyBackfillAll ? { backfillAll: true } : { createdSince }),
+      ...(backfillAll ? { backfillAll: true } : { createdSince }),
     });
+    const backfillProgress = backfillAll ? await getHistoricalBackfillProgress() : null;
     return {
       itemsProcessed: result.jobsClaimed,
       metadata: {
@@ -23,15 +23,27 @@ export async function GET(request: NextRequest) {
         emailsVerified: result.emailsVerified,
         millionVerifierStatus: result.millionVerifierStatus,
         instantly: result.instantly,
+        ...(backfillProgress ? { backfillProgress } : {}),
         ...(backfillAll
           ? {
               backfillMode: "all",
               backfillBatchLimit: 500,
-              backfillMayContinue: enqueued === 500 || (result.instantly?.candidatesFound ?? 0) === 500,
+              backfillMayContinue: backfillProgress
+                ? backfillProgress.verificationCandidatesRemaining > 0
+                  || backfillProgress.verificationJobsPending > 0
+                  || backfillProgress.eligibleValidContactsRemaining > 0
+                  || backfillProgress.instantlyImportJobsPending > 0
+                : enqueued === 500 || result.jobsClaimed === 50 || (result.instantly?.candidatesFound ?? 0) === 500,
+              remainingHistorical: backfillProgress
+                ? backfillProgress.verificationCandidatesRemaining
+                  + backfillProgress.verificationJobsPending
+                  + backfillProgress.eligibleValidContactsRemaining
+                  + backfillProgress.instantlyImportJobsPending
+                : null,
             }
           : backfillMode === "48h"
             ? { backfillMode: "48h", backfillWindowHours: 48 }
-            : { instantlyBackfillMode: "all", instantlyBackfillBatchLimit: 500 }),
+            : { backfillMode: "48h", backfillWindowHours: 48 }),
       },
     };
   });

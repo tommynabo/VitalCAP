@@ -134,3 +134,31 @@ export async function releaseInstantlyImportLock(providerCampaignId: string, loc
     WHERE provider_campaign_id = ${providerCampaignId} AND lock_token = ${lockToken}
   `);
 }
+
+export async function isInstantlyImportCircuitOpen(providerCampaignId: string): Promise<boolean> {
+  const db = getDb();
+  const result = await db.execute(sql`
+    SELECT 1
+    FROM instantly_import_locks
+    WHERE provider_campaign_id = ${providerCampaignId}
+      AND lock_token LIKE 'auth-failure:%'
+    LIMIT 1
+  `);
+  return result.rows.length > 0;
+}
+
+export async function tripInstantlyImportCircuitBreaker(
+  providerCampaignId: string,
+  lockToken: string,
+  requestId: string,
+): Promise<void> {
+  const db = getDb();
+  await db.execute(sql`
+    UPDATE instantly_import_locks
+    SET lock_token = ${`auth-failure:${requestId.slice(0, 100)}`},
+        locked_until = 'infinity'::timestamptz,
+        updated_at = NOW()
+    WHERE provider_campaign_id = ${providerCampaignId}
+      AND lock_token = ${lockToken}
+  `);
+}

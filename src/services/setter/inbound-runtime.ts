@@ -35,8 +35,22 @@ export interface SetterInboundRuntimeStore {
   completeWebhookEvent(event: InboundEmailReply, status: string, workspaceId: string | null, failureCode?: string): Promise<void>;
 }
 
+export type SetterInboundRoutingFailureCode =
+  | "UNKNOWN_CAMPAIGN"
+  | "AMBIGUOUS_CAMPAIGN"
+  | "CONTACT_NOT_FOUND"
+  | "AMBIGUOUS_CONTACT_MATCH";
+
+export class SetterInboundRoutingError extends Error {
+  constructor(readonly code: SetterInboundRoutingFailureCode, readonly workspaceId: string | null = null) {
+    super(code);
+    this.name = "SetterInboundRoutingError";
+  }
+}
+
 export type SetterInboundRuntimeResult =
   | { outcome: "duplicate_skipped" }
+  | { outcome: "ignored_unknown_campaign" }
   | { outcome: "processed"; result: ProcessIncomingReplyResult }
   | { outcome: "human_required"; failureCode: string };
 
@@ -102,6 +116,13 @@ export async function processInstantlyInboundReply(
     await store.completeWebhookEvent(event, eventStatus, workspaceId);
     return { outcome: "processed", result };
   } catch (error) {
+    if (error instanceof SetterInboundRoutingError && !persisted) {
+      const ignored = error.code === "UNKNOWN_CAMPAIGN";
+      await store.completeWebhookEvent(event, ignored ? "ignored" : "human_required", error.workspaceId, error.code);
+      return ignored
+        ? { outcome: "ignored_unknown_campaign" }
+        : { outcome: "human_required", failureCode: error.code };
+    }
     const failureCode = safeFailureCode(error);
     if (persisted) {
       await store.persistFailure(persisted, failureCode, "Setter processing failed; human review is required.");

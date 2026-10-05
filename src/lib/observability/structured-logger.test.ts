@@ -36,6 +36,17 @@ describe("structured logger", () => {
     expect(line.fields).toMatchObject({ correlationId: "corr_3", jobId: "job_1", campaignId: "camp_1", durationMs: 120, outcome: "succeeded" });
   });
 
+  it("preserves provider request UUIDs for correlation", () => {
+    const requestId = "25d7e0fe-883f-0b0d-96a4-4d301ba40d30";
+    const line = buildLogLine("error", "provider request failed", {
+      correlationId: requestId,
+      requestId,
+    });
+
+    expect(line.fields.correlationId).toBe(requestId);
+    expect(line.fields.requestId).toBe(requestId);
+  });
+
   it("emits one JSON line to console.error for error level and console.log otherwise", () => {
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});

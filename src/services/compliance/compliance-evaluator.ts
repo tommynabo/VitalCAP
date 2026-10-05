@@ -15,7 +15,7 @@ export async function evaluateComplianceForAccount(workspaceId: string, accountI
   const acceptancePolicy = createVerificationAcceptancePolicy(getVerificationEnv().EMAIL_VERIFICATION_ALLOW_CATCH_ALL);
 
   for (const membership of memberships) {
-    if (membership.stage !== "qualified" && membership.stage !== "ready") continue;
+    if (membership.stage !== "qualified" && membership.stage !== "contact_selected" && membership.stage !== "ready") continue;
 
     // 3. For each contact point, evaluate compliance
     for (const cp of contactPoints) {
@@ -123,7 +123,7 @@ export async function evaluateComplianceForAccount(workspaceId: string, accountI
       const readinessService = new OutreachReadinessService();
       const isReady = await readinessService.evaluateCandidate(workspaceId, membership.campaignId, accountId, selectedContactPointId);
       
-      if (isReady && membership.stage === "qualified") {
+      if (isReady && membership.stage !== "ready") {
         await db.update(schema.campaignMemberships)
           .set({ stage: "ready", readyAt: new Date(), rejectionReason: null })
           .where(eq(schema.campaignMemberships.id, membership.id));

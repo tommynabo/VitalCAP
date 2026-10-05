@@ -240,6 +240,7 @@ export interface SetterClassificationOutput {
 }
 
 export interface InboundEmailReply {
+  eventType?: "email_replied" | "reply_received";
   providerEventId: string;
   providerMessageId: string;
   providerThreadId: string;
@@ -248,6 +249,9 @@ export interface InboundEmailReply {
   subject: string;
   body: string;
   occurredAt: string;
+  emailAccount?: string | null;
+  workspace?: string | null;
+  campaignName?: string | null;
 }
 
 export interface LLMProvider {

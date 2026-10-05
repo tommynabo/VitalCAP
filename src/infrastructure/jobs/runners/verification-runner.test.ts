@@ -9,11 +9,13 @@ const mocks = vi.hoisted(() => ({
   insertValues: vi.fn(),
   verifyWithCache: vi.fn(),
   enqueueVerificationJob: vi.fn(),
+  upsertCampaignMembership: vi.fn(),
   update: vi.fn(),
   set: vi.fn(),
   where: vi.fn(),
   createProvider: vi.fn(),
   runInstantlyImportTick: vi.fn(),
+  evaluateComplianceForAccount: vi.fn(),
 }));
 
 vi.mock("drizzle-orm", () => ({
@@ -44,7 +46,7 @@ vi.mock("@/services/verification/email-verification-cache", () => ({
   verifyEmailsWithCache: mocks.verifyWithCache,
 }));
 vi.mock("@/services/compliance/compliance-evaluator", () => ({
-  evaluateComplianceForAccount: vi.fn(),
+  evaluateComplianceForAccount: mocks.evaluateComplianceForAccount,
 }));
 vi.mock("@/lib/config/env", () => ({
   getVerificationEnv: () => ({
@@ -55,6 +57,9 @@ vi.mock("@/lib/config/env", () => ({
 }));
 vi.mock("@/infrastructure/neon/repositories/verification-queue", () => ({
   enqueueVerificationJob: mocks.enqueueVerificationJob,
+}));
+vi.mock("@/infrastructure/neon/repositories/campaigns", () => ({
+  upsertCampaignMembership: mocks.upsertCampaignMembership,
 }));
 vi.mock("@/infrastructure/jobs/runners/instantly-import-runner", () => ({
   runInstantlyImportTick: mocks.runInstantlyImportTick,
@@ -204,6 +209,9 @@ describe("enqueueVerificationJobs scope", () => {
   });
 
   it("queues the selected historical contact point without a date cutoff", async () => {
+    mocks.execute
+      .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [] });
     mocks.execute.mockResolvedValueOnce({ rows: [{
       contact_point_id: "selected-contact-point",
       workspace_id: "workspace-1",
@@ -211,10 +219,10 @@ describe("enqueueVerificationJobs scope", () => {
     }] });
 
     const queued = await enqueueVerificationJobs();
-    const query = mocks.execute.mock.calls[0]?.[0] as { strings: string[] };
+    const query = mocks.execute.mock.calls[2]?.[0] as { strings: string[] };
 
     expect(queued).toBe(1);
-    expect(query.strings.join(" ")).toContain("cp.id = ea.selected_contact_point_id");
+    expect(query.strings.join(" ")).toContain("DISTINCT ON (ea.campaign_id, ea.account_id)");
     expect(query.strings.join(" ")).not.toContain("cp.created_at >=");
     expect(mocks.enqueueVerificationJob).toHaveBeenCalledWith({
       workspaceId: "workspace-1",
@@ -225,13 +233,35 @@ describe("enqueueVerificationJobs scope", () => {
   });
 
   it("limits continuous verification discovery to the configured recent window", async () => {
+    mocks.execute
+      .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [] });
     mocks.execute.mockResolvedValueOnce({ rows: [] });
     const createdSince = new Date("2026-10-02T00:00:00.000Z");
 
     await enqueueVerificationJobs({ createdSince });
-    const query = sqlParts(mocks.execute.mock.calls[0]?.[0]);
+    const query = sqlParts(mocks.execute.mock.calls[2]?.[0]);
 
     expect(query.text).toContain("AND cp.created_at >=");
     expect(query.values).toContain(createdSince.toISOString());
+  });
+
+  it("adds qualified canonical historical accounts through existing compliance evaluation", async () => {
+    mocks.execute
+      .mockResolvedValueOnce({ rows: [{ workspace_id: "workspace-1", campaign_id: "campaign-1", account_id: "account-1" }] })
+      .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [] });
+
+    await enqueueVerificationJobs();
+
+    expect(mocks.upsertCampaignMembership).toHaveBeenCalledWith({
+      campaignId: "campaign-1",
+      accountId: "account-1",
+      stage: "qualified",
+    });
+    expect(mocks.evaluateComplianceForAccount).toHaveBeenCalledWith("workspace-1", "account-1");
+    const preparationQuery = sqlParts(mocks.execute.mock.calls[0]?.[0]);
+    expect(preparationQuery.text).toContain("rc.processed = true");
+    expect(preparationQuery.text).toContain("a.status IN ('qualified', 'contactable', 'outreach_ready')");
   });
 });

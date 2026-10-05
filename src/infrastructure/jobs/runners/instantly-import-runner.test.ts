@@ -9,11 +9,13 @@ const mocks = vi.hoisted(() => ({
   deferByPlanLimit: vi.fn(),
   enqueueImport: vi.fn(),
   getImportCounts: vi.fn(),
+  isCircuitOpen: vi.fn(),
   releaseLock: vi.fn(),
+  tripCircuitBreaker: vi.fn(),
   updateImport: vi.fn(),
   getPlanUsage: vi.fn(),
   getMonthlyEmailUsage: vi.fn(),
-  addLead: vi.fn(),
+  addLeads: vi.fn(),
 }));
 
 vi.mock("@/infrastructure/neon/db", () => ({ getDb: () => ({ execute: mocks.execute }) }));
@@ -26,14 +28,16 @@ vi.mock("@/infrastructure/neon/repositories/instantly-lead-imports", () => ({
   deferInstantlyLeadImportsForPlanLimit: mocks.deferByPlanLimit,
   enqueueInstantlyLeadImport: mocks.enqueueImport,
   getInstantlyLeadImportCounts: mocks.getImportCounts,
+  isInstantlyImportCircuitOpen: mocks.isCircuitOpen,
   releaseInstantlyImportLock: mocks.releaseLock,
+  tripInstantlyImportCircuitBreaker: mocks.tripCircuitBreaker,
   updateInstantlyLeadImport: mocks.updateImport,
 }));
 vi.mock("@/infrastructure/providers/instantly/provider", () => ({
   InstantlyEmailDeliveryProvider: class {
     getPlanUsage = mocks.getPlanUsage;
     getMonthlyEmailUsage = mocks.getMonthlyEmailUsage;
-    addLead = mocks.addLead;
+    addLeads = mocks.addLeads;
   },
 }));
 
@@ -110,11 +114,13 @@ beforeEach(() => {
   mocks.enqueueImport.mockResolvedValue(true);
   mocks.getImportCounts.mockResolvedValue({});
   mocks.releaseLock.mockResolvedValue(undefined);
+  mocks.isCircuitOpen.mockResolvedValue(false);
+  mocks.tripCircuitBreaker.mockResolvedValue(undefined);
   mocks.updateImport.mockResolvedValue(undefined);
   mocks.getPlanUsage.mockResolvedValue({ currentLeadCount: 10, totalLeadLimit: 5000 });
   mocks.getMonthlyEmailUsage.mockResolvedValue({ emailsSent: 100 });
-  mocks.addLead.mockResolvedValue({
-    result: { providerLeadId: "provider-lead-1", status: "added" },
+  mocks.addLeads.mockResolvedValue({
+    outcomes: [{ index: 0, providerLeadId: "provider-lead-1", status: "added", diagnostic: null }],
     usage: { calls: 1, items: 1, errors: 0, totalLatencyMs: 1, costUsd: 0, quotaRemaining: 999 },
   });
 });
@@ -134,7 +140,7 @@ describe("runInstantlyImportTick", () => {
     expect(result.candidatesFound).toBe(0);
     expect(mocks.getPlanUsage).not.toHaveBeenCalled();
     expect(mocks.claimImports).not.toHaveBeenCalled();
-    expect(mocks.addLead).not.toHaveBeenCalled();
+    expect(mocks.addLeads).not.toHaveBeenCalled();
   });
 
   it("queues eligible leads without sending when Instantly delivery is disabled", async () => {
@@ -146,7 +152,7 @@ describe("runInstantlyImportTick", () => {
 
     expect(result.leadsQueued).toBe(1);
     expect(result.providerStatus).toBe("missing_configuration");
-    expect(mocks.addLead).not.toHaveBeenCalled();
+    expect(mocks.addLeads).not.toHaveBeenCalled();
   });
 
   it("imports an eligible verified lead and persists the provider result", async () => {
@@ -154,8 +160,9 @@ describe("runInstantlyImportTick", () => {
 
     const result = await runInstantlyImportTick({ contactPointIds: ["contact-point-1"] });
 
+    expect(mocks.addLeads).toHaveBeenCalledOnce();
     expect(result.leadsAdded).toBe(1);
-    expect(mocks.addLead).toHaveBeenCalledWith(expect.objectContaining({
+    expect(mocks.addLeads).toHaveBeenCalledWith([expect.objectContaining({
       providerCampaignId: campaignId,
       email: "person@example.com",
       skipIfExisting: true,
@@ -168,7 +175,7 @@ describe("runInstantlyImportTick", () => {
         city: "Madrid",
         country: "ES",
       }),
-    }));
+    })]);
     expect(mocks.updateImport).toHaveBeenCalledWith("import-1", expect.objectContaining({
       status: "instantly_added",
       providerLeadId: "provider-lead-1",
@@ -184,7 +191,7 @@ describe("runInstantlyImportTick", () => {
 
       expect(result.leadsQueued).toBe(0);
       expect(mocks.enqueueImport).not.toHaveBeenCalled();
-      expect(mocks.addLead).not.toHaveBeenCalled();
+      expect(mocks.addLeads).not.toHaveBeenCalled();
     },
   );
 
@@ -196,7 +203,7 @@ describe("runInstantlyImportTick", () => {
 
     expect(result.leadsQueued).toBe(0);
     expect(mocks.enqueueImport).not.toHaveBeenCalled();
-    expect(mocks.addLead).not.toHaveBeenCalled();
+    expect(mocks.addLeads).not.toHaveBeenCalled();
   });
 
   it("lets the database account identity admit only one contact from a duplicate account", async () => {
@@ -209,12 +216,12 @@ describe("runInstantlyImportTick", () => {
 
     expect(result.leadsQueued).toBe(1);
     expect(mocks.enqueueImport).toHaveBeenCalledTimes(2);
-    expect(mocks.addLead).toHaveBeenCalledOnce();
+    expect(mocks.addLeads).toHaveBeenCalledOnce();
   });
 
   it("persists provider failures as retryable imports", async () => {
     setupWithOneClaimedJob([candidate()]);
-    mocks.addLead.mockRejectedValue(new Error("Instantly API error: 503"));
+    mocks.addLeads.mockRejectedValue(new Error("Instantly API error: 503"));
 
     const result = await runInstantlyImportTick({ contactPointIds: ["contact-point-1"] });
 
@@ -224,6 +231,72 @@ describe("runInstantlyImportTick", () => {
       lastError: "Instantly API error: 503",
       nextAttemptAt: expect.any(Date),
     }));
+  });
+
+  it.each(["billing", "analytics"])("imports despite an unavailable %s telemetry endpoint", async (unavailableTelemetry) => {
+    if (unavailableTelemetry === "billing") {
+      setupWithOneClaimedJob([candidate()]);
+      mocks.getPlanUsage.mockRejectedValue(new Error("billing scope missing"));
+    } else {
+      configureDbResults([
+        readySchemaRows,
+        metricReads(),
+        [candidate()],
+        metricReads(),
+        [{ count: 100 }],
+        [candidate()],
+        metricReads(),
+      ]);
+      mocks.claimImports.mockResolvedValue([{
+        id: "import-1",
+        account_id: "account-1",
+        contact_point_id: "contact-point-1",
+        attempt_count: 1,
+        max_attempts: 8,
+      }]);
+    }
+    if (unavailableTelemetry === "analytics") {
+      mocks.getMonthlyEmailUsage.mockRejectedValue(new Error("analytics scope missing"));
+    }
+
+    const result = await runInstantlyImportTick({ contactPointIds: ["contact-point-1"] });
+
+    expect(result.leadsAdded).toBe(1);
+    expect(result.instantlyTelemetryReady).toBe(false);
+    expect(result.telemetryWarnings).toContain(
+      unavailableTelemetry === "billing" ? "workspace-billing/plan-details unavailable" : "campaigns/analytics unavailable",
+    );
+    expect(result.instantlyLeadImportReady).toBe(true);
+    expect(mocks.addLeads).toHaveBeenCalledOnce();
+  });
+
+  it("opens a durable circuit on leads/add 401 and blocks later ticks", async () => {
+    setupWithOneClaimedJob([candidate()]);
+    const unauthorized = new Error("Instantly API request failed: endpoint=leads/add http_status=401 provider_code=Unauthorized message=Invalid key request_id=req-123");
+    unauthorized.name = "InstantlyApiError";
+    Object.assign(unauthorized, { details: { endpointCategory: "leads/add", httpStatus: 401, requestId: "req-123" } });
+    mocks.addLeads.mockRejectedValue(unauthorized);
+
+    const result = await runInstantlyImportTick({ contactPointIds: ["contact-point-1"] });
+
+    expect(result.providerStatus).toBe("unhealthy");
+    expect(result.instantlyLeadImportReady).toBe(false);
+    expect(result.leadsFailed).toBe(1);
+    expect(mocks.updateImport).toHaveBeenCalledWith("import-1", expect.objectContaining({
+      status: "failed",
+      lastError: expect.stringContaining("endpoint=leads/add http_status=401"),
+    }));
+    expect(mocks.tripCircuitBreaker).toHaveBeenCalledWith(campaignId, expect.any(String), "req-123");
+    expect(mocks.releaseLock).not.toHaveBeenCalled();
+    expect(mocks.addLeads).toHaveBeenCalledOnce();
+
+    configureDbResults([readySchemaRows, metricReads(), [candidate()], metricReads(), metricReads()]);
+    mocks.acquireLock.mockResolvedValue(false);
+    mocks.isCircuitOpen.mockResolvedValue(true);
+    const nextTick = await runInstantlyImportTick({ contactPointIds: ["contact-point-1"] });
+
+    expect(nextTick.providerStatus).toBe("unhealthy");
+    expect(mocks.addLeads).toHaveBeenCalledOnce();
   });
 
   it("stops at contact and monthly plan limits before claiming jobs", async () => {
@@ -243,7 +316,7 @@ describe("runInstantlyImportTick", () => {
     expect(result.leadsDeferred).toBe(1);
     expect(mocks.deferByPlanLimit).toHaveBeenCalledWith(campaignId, expect.any(Date));
     expect(mocks.claimImports).not.toHaveBeenCalled();
-    expect(mocks.addLead).not.toHaveBeenCalled();
+    expect(mocks.addLeads).not.toHaveBeenCalled();
   });
 
   it("limits claims to remaining contact slots near the hard limit", async () => {
@@ -274,7 +347,7 @@ describe("runInstantlyImportTick", () => {
       contactPointId: "contact-point-1",
       providerCampaignId: campaignId,
     }));
-    expect(mocks.addLead).not.toHaveBeenCalled();
+    expect(mocks.addLeads).not.toHaveBeenCalled();
   });
 
   it("imports a historical valid contact in full-backfill mode", async () => {
@@ -284,7 +357,7 @@ describe("runInstantlyImportTick", () => {
 
     expect(result.candidatesFound).toBe(1);
     expect(result.leadsAdded).toBe(1);
-    expect(mocks.addLead).toHaveBeenCalledOnce();
+    expect(mocks.addLeads).toHaveBeenCalledOnce();
   });
 
   it("continues the full historical scan in a second bounded batch", async () => {

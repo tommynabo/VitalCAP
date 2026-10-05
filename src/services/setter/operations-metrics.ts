@@ -26,6 +26,7 @@ export interface SetterOperationsMetrics {
   webhooks: {
     received: number;
     processed: number;
+    ignored: number;
     duplicateSkipped: number;
     humanRequired: number;
     failed: number;
@@ -39,7 +40,7 @@ export function requiresHumanIntervention(draft: SetterDraft): boolean {
     || draft.confidence < 0.6;
 }
 
-const TERMINAL_WEBHOOK_STATUSES = new Set(["duplicate_skipped", "human_required", "failed"]);
+const TERMINAL_WEBHOOK_STATUSES = new Set(["duplicate_skipped", "human_required", "failed", "ignored"]);
 const CONVERSATION_STATES = new Set([
   "reply_received",
   "pre_routed",
@@ -98,6 +99,7 @@ export function computeSetterOperationsMetrics(input: {
       received: input.webhookEvents.length + duplicateAttempts,
       processed: input.webhookEvents.filter((event) => !TERMINAL_WEBHOOK_STATUSES.has(event.status)
         && CONVERSATION_STATES.has(event.status)).length,
+      ignored: eventCount("ignored"),
       duplicateSkipped: eventCount("duplicate_skipped") + duplicateAttempts,
       humanRequired: eventCount("human_required"),
       failed: eventCount("failed"),

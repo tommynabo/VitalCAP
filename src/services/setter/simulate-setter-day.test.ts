@@ -205,7 +205,7 @@ describe("simulate a day of AI Setter activity", () => {
     expect(result.conversation.state).toBe("suppressed");
   });
 
-  it("runs the full classify -> draft -> review -> approve flow without sending", async () => {
+  it("runs the full classify -> draft -> review -> approve flow without invoking delivery", async () => {
     const result = await processIncomingReply({
       workspaceId: "ws-1",
       conversation: conversation(),
@@ -240,7 +240,7 @@ describe("simulate a day of AI Setter activity", () => {
       },
       nextId,
     );
-    expect(review.conversation.state).toBe("approved");
+    expect(review.conversation.state).toBe("approved_pending_send");
     expect(review.outgoingMessage).toBeNull();
   });
 

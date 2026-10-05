@@ -35,6 +35,7 @@ const PHONE_PATTERN = /\+?\d[\d\s().-]{7,}\d/g;
 /** Masks a value that looks like a secret, email, or phone number; leaves everything else untouched. */
 function redactValue(key: string, value: unknown): unknown {
   if (SECRET_KEY_PATTERN.test(key)) return "[REDACTED]";
+  if (key === "correlationId" || key === "requestId") return value;
   if (typeof value === "string") {
     return value.replace(EMAIL_PATTERN, "[email]").replace(PHONE_PATTERN, "[phone]");
   }

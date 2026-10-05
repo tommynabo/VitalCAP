@@ -9,8 +9,8 @@ import type { Conversation, ConversationMessage, ConversationState, ReviewDecisi
  */
 
 const STATE_BY_DECISION: Record<ReviewDecision, ConversationState> = {
-  approve: "approved",
-  edit_and_send: "edited",
+  approve: "approved_pending_send",
+  edit_and_send: "approved_pending_send",
   reject: "rejected",
   no_reply_needed: "no_reply_needed",
   escalate: "escalated",
@@ -37,6 +37,9 @@ export interface ReviewActionResult {
 }
 
 export function applyReviewDecision(input: ReviewActionInput, generateId: () => string): ReviewActionResult {
+  if (input.decision === "approve" && !input.draft.draft.trim()) {
+    throw new Error("approve requires draft text");
+  }
   if (input.decision === "edit_and_send" && !input.finalText?.trim()) {
     throw new Error("edit_and_send requires finalText");
   }

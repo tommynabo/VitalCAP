@@ -111,6 +111,8 @@ export function SetterClient({
   const [ageFilter, setAgeFilter] = useState<AgeFilter>("any");
   const [campaignFilter, setCampaignFilter] = useState("all");
   const [accountFilter, setAccountFilter] = useState("all");
+  const [searchText, setSearchText] = useState("");
+  const [branchFilter, setBranchFilter] = useState("all");
   const analytics = useMemo(
     () =>
       computeSetterAnalytics({
@@ -156,6 +158,21 @@ export function SetterClient({
       if (ageFilter !== "any" && ageHours < Number(ageFilter)) return false;
       if (campaignFilter !== "all" && conversation.campaignId !== campaignFilter) return false;
       if (accountFilter !== "all" && conversation.accountId !== accountFilter) return false;
+      if (branchFilter !== "all" && draft.branch !== branchFilter) return false;
+      if (searchText.trim()) {
+        const bundle = accountBundleById.get(conversation.accountId);
+        const email = typeof message.metadata.leadEmail === "string"
+          ? message.metadata.leadEmail
+          : bundle?.contactPoints.find((point) => point.type === "email")?.value ?? "";
+        const searchHaystack = [
+          bundle?.account.canonicalName,
+          email,
+          campaignById.get(conversation.campaignId)?.name,
+          message.body,
+          draft.draft,
+        ].join(" ").toLowerCase();
+        if (!searchHaystack.includes(searchText.trim().toLowerCase())) return false;
+      }
       return true;
     })
     .sort((left, right) => {
@@ -174,6 +191,10 @@ export function SetterClient({
     webhookEvents,
   });
   const pendingDrafts = visibleQueueItems.map(({ draft }) => draft);
+  const recentDeliveryItems = conversations
+    .filter((conversation) => ["sending", "send_accepted", "send_failed", "send_unknown", "sent"].includes(conversation.state))
+    .sort((left, right) => Date.parse(right.updatedAt) - Date.parse(left.updatedAt))
+    .slice(0, 10);
 
   async function submitReview(draft: SetterDraft, decision: "approve" | "edit_and_send" | "reject" | "take_over") {
     setBusyDraftId(draft.id);
@@ -190,7 +211,10 @@ export function SetterClient({
         }),
       });
       const result = await response.json().catch(() => ({}));
-      if (!response.ok) throw new Error(result.error ?? "Review decision could not be saved.");
+      if (!response.ok) {
+        if (result.state || result.delivery) router.refresh();
+        throw new Error(result.error ?? result.errorCode ?? "Review decision could not be saved.");
+      }
       router.refresh();
     } catch (error) {
       setActionError(error instanceof Error ? error.message : "Review decision could not be saved.");
@@ -202,7 +226,7 @@ export function SetterClient({
     <div className="space-y-6">
       <header className="flex flex-wrap items-center justify-between gap-3">
         <h1 className="text-xl font-semibold text-text">AI Setter</h1>
-        <Badge variant="warning">Dry run · Auto-send off</Badge>
+        <Badge variant="warning">Human-approved sends · Auto-send off</Badge>
       </header>
 
       <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-6">
@@ -221,7 +245,11 @@ export function SetterClient({
           <h2 id="setter-review-heading" className="text-base font-semibold text-text">Review queue</h2>
           <span className="text-sm text-text-muted">{visibleQueueItems.length} of {queueItems.length} pending · priority order</span>
         </div>
-        <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
+        <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-6">
+          <label className="text-xs text-text-muted">
+            Search inbox
+            <input value={searchText} onChange={(event) => setSearchText(event.target.value)} placeholder="Account, email, message" className="mt-1 w-full rounded-md border border-border bg-surface px-3 py-2 text-sm text-text" />
+          </label>
           <label className="text-xs text-text-muted">
             Queue
             <select value={queueMode} onChange={(event) => setQueueMode(event.target.value as QueueMode)} className="mt-1 w-full rounded-md border border-border bg-surface px-3 py-2 text-sm text-text">
@@ -247,6 +275,13 @@ export function SetterClient({
             </select>
           </label>
           <label className="text-xs text-text-muted">
+            Branch
+            <select value={branchFilter} onChange={(event) => setBranchFilter(event.target.value)} className="mt-1 w-full rounded-md border border-border bg-surface px-3 py-2 text-sm text-text">
+              <option value="all">All branches</option>
+              {[...new Set(setterDrafts.map((draft) => draft.branch))].sort().map((branch) => <option key={branch} value={branch}>{branch}</option>)}
+            </select>
+          </label>
+          <label className="text-xs text-text-muted">
             Minimum age / SLA
             <select value={ageFilter} onChange={(event) => setAgeFilter(event.target.value as AgeFilter)} className="mt-1 w-full rounded-md border border-border bg-surface px-3 py-2 text-sm text-text">
               <option value="any">Any age</option>
@@ -264,11 +299,13 @@ export function SetterClient({
             {pendingDrafts.map((draft) => {
               const message = messageById.get(draft.conversationMessageId);
               const conversation = message ? conversationById.get(message.conversationId) : null;
+              if (!message || !conversation) return null;
               const bundle = conversation ? accountBundleById.get(conversation.accountId) : null;
               const contact = bundle?.contacts.find((item) => item.id === conversation?.contactId) ?? null;
-              const contactPoint = bundle?.contactPoints.find((point) => point.contactId === contact?.id && point.type === "email")
+              const leadEmail = typeof message.metadata.leadEmail === "string" ? message.metadata.leadEmail : null;
+              const contactPoint = bundle?.contactPoints.find((point) => point.type === "email" && point.normalizedValue === leadEmail)
+                ?? bundle?.contactPoints.find((point) => point.contactId === contact?.id && point.type === "email")
                 ?? bundle?.contactPoints.find((point) => point.type === "email");
-              if (!message || !conversation) return null;
 
               return (
                 <article key={draft.id} className="grid min-w-0 gap-5 py-5 lg:grid-cols-[minmax(0,1fr)_minmax(280px,0.9fr)]">
@@ -282,7 +319,9 @@ export function SetterClient({
                       <p>Campaign: {campaignById.get(conversation.campaignId)?.name ?? "Unknown campaign"}</p>
                       <p>{contact?.fullName ?? contact?.firstName ?? "Contact not identified"}{contact?.jobTitle ? ` · ${contact.jobTitle}` : ""}</p>
                       <p className="break-all">{contactPoint?.value ?? ""}</p>
+                      <p className="break-all">Sending account: {typeof message.metadata.emailAccount === "string" ? message.metadata.emailAccount : "Not resolved"}</p>
                     </div>
+                    <Badge variant={busyDraftId === draft.id ? "warning" : "danger"}>{busyDraftId === draft.id ? "SENDING" : "NOT SENT"}</Badge>
                     <div>
                       <h3 className="mb-1 text-xs font-semibold uppercase text-text-muted">Incoming message</h3>
                       <p className="whitespace-pre-wrap break-words rounded-md bg-surface-muted p-3 text-sm text-text">{message.body}</p>
@@ -320,7 +359,7 @@ export function SetterClient({
                       ) : <p className="text-sm text-text-muted">No matching approved facts.</p>}
                     </div>
                     <div>
-                      <label htmlFor={`draft-${draft.id}`} className="mb-1 block text-xs font-semibold uppercase text-text-muted">Prepared reply · not sent</label>
+                      <label htmlFor={`draft-${draft.id}`} className="mb-1 block text-xs font-semibold uppercase text-text-muted">Prepared reply</label>
                       <textarea
                         id={`draft-${draft.id}`}
                         value={editedDrafts[draft.id] ?? draft.draft}
@@ -356,10 +395,10 @@ export function SetterClient({
                     />
                     <div className="flex flex-wrap gap-2">
                       <Button size="sm" disabled={busyDraftId === draft.id} onClick={() => submitReview(draft, "approve")}>
-                        <Check size={15} aria-hidden="true" /> Approve
+                        <Check size={15} aria-hidden="true" /> Approve &amp; Send
                       </Button>
                       <Button size="sm" variant="secondary" disabled={busyDraftId === draft.id} onClick={() => submitReview(draft, "edit_and_send")}>
-                        <FilePenLine size={15} aria-hidden="true" /> Edit &amp; approve
+                        <FilePenLine size={15} aria-hidden="true" /> Edit &amp; Send
                       </Button>
                       <Button size="sm" variant="danger" disabled={busyDraftId === draft.id} onClick={() => submitReview(draft, "reject")}>
                         <X size={15} aria-hidden="true" /> Reject
@@ -374,6 +413,40 @@ export function SetterClient({
             })}
           </div>
         )}
+      </section>
+
+      <section className="space-y-3" aria-labelledby="setter-delivery-heading">
+        <h2 id="setter-delivery-heading" className="text-base font-semibold text-text">Reply delivery</h2>
+        <div className="divide-y divide-border border-y border-border">
+          {recentDeliveryItems.map((conversation) => {
+            const thread = messagesByConversationId.get(conversation.id) ?? [];
+            const incoming = [...thread].reverse().find((message) => message.direction === "incoming");
+            const outgoing = [...thread].reverse().find((message) => message.direction === "outgoing");
+            const bundle = accountBundleById.get(conversation.accountId);
+            const statusLabel = conversation.state === "send_unknown" ? "DELIVERY UNKNOWN"
+              : conversation.state === "send_failed" ? "FAILED"
+                : conversation.state === "sent" ? "SENT"
+                  : "SENDING";
+            const statusVariant = conversation.state === "sent" ? "success"
+              : conversation.state === "send_failed" || conversation.state === "send_unknown" ? "danger"
+                : "warning";
+            return (
+              <article key={conversation.id} className="grid gap-3 py-3 md:grid-cols-[minmax(180px,0.7fr)_minmax(0,1.3fr)]">
+                <div className="space-y-1 text-sm">
+                  <Badge variant={statusVariant}>{statusLabel}</Badge>
+                  <p className="font-medium text-text">{bundle?.account.canonicalName ?? "Unknown account"}</p>
+                  <p className="text-xs text-text-muted">{campaignById.get(conversation.campaignId)?.name ?? "Unknown campaign"}</p>
+                  <time className="text-xs text-text-muted" dateTime={conversation.updatedAt}>{new Date(conversation.updatedAt).toLocaleString()}</time>
+                </div>
+                <div className="space-y-2 text-sm">
+                  {incoming && <p className="text-text-muted">Incoming: {incoming.body}</p>}
+                  {outgoing && <p className="whitespace-pre-wrap text-text">Sent: {outgoing.body}</p>}
+                </div>
+              </article>
+            );
+          })}
+          {recentDeliveryItems.length === 0 && <p className="py-4 text-sm text-text-muted">No reviewed replies have entered delivery.</p>}
+        </div>
       </section>
 
       <Card>
@@ -412,9 +485,10 @@ export function SetterClient({
 
       <section className="space-y-3" aria-labelledby="setter-webhook-heading">
         <h2 id="setter-webhook-heading" className="text-base font-semibold text-text">Webhook observability</h2>
-        <div className="grid grid-cols-2 gap-3 sm:grid-cols-5">
+        <div className="grid grid-cols-2 gap-3 sm:grid-cols-6">
           <KpiStat label="Received" value={String(operationsMetrics.webhooks.received)} />
           <KpiStat label="Processed" value={String(operationsMetrics.webhooks.processed)} />
+          <KpiStat label="Ignored" value={String(operationsMetrics.webhooks.ignored)} />
           <KpiStat label="Duplicate skipped" value={String(operationsMetrics.webhooks.duplicateSkipped)} />
           <KpiStat label="Human required" value={String(operationsMetrics.webhooks.humanRequired)} />
           <KpiStat label="Failed" value={String(operationsMetrics.webhooks.failed)} />

@@ -5,13 +5,15 @@ import { createEmailVerificationProvider } from "@/infrastructure/providers/prov
 import { ProviderBudgetExceededError } from "@/domain/providers/errors";
 import { DbVerificationCacheStore } from "@/services/verification/db-verification-cache";
 import { verifyEmailsWithCache } from "@/services/verification/email-verification-cache";
-import { getVerificationEnv } from "@/lib/config/env";
+import { getDeliveryEnv, getVerificationEnv } from "@/lib/config/env";
 import { enqueueVerificationJob } from "@/infrastructure/neon/repositories/verification-queue";
+import { upsertCampaignMembership } from "@/infrastructure/neon/repositories/campaigns";
 import { EMAIL_VERIFICATION_PIPELINE_VERSION } from "@/domain/providers/email-verification-idempotency";
 import { runInstantlyImportTick, type InstantlyImportTickResult } from "@/infrastructure/jobs/runners/instantly-import-runner";
 
 const BATCH_SIZE = 50;
 const LOCK_TIMEOUT_MINUTES = 15;
+const HISTORICAL_PREPARATION_BATCH_SIZE = 500;
 
 export interface VerificationRunnerResult {
   jobsClaimed: number;
@@ -62,20 +64,87 @@ async function deferVerificationJobs(
 
 export async function enqueueVerificationJobs(options: { createdSince?: Date } = {}): Promise<number> {
   const db = getDb();
+  const createdRawFilter = options.createdSince
+    ? sql`AND rc.discovered_at >= ${options.createdSince.toISOString()}`
+    : sql``;
+  const preparationRows = await db.execute(sql`
+    SELECT DISTINCT c.workspace_id, c.id AS campaign_id, a.id AS account_id
+    FROM raw_candidates rc
+    JOIN campaigns c ON c.id = rc.campaign_id
+    JOIN accounts a ON a.id = rc.account_id AND a.workspace_id = c.workspace_id
+    LEFT JOIN campaign_memberships cm ON cm.campaign_id = c.id AND cm.account_id = a.id
+    WHERE rc.processed = true
+      AND c.status = 'active'
+      AND c.autopilot_enabled = true
+      AND a.status IN ('qualified', 'contactable', 'outreach_ready')
+      AND (cm.id IS NULL OR cm.stage = 'discovered')
+      ${createdRawFilter}
+    ORDER BY a.id
+    LIMIT ${HISTORICAL_PREPARATION_BATCH_SIZE}
+  `);
+  for (const row of preparationRows.rows as Array<{ workspace_id: string; campaign_id: string; account_id: string }>) {
+    await upsertCampaignMembership({
+      campaignId: row.campaign_id,
+      accountId: row.account_id,
+      stage: "qualified",
+    });
+  }
+
+  const complianceRows = await db.execute(sql`
+    SELECT DISTINCT c.workspace_id, c.id AS campaign_id, a.id AS account_id
+    FROM campaign_memberships cm
+    JOIN campaigns c ON c.id = cm.campaign_id
+    JOIN accounts a ON a.id = cm.account_id AND a.workspace_id = c.workspace_id
+    WHERE c.status = 'active'
+      AND c.autopilot_enabled = true
+      AND cm.stage IN ('qualified', 'contact_selected', 'ready')
+      AND a.status IN ('qualified', 'contactable', 'outreach_ready')
+      AND EXISTS (
+        SELECT 1 FROM raw_candidates rc
+        WHERE rc.campaign_id = c.id AND rc.account_id = a.id AND rc.processed = true
+      )
+      AND EXISTS (
+        SELECT 1 FROM contact_points cp
+        WHERE cp.account_id = a.id
+          AND cp.type = 'email'
+          AND cp.channel_eligibility IN ('eligible_email', 'consented_email', 'prior_relationship')
+          AND cp.verification_status IN ('valid', 'unverified', 'unknown')
+          AND (cp.verification_status <> 'unknown' OR cp.verification_checked_at IS NULL OR cp.verification_checked_at <= NOW() - INTERVAL '3 days')
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM contact_points cp
+        JOIN compliance_decisions cd ON cd.contact_point_id = cp.id
+        WHERE cp.account_id = a.id
+          AND cd.campaign_id = c.id
+          AND cd.decision = 'allowed'
+          AND cd.superseded_at IS NULL
+          AND cp.verification_status = 'valid'
+      )
+    ORDER BY a.id
+    LIMIT ${HISTORICAL_PREPARATION_BATCH_SIZE}
+  `);
+  const { evaluateComplianceForAccount } = await import("@/services/compliance/compliance-evaluator");
+  const preparedAccounts = new Set<string>();
+  for (const row of [...preparationRows.rows, ...complianceRows.rows] as Array<{ workspace_id: string; account_id: string }>) {
+    const key = `${row.workspace_id}:${row.account_id}`;
+    if (preparedAccounts.has(key)) continue;
+    preparedAccounts.add(key);
+    await evaluateComplianceForAccount(row.workspace_id, row.account_id);
+  }
+
   const createdFilter = options.createdSince
     ? sql`AND cp.created_at >= ${options.createdSince.toISOString()}`
     : sql``;
-  
-  // Requeue unverified contacts and unknown results after their short cache window expires.
-  // Limit to 500 per tick to avoid blowing up the query
+
+  // Pick one verification candidate per qualified canonical account.
   const query = sql`
     WITH eligible_accounts AS (
-      SELECT DISTINCT cm.account_id, cm.workspace_id, cm.selected_contact_point_id
+      SELECT DISTINCT cm.account_id, cm.workspace_id, cm.campaign_id, cm.selected_contact_point_id
       FROM campaign_memberships cm
       JOIN campaigns c ON cm.campaign_id = c.id
-      WHERE cm.stage IN ('qualified', 'ready')
+      WHERE cm.stage IN ('qualified', 'contact_selected', 'ready')
         AND c.status = 'active'
-        AND cm.selected_contact_point_id IS NOT NULL
         AND cm.contacted_at IS NULL
         AND NOT EXISTS (
           SELECT 1 FROM suppression_entries se
@@ -96,28 +165,67 @@ export async function enqueueVerificationJobs(options: { createdSince?: Date } =
           JOIN conversations conv ON conv.id = m.conversation_id
           WHERE conv.workspace_id = cm.workspace_id AND conv.account_id = cm.account_id
         )
+    ), ranked_candidates AS (
+      SELECT DISTINCT ON (ea.campaign_id, ea.account_id)
+        cp.id AS contact_point_id,
+        ea.workspace_id,
+        cp.normalized_value,
+        cp.id = ea.selected_contact_point_id AS currently_selected
+      FROM eligible_accounts ea
+      JOIN contact_points cp ON cp.account_id = ea.account_id
+      LEFT JOIN contacts co ON co.id = cp.contact_id
+      WHERE cp.type = 'email'
+        AND BTRIM(cp.normalized_value) <> ''
+        AND cp.channel_eligibility IN ('eligible_email', 'consented_email', 'prior_relationship')
+        AND cp.last_contacted_at IS NULL
+        AND (
+          cp.verification_status = 'unverified'
+          OR (cp.verification_status = 'unknown' AND (cp.verification_checked_at IS NULL OR cp.verification_checked_at <= NOW() - INTERVAL '3 days'))
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM suppression_entries se
+          WHERE se.workspace_id = ea.workspace_id
+            AND (se.account_id = cp.account_id OR se.contact_point_id = cp.id)
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM verification_jobs vj
+          WHERE vj.contact_point_id = cp.id
+            AND (vj.status IN ('pending', 'processing') OR (vj.status = 'failed' AND vj.attempt_count < vj.max_attempts))
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM outreach_queue oq
+          WHERE oq.workspace_id = ea.workspace_id AND oq.account_id = ea.account_id AND oq.channel = 'email'
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM conversations conv
+          WHERE conv.workspace_id = ea.workspace_id
+            AND conv.account_id = ea.account_id
+            AND conv.state NOT IN ('rejected', 'no_reply_needed', 'suppressed')
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM meetings m
+          JOIN conversations conv ON conv.id = m.conversation_id
+          WHERE conv.workspace_id = ea.workspace_id AND conv.account_id = ea.account_id
+        )
+        ${createdFilter}
+      ORDER BY ea.campaign_id, ea.account_id,
+        (cp.id = ea.selected_contact_point_id) DESC,
+        COALESCE(co.is_decision_maker, false) DESC,
+        cp.is_personal_or_named DESC,
+        CASE
+          WHEN COALESCE(co.role_type, cp.label, '') ILIKE '%owner%' OR COALESCE(co.job_title, '') ILIKE '%titular%' OR COALESCE(co.seniority, '') ILIKE '%owner%' THEN 1
+          WHEN COALESCE(co.role_type, cp.label, '') ILIKE '%purchasing%' OR COALESCE(co.role_type, cp.label, '') ILIKE '%compras%' OR COALESCE(co.job_title, '') ILIKE '%buyer%' THEN 2
+          WHEN COALESCE(co.role_type, cp.label, '') ILIKE '%manager%' OR COALESCE(co.job_title, '') ILIKE '%director%' OR COALESCE(co.job_title, '') ILIKE '%gerente%' THEN 3
+          WHEN COALESCE(co.role_type, cp.label, '') ILIKE '%professional%' OR COALESCE(co.job_title, '') ILIKE '%pharmacist%' THEN 4
+          ELSE 10
+        END,
+        cp.is_generic ASC,
+        cp.priority_score DESC,
+        cp.created_at ASC
     )
-    SELECT cp.id as contact_point_id, ea.workspace_id, cp.normalized_value
-    FROM contact_points cp
-    JOIN eligible_accounts ea ON cp.account_id = ea.account_id AND cp.id = ea.selected_contact_point_id
-    WHERE cp.type = 'email'
-      AND BTRIM(cp.normalized_value) <> ''
-      AND cp.last_contacted_at IS NULL
-      AND NOT EXISTS (
-        SELECT 1 FROM suppression_entries se
-        WHERE se.workspace_id = ea.workspace_id
-          AND (se.account_id = cp.account_id OR se.contact_point_id = cp.id)
-      )
-      AND (
-        cp.verification_status = 'unverified'
-        OR (cp.verification_status = 'unknown' AND (cp.verification_checked_at IS NULL OR cp.verification_checked_at <= NOW() - INTERVAL '3 days'))
-      )
-      AND NOT EXISTS (
-        SELECT 1 FROM verification_jobs vj
-        WHERE vj.contact_point_id = cp.id
-          AND vj.status IN ('pending', 'processing')
-      )
-      ${createdFilter}
+    SELECT contact_point_id, workspace_id, normalized_value
+    FROM ranked_candidates
+    ORDER BY currently_selected DESC, contact_point_id
     LIMIT 500
   `;
 
@@ -136,6 +244,92 @@ export async function enqueueVerificationJobs(options: { createdSince?: Date } =
   }
 
   return count;
+}
+
+export interface HistoricalBackfillProgress {
+  verificationCandidatesRemaining: number;
+  verificationJobsPending: number;
+  eligibleValidContactsRemaining: number;
+  instantlyImportJobsPending: number;
+  instantlyDeferredDueToPlanLimit: number;
+}
+
+export async function getHistoricalBackfillProgress(): Promise<HistoricalBackfillProgress> {
+  const db = getDb();
+  const providerCampaignId = getDeliveryEnv().INSTANTLY_CAMPAIGN_ID;
+  const verificationProvider = getVerificationEnv().EMAIL_VERIFICATION_PROVIDER;
+  const result = await db.execute(sql`
+    SELECT
+      (
+        SELECT COUNT(DISTINCT cm.account_id)::int
+        FROM campaign_memberships cm
+        JOIN campaigns c ON c.id = cm.campaign_id
+        JOIN contact_points cp ON cp.account_id = cm.account_id AND cp.type = 'email'
+        WHERE c.status = 'active' AND c.autopilot_enabled = true
+          AND cm.stage IN ('qualified', 'contact_selected', 'ready')
+          AND cp.channel_eligibility IN ('eligible_email', 'consented_email', 'prior_relationship')
+          AND cp.verification_status IN ('unverified', 'unknown')
+          AND (cp.verification_status <> 'unknown' OR cp.verification_checked_at IS NULL OR cp.verification_checked_at <= NOW() - INTERVAL '3 days')
+          AND NOT EXISTS (
+            SELECT 1 FROM verification_jobs vj
+            WHERE vj.contact_point_id = cp.id
+              AND (vj.status IN ('pending', 'processing') OR (vj.status = 'failed' AND vj.attempt_count < vj.max_attempts))
+          )
+          AND NOT EXISTS (SELECT 1 FROM suppression_entries se WHERE se.workspace_id = cm.workspace_id AND (se.account_id = cm.account_id OR se.contact_point_id = cp.id))
+          AND NOT EXISTS (SELECT 1 FROM outreach_queue oq WHERE oq.workspace_id = cm.workspace_id AND oq.account_id = cm.account_id AND oq.channel = 'email')
+          AND NOT EXISTS (SELECT 1 FROM conversations conv WHERE conv.workspace_id = cm.workspace_id AND conv.account_id = cm.account_id AND conv.state NOT IN ('rejected', 'no_reply_needed', 'suppressed'))
+          AND NOT EXISTS (SELECT 1 FROM meetings m JOIN conversations conv ON conv.id = m.conversation_id WHERE conv.workspace_id = cm.workspace_id AND conv.account_id = cm.account_id)
+      ) AS verification_candidates_remaining,
+      (
+        SELECT COUNT(*)::int
+        FROM verification_jobs vj
+        WHERE vj.provider = ${verificationProvider}
+          AND (vj.status IN ('pending', 'processing') OR (vj.status = 'failed' AND vj.attempt_count < vj.max_attempts))
+      ) AS verification_jobs_pending,
+      (
+        SELECT COUNT(DISTINCT cp.id)::int
+        FROM campaign_memberships cm
+        JOIN campaigns c ON c.id = cm.campaign_id
+        JOIN contact_points cp ON cp.id = cm.selected_contact_point_id AND cp.type = 'email'
+        JOIN compliance_decisions cd ON cd.campaign_id = cm.campaign_id
+          AND cd.account_id = cm.account_id AND cd.contact_point_id = cp.id
+          AND cd.decision = 'allowed' AND cd.superseded_at IS NULL
+        WHERE c.status = 'active' AND c.autopilot_enabled = true
+          AND cm.stage IN ('qualified', 'contact_selected', 'ready')
+          AND cp.verification_status = 'valid'
+          AND cp.channel_eligibility IN ('eligible_email', 'consented_email', 'prior_relationship')
+          AND cp.last_contacted_at IS NULL AND cm.contacted_at IS NULL
+          AND NOT EXISTS (SELECT 1 FROM suppression_entries se WHERE se.workspace_id = cm.workspace_id AND (se.account_id = cm.account_id OR se.contact_point_id = cp.id))
+          AND NOT EXISTS (SELECT 1 FROM outreach_queue oq WHERE oq.workspace_id = cm.workspace_id AND oq.account_id = cm.account_id AND oq.channel = 'email')
+          AND NOT EXISTS (SELECT 1 FROM conversations conv WHERE conv.workspace_id = cm.workspace_id AND conv.account_id = cm.account_id AND conv.state NOT IN ('rejected', 'no_reply_needed', 'suppressed'))
+          AND NOT EXISTS (SELECT 1 FROM meetings m JOIN conversations conv ON conv.id = m.conversation_id WHERE conv.workspace_id = cm.workspace_id AND conv.account_id = cm.account_id)
+          AND NOT EXISTS (
+            SELECT 1 FROM instantly_lead_imports ili
+            WHERE ili.workspace_id = cm.workspace_id AND ili.account_id = cm.account_id
+              AND ili.contact_point_id = cp.id AND ili.provider_campaign_id = ${providerCampaignId}
+              AND ili.status IN ('instantly_added', 'skipped_existing', 'deferred_due_to_plan_limit')
+          )
+      ) AS eligible_valid_contacts_remaining,
+      (
+        SELECT COUNT(*)::int FROM instantly_lead_imports
+        WHERE provider_campaign_id = ${providerCampaignId}
+          AND status IN ('eligible', 'instantly_queued', 'failed', 'deferred')
+          AND attempt_count < max_attempts
+      ) AS instantly_import_jobs_pending,
+      (
+        SELECT COUNT(*)::int FROM instantly_lead_imports
+        WHERE provider_campaign_id = ${providerCampaignId}
+          AND status = 'deferred_due_to_plan_limit'
+      ) AS instantly_deferred_due_to_plan_limit
+  `);
+  const counts = result.rows[0] as Record<string, number | string> | undefined;
+  return {
+    verificationCandidatesRemaining: Number(counts?.verification_candidates_remaining ?? 0),
+    verificationJobsPending: Number(counts?.verification_jobs_pending ?? 0),
+    eligibleValidContactsRemaining: Number(counts?.eligible_valid_contacts_remaining ?? 0),
+    instantlyImportJobsPending: Number(counts?.instantly_import_jobs_pending ?? 0),
+    instantlyDeferredDueToPlanLimit: Number(counts?.instantly_deferred_due_to_plan_limit ?? 0),
+  };
 }
 
 export async function runVerificationCronTick(

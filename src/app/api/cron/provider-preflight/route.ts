@@ -14,6 +14,7 @@ const requiredMigrations = [
   "0015_email_verification_pipeline.sql",
   "0016_email_verification_cache_version.sql",
 ] as const;
+const requiredMigrationsThrough0017 = [...requiredMigrations, "0017_instantly_lead_imports.sql"] as const;
 const requiredInstantlyIndexes = [
   "uq_instantly_import_identity",
   "uq_instantly_import_idempotency",
@@ -39,6 +40,7 @@ async function readDatabaseState() {
       configured: false,
       healthy: false,
       through0016: false,
+      through0017: false,
       migration0017Applied: false,
       instantlyTablesExist: false,
       requiredIndexesPresent: false,
@@ -94,10 +96,11 @@ async function readDatabaseState() {
       configured: true,
       healthy: true,
       through0016: migrationLedgerExists && requiredMigrations.every((filename) => applied.has(filename)),
+      through0017: migrationLedgerExists && requiredMigrationsThrough0017.every((filename) => applied.has(filename)),
       migration0017Applied: applied.has("0017_instantly_lead_imports.sql"),
       instantlyTablesExist: tablesExist,
       requiredIndexesPresent: tablesExist && requiredInstantlyIndexes.every((index) => indexes.has(index)),
-      missingMigrations: requiredMigrations.filter((filename) => !applied.has(filename)),
+      missingMigrations: requiredMigrationsThrough0017.filter((filename) => !applied.has(filename)),
       errorCode: migrationLedgerExists ? null : "MIGRATION_LEDGER_MISSING",
     };
   } catch {
@@ -105,11 +108,100 @@ async function readDatabaseState() {
       configured: true,
       healthy: false,
       through0016: false,
+      through0017: false,
       migration0017Applied: false,
       instantlyTablesExist: false,
       requiredIndexesPresent: false,
       errorCode: "DATABASE_PREFLIGHT_FAILED",
     };
+  }
+}
+
+async function readHistoricalFunnel(): Promise<Record<string, number> | null> {
+  try {
+    const sql = getNeonSql();
+    const [row] = await sql`
+      WITH scoped_raw AS (
+        SELECT rc.id AS raw_candidate_id, c.id AS campaign_id, c.workspace_id, rc.account_id
+        FROM raw_candidates rc
+        JOIN campaigns c ON c.id = rc.campaign_id
+        JOIN accounts a ON a.id = rc.account_id AND a.workspace_id = c.workspace_id
+        WHERE c.status = 'active'
+          AND c.autopilot_enabled = true
+      ), scope AS (
+        SELECT DISTINCT campaign_id, workspace_id, account_id
+        FROM scoped_raw
+      ), points AS (
+        SELECT
+          s.campaign_id,
+          s.workspace_id,
+          s.account_id,
+          cm.id AS membership_id,
+          cm.stage,
+          cm.selected_contact_point_id,
+          cp.id AS contact_point_id,
+          cp.verification_status,
+          cp.channel_eligibility,
+          cp.last_contacted_at,
+          cd.decision,
+          ev.status AS cached_verification_status,
+          (se.id IS NOT NULL) AS suppressed,
+          (oq.id IS NOT NULL OR cp.last_contacted_at IS NOT NULL OR cm.contacted_at IS NOT NULL) AS prior_outreach,
+          (conv.id IS NOT NULL OR meeting.id IS NOT NULL) AS active_conversation
+        FROM scope s
+        LEFT JOIN campaign_memberships cm ON cm.campaign_id = s.campaign_id AND cm.account_id = s.account_id
+        LEFT JOIN contact_points cp ON cp.account_id = s.account_id AND cp.type = 'email'
+        LEFT JOIN compliance_decisions cd ON cd.campaign_id = s.campaign_id
+          AND cd.account_id = s.account_id
+          AND cd.contact_point_id = cp.id
+          AND cd.superseded_at IS NULL
+        LEFT JOIN email_verifications ev ON ev.workspace_id = s.workspace_id
+          AND ev.normalized_email = LOWER(TRIM(cp.normalized_value))
+          AND ev.provider = 'millionverifier'
+          AND ev.expires_at > NOW()
+        LEFT JOIN suppression_entries se ON se.workspace_id = s.workspace_id
+          AND (se.account_id = s.account_id OR se.contact_point_id = cp.id)
+        LEFT JOIN outreach_queue oq ON oq.workspace_id = s.workspace_id
+          AND oq.account_id = s.account_id AND oq.channel = 'email'
+        LEFT JOIN conversations conv ON conv.workspace_id = s.workspace_id
+          AND conv.account_id = s.account_id
+          AND conv.state NOT IN ('rejected', 'no_reply_needed', 'suppressed')
+        LEFT JOIN meetings meeting ON meeting.conversation_id = conv.id
+      )
+      SELECT
+        (SELECT COUNT(DISTINCT raw_candidate_id) FROM scoped_raw)::int AS raw_autopilot_candidates,
+        (SELECT COUNT(DISTINCT account_id) FROM scope)::int AS canonical_accounts,
+        COUNT(DISTINCT account_id) FILTER (WHERE contact_point_id IS NOT NULL)::int AS accounts_with_email,
+        COUNT(DISTINCT membership_id)::int AS campaign_memberships,
+        COUNT(DISTINCT account_id) FILTER (WHERE stage IN ('qualified', 'contact_selected'))::int AS qualified,
+        COUNT(DISTINCT account_id) FILTER (WHERE stage = 'ready')::int AS ready,
+        COUNT(DISTINCT contact_point_id) FILTER (WHERE contact_point_id = selected_contact_point_id)::int AS selected_email,
+        COUNT(DISTINCT contact_point_id) FILTER (WHERE verification_status IN ('unverified', 'unknown'))::int AS unverified,
+        COUNT(DISTINCT contact_point_id) FILTER (WHERE cached_verification_status = 'valid')::int AS valid_cached,
+        COUNT(DISTINCT contact_point_id) FILTER (WHERE cached_verification_status IN ('invalid', 'risky', 'catch_all', 'disposable'))::int AS invalid_cached,
+        COUNT(DISTINCT contact_point_id) FILTER (WHERE contact_point_id = selected_contact_point_id AND decision IS NULL)::int AS missing_compliance,
+        COUNT(DISTINCT contact_point_id) FILTER (WHERE decision = 'allowed')::int AS compliance_allowed,
+        COUNT(DISTINCT contact_point_id) FILTER (WHERE suppressed)::int AS suppressed,
+        COUNT(DISTINCT account_id) FILTER (WHERE prior_outreach)::int AS prior_outreach,
+        COUNT(DISTINCT account_id) FILTER (WHERE active_conversation)::int AS active_conversation,
+        COUNT(DISTINCT contact_point_id) FILTER (
+          WHERE verification_status IN ('unverified', 'unknown')
+            AND channel_eligibility IN ('eligible_email', 'consented_email', 'prior_relationship')
+            AND NOT suppressed AND NOT prior_outreach AND NOT active_conversation
+        )::int AS eligible_for_verification,
+        COUNT(DISTINCT contact_point_id) FILTER (
+          WHERE contact_point_id = selected_contact_point_id
+            AND verification_status = 'valid'
+            AND channel_eligibility IN ('eligible_email', 'consented_email', 'prior_relationship')
+            AND decision = 'allowed'
+            AND NOT suppressed AND NOT prior_outreach AND NOT active_conversation
+        )::int AS eligible_for_instantly
+      FROM points
+    `;
+    if (!row) return null;
+    return Object.fromEntries(Object.entries(row).map(([key, value]) => [key, Number(value ?? 0)]));
+  } catch {
+    return null;
   }
 }
 
@@ -179,11 +271,21 @@ async function readInstantlyState() {
   if (!configured || !apiKey) {
     return {
       configured,
-      healthy: false,
+      instantlyLeadImportReady: false,
+      telemetryReady: false,
       campaignAccessible: false,
       campaignId,
+      auth: { leadsWrite: "NOT_TESTED", campaignRead: "FAIL", analyticsRead: "OPTIONAL_FAIL", billingRead: "OPTIONAL_FAIL" },
       httpStatus: { plan: null, analytics: null, campaign: null },
-      planUsage: null,
+      planUsage: {
+        uploadedContacts: null,
+        providerContactLimit: null,
+        contactLimit: limits.contactLimit,
+        monthlyEmailsSent: null,
+        monthlyEmailLimit: limits.monthlyEmailLimit,
+        contactWarningThreshold: limits.contactWarningThreshold,
+        monthlyEmailWarningThreshold: limits.monthlyEmailWarningThreshold,
+      },
       errorCode: "INSTANTLY_CONFIGURATION_MISSING",
       limits,
     };
@@ -197,20 +299,52 @@ async function readInstantlyState() {
   analyticsUrl.searchParams.set("exclude_total_leads_count", "true");
   const headers = { Authorization: `Bearer ${apiKey}` };
 
-  try {
-    const [planResponse, analyticsResponse, campaignResponse] = await Promise.all([
-      fetch(`${instantlyApiBaseUrl}/workspace-billing/plan-details`, { headers, signal: AbortSignal.timeout(10_000), cache: "no-store" }),
-      fetch(analyticsUrl, { headers, signal: AbortSignal.timeout(10_000), cache: "no-store" }),
-      fetch(`${instantlyApiBaseUrl}/campaigns/${encodeURIComponent(campaignId)}`, { headers, signal: AbortSignal.timeout(10_000), cache: "no-store" }),
-    ]);
-    const [planData, analyticsData, campaignData] = await Promise.all([
-      planResponse.json().catch(() => null) as Promise<{
-        subscriptions?: { outreach?: { current_lead_count?: number; total_lead_limit?: number }; bundle?: { current_lead_count?: number; total_lead_limit?: number } };
-      } | null>,
-      analyticsResponse.json().catch(() => null) as Promise<Array<{ emails_sent_count?: number }> | null>,
-      campaignResponse.json().catch(() => null) as Promise<{ id?: string; campaign?: { id?: string } } | null>,
-    ]);
-    const plan = planData?.subscriptions?.outreach ?? planData?.subscriptions?.bundle;
+  async function readEndpoint(endpointCategory: string, url: string | URL) {
+    try {
+      const response = await fetch(url, { headers, signal: AbortSignal.timeout(10_000), cache: "no-store" });
+      const data = await response.json().catch(() => null) as Record<string, unknown> | Array<Record<string, unknown>> | null;
+      if (!response.ok) {
+        const errorBody = data && !Array.isArray(data) ? data : {};
+        const requestId = response.headers.get("x-request-id") ?? response.headers.get("request-id") ?? randomUUID();
+        const apiKeySafeMessage = typeof errorBody.message === "string" ? errorBody.message : typeof errorBody.error === "string" ? errorBody.error : null;
+        logEvent("warn", "Instantly preflight endpoint unavailable", {
+          correlationId: requestId.replace(/[^a-zA-Z0-9._:-]/g, "").slice(0, 100) || randomUUID(),
+          provider: "instantly",
+          endpointCategory,
+          httpStatus: response.status,
+          providerErrorCode: typeof errorBody.error_code === "string" ? errorBody.error_code : typeof errorBody.code === "string" ? errorBody.code : null,
+          providerMessage: apiKeySafeMessage
+            ?.replaceAll(apiKey!, "[REDACTED]")
+            .replace(/[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/gi, "[email]")
+            .replace(/\+?\d[\d\s().-]{7,}\d/g, "[phone]")
+            .slice(0, 300) ?? null,
+        });
+      }
+      return { status: response.status, ok: response.ok, data };
+    } catch (error) {
+      logEvent("warn", "Instantly preflight endpoint unavailable", {
+        correlationId: randomUUID(),
+        provider: "instantly",
+        endpointCategory,
+        httpStatus: null,
+        providerErrorCode: safeErrorCode(error),
+        providerMessage: null,
+      });
+      return { status: null, ok: false, data: null };
+    }
+  }
+
+  const [planResponse, analyticsResponse, campaignResponse] = await Promise.all([
+    readEndpoint("plan-details", `${instantlyApiBaseUrl}/workspace-billing/plan-details`),
+    readEndpoint("analytics", analyticsUrl),
+    readEndpoint("campaign", `${instantlyApiBaseUrl}/campaigns/${encodeURIComponent(campaignId)}`),
+  ]);
+  const planData = planResponse.data as {
+    subscriptions?: { outreach?: { current_lead_count?: number; total_lead_limit?: number }; bundle?: { current_lead_count?: number; total_lead_limit?: number } };
+  } | null;
+  const analyticsData = analyticsResponse.data as Array<{ emails_sent_count?: number }> | null;
+  const campaignData = campaignResponse.data as { id?: string; campaign?: { id?: string } } | null;
+  const plan = planData?.subscriptions?.outreach ?? planData?.subscriptions?.bundle;
     const uploadedContacts = plan?.current_lead_count;
     const providerContactLimit = plan?.total_lead_limit;
     const monthlyEmailsSent = Array.isArray(analyticsData)
@@ -221,14 +355,25 @@ async function readInstantlyState() {
       && (campaignData?.id === campaignId || campaignData?.campaign?.id === campaignId);
     const planReadable = planResponse.ok && Number.isFinite(uploadedContacts) && Number.isFinite(providerContactLimit);
     const analyticsReadable = analyticsResponse.ok && monthlyEmailsSent !== null;
-    const healthy = planReadable && analyticsReadable && campaignAccessible && campaignId === instantlyCampaignId;
-    const failedStatus = [planResponse, analyticsResponse, campaignResponse].find((response) => !response.ok)?.status ?? null;
+    const campaignReadAuth = campaignResponse.ok && campaignAccessible ? "PASS" : "FAIL";
+    const campaignUsable = campaignResponse.ok ? campaignAccessible : campaignResponse.status !== 404;
+    const instantlyLeadImportReady = campaignId === instantlyCampaignId && campaignUsable;
+    const telemetryReady = planReadable && analyticsReadable;
+    const billingReadAuth = planReadable ? "PASS" : "OPTIONAL_FAIL";
+    const analyticsReadAuth = analyticsReadable ? "PASS" : "OPTIONAL_FAIL";
 
     return {
       configured,
-      healthy,
+      instantlyLeadImportReady,
+      telemetryReady,
       campaignAccessible,
       campaignId,
+      auth: {
+        leadsWrite: "NOT_TESTED",
+        campaignRead: campaignReadAuth,
+        analyticsRead: analyticsReadAuth,
+        billingRead: billingReadAuth,
+      },
       httpStatus: { plan: planResponse.status, analytics: analyticsResponse.status, campaign: campaignResponse.status },
       planUsage: {
         uploadedContacts: Number.isFinite(uploadedContacts) ? uploadedContacts : null,
@@ -239,37 +384,30 @@ async function readInstantlyState() {
         contactWarningThreshold: limits.contactWarningThreshold,
         monthlyEmailWarningThreshold: limits.monthlyEmailWarningThreshold,
       },
-      errorCode: healthy ? null : campaignId !== instantlyCampaignId ? "CAMPAIGN_ID_MISMATCH" : failedStatus === 401 || failedStatus === 403 ? "PROVIDER_UNAUTHORIZED" : "PROVIDER_PREFLIGHT_FAILED",
+      errorCode: instantlyLeadImportReady ? null : campaignId !== instantlyCampaignId ? "CAMPAIGN_ID_MISMATCH" : "CAMPAIGN_UNAVAILABLE",
       limits,
     };
-  } catch (error) {
-    return {
-      configured,
-      healthy: false,
-      campaignAccessible: false,
-      campaignId,
-      httpStatus: { plan: null, analytics: null, campaign: null },
-      planUsage: null,
-      errorCode: safeErrorCode(error),
-      limits,
-    };
-  }
 }
 
 export async function GET(request: NextRequest) {
   if (!isAuthorizedCronRequest(request)) return unauthorizedCronResponse();
 
   const startedAt = Date.now();
-  const [database, millionVerifier, instantly] = await Promise.all([
+  const [database, millionVerifier, instantly, historicalFunnel] = await Promise.all([
     readDatabaseState(),
     readMillionVerifierState(),
     readInstantlyState(),
+    readHistoricalFunnel(),
   ]);
-  const healthy = database.healthy
-    && database.through0016
+  const instantlyLeadImportReady = database.healthy
+    && database.through0017
+    && database.instantlyTablesExist
+    && database.requiredIndexesPresent
+    && instantly.instantlyLeadImportReady;
+  const instantlyTelemetryReady = instantly.telemetryReady;
+  const healthy = instantlyLeadImportReady
     && millionVerifier.healthy
-    && millionVerifier.creditsAvailable
-    && instantly.healthy;
+    && millionVerifier.creditsAvailable;
 
   logEvent("info", "cron.provider-preflight", {
     correlationId: randomUUID(),
@@ -278,6 +416,7 @@ export async function GET(request: NextRequest) {
     databaseConfigured: database.configured,
     databaseHealthy: database.healthy,
     through0016: database.through0016,
+    through0017: database.through0017,
     migration0017Applied: database.migration0017Applied,
     instantlyTablesExist: database.instantlyTablesExist,
     requiredIndexesPresent: database.requiredIndexesPresent,
@@ -290,7 +429,8 @@ export async function GET(request: NextRequest) {
     millionVerifierHttpStatus: millionVerifier.httpStatus,
     millionVerifierErrorCode: millionVerifier.errorCode,
     instantlyConfigured: instantly.configured,
-    instantlyHealthy: instantly.healthy,
+    instantlyLeadImportReady,
+    instantlyTelemetryReady,
     instantlyCampaignAccessible: instantly.campaignAccessible,
     instantlyCampaignId: instantly.campaignId,
     instantlyHttpStatus: instantly.httpStatus,
@@ -298,7 +438,7 @@ export async function GET(request: NextRequest) {
     instantlyErrorCode: instantly.errorCode,
   });
 
-  return NextResponse.json({ database, millionVerifier, instantly, healthy }, {
+  return NextResponse.json({ database, millionVerifier, instantly, instantlyLeadImportReady, instantlyTelemetryReady, historicalFunnel, healthy }, {
     status: healthy ? 200 : 503,
     headers: { "Cache-Control": "no-store" },
   });

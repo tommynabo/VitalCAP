@@ -3,7 +3,7 @@ import type { Conversation, ConversationMessage } from "@/domain/conversations/t
 import type { InboundEmailReply, LLMProvider } from "@/domain/providers/types";
 import { seedAccountBundles, seedOffer } from "@/lib/seed/dev-seed";
 import { MockLLMProvider } from "@/infrastructure/providers/llm/mock-provider";
-import { processInstantlyInboundReply, type PersistedInboundReply, type SetterInboundRuntimeStore } from "./inbound-runtime";
+import { processInstantlyInboundReply, SetterInboundRoutingError, type PersistedInboundReply, type SetterInboundRuntimeStore } from "./inbound-runtime";
 
 const event: InboundEmailReply = {
   providerEventId: "event-1",
@@ -177,5 +177,29 @@ describe("processInstantlyInboundReply", () => {
     expect(result.outcome).toBe("human_required");
     expect(store.statuses).toContain("human_required");
     expect(store.workspaceIds).toContain("ws_demo");
+  });
+
+  it("acknowledges an unknown campaign without persisting a message or constructing an LLM", async () => {
+    const store = storeFixture();
+    store.persistIncomingReply = async () => { throw new SetterInboundRoutingError("UNKNOWN_CAMPAIGN"); };
+    const providerFactory = vi.fn(() => new MockLLMProvider());
+
+    const result = await processInstantlyInboundReply(event, "hash", store, new Date(event.occurredAt), providerFactory);
+
+    expect(result).toEqual({ outcome: "ignored_unknown_campaign" });
+    expect(store.statuses).toContain("ignored");
+    expect(providerFactory).not.toHaveBeenCalled();
+  });
+
+  it("records ambiguous contact mapping as human-required without constructing an LLM", async () => {
+    const store = storeFixture();
+    store.persistIncomingReply = async () => { throw new SetterInboundRoutingError("AMBIGUOUS_CONTACT_MATCH"); };
+    const providerFactory = vi.fn(() => new MockLLMProvider());
+
+    const result = await processInstantlyInboundReply(event, "hash", store, new Date(event.occurredAt), providerFactory);
+
+    expect(result).toEqual({ outcome: "human_required", failureCode: "AMBIGUOUS_CONTACT_MATCH" });
+    expect(store.statuses).toContain("human_required");
+    expect(providerFactory).not.toHaveBeenCalled();
   });
 });

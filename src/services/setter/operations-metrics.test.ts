@@ -41,6 +41,7 @@ describe("computeSetterOperationsMetrics", () => {
         { status: "duplicate_skipped" },
         { status: "human_required" },
         { status: "failed" },
+        { status: "ignored" },
       ],
     });
 
@@ -53,7 +54,7 @@ describe("computeSetterOperationsMetrics", () => {
     expect(metrics.approvalRate).toBe(0.5);
     expect(metrics.editRate).toBe(0.5);
     expect(metrics.rejectRate).toBe(0);
-    expect(metrics.webhooks).toEqual({ received: 6, processed: 1, duplicateSkipped: 3, humanRequired: 1, failed: 1 });
+    expect(metrics.webhooks).toEqual({ received: 7, processed: 1, ignored: 1, duplicateSkipped: 3, humanRequired: 1, failed: 1 });
   });
 
   it("returns unavailable values when no source data exists", () => {

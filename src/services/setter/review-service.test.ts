@@ -58,18 +58,18 @@ function baseInput(overrides: Partial<ReviewActionInput> = {}): ReviewActionInpu
 }
 
 describe("applyReviewDecision", () => {
-  it("approve: records the AI draft as final without creating an outbound message", () => {
+  it("approve: records the AI draft as final and queues the explicit human-approved send", () => {
     const result = applyReviewDecision(baseInput(), nextId);
-    expect(result.conversation.state).toBe("approved");
+    expect(result.conversation.state).toBe("approved_pending_send");
     expect(result.outgoingMessage).toBeNull();
     expect(result.feedback.decision).toBe("approve");
     expect(result.feedback.correctedText).toBeNull();
     expect(result.feedback.finalText).toBe(draftFixture().draft);
   });
 
-  it("edit_and_send: records the human's final text without creating an outbound message", () => {
+  it("edit_and_send: records the exact human text and queues that text for sending", () => {
     const result = applyReviewDecision(baseInput({ decision: "edit_and_send", finalText: "Texto corregido por humano." }), nextId);
-    expect(result.conversation.state).toBe("edited");
+    expect(result.conversation.state).toBe("approved_pending_send");
     expect(result.outgoingMessage).toBeNull();
     expect(result.feedback.correctedText).toBe("Texto corregido por humano.");
     expect(result.feedback.finalText).toBe("Texto corregido por humano.");
@@ -83,6 +83,10 @@ describe("applyReviewDecision", () => {
 
   it("edit_and_send without finalText throws", () => {
     expect(() => applyReviewDecision(baseInput({ decision: "edit_and_send", finalText: null }), nextId)).toThrow();
+  });
+
+  it("approve without an AI draft throws rather than claiming an empty send", () => {
+    expect(() => applyReviewDecision(baseInput({ draft: { ...draftFixture(), draft: "" } }), nextId)).toThrow("approve requires draft text");
   });
 
   it("reject: no outgoing message, conversation moves to rejected", () => {
