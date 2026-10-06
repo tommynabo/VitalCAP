@@ -2,6 +2,7 @@ import type { ComplianceCheckInput, ComplianceCheckResult, ComplianceGate } from
 import type { ChannelEligibilityStatus } from "@/domain/contacts/types";
 import type { SuppressionEntry } from "@/domain/outreach/types";
 import { checkSuppression } from "./suppression-service";
+import { isEmailChannelEligible } from "./email-channel-policy";
 
 /**
  * `ComplianceGate` implementation (Prompt 0 §0.9, Prompt 3 §3.2/§3.7).
@@ -11,20 +12,13 @@ import { checkSuppression } from "./suppression-service";
  * SMS-eligible and vice versa (channel eligibility ≠ endpoint existence).
  */
 
-const EMAIL_ELIGIBLE: ReadonlySet<ChannelEligibilityStatus> = new Set([
-  "professional_contact",
-  "eligible_email",
-  "consented_email",
-  "prior_relationship",
-]);
-
 const SMS_ELIGIBLE: ReadonlySet<ChannelEligibilityStatus> = new Set(["eligible_sms", "consented_sms", "prior_relationship"]);
 
 const ALWAYS_BLOCKED: ReadonlySet<ChannelEligibilityStatus> = new Set(["opted_out", "blocked"]);
 
 export function evaluateChannelEligibility(channel: ComplianceCheckInput["channel"], status: ChannelEligibilityStatus): boolean {
   if (ALWAYS_BLOCKED.has(status)) return false;
-  if (channel === "email") return EMAIL_ELIGIBLE.has(status);
+  if (channel === "email") return isEmailChannelEligible(status);
   if (channel === "phone") return SMS_ELIGIBLE.has(status);
   // linkedin/other channels have no delivery provider implemented this phase — never eligible by default.
   return false;

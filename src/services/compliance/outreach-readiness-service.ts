@@ -4,6 +4,8 @@ import { checkSuppression } from "./suppression";
 import { createVerificationAcceptancePolicy, isContactPointAcceptable } from "@/services/verification/acceptance-policy";
 import { evaluateContactEligibility } from "@/services/verification/contact-eligibility";
 import { getVerificationEnv } from "@/lib/config/env";
+import { isEmailChannelEligible } from "./email-channel-policy";
+import type { ChannelEligibilityStatus } from "@/domain/contacts/types";
 
 export class OutreachReadinessService {
   async evaluateCandidate(
@@ -50,7 +52,7 @@ export class OutreachReadinessService {
     if (!cp
       || !isContactPointAcceptable(cp.verificationStatus as any, acceptancePolicy)
       || !evaluateContactEligibility({ hasEmail: cp.type === "email", verificationStatus: cp.verificationStatus as any, allowCatchAll: acceptancePolicy.acceptedStatuses.includes("catch_all") }).eligible
-      || !["eligible_email", "consented_email", "prior_relationship"].includes(cp.channelEligibility)) return false;
+      || !isEmailChannelEligible(cp.channelEligibility as ChannelEligibilityStatus)) return false;
 
     // 6. Current Compliance decision
     const [decision] = await db.select({ eligibilityAfter: schema.complianceDecisions.eligibilityAfter })

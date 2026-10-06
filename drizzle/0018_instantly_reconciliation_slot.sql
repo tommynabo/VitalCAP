@@ -1,0 +1,3 @@
+DROP INDEX "uq_instantly_import_active_account";
+--> statement-breakpoint
+CREATE UNIQUE INDEX "uq_instantly_import_active_account" ON "instantly_lead_imports" USING btree ("workspace_id", "account_id", "provider_campaign_id") WHERE "instantly_lead_imports"."status" in ('eligible', 'instantly_queued', 'instantly_added', 'skipped_existing', 'failed', 'deferred', 'deferred_due_to_plan_limit', 'reconciliation_required');

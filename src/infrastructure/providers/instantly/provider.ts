@@ -27,7 +27,28 @@ interface InstantlyAddLeadsResponse {
   created_leads?: Array<{ id?: string; index?: number }>;
 }
 
-export type InstantlyLeadImportStatus = "added" | "skipped_existing" | "needs_campaign_move" | "failed";
+interface InstantlyLeadResponse {
+  id?: string;
+  email?: string | null;
+  campaign?: string | null;
+  timestamp_created?: string;
+}
+
+interface InstantlyListLeadsResponse {
+  items?: InstantlyLeadResponse[];
+}
+
+export type InstantlySingleLeadStatus = "added" | "already_in_target" | "failed";
+
+export interface InstantlySingleLeadResult {
+  status: InstantlySingleLeadStatus;
+  providerLeadId: string | null;
+  httpStatus: number | null;
+  requestId: string | null;
+  sanitizedProviderMessage: string | null;
+}
+
+export type InstantlyLeadImportStatus = "added" | "skipped_existing" | "needs_campaign_move" | "reconciliation_required" | "failed";
 
 export interface InstantlyLeadImportOutcome {
   index: number;
@@ -36,7 +57,7 @@ export interface InstantlyLeadImportOutcome {
   diagnostic: string | null;
 }
 
-type InstantlyEndpointCategory = "leads/add" | "workspace-billing/plan-details" | "campaigns/analytics";
+type InstantlyEndpointCategory = "leads" | "leads/list" | "leads/add" | "workspace-billing/plan-details" | "campaigns/analytics";
 
 export class InstantlyApiError extends Error {
   constructor(readonly details: {
@@ -249,10 +270,121 @@ export class InstantlyEmailDeliveryProvider implements EmailDeliveryProvider {
     return { emailsSent: data.reduce((total, campaign) => total + (campaign.emails_sent_count ?? 0), 0) };
   }
 
+  async findLeadInCampaign(providerCampaignId: string, email: string): Promise<string | null> {
+    this.ensureConfigured();
+    const { data } = await this.requestJson<InstantlyListLeadsResponse>("leads/list", `${INSTANTLY_API_BASE_URL}/leads/list`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${this.apiKey}`,
+      },
+      body: JSON.stringify({ campaign: providerCampaignId, contacts: [email.trim().toLowerCase()], limit: 1 }),
+      signal: AbortSignal.timeout(15_000),
+    });
+    const lead = data.items?.find((item) =>
+      item.email?.trim().toLowerCase() === email.trim().toLowerCase()
+      && item.campaign === providerCampaignId
+      && typeof item.id === "string",
+    );
+    return lead?.id ?? null;
+  }
+
+  async addLeadToCampaign(input: EmailLeadInput): Promise<InstantlySingleLeadResult> {
+    this.ensureConfigured();
+    const email = input.email.trim().toLowerCase();
+    if (!email) {
+      return { status: "failed", providerLeadId: null, httpStatus: null, requestId: null, sanitizedProviderMessage: "Email is required." };
+    }
+    const coreEnv = getCoreEnv();
+    if (coreEnv.DEFAULT_DELIVERY_MODE === "dry_run" && !input.allowCampaignImportInDryRun) {
+      return { status: "failed", providerLeadId: null, httpStatus: null, requestId: null, sanitizedProviderMessage: "Explicit campaign-import authorization is required in dry-run mode." };
+    }
+
+    const startedAt = Date.now();
+    let response: { data: InstantlyLeadResponse; requestId: string } | null = null;
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        response = await this.requestJson<InstantlyLeadResponse>("leads", `${INSTANTLY_API_BASE_URL}/leads`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${this.apiKey}`,
+          },
+          body: JSON.stringify({
+            campaign: input.providerCampaignId,
+            ...leadPayload(input),
+            skip_if_in_workspace: false,
+            skip_if_in_campaign: true,
+          }),
+          signal: AbortSignal.timeout(15_000),
+        });
+        break;
+      } catch (error) {
+        lastError = error;
+        const details = error instanceof InstantlyApiError ? error.details : null;
+        const retryable = details?.httpStatus === null || details?.httpStatus === 429 || (details?.httpStatus ?? 0) >= 500;
+        if (!retryable || attempt === 3) break;
+        await this.sleepImpl(2 ** attempt * 1000);
+      }
+    }
+
+    if (response) {
+      const { data, requestId } = response;
+      if (!data.id) {
+        return { status: "failed", providerLeadId: null, httpStatus: 200, requestId, sanitizedProviderMessage: "Instantly returned no lead ID." };
+      }
+      if (data.campaign && data.campaign !== input.providerCampaignId) {
+        return {
+          status: "failed",
+          providerLeadId: data.id,
+          httpStatus: 200,
+          requestId,
+          sanitizedProviderMessage: "Instantly did not confirm the lead belongs to the requested campaign.",
+        };
+      }
+      const createdAt = data.timestamp_created ? Date.parse(data.timestamp_created) : Number.NaN;
+      const status = Number.isFinite(createdAt) && createdAt < startedAt - 60_000 ? "already_in_target" : "added";
+      return { status, providerLeadId: data.id, httpStatus: 200, requestId, sanitizedProviderMessage: null };
+    }
+
+    const details = lastError instanceof InstantlyApiError ? lastError.details : null;
+    const providerMessage = details?.providerMessage ?? (lastError instanceof Error ? sanitizeProviderText(lastError.message, this.apiKey ?? "") : "Instantly request failed.");
+    if (details?.httpStatus === 409 || details?.httpStatus === null || (details?.httpStatus ?? 0) >= 500) {
+      try {
+        const providerLeadId = await this.findLeadInCampaign(input.providerCampaignId, email);
+        if (providerLeadId) {
+          return {
+            status: "already_in_target",
+            providerLeadId,
+            httpStatus: details?.httpStatus ?? null,
+            requestId: details?.requestId ?? null,
+            sanitizedProviderMessage: providerMessage,
+          };
+        }
+      } catch {
+        return {
+          status: "failed",
+          providerLeadId: null,
+          httpStatus: details?.httpStatus ?? null,
+          requestId: details?.requestId ?? null,
+          sanitizedProviderMessage: providerMessage,
+        };
+      }
+    }
+    return {
+      status: "failed",
+      providerLeadId: null,
+      httpStatus: details?.httpStatus ?? null,
+      requestId: details?.requestId ?? null,
+      sanitizedProviderMessage: providerMessage,
+    };
+  }
+
   async addLead(input: EmailLeadInput): Promise<{ result: EmailLeadResult; usage: ProviderUsageStats }> {
     const { outcomes, usage } = await this.addLeads([input]);
     const outcome = outcomes[0];
-    if (!outcome || outcome.status === "failed") {
+    if (!outcome || outcome.status === "failed" || outcome.status === "reconciliation_required") {
       throw new Error(outcome?.diagnostic ?? "Instantly leads/add did not return an outcome.");
     }
     return {
@@ -361,11 +493,15 @@ export class InstantlyEmailDeliveryProvider implements EmailDeliveryProvider {
       }
     } else if (uncreated.length > 0 && rejectedCount === uncreated.length && skippedCount === 0 && duplicateRequestCount === 0) {
       for (const outcome of uncreated) {
+        outcome.status = "reconciliation_required";
         outcome.diagnostic = `Instantly leads/add rejected a lead (blocklist=${data.in_blocklist ?? 0}, invalid=${data.invalid_email_count ?? 0}, incomplete=${data.incomplete_count ?? 0}).`;
       }
     } else if (uncreated.length > 0) {
       const diagnostic = `Instantly leads/add returned aggregate-only outcomes (uncreated=${uncreated.length}, duplicate_or_skipped=${skippedCount}, rejected=${aggregateRejectedCount}); individual results are ambiguous.`;
-      for (const outcome of uncreated) outcome.diagnostic = diagnostic;
+      for (const outcome of uncreated) {
+        outcome.status = "reconciliation_required";
+        outcome.diagnostic = diagnostic;
+      }
     }
 
     return {

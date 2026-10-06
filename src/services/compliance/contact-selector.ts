@@ -4,6 +4,8 @@ import { createVerificationAcceptancePolicy, isContactPointAcceptable } from "@/
 import { evaluateContactEligibility } from "@/services/verification/contact-eligibility";
 import { getVerificationEnv } from "@/lib/config/env";
 import { selectPreferredContactPoint } from "./contact-selection-policy";
+import { isEmailChannelEligible } from "./email-channel-policy";
+import type { ChannelEligibilityStatus } from "@/domain/contacts/types";
 
 function getRoleScore(contact: any, label: string | null): number {
   const role = contact?.roleType?.toLowerCase() || label?.toLowerCase() || "";
@@ -43,6 +45,7 @@ export async function selectPrimaryContact(workspaceId: string, campaignId: stri
 
   const eligible = rows.filter(({ cp, decision }) =>
     decision?.eligibilityAfter === "allowed"
+    && isEmailChannelEligible(cp.channelEligibility as ChannelEligibilityStatus)
     && isContactPointAcceptable(cp.verificationStatus as any, acceptancePolicy)
     && evaluateContactEligibility({ hasEmail: cp.type === "email", verificationStatus: cp.verificationStatus as any, allowCatchAll: acceptancePolicy.acceptedStatuses.includes("catch_all") }).eligible,
   );

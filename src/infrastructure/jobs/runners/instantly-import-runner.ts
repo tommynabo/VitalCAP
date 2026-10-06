@@ -18,6 +18,8 @@ import {
 import { actualPriorColdOutreachSql, hasActualPriorColdOutreach } from "@/infrastructure/neon/repositories/actual-outreach";
 import { evaluateInstantlyLeadEligibility } from "@/services/verification/instantly-lead-eligibility";
 import { logEvent } from "@/lib/observability/structured-logger";
+import { emailChannelEligibilitySql, isEmailChannelEligible } from "@/services/compliance/email-channel-policy";
+import type { ChannelEligibilityStatus } from "@/domain/contacts/types";
 
 const IMPORT_BATCH_SIZE = 50;
 const IMPORT_LOCK_MS = 15 * 60_000;
@@ -32,7 +34,7 @@ interface CandidateRow {
   contact_point_id: string;
   normalized_email: string;
   verification_status: string;
-  channel_eligibility: string;
+  channel_eligibility: ChannelEligibilityStatus;
   canonical_name: string;
   website_url: string | null;
   normalized_domain: string | null;
@@ -48,6 +50,9 @@ export interface InstantlyImportTickResult {
   leadsQueued: number;
   leadsAdded: number;
   leadsSkipped: number;
+  leadsExistingTarget?: number;
+  leadsNeedsCampaignMove?: number;
+  leadsNeedsReconciliation?: number;
   leadsDeferred: number;
   leadsFailed: number;
   providerStatus: "ready" | "missing_configuration" | "unhealthy" | "busy" | "schema_not_ready";
@@ -111,15 +116,17 @@ async function listEligibleCandidates(options: {
       co.full_name
     FROM campaign_memberships cm
     JOIN campaigns c ON c.id = cm.campaign_id
-    JOIN accounts a ON a.id = cm.account_id
+    JOIN accounts a ON a.id = cm.account_id AND a.workspace_id = c.workspace_id
     JOIN contact_points cp ON cp.id = cm.selected_contact_point_id
+      AND cp.account_id = a.id AND cp.workspace_id = a.workspace_id
     LEFT JOIN contacts co ON co.id = COALESCE(cp.contact_id, cm.contact_id)
+      AND co.workspace_id = a.workspace_id
     WHERE c.status = 'active'
       AND cm.stage = 'ready'
       AND cp.type = 'email'
       AND TRIM(cp.normalized_value) <> ''
       AND cp.verification_status = 'valid'
-      AND cp.channel_eligibility IN ('eligible_email', 'consented_email', 'prior_relationship')
+      AND ${emailChannelEligibilitySql(sql`cp.channel_eligibility`)}
       AND cp.last_contacted_at IS NULL
       AND cm.contacted_at IS NULL
       AND EXISTS (
@@ -168,6 +175,7 @@ async function enqueueCandidates(
 ): Promise<number> {
   let enqueued = 0;
   for (const row of rows) {
+    if (!isEmailChannelEligible(row.channel_eligibility)) continue;
     const hasPriorOutreach = await hasActualPriorColdOutreach({
       workspaceId: row.workspace_id,
       accountId: row.account_id,
@@ -235,7 +243,8 @@ async function readPipelineMetrics(): Promise<Record<string, number>> {
   const imports = await getInstantlyLeadImportCounts();
   const eligible = (imports.eligible ?? 0) + (imports.instantly_queued ?? 0) + (imports.instantly_added ?? 0)
     + (imports.skipped_existing ?? 0) + (imports.failed ?? 0) + (imports.deferred ?? 0)
-    + (imports.deferred_due_to_plan_limit ?? 0);
+    + (imports.deferred_due_to_plan_limit ?? 0) + (imports.needs_campaign_move ?? 0)
+    + (imports.reconciliation_required ?? 0);
   return {
     awaiting_verification: Number(verification?.awaiting_verification ?? 0),
     verification_valid: Number(verification?.verification_valid ?? 0),
@@ -245,6 +254,8 @@ async function readPipelineMetrics(): Promise<Record<string, number>> {
       + (imports.deferred_due_to_plan_limit ?? 0),
     instantly_added: imports.instantly_added ?? 0,
     instantly_failed: imports.failed ?? 0,
+    instantly_needs_campaign_move: imports.needs_campaign_move ?? 0,
+    instantly_needs_reconciliation: imports.reconciliation_required ?? 0,
   };
 }
 
@@ -286,6 +297,9 @@ export async function runInstantlyImportTick(options: {
     leadsQueued: 0,
     leadsAdded: 0,
     leadsSkipped: 0,
+    leadsExistingTarget: 0,
+    leadsNeedsCampaignMove: 0,
+    leadsNeedsReconciliation: 0,
     leadsDeferred: 0,
     leadsFailed: 0,
     providerStatus: "missing_configuration",
@@ -416,16 +430,53 @@ export async function runInstantlyImportTick(options: {
 
     if (importableJobs.length > 0) {
       try {
-        const batch = await provider.addLeads(importableJobs.map(({ candidate }) => ({
-          providerCampaignId: env.INSTANTLY_CAMPAIGN_ID,
-          email: candidate.normalized_email,
-          customVariables: buildLeadVariables(candidate),
-          skipIfInWorkspace: false,
-          skipIfInCampaign: false,
-          allowCampaignImportInDryRun: true,
-        })));
-        result.instantlyLeadImportReady = true;
-        for (const outcome of batch.outcomes) {
+        let outcomes;
+        if (importableJobs.length === 1) {
+          const { candidate } = importableJobs[0]!;
+          const input = {
+            providerCampaignId: env.INSTANTLY_CAMPAIGN_ID,
+            email: candidate.normalized_email,
+            customVariables: buildLeadVariables(candidate),
+            skipIfInWorkspace: false,
+            skipIfInCampaign: true,
+            allowCampaignImportInDryRun: true,
+          };
+          const single = await provider.addLeadToCampaign(input);
+          let status: "added" | "skipped_existing" | "needs_campaign_move" | "reconciliation_required" | "failed";
+          let providerLeadId = single.providerLeadId;
+          let diagnostic = single.sanitizedProviderMessage;
+          if (single.status === "added" || single.status === "already_in_target") {
+            const targetLeadId = await provider.findLeadInCampaign(env.INSTANTLY_CAMPAIGN_ID, candidate.normalized_email);
+            providerLeadId = targetLeadId ?? providerLeadId;
+            status = targetLeadId
+              ? single.status === "added" ? "added" : "skipped_existing"
+              : "reconciliation_required";
+            if (!targetLeadId) diagnostic = "Instantly accepted the single-lead request, but target-campaign read-back did not find the lead.";
+          } else {
+            status = "failed";
+          }
+          if (single.httpStatus === 401 || single.httpStatus === 403) {
+            result.providerStatus = "unhealthy";
+            preserveLock = true;
+            await tripInstantlyImportCircuitBreaker(
+              env.INSTANTLY_CAMPAIGN_ID,
+              lockToken,
+              single.requestId ?? randomUUID(),
+            );
+          }
+          outcomes = [{ index: 0, status, providerLeadId, diagnostic }];
+        } else {
+          outcomes = (await provider.addLeads(importableJobs.map(({ candidate }) => ({
+            providerCampaignId: env.INSTANTLY_CAMPAIGN_ID,
+            email: candidate.normalized_email,
+            customVariables: buildLeadVariables(candidate),
+            skipIfInWorkspace: false,
+            skipIfInCampaign: false,
+            allowCampaignImportInDryRun: true,
+          })))).outcomes;
+        }
+        result.instantlyLeadImportReady = importableJobs.length > 1 || outcomes.some((outcome) => outcome.status !== "failed");
+        for (const outcome of outcomes) {
           const { job, candidate } = importableJobs[outcome.index]!;
           const jobId = String(job.id);
           if (outcome.status === "added") {
@@ -443,6 +494,7 @@ export async function runInstantlyImportTick(options: {
             providerLeadId: outcome.providerLeadId,
           });
           result.leadsSkipped++;
+            result.leadsExistingTarget = (result.leadsExistingTarget ?? 0) + 1;
           } else if (outcome.status === "needs_campaign_move") {
             await updateInstantlyLeadImport(jobId, {
               status: "needs_campaign_move",
@@ -450,6 +502,14 @@ export async function runInstantlyImportTick(options: {
               lastError: outcome.diagnostic ?? "Instantly did not confirm target-campaign membership.",
             });
             result.leadsDeferred++;
+            result.leadsNeedsCampaignMove = (result.leadsNeedsCampaignMove ?? 0) + 1;
+          } else if (outcome.status === "reconciliation_required") {
+            await updateInstantlyLeadImport(jobId, {
+              status: "reconciliation_required",
+              now,
+              lastError: outcome.diagnostic ?? "Instantly did not provide an unambiguous per-lead result.",
+            });
+            result.leadsNeedsReconciliation = (result.leadsNeedsReconciliation ?? 0) + 1;
           } else {
             await updateInstantlyLeadImport(jobId, {
               status: "failed",
@@ -473,7 +533,7 @@ export async function runInstantlyImportTick(options: {
           providerMessage: error instanceof Error ? error.message : "Instantly bulk import failed.",
         });
         const apiErrorDetails = error instanceof Error && error.name === "InstantlyApiError" && "details" in error
-          ? (error as Error & { details: { httpStatus: number | null; requestId?: string } }).details
+          ? (error as Error & { details: { httpStatus: number | null; requestId?: string; providerErrorCode?: string | null } }).details
           : null;
         if (apiErrorDetails?.httpStatus === 401 || apiErrorDetails?.httpStatus === 403) {
           result.providerStatus = "unhealthy";
@@ -487,13 +547,15 @@ export async function runInstantlyImportTick(options: {
         for (const { job } of importableJobs) {
           const attempts = Number(job.attempt_count ?? 1);
           const exhausted = attempts >= Number(job.max_attempts ?? 8);
+          const ambiguousResult = apiErrorDetails?.providerErrorCode === "INVALID_BULK_RESPONSE";
           await updateInstantlyLeadImport(String(job.id), {
-            status: "failed",
+            status: ambiguousResult ? "reconciliation_required" : "failed",
             now,
-            nextAttemptAt: exhausted ? null : retryAt(attempts, now),
+            nextAttemptAt: ambiguousResult || exhausted ? null : retryAt(attempts, now),
             lastError: error instanceof Error ? error.message : "Instantly import failed.",
           });
-          result.leadsFailed++;
+          if (ambiguousResult) result.leadsNeedsReconciliation = (result.leadsNeedsReconciliation ?? 0) + 1;
+          else result.leadsFailed++;
         }
       }
     }

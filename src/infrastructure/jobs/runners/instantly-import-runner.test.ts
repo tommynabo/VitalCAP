@@ -16,6 +16,8 @@ const mocks = vi.hoisted(() => ({
   getPlanUsage: vi.fn(),
   getMonthlyEmailUsage: vi.fn(),
   addLeads: vi.fn(),
+  addLeadToCampaign: vi.fn(),
+  findLeadInCampaign: vi.fn(),
 }));
 
 vi.mock("@/infrastructure/neon/db", () => ({ getDb: () => ({ execute: mocks.execute }) }));
@@ -39,6 +41,8 @@ vi.mock("@/infrastructure/providers/instantly/provider", () => ({
     getPlanUsage = mocks.getPlanUsage;
     getMonthlyEmailUsage = mocks.getMonthlyEmailUsage;
     addLeads = mocks.addLeads;
+    addLeadToCampaign = mocks.addLeadToCampaign;
+    findLeadInCampaign = mocks.findLeadInCampaign;
   },
 }));
 
@@ -124,6 +128,14 @@ beforeEach(() => {
     outcomes: [{ index: 0, providerLeadId: "provider-lead-1", status: "added", diagnostic: null }],
     usage: { calls: 1, items: 1, errors: 0, totalLatencyMs: 1, costUsd: 0, quotaRemaining: 999 },
   });
+  mocks.addLeadToCampaign.mockResolvedValue({
+    status: "added",
+    providerLeadId: "provider-lead-1",
+    httpStatus: 200,
+    requestId: "request-1",
+    sanitizedProviderMessage: null,
+  });
+  mocks.findLeadInCampaign.mockResolvedValue("provider-lead-1");
 });
 
 afterEach(() => {
@@ -161,13 +173,14 @@ describe("runInstantlyImportTick", () => {
 
     const result = await runInstantlyImportTick({ contactPointIds: ["contact-point-1"] });
 
-    expect(mocks.addLeads).toHaveBeenCalledOnce();
+    expect(mocks.addLeadToCampaign).toHaveBeenCalledOnce();
+    expect(mocks.findLeadInCampaign).toHaveBeenCalledWith(campaignId, "person@example.com");
     expect(result.leadsAdded).toBe(1);
-    expect(mocks.addLeads).toHaveBeenCalledWith([expect.objectContaining({
+    expect(mocks.addLeadToCampaign).toHaveBeenCalledWith(expect.objectContaining({
       providerCampaignId: campaignId,
       email: "person@example.com",
       skipIfInWorkspace: false,
-      skipIfInCampaign: false,
+      skipIfInCampaign: true,
       allowCampaignImportInDryRun: true,
       customVariables: expect.objectContaining({
         first_name: "Alex",
@@ -177,7 +190,7 @@ describe("runInstantlyImportTick", () => {
         city: "Madrid",
         country: "ES",
       }),
-    })]);
+    }));
     expect(mocks.updateImport).toHaveBeenCalledWith("import-1", expect.objectContaining({
       status: "instantly_added",
       providerLeadId: "provider-lead-1",
@@ -206,6 +219,7 @@ describe("runInstantlyImportTick", () => {
     expect(result.leadsQueued).toBe(0);
     expect(mocks.enqueueImport).not.toHaveBeenCalled();
     expect(mocks.addLeads).not.toHaveBeenCalled();
+    expect(mocks.addLeadToCampaign).not.toHaveBeenCalled();
   });
 
   it("lets the database account identity admit only one contact from a duplicate account", async () => {
@@ -218,19 +232,25 @@ describe("runInstantlyImportTick", () => {
 
     expect(result.leadsQueued).toBe(1);
     expect(mocks.enqueueImport).toHaveBeenCalledTimes(2);
-    expect(mocks.addLeads).toHaveBeenCalledOnce();
+    expect(mocks.addLeadToCampaign).toHaveBeenCalledOnce();
   });
 
   it("persists provider failures as retryable imports", async () => {
     setupWithOneClaimedJob([candidate()]);
-    mocks.addLeads.mockRejectedValue(new Error("Instantly API error: 503"));
+    mocks.addLeadToCampaign.mockResolvedValue({
+      status: "failed",
+      providerLeadId: null,
+      httpStatus: 503,
+      requestId: "request-503",
+      sanitizedProviderMessage: "Temporarily unavailable",
+    });
 
     const result = await runInstantlyImportTick({ contactPointIds: ["contact-point-1"] });
 
     expect(result.leadsFailed).toBe(1);
     expect(mocks.updateImport).toHaveBeenCalledWith("import-1", expect.objectContaining({
       status: "failed",
-      lastError: "Instantly API error: 503",
+      lastError: "Temporarily unavailable",
       nextAttemptAt: expect.any(Date),
     }));
   });
@@ -269,7 +289,7 @@ describe("runInstantlyImportTick", () => {
       unavailableTelemetry === "billing" ? "workspace-billing/plan-details unavailable" : "campaigns/analytics unavailable",
     );
     expect(result.instantlyLeadImportReady).toBe(true);
-    expect(mocks.addLeads).toHaveBeenCalledOnce();
+    expect(mocks.addLeadToCampaign).toHaveBeenCalledOnce();
   });
 
   it("opens a durable circuit on leads/add 401 and blocks later ticks", async () => {
@@ -277,7 +297,13 @@ describe("runInstantlyImportTick", () => {
     const unauthorized = new Error("Instantly API request failed: endpoint=leads/add http_status=401 provider_code=Unauthorized message=Invalid key request_id=req-123");
     unauthorized.name = "InstantlyApiError";
     Object.assign(unauthorized, { details: { endpointCategory: "leads/add", httpStatus: 401, requestId: "req-123" } });
-    mocks.addLeads.mockRejectedValue(unauthorized);
+    mocks.addLeadToCampaign.mockResolvedValue({
+      status: "failed",
+      providerLeadId: null,
+      httpStatus: 401,
+      requestId: "req-123",
+      sanitizedProviderMessage: "Invalid key",
+    });
 
     const result = await runInstantlyImportTick({ contactPointIds: ["contact-point-1"] });
 
@@ -286,11 +312,11 @@ describe("runInstantlyImportTick", () => {
     expect(result.leadsFailed).toBe(1);
     expect(mocks.updateImport).toHaveBeenCalledWith("import-1", expect.objectContaining({
       status: "failed",
-      lastError: expect.stringContaining("endpoint=leads/add http_status=401"),
+      lastError: "Invalid key",
     }));
     expect(mocks.tripCircuitBreaker).toHaveBeenCalledWith(campaignId, expect.any(String), "req-123");
     expect(mocks.releaseLock).not.toHaveBeenCalled();
-    expect(mocks.addLeads).toHaveBeenCalledOnce();
+    expect(mocks.addLeadToCampaign).toHaveBeenCalledOnce();
 
     configureDbResults([readySchemaRows, metricReads(), [candidate()], metricReads(), metricReads()]);
     mocks.acquireLock.mockResolvedValue(false);
@@ -298,7 +324,7 @@ describe("runInstantlyImportTick", () => {
     const nextTick = await runInstantlyImportTick({ contactPointIds: ["contact-point-1"] });
 
     expect(nextTick.providerStatus).toBe("unhealthy");
-    expect(mocks.addLeads).toHaveBeenCalledOnce();
+    expect(mocks.addLeadToCampaign).toHaveBeenCalledOnce();
   });
 
   it("stops at contact and monthly plan limits before claiming jobs", async () => {
@@ -359,7 +385,7 @@ describe("runInstantlyImportTick", () => {
 
     expect(result.candidatesFound).toBe(1);
     expect(result.leadsAdded).toBe(1);
-    expect(mocks.addLeads).toHaveBeenCalledOnce();
+    expect(mocks.addLeadToCampaign).toHaveBeenCalledOnce();
   });
 
   it("continues the full historical scan in a second bounded batch", async () => {

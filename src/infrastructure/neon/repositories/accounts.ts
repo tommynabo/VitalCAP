@@ -6,6 +6,7 @@ import type { Account, AccountSource, AccountStatus, BusinessType } from "@/doma
 import type { Contact, ContactPoint, ContactPointType, VerificationStatus } from "@/domain/contacts/types";
 import type { AccountIdentitySignals } from "@/services/deduplication/account-dedup";
 import { evaluateAccountDedup } from "@/services/deduplication/account-dedup";
+import { deriveEmailChannelEligibility } from "@/services/compliance/email-channel-policy";
 
 export interface AccountBundle {
   account: Account;
@@ -545,7 +546,7 @@ export async function insertContactPoint(input: InsertContactPointInput): Promis
       verificationStatus: input.verificationStatus,
       verificationProvider: input.verificationProvider,
       verificationCheckedAt: input.verificationCheckedAt ?? (input.verificationStatus === "unverified" ? null : new Date()),
-      channelEligibility: "unknown",
+      channelEligibility: deriveEmailChannelEligibility(),
       sourceUrl: input.sourceUrl,
       sourceType: input.sourceType,
       status: verificationToContactPointStatus(input.verificationStatus),

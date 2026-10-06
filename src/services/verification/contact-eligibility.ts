@@ -1,4 +1,5 @@
 import type { VerificationStatus } from "@/domain/contacts/types";
+import { createVerificationAcceptancePolicy, isContactPointAcceptable } from "./acceptance-policy";
 
 export type ContactEligibilityReason =
   | "eligible"
@@ -27,13 +28,14 @@ export function evaluateContactEligibility(input: ContactEligibilityInput): Cont
   if (input.isSuppressed) return { eligible: false, reason: "suppressed" };
   if (input.complianceAllowed === false) return { eligible: false, reason: "compliance_blocked" };
 
-  switch (input.verificationStatus ?? "unverified") {
+  const status = input.verificationStatus ?? "unverified";
+  if (isContactPointAcceptable(status, createVerificationAcceptancePolicy(input.allowCatchAll ?? false))) {
+    return { eligible: true, reason: "eligible" };
+  }
+
+  switch (status) {
     case "valid":
-      return { eligible: true, reason: "eligible" };
     case "catch_all":
-      return input.allowCatchAll
-        ? { eligible: true, reason: "eligible" }
-        : { eligible: false, reason: "risky" };
     case "risky":
       return { eligible: false, reason: "risky" };
     case "invalid":

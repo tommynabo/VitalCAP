@@ -4,12 +4,14 @@ const mocks = vi.hoisted(() => ({
   enqueueVerificationJobs: vi.fn(),
   runVerificationCronTick: vi.fn(),
   getHistoricalBackfillProgress: vi.fn(),
+  repairProviderDisabledVerificationJobs: vi.fn(),
 }));
 
 vi.mock("@/infrastructure/jobs/runners/verification-runner", () => ({
   enqueueVerificationJobs: mocks.enqueueVerificationJobs,
   runVerificationCronTick: mocks.runVerificationCronTick,
   getHistoricalBackfillProgress: mocks.getHistoricalBackfillProgress,
+  repairProviderDisabledVerificationJobs: mocks.repairProviderDisabledVerificationJobs,
 }));
 vi.mock("../_lib/cron-http", () => ({
   isAuthorizedCronRequest: () => true,
@@ -48,16 +50,19 @@ describe("verification cron Instantly scan scope", () => {
 
   it("keeps scheduled verification and import work within the recent window", async () => {
     mocks.enqueueVerificationJobs.mockResolvedValue(0);
+    mocks.repairProviderDisabledVerificationJobs.mockResolvedValue({ inspected: 0, resolvedFromCurrentResult: 0, reactivated: 0, suppressed: 0 });
     mocks.runVerificationCronTick.mockResolvedValue(tickResult);
 
     await GET(request());
 
     expect(mocks.enqueueVerificationJobs).toHaveBeenCalledWith({ createdSince: expect.any(Date) });
+    expect(mocks.repairProviderDisabledVerificationJobs).toHaveBeenCalledOnce();
     expect(mocks.runVerificationCronTick).toHaveBeenCalledWith(50, { createdSince: expect.any(Date) });
   });
 
   it("uses bounded historical work only for explicit full backfill", async () => {
     mocks.enqueueVerificationJobs.mockResolvedValue(500);
+    mocks.repairProviderDisabledVerificationJobs.mockResolvedValue({ inspected: 0, resolvedFromCurrentResult: 0, reactivated: 0, suppressed: 0 });
     mocks.runVerificationCronTick.mockResolvedValue(tickResult);
     mocks.getHistoricalBackfillProgress.mockResolvedValue({
       verificationCandidatesRemaining: 11,
@@ -86,6 +91,7 @@ describe("verification cron Instantly scan scope", () => {
 
   it("keeps the explicit 48-hour import scope", async () => {
     mocks.enqueueVerificationJobs.mockResolvedValue(0);
+    mocks.repairProviderDisabledVerificationJobs.mockResolvedValue({ inspected: 0, resolvedFromCurrentResult: 0, reactivated: 0, suppressed: 0 });
     mocks.runVerificationCronTick.mockResolvedValue(tickResult);
 
     await GET(request("?backfill=48h"));

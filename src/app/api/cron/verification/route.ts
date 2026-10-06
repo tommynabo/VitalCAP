@@ -1,5 +1,10 @@
 import type { NextRequest } from "next/server";
-import { runVerificationCronTick, enqueueVerificationJobs, getHistoricalBackfillProgress } from "@/infrastructure/jobs/runners/verification-runner";
+import {
+  runVerificationCronTick,
+  enqueueVerificationJobs,
+  getHistoricalBackfillProgress,
+  repairProviderDisabledVerificationJobs,
+} from "@/infrastructure/jobs/runners/verification-runner";
 import { isAuthorizedCronRequest, unauthorizedCronResponse, runCronRoute } from "../_lib/cron-http";
 
 export const dynamic = "force-dynamic";
@@ -10,6 +15,7 @@ export async function GET(request: NextRequest) {
     const backfillMode = request.nextUrl.searchParams.get("backfill");
     const backfillAll = backfillMode === "all";
     const createdSince = new Date(Date.now() - 48 * 60 * 60_000);
+    const providerDisabledRepair = await repairProviderDisabledVerificationJobs();
     const enqueued = await enqueueVerificationJobs(backfillAll ? {} : { createdSince });
     const result = await runVerificationCronTick(50, {
       ...(backfillAll ? { backfillAll: true } : { createdSince }),
@@ -19,6 +25,7 @@ export async function GET(request: NextRequest) {
       itemsProcessed: result.jobsClaimed,
       metadata: {
         enqueued,
+        providerDisabledRepair,
         jobsClaimed: result.jobsClaimed,
         emailsVerified: result.emailsVerified,
         millionVerifierStatus: result.millionVerifierStatus,
