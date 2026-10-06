@@ -63,12 +63,16 @@ export async function updateInstantlyLeadImport(
     nextAttemptAt?: Date | null;
     lastError?: string | null;
     providerLeadId?: string | null;
+    decrementAttemptCount?: boolean;
   },
 ): Promise<void> {
   const db = getDb();
   await db.update(schema.instantlyLeadImports).set({
     status: update.status,
     lockedAt: null,
+    attemptCount: update.decrementAttemptCount
+      ? sql`${schema.instantlyLeadImports.attemptCount} - 1`
+      : undefined,
     nextAttemptAt: update.nextAttemptAt ?? null,
     lastError: update.lastError?.slice(0, 1000) ?? null,
     providerLeadId: update.providerLeadId ?? null,

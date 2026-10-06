@@ -22,6 +22,9 @@ import { emailChannelEligibilitySql, isEmailChannelEligible } from "@/services/c
 import type { ChannelEligibilityStatus } from "@/domain/contacts/types";
 
 const IMPORT_BATCH_SIZE = 50;
+const MAX_INSTANTLY_WRITE_CONCURRENCY = 2;
+const TARGET_READBACK_ATTEMPTS = 4;
+const TARGET_READBACK_RETRY_DELAY_MS = 3_333;
 const IMPORT_LOCK_MS = 15 * 60_000;
 const RETRY_BASE_MINUTES = 15;
 const MAX_RETRY_MINUTES = 24 * 60;
@@ -48,6 +51,7 @@ interface CandidateRow {
 export interface InstantlyImportTickResult {
   candidatesFound: number;
   leadsQueued: number;
+  leadsAttempted: number;
   leadsAdded: number;
   leadsSkipped: number;
   leadsExistingTarget?: number;
@@ -230,6 +234,151 @@ function retryAt(attemptCount: number, now: Date): Date {
   return new Date(now.getTime() + minutes * 60_000);
 }
 
+interface DirectImportOutcome {
+  index: number;
+  status: "added" | "skipped_existing" | "reconciliation_required" | "failed" | "deferred";
+  providerLeadId: string | null;
+  diagnostic: string | null;
+  authFailure: boolean;
+  requestId: string | null;
+}
+
+function instantlyHttpErrorDetails(error: unknown): { httpStatus: number | null; requestId?: string } | null {
+  if (!(error instanceof Error) || error.name !== "InstantlyApiError" || !("details" in error)) return null;
+  const details = (error as Error & { details?: { httpStatus?: number | null; requestId?: string } }).details;
+  if (!details) return null;
+  return { httpStatus: details.httpStatus ?? null, requestId: details.requestId };
+}
+
+async function findLeadInCampaignWithRetry(
+  provider: InstantlyEmailDeliveryProvider,
+  providerCampaignId: string,
+  email: string,
+): Promise<{ providerLeadId: string | null; authFailure: boolean; requestId: string | null }> {
+  for (let attempt = 1; attempt <= TARGET_READBACK_ATTEMPTS; attempt++) {
+    try {
+      const providerLeadId = await provider.findLeadInCampaign(providerCampaignId, email);
+      if (providerLeadId) return { providerLeadId, authFailure: false, requestId: null };
+    } catch (error) {
+      const details = instantlyHttpErrorDetails(error);
+      if (details?.httpStatus === 401 || details?.httpStatus === 403) {
+        return { providerLeadId: null, authFailure: true, requestId: details.requestId ?? null };
+      }
+    }
+    if (attempt < TARGET_READBACK_ATTEMPTS) {
+      await new Promise((resolve) => setTimeout(resolve, TARGET_READBACK_RETRY_DELAY_MS));
+    }
+  }
+  return { providerLeadId: null, authFailure: false, requestId: null };
+}
+
+async function importSingleLead(
+  provider: InstantlyEmailDeliveryProvider,
+  providerCampaignId: string,
+  candidate: CandidateRow,
+  index: number,
+): Promise<DirectImportOutcome> {
+  let single;
+  try {
+    single = await provider.addLeadToCampaign({
+      providerCampaignId,
+      email: candidate.normalized_email,
+      customVariables: buildLeadVariables(candidate),
+      skipIfInWorkspace: false,
+      skipIfInCampaign: true,
+      allowCampaignImportInDryRun: true,
+    });
+  } catch (error) {
+    const details = instantlyHttpErrorDetails(error);
+    return {
+      index,
+      status: "failed",
+      providerLeadId: null,
+      diagnostic: error instanceof Error ? error.message : "Instantly single-lead request failed.",
+      authFailure: details?.httpStatus === 401 || details?.httpStatus === 403,
+      requestId: details?.requestId ?? null,
+    };
+  }
+
+  const authFailure = single.httpStatus === 401 || single.httpStatus === 403;
+  if (single.status === "failed") {
+    return {
+      index,
+      status: "failed",
+      providerLeadId: single.providerLeadId,
+      diagnostic: single.sanitizedProviderMessage ?? "Instantly rejected the single-lead request.",
+      authFailure,
+      requestId: single.requestId,
+    };
+  }
+
+  const readback = await findLeadInCampaignWithRetry(provider, providerCampaignId, candidate.normalized_email);
+  if (!readback.providerLeadId) {
+    return {
+      index,
+      status: "reconciliation_required",
+      providerLeadId: single.providerLeadId,
+      diagnostic: readback.authFailure
+        ? "Instantly read-back stopped after an authorization error."
+        : "Instantly accepted the lead, but target-campaign read-back did not confirm membership after retries.",
+      authFailure: authFailure || readback.authFailure,
+      requestId: single.requestId ?? readback.requestId,
+    };
+  }
+
+  return {
+    index,
+    status: single.status === "added" ? "added" : "skipped_existing",
+    providerLeadId: readback.providerLeadId,
+    diagnostic: null,
+    authFailure,
+    requestId: single.requestId,
+  };
+}
+
+async function importLeadsDirect(
+  provider: InstantlyEmailDeliveryProvider,
+  providerCampaignId: string,
+  candidates: readonly CandidateRow[],
+  onAuthorizationFailure: (requestId: string | null) => Promise<void>,
+): Promise<{ outcomes: DirectImportOutcome[]; attempted: number }> {
+  const outcomes: Array<DirectImportOutcome | undefined> = Array.from({ length: candidates.length });
+  let nextIndex = 0;
+  let attempted = 0;
+  let stopScheduling = false;
+  let reconciliationFailures = 0;
+  const worker = async () => {
+    while (!stopScheduling) {
+      const index = nextIndex++;
+      if (index >= candidates.length) return;
+      attempted++;
+      const outcome = await importSingleLead(provider, providerCampaignId, candidates[index]!, index);
+      outcomes[index] = outcome;
+      if (outcome.authFailure) {
+        stopScheduling = true;
+        await onAuthorizationFailure(outcome.requestId);
+      } else if (outcome.status === "reconciliation_required") {
+        reconciliationFailures++;
+        if (reconciliationFailures >= 2) stopScheduling = true;
+      }
+    }
+  };
+  await Promise.all(
+    Array.from({ length: Math.min(MAX_INSTANTLY_WRITE_CONCURRENCY, candidates.length) }, () => worker()),
+  );
+  return {
+    attempted,
+    outcomes: outcomes.map((outcome, index) => outcome ?? {
+      index,
+      status: "deferred",
+      providerLeadId: null,
+      diagnostic: "Import paused after a provider or repeated read-back safety stop.",
+      authFailure: false,
+      requestId: null,
+    }),
+  };
+}
+
 async function readPipelineMetrics(): Promise<Record<string, number>> {
   const db = getDb();
   const [verification] = await db.execute(sql`
@@ -264,6 +413,7 @@ export async function runInstantlyImportTick(options: {
   contactPointIds?: readonly string[];
   backfillAll?: boolean;
   processQueueOnly?: boolean;
+  maxJobs?: number;
   now?: Date;
 } = {}): Promise<InstantlyImportTickResult> {
   const now = options.now ?? new Date();
@@ -279,6 +429,7 @@ export async function runInstantlyImportTick(options: {
     return {
       candidatesFound: 0,
       leadsQueued: 0,
+      leadsAttempted: 0,
       leadsAdded: 0,
       leadsSkipped: 0,
       leadsDeferred: 0,
@@ -295,6 +446,7 @@ export async function runInstantlyImportTick(options: {
   const result: InstantlyImportTickResult = {
     candidatesFound: 0,
     leadsQueued: 0,
+    leadsAttempted: 0,
     leadsAdded: 0,
     leadsSkipped: 0,
     leadsExistingTarget: 0,
@@ -404,8 +556,11 @@ export async function runInstantlyImportTick(options: {
       return result;
     }
 
-    const slots = Math.min(IMPORT_BATCH_SIZE, quotaDecision.remaining);
-    const jobs = await claimInstantlyLeadImports(Math.min(IMPORT_BATCH_SIZE, slots), now);
+    const requestedBatchSize = options.maxJobs === undefined
+      ? IMPORT_BATCH_SIZE
+      : Math.max(1, Math.floor(options.maxJobs));
+    const slots = Math.min(IMPORT_BATCH_SIZE, requestedBatchSize, quotaDecision.remaining);
+    const jobs = await claimInstantlyLeadImports(slots, now);
     const currentCandidates = jobs.length > 0 ? await listEligibleCandidates({
         providerCampaignId: env.INSTANTLY_CAMPAIGN_ID,
         contactPointIds: jobs.map((job) => String(job.contact_point_id)),
@@ -430,54 +585,29 @@ export async function runInstantlyImportTick(options: {
 
     if (importableJobs.length > 0) {
       try {
-        let outcomes;
-        if (importableJobs.length === 1) {
-          const { candidate } = importableJobs[0]!;
-          const input = {
-            providerCampaignId: env.INSTANTLY_CAMPAIGN_ID,
-            email: candidate.normalized_email,
-            customVariables: buildLeadVariables(candidate),
-            skipIfInWorkspace: false,
-            skipIfInCampaign: true,
-            allowCampaignImportInDryRun: true,
-          };
-          const single = await provider.addLeadToCampaign(input);
-          let status: "added" | "skipped_existing" | "needs_campaign_move" | "reconciliation_required" | "failed";
-          let providerLeadId = single.providerLeadId;
-          let diagnostic = single.sanitizedProviderMessage;
-          if (single.status === "added" || single.status === "already_in_target") {
-            const targetLeadId = await provider.findLeadInCampaign(env.INSTANTLY_CAMPAIGN_ID, candidate.normalized_email);
-            providerLeadId = targetLeadId ?? providerLeadId;
-            status = targetLeadId
-              ? single.status === "added" ? "added" : "skipped_existing"
-              : "reconciliation_required";
-            if (!targetLeadId) diagnostic = "Instantly accepted the single-lead request, but target-campaign read-back did not find the lead.";
-          } else {
-            status = "failed";
-          }
-          if (single.httpStatus === 401 || single.httpStatus === 403) {
+        const direct = await importLeadsDirect(
+          provider,
+          env.INSTANTLY_CAMPAIGN_ID,
+          importableJobs.map(({ candidate }) => candidate),
+          async (requestId) => {
             result.providerStatus = "unhealthy";
             preserveLock = true;
             await tripInstantlyImportCircuitBreaker(
               env.INSTANTLY_CAMPAIGN_ID,
               lockToken,
-              single.requestId ?? randomUUID(),
+              requestId ?? randomUUID(),
             );
-          }
-          outcomes = [{ index: 0, status, providerLeadId, diagnostic }];
-        } else {
-          outcomes = (await provider.addLeads(importableJobs.map(({ candidate }) => ({
-            providerCampaignId: env.INSTANTLY_CAMPAIGN_ID,
-            email: candidate.normalized_email,
-            customVariables: buildLeadVariables(candidate),
-            skipIfInWorkspace: false,
-            skipIfInCampaign: false,
-            allowCampaignImportInDryRun: true,
-          })))).outcomes;
-        }
-        result.instantlyLeadImportReady = importableJobs.length > 1 || outcomes.some((outcome) => outcome.status !== "failed");
+          },
+        );
+        const outcomes = direct.outcomes;
+        result.leadsAttempted += direct.attempted;
+        result.instantlyLeadImportReady = outcomes.some((outcome) =>
+          outcome.status === "added"
+          || outcome.status === "skipped_existing"
+          || outcome.status === "reconciliation_required",
+        );
         for (const outcome of outcomes) {
-          const { job, candidate } = importableJobs[outcome.index]!;
+          const { job } = importableJobs[outcome.index]!;
           const jobId = String(job.id);
           if (outcome.status === "added") {
             await updateInstantlyLeadImport(jobId, {
@@ -495,14 +625,6 @@ export async function runInstantlyImportTick(options: {
           });
           result.leadsSkipped++;
             result.leadsExistingTarget = (result.leadsExistingTarget ?? 0) + 1;
-          } else if (outcome.status === "needs_campaign_move") {
-            await updateInstantlyLeadImport(jobId, {
-              status: "needs_campaign_move",
-              now,
-              lastError: outcome.diagnostic ?? "Instantly did not confirm target-campaign membership.",
-            });
-            result.leadsDeferred++;
-            result.leadsNeedsCampaignMove = (result.leadsNeedsCampaignMove ?? 0) + 1;
           } else if (outcome.status === "reconciliation_required") {
             await updateInstantlyLeadImport(jobId, {
               status: "reconciliation_required",
@@ -510,6 +632,15 @@ export async function runInstantlyImportTick(options: {
               lastError: outcome.diagnostic ?? "Instantly did not provide an unambiguous per-lead result.",
             });
             result.leadsNeedsReconciliation = (result.leadsNeedsReconciliation ?? 0) + 1;
+          } else if (outcome.status === "deferred") {
+            await updateInstantlyLeadImport(jobId, {
+              status: "deferred",
+              now,
+              nextAttemptAt: now,
+              lastError: outcome.diagnostic,
+              decrementAttemptCount: true,
+            });
+            result.leadsDeferred++;
           } else {
             await updateInstantlyLeadImport(jobId, {
               status: "failed",
@@ -523,40 +654,15 @@ export async function runInstantlyImportTick(options: {
           result.quota.warning = uploadedContacts >= env.INSTANTLY_CONTACT_USAGE_WARNING_THRESHOLD;
         }
       } catch (error) {
-        logEvent("error", "Instantly bulk import batch failed", {
-          correlationId: randomUUID(),
+        const details = instantlyHttpErrorDetails(error);
+        logEvent("error", "Instantly direct import failed", {
+          correlationId: details?.requestId ?? randomUUID(),
           provider: "instantly",
-          endpointCategory: "leads/add",
-          httpStatus: error instanceof Error && error.name === "InstantlyApiError" && "details" in error
-            ? (error as Error & { details: { httpStatus: number | null } }).details.httpStatus
-            : null,
-          providerMessage: error instanceof Error ? error.message : "Instantly bulk import failed.",
+          endpointCategory: "leads",
+          httpStatus: details?.httpStatus ?? null,
+          providerMessage: error instanceof Error ? error.message : "Instantly direct import failed.",
         });
-        const apiErrorDetails = error instanceof Error && error.name === "InstantlyApiError" && "details" in error
-          ? (error as Error & { details: { httpStatus: number | null; requestId?: string; providerErrorCode?: string | null } }).details
-          : null;
-        if (apiErrorDetails?.httpStatus === 401 || apiErrorDetails?.httpStatus === 403) {
-          result.providerStatus = "unhealthy";
-          preserveLock = true;
-          await tripInstantlyImportCircuitBreaker(
-            env.INSTANTLY_CAMPAIGN_ID,
-            lockToken,
-            apiErrorDetails.requestId ?? randomUUID(),
-          );
-        }
-        for (const { job } of importableJobs) {
-          const attempts = Number(job.attempt_count ?? 1);
-          const exhausted = attempts >= Number(job.max_attempts ?? 8);
-          const ambiguousResult = apiErrorDetails?.providerErrorCode === "INVALID_BULK_RESPONSE";
-          await updateInstantlyLeadImport(String(job.id), {
-            status: ambiguousResult ? "reconciliation_required" : "failed",
-            now,
-            nextAttemptAt: ambiguousResult || exhausted ? null : retryAt(attempts, now),
-            lastError: error instanceof Error ? error.message : "Instantly import failed.",
-          });
-          if (ambiguousResult) result.leadsNeedsReconciliation = (result.leadsNeedsReconciliation ?? 0) + 1;
-          else result.leadsFailed++;
-        }
+        throw error;
       }
     }
   } finally {

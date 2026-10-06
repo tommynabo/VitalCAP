@@ -100,6 +100,15 @@ function setupWithOneClaimedJob(candidateRows: Array<Record<string, unknown>>, r
   }]);
 }
 
+function setupWithClaimedJobs(
+  candidateRows: Array<Record<string, unknown>>,
+  jobs: Array<Record<string, unknown>>,
+  recheckRows = candidateRows,
+): void {
+  configureDbResults([readySchemaRows, metricReads(), candidateRows, metricReads(), recheckRows, metricReads()]);
+  mocks.claimImports.mockResolvedValue(jobs);
+}
+
 beforeEach(() => {
   vi.stubEnv("APP_ENV", "test");
   vi.stubEnv("VERCEL_ENV", "");
@@ -140,6 +149,7 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.unstubAllEnvs();
+  vi.useRealTimers();
   resetServerEnvCacheForTests();
 });
 
@@ -195,6 +205,184 @@ describe("runInstantlyImportTick", () => {
       status: "instantly_added",
       providerLeadId: "provider-lead-1",
     }));
+  });
+
+  it("uses direct single-lead writes with exact flags and readback for every claimed job", async () => {
+    const candidates = [
+      candidate(),
+      candidate({
+        account_id: "account-2",
+        contact_point_id: "contact-point-2",
+        normalized_email: "second@example.com",
+      }),
+    ];
+    setupWithClaimedJobs(candidates, [
+      { id: "import-1", account_id: "account-1", contact_point_id: "contact-point-1", attempt_count: 1, max_attempts: 8 },
+      { id: "import-2", account_id: "account-2", contact_point_id: "contact-point-2", attempt_count: 1, max_attempts: 8 },
+    ]);
+
+    const result = await runInstantlyImportTick({
+      contactPointIds: candidates.map((row) => String(row.contact_point_id)),
+      maxJobs: 2,
+    });
+
+    expect(result.leadsAttempted).toBe(2);
+    expect(result.leadsAdded).toBe(2);
+    expect(mocks.claimImports).toHaveBeenCalledWith(2, expect.any(Date));
+    expect(mocks.addLeads).not.toHaveBeenCalled();
+    expect(mocks.addLeadToCampaign).toHaveBeenCalledTimes(2);
+    for (const [input] of mocks.addLeadToCampaign.mock.calls) {
+      expect(input).toEqual(expect.objectContaining({
+        providerCampaignId: campaignId,
+        skipIfInWorkspace: false,
+        skipIfInCampaign: true,
+      }));
+    }
+    expect(mocks.findLeadInCampaign).toHaveBeenCalledTimes(2);
+    expect(mocks.findLeadInCampaign).toHaveBeenCalledWith(campaignId, "person@example.com");
+    expect(mocks.findLeadInCampaign).toHaveBeenCalledWith(campaignId, "second@example.com");
+  });
+
+  it("limits simultaneous direct Instantly writes to two", async () => {
+    const candidates = Array.from({ length: 4 }, (_, index) => candidate({
+      account_id: `account-${index}`,
+      contact_point_id: `contact-point-${index}`,
+      normalized_email: `person-${index}@example.com`,
+    }));
+    const jobs = candidates.map((row, index) => ({
+      id: `import-${index}`,
+      account_id: row.account_id,
+      contact_point_id: row.contact_point_id,
+      attempt_count: 1,
+      max_attempts: 8,
+    }));
+    setupWithClaimedJobs(candidates, jobs);
+    let activeWrites = 0;
+    let maxActiveWrites = 0;
+    mocks.addLeadToCampaign.mockImplementation(async () => {
+      activeWrites++;
+      maxActiveWrites = Math.max(maxActiveWrites, activeWrites);
+      await Promise.resolve();
+      activeWrites--;
+      return {
+        status: "added",
+        providerLeadId: "provider-lead",
+        httpStatus: 200,
+        requestId: "request-1",
+        sanitizedProviderMessage: null,
+      };
+    });
+
+    await runInstantlyImportTick({
+      contactPointIds: candidates.map((row) => String(row.contact_point_id)),
+      maxJobs: 4,
+    });
+
+    expect(maxActiveWrites).toBe(2);
+    expect(mocks.addLeadToCampaign).toHaveBeenCalledTimes(4);
+    expect(mocks.addLeads).not.toHaveBeenCalled();
+  });
+
+  it.each([401, 403])("stops scheduling after a direct-write authorization failure (%i)", async (httpStatus) => {
+    const candidates = Array.from({ length: 4 }, (_, index) => candidate({
+      account_id: `account-${index}`,
+      contact_point_id: `contact-point-${index}`,
+      normalized_email: `person-${index}@example.com`,
+    }));
+    const jobs = candidates.map((row, index) => ({
+      id: `import-${index}`,
+      account_id: row.account_id,
+      contact_point_id: row.contact_point_id,
+      attempt_count: 1,
+      max_attempts: 8,
+    }));
+    setupWithClaimedJobs(candidates, jobs);
+    let releaseSecondWrite: ((result: {
+      status: "failed";
+      providerLeadId: null;
+      httpStatus: number;
+      requestId: string;
+      sanitizedProviderMessage: string;
+    }) => void) | undefined;
+    let writeCount = 0;
+    mocks.addLeadToCampaign.mockImplementation(() => {
+      writeCount++;
+      if (writeCount === 1) {
+        return Promise.resolve({
+          status: "failed",
+          providerLeadId: null,
+          httpStatus,
+          requestId: "auth-request",
+          sanitizedProviderMessage: "Unauthorized",
+        });
+      }
+      if (writeCount === 2) {
+        return new Promise((resolve) => { releaseSecondWrite = resolve; });
+      }
+      return Promise.resolve({
+        status: "added",
+        providerLeadId: "unexpected-lead",
+        httpStatus: 200,
+        requestId: "unexpected-request",
+        sanitizedProviderMessage: null,
+      });
+    });
+
+    const pending = runInstantlyImportTick({
+      contactPointIds: candidates.map((row) => String(row.contact_point_id)),
+      maxJobs: 4,
+    });
+    await vi.waitFor(() => expect(mocks.tripCircuitBreaker).toHaveBeenCalledOnce());
+    releaseSecondWrite?.({
+      status: "failed",
+      providerLeadId: null,
+      httpStatus: 503,
+      requestId: "temporary-request",
+      sanitizedProviderMessage: "Unavailable",
+    });
+    const result = await pending;
+
+    expect(result.providerStatus).toBe("unhealthy");
+    expect(result.instantlyLeadImportReady).toBe(false);
+    expect(result.leadsAttempted).toBe(2);
+    expect(result.leadsDeferred).toBe(2);
+    expect(mocks.addLeadToCampaign).toHaveBeenCalledTimes(2);
+    expect(mocks.addLeads).not.toHaveBeenCalled();
+    expect(mocks.tripCircuitBreaker).toHaveBeenCalledWith(campaignId, expect.any(String), "auth-request");
+    expect(mocks.updateImport).toHaveBeenCalledWith("import-2", expect.objectContaining({
+      status: "deferred",
+      decrementAttemptCount: true,
+    }));
+  });
+
+  it("retries failed membership readback without posting the lead again", async () => {
+    vi.useFakeTimers();
+    setupWithOneClaimedJob([candidate()]);
+    mocks.findLeadInCampaign.mockResolvedValue(null);
+
+    const pending = runInstantlyImportTick({ contactPointIds: ["contact-point-1"] });
+    await vi.runAllTimersAsync();
+    const result = await pending;
+
+    expect(result.leadsAttempted).toBe(1);
+    expect(result.leadsNeedsReconciliation).toBe(1);
+    expect(mocks.addLeadToCampaign).toHaveBeenCalledOnce();
+    expect(mocks.addLeads).not.toHaveBeenCalled();
+    expect(mocks.findLeadInCampaign).toHaveBeenCalledTimes(4);
+    expect(mocks.updateImport).toHaveBeenCalledWith("import-1", expect.objectContaining({
+      status: "reconciliation_required",
+    }));
+  });
+
+  it("records an Instantly import without marking actual cold outreach", async () => {
+    setupWithOneClaimedJob([candidate()]);
+
+    const result = await runInstantlyImportTick({ contactPointIds: ["contact-point-1"] });
+
+    expect(result.leadsAdded).toBe(1);
+    expect(mocks.updateImport).toHaveBeenCalledTimes(1);
+    expect(mocks.updateImport).toHaveBeenCalledWith("import-1", expect.objectContaining({ status: "instantly_added" }));
+    expect(mocks.hasActualPriorColdOutreach).toHaveBeenCalledOnce();
   });
 
   it.each(["invalid", "catch_all", "risky", "unknown", "disposable"])(
@@ -292,15 +480,15 @@ describe("runInstantlyImportTick", () => {
     expect(mocks.addLeadToCampaign).toHaveBeenCalledOnce();
   });
 
-  it("opens a durable circuit on leads/add 401 and blocks later ticks", async () => {
+  it.each([401, 403])("opens a durable circuit on leads/add %i and blocks later ticks", async (httpStatus) => {
     setupWithOneClaimedJob([candidate()]);
-    const unauthorized = new Error("Instantly API request failed: endpoint=leads/add http_status=401 provider_code=Unauthorized message=Invalid key request_id=req-123");
+    const unauthorized = new Error(`Instantly API request failed: endpoint=leads/add http_status=${httpStatus} provider_code=Unauthorized message=Invalid key request_id=req-123`);
     unauthorized.name = "InstantlyApiError";
-    Object.assign(unauthorized, { details: { endpointCategory: "leads/add", httpStatus: 401, requestId: "req-123" } });
+    Object.assign(unauthorized, { details: { endpointCategory: "leads/add", httpStatus, requestId: "req-123" } });
     mocks.addLeadToCampaign.mockResolvedValue({
       status: "failed",
       providerLeadId: null,
-      httpStatus: 401,
+      httpStatus,
       requestId: "req-123",
       sanitizedProviderMessage: "Invalid key",
     });

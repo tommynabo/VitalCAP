@@ -56,6 +56,7 @@ function emptyDependencies(state: HistoricalBackfillProgress): HistoricalBackfil
     runInstantlyTick: async () => ({
       candidatesFound: 0,
       leadsQueued: 0,
+      leadsAttempted: 0,
       leadsAdded: 0,
       leadsSkipped: 0,
       leadsDeferred: 0,
@@ -92,6 +93,7 @@ describe("drainHistoricalBackfill", () => {
       return {
         candidatesFound: added,
         leadsQueued: added,
+        leadsAttempted: added,
         leadsAdded: added,
         leadsSkipped: 0,
         leadsDeferred: 0,
@@ -145,6 +147,7 @@ describe("drainHistoricalBackfill", () => {
       return {
         candidatesFound: 1,
         leadsQueued: 0,
+        leadsAttempted: 0,
         leadsAdded: 0,
         leadsSkipped: 0,
         leadsDeferred: 1,

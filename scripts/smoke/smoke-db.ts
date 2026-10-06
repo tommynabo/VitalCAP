@@ -99,10 +99,10 @@ const rawAndSourceIndexes = await db`
   SELECT indexname
   FROM pg_indexes
   WHERE schemaname = 'public'
-    AND indexname IN ('uq_raw_candidates_campaign_engine_fingerprint', 'uq_account_sources_external')
+    AND indexname IN ('uq_raw_candidates_campaign_engine_fingerprint', 'uq_account_sources_identity')
 `;
 const expectedReplayIndexes = new Set(rawAndSourceIndexes.map((row) => (row as { indexname: string }).indexname));
-if (!expectedReplayIndexes.has("uq_raw_candidates_campaign_engine_fingerprint") || !expectedReplayIndexes.has("uq_account_sources_external")) {
+if (!expectedReplayIndexes.has("uq_raw_candidates_campaign_engine_fingerprint") || !expectedReplayIndexes.has("uq_account_sources_identity")) {
   throw new Error("Replay idempotency indexes: FAIL");
 }
 const tables = await db`
