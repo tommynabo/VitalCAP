@@ -430,16 +430,53 @@ export async function runInstantlyImportTick(options: {
 
     if (importableJobs.length > 0) {
       try {
-        const batch = await provider.addLeads(importableJobs.map(({ candidate }) => ({
-          providerCampaignId: env.INSTANTLY_CAMPAIGN_ID,
-          email: candidate.normalized_email,
-          customVariables: buildLeadVariables(candidate),
-          skipIfInWorkspace: false,
-          skipIfInCampaign: false,
-          allowCampaignImportInDryRun: true,
-        })));
-        result.instantlyLeadImportReady = true;
-        for (const outcome of batch.outcomes) {
+        let outcomes;
+        if (importableJobs.length === 1) {
+          const { candidate } = importableJobs[0]!;
+          const input = {
+            providerCampaignId: env.INSTANTLY_CAMPAIGN_ID,
+            email: candidate.normalized_email,
+            customVariables: buildLeadVariables(candidate),
+            skipIfInWorkspace: false,
+            skipIfInCampaign: true,
+            allowCampaignImportInDryRun: true,
+          };
+          const single = await provider.addLeadToCampaign(input);
+          let status: "added" | "skipped_existing" | "needs_campaign_move" | "reconciliation_required" | "failed";
+          let providerLeadId = single.providerLeadId;
+          let diagnostic = single.sanitizedProviderMessage;
+          if (single.status === "added" || single.status === "already_in_target") {
+            const targetLeadId = await provider.findLeadInCampaign(env.INSTANTLY_CAMPAIGN_ID, candidate.normalized_email);
+            providerLeadId = targetLeadId ?? providerLeadId;
+            status = targetLeadId
+              ? single.status === "added" ? "added" : "skipped_existing"
+              : "reconciliation_required";
+            if (!targetLeadId) diagnostic = "Instantly accepted the single-lead request, but target-campaign read-back did not find the lead.";
+          } else {
+            status = "failed";
+          }
+          if (single.httpStatus === 401 || single.httpStatus === 403) {
+            result.providerStatus = "unhealthy";
+            preserveLock = true;
+            await tripInstantlyImportCircuitBreaker(
+              env.INSTANTLY_CAMPAIGN_ID,
+              lockToken,
+              single.requestId ?? randomUUID(),
+            );
+          }
+          outcomes = [{ index: 0, status, providerLeadId, diagnostic }];
+        } else {
+          outcomes = (await provider.addLeads(importableJobs.map(({ candidate }) => ({
+            providerCampaignId: env.INSTANTLY_CAMPAIGN_ID,
+            email: candidate.normalized_email,
+            customVariables: buildLeadVariables(candidate),
+            skipIfInWorkspace: false,
+            skipIfInCampaign: false,
+            allowCampaignImportInDryRun: true,
+          })))).outcomes;
+        }
+        result.instantlyLeadImportReady = importableJobs.length > 1 || outcomes.some((outcome) => outcome.status !== "failed");
+        for (const outcome of outcomes) {
           const { job, candidate } = importableJobs[outcome.index]!;
           const jobId = String(job.id);
           if (outcome.status === "added") {

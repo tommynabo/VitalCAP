@@ -15,6 +15,7 @@ const mocks = vi.hoisted(() => ({
   where: vi.fn(),
   createProvider: vi.fn(),
   runInstantlyImportTick: vi.fn(),
+  repairVerifiedAutopilotEmailMetadata: vi.fn(),
   evaluateComplianceForAccount: vi.fn(),
 }));
 
@@ -49,6 +50,7 @@ vi.mock("@/services/verification/email-verification-cache", () => ({
   verifyEmailsWithCache: mocks.verifyWithCache,
 }));
 vi.mock("@/services/compliance/compliance-evaluator", () => ({
+  repairVerifiedAutopilotEmailMetadata: mocks.repairVerifiedAutopilotEmailMetadata,
   evaluateComplianceForAccount: mocks.evaluateComplianceForAccount,
 }));
 vi.mock("@/lib/config/env", () => ({
@@ -72,7 +74,12 @@ vi.mock("@/infrastructure/jobs/runners/instantly-import-runner", () => ({
   runInstantlyImportTick: mocks.runInstantlyImportTick,
 }));
 
-import { enqueueVerificationJobs, getHistoricalBackfillProgress, runVerificationCronTick } from "./verification-runner";
+import {
+  enqueueVerificationJobs,
+  getHistoricalBackfillProgress,
+  repairProviderDisabledVerificationJobs,
+  runVerificationCronTick,
+} from "./verification-runner";
 
 function sqlParts(value: unknown): { text: string; values: unknown[] } {
   if (!value || typeof value !== "object" || !("strings" in value) || !Array.isArray(value.strings)) {
@@ -202,6 +209,7 @@ describe("runVerificationCronTick eligibility recheck", () => {
       expect.any(Date),
     );
     expect(result.emailsVerified).toBe(1);
+    expect(mocks.repairVerifiedAutopilotEmailMetadata).toHaveBeenCalledWith("workspace-1", "account-1");
     expect(mocks.runInstantlyImportTick).toHaveBeenCalledWith(expect.objectContaining({
       contactPointIds: ["contact-point-1"],
       backfillAll: true,
@@ -215,7 +223,7 @@ describe("enqueueVerificationJobs scope", () => {
     mocks.enqueueVerificationJob.mockResolvedValue(true);
   });
 
-  it("queues the selected historical contact point without a date cutoff", async () => {
+  it("queues unknown-channel email contacts for verification without a date cutoff", async () => {
     mocks.execute
       .mockResolvedValueOnce({ rows: [] })
       .mockResolvedValueOnce({ rows: [] });
@@ -232,6 +240,14 @@ describe("enqueueVerificationJobs scope", () => {
     expect(query.text).toContain("DISTINCT ON (ea.campaign_id, ea.account_id)");
     expect(query.text).toContain("SELECT DISTINCT cm.account_id, c.workspace_id");
     expect(query.text).toContain("TRUE c.workspace_id");
+    expect(query.text).toContain("cp.channel_eligibility NOT IN ('opted_out', 'blocked')");
+    expect(query.text).not.toContain("channel_eligibility IN (");
+    expect(query.values).not.toEqual(expect.arrayContaining([
+      "professional_contact",
+      "eligible_email",
+      "consented_email",
+      "prior_relationship",
+    ]));
     expect(query.text).not.toContain("cm.workspace_id");
     expect(query.text).not.toContain("cp.created_at >=");
     expect(mocks.enqueueVerificationJob).toHaveBeenCalledWith({
@@ -240,6 +256,57 @@ describe("enqueueVerificationJobs scope", () => {
       normalizedEmail: "person@example.com",
       provider: "millionverifier",
     });
+  });
+
+  it("reactivates a provider-disabled unverified email with unknown channel eligibility", async () => {
+    mocks.execute.mockResolvedValueOnce({ rows: [{
+      id: "verification-job-1",
+      workspace_id: "workspace-1",
+      contact_point_id: "contact-point-1",
+      account_id: "account-1",
+      verification_status: "unverified",
+      verification_checked_at: null,
+      cached_status: null,
+      cache_checked_at: null,
+      obsolete: false,
+    }] });
+
+    const result = await repairProviderDisabledVerificationJobs();
+    const query = sqlParts(mocks.execute.mock.calls[0]?.[0]);
+
+    expect(result).toMatchObject({ inspected: 1, reactivated: 1, suppressed: 0 });
+    expect(query.text).toContain("cp.channel_eligibility IN ('opted_out', 'blocked')");
+    expect(query.text).not.toContain("cp.channel_eligibility = 'unknown'");
+    expect(mocks.set).toHaveBeenCalledWith(expect.objectContaining({
+      provider: "millionverifier",
+      status: "pending",
+      lockedAt: null,
+    }));
+  });
+
+  it("keeps explicitly opted-out provider-disabled contacts suppressed", async () => {
+    mocks.execute.mockResolvedValueOnce({ rows: [{
+      id: "verification-job-2",
+      workspace_id: "workspace-1",
+      contact_point_id: "contact-point-2",
+      account_id: "account-2",
+      verification_status: "unverified",
+      verification_checked_at: null,
+      cached_status: null,
+      cache_checked_at: null,
+      obsolete: true,
+    }] });
+
+    const result = await repairProviderDisabledVerificationJobs();
+    const query = sqlParts(mocks.execute.mock.calls[0]?.[0]);
+
+    expect(result).toMatchObject({ inspected: 1, reactivated: 0, suppressed: 1 });
+    expect(query.text).toContain("cp.channel_eligibility IN ('opted_out', 'blocked')");
+    expect(mocks.set).toHaveBeenCalledWith(expect.objectContaining({
+      status: "suppressed",
+      lastError: expect.stringContaining("no longer eligible"),
+    }));
+    expect(mocks.set).not.toHaveBeenCalledWith(expect.objectContaining({ status: "pending" }));
   });
 
   it("limits continuous verification discovery to the configured recent window", async () => {

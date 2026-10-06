@@ -20,6 +20,80 @@ afterEach(() => {
 });
 
 describe("InstantlyEmailDeliveryProvider", () => {
+  it("creates one lead through the documented V2 endpoint and includes target-campaign flags", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(jsonResponse({
+      id: "lead-single-1",
+      email: "person@example.com",
+      timestamp_created: new Date().toISOString(),
+    }, 200));
+    const provider = new InstantlyEmailDeliveryProvider({ apiKey: "secret-test-key", fetchImpl });
+
+    const result = await provider.addLeadToCampaign({
+      providerCampaignId: "campaign-1",
+      email: " Person@Example.com ",
+      customVariables: {
+        first_name: "Person",
+        last_name: "Example",
+        company_name: "Example Ltd",
+        source: "autopilot",
+      },
+      allowCampaignImportInDryRun: true,
+    });
+
+    expect(fetchImpl).toHaveBeenCalledOnce();
+    expect(fetchImpl).toHaveBeenCalledWith("https://api.instantly.ai/api/v2/leads", expect.objectContaining({ method: "POST" }));
+    const request = fetchImpl.mock.calls[0]?.[1] as RequestInit;
+    expect(JSON.parse(String(request.body))).toEqual({
+      campaign: "campaign-1",
+      email: "person@example.com",
+      first_name: "Person",
+      last_name: "Example",
+      company_name: "Example Ltd",
+      custom_variables: { source: "autopilot" },
+      skip_if_in_workspace: false,
+      skip_if_in_campaign: true,
+    });
+    expect(result).toMatchObject({ status: "added", providerLeadId: "lead-single-1", httpStatus: 200 });
+    expect(result.requestId).toEqual(expect.any(String));
+  });
+
+  it("reads a lead back from the exact target campaign", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(jsonResponse({ items: [{
+      id: "lead-readback-1",
+      email: "person@example.com",
+      campaign: "campaign-1",
+    }] }));
+    const provider = new InstantlyEmailDeliveryProvider({ apiKey: "secret-test-key", fetchImpl });
+
+    await expect(provider.findLeadInCampaign("campaign-1", "Person@Example.com")).resolves.toBe("lead-readback-1");
+    expect(fetchImpl).toHaveBeenCalledWith("https://api.instantly.ai/api/v2/leads/list", expect.objectContaining({
+      method: "POST",
+      body: JSON.stringify({ campaign: "campaign-1", contacts: ["person@example.com"], limit: 1 }),
+    }));
+  });
+
+  it.each([401, 403])("returns a structured sanitized failure for HTTP %s", async (status) => {
+    const fetchImpl = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      message: "Denied for Person@example.com using secret-test-key",
+    }), {
+      status,
+      headers: { "Content-Type": "application/json", "x-request-id": "request-denied" },
+    }));
+    const provider = new InstantlyEmailDeliveryProvider({ apiKey: "secret-test-key", fetchImpl });
+
+    const result = await provider.addLeadToCampaign({
+      providerCampaignId: "campaign-1",
+      email: "person@example.com",
+      customVariables: {},
+      allowCampaignImportInDryRun: true,
+    });
+
+    expect(result).toMatchObject({ status: "failed", httpStatus: status, requestId: "request-denied" });
+    expect(result.sanitizedProviderMessage).toContain("[email]");
+    expect(result.sanitizedProviderMessage).not.toContain("secret-test-key");
+    expect(fetchImpl).toHaveBeenCalledOnce();
+  });
+
   it("adds campaign leads through API v2 with bearer auth while VitalCAP stays in dry-run", async () => {
     const fetchImpl = vi.fn().mockResolvedValue(jsonResponse({
       status: "success",

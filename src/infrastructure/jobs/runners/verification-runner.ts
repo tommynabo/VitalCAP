@@ -10,10 +10,9 @@ import { enqueueVerificationJob } from "@/infrastructure/neon/repositories/verif
 import { actualPriorColdOutreachSql } from "@/infrastructure/neon/repositories/actual-outreach";
 import { upsertCampaignMembership } from "@/infrastructure/neon/repositories/campaigns";
 import { EMAIL_VERIFICATION_PIPELINE_VERSION } from "@/domain/providers/email-verification-idempotency";
-import type { ChannelEligibilityStatus, VerificationStatus } from "@/domain/contacts/types";
+import type { VerificationStatus } from "@/domain/contacts/types";
 import { runInstantlyImportTick, type InstantlyImportTickResult } from "@/infrastructure/jobs/runners/instantly-import-runner";
 import {
-  classifyEmailChannelEligibility,
   EMAIL_CHANNEL_ELIGIBLE_STATUSES,
   emailChannelEligibilitySql,
   VITALCAP_B2B_EMAIL_POLICY_VERSION,
@@ -90,7 +89,6 @@ export async function repairProviderDisabledVerificationJobs(
       cp.verification_status,
       cp.verification_checked_at,
       cp.last_contacted_at,
-      cp.channel_eligibility,
       cache.status AS cached_status,
       cache.checked_at AS cache_checked_at,
       EXISTS (
@@ -99,6 +97,20 @@ export async function repairProviderDisabledVerificationJobs(
           AND (se.account_id = cp.account_id OR se.contact_point_id = cp.id)
       )
       OR cp.last_contacted_at IS NOT NULL
+      OR cp.type <> 'email'
+      OR BTRIM(cp.normalized_value) = ''
+      OR cp.channel_eligibility IN ('opted_out', 'blocked')
+      OR NOT EXISTS (
+        SELECT 1
+        FROM campaign_memberships cm
+        JOIN campaigns c ON c.id = cm.campaign_id AND c.workspace_id = vj.workspace_id
+        JOIN raw_candidates rc ON rc.campaign_id = c.id AND rc.account_id = cm.account_id AND rc.processed = true
+        WHERE cm.account_id = cp.account_id
+          AND cm.contacted_at IS NULL
+          AND cm.stage IN ('qualified', 'contact_selected', 'ready')
+          AND c.status = 'active'
+          AND c.autopilot_enabled = true
+      )
       OR EXISTS (
         SELECT 1 FROM campaign_memberships cm
         JOIN campaigns c ON c.id = cm.campaign_id AND c.workspace_id = vj.workspace_id
@@ -149,7 +161,6 @@ export async function repairProviderDisabledVerificationJobs(
     account_id: string;
     verification_status: string;
     verification_checked_at: Date | string | null;
-    channel_eligibility: string;
     cached_status: string | null;
     cache_checked_at: Date | string | null;
     obsolete: boolean;
@@ -179,6 +190,14 @@ export async function repairProviderDisabledVerificationJobs(
           updatedAt: now,
         }).where(eq(schema.contactPoints.id, row.contact_point_id));
       }
+      const { repairVerifiedAutopilotEmailMetadata, evaluateComplianceForAccount } = await import("@/services/compliance/compliance-evaluator");
+      if (currentStatus === "valid") {
+        await repairVerifiedAutopilotEmailMetadata(row.workspace_id, row.account_id);
+      }
+      await evaluateComplianceForAccount(row.workspace_id, row.account_id);
+      if (currentStatus === "valid") {
+        await runInstantlyImportTick({ contactPointIds: [row.contact_point_id], now });
+      }
       await db.update(schema.verificationJobs).set({
         provider: env.EMAIL_VERIFICATION_PROVIDER,
         status: "completed",
@@ -188,17 +207,15 @@ export async function repairProviderDisabledVerificationJobs(
         nextAttemptAt: null,
         lastError: null,
       }).where(eq(schema.verificationJobs.id, row.id));
-      await evaluateComplianceForAccount(row.workspace_id, row.account_id);
       result.resolvedFromCurrentResult++;
       continue;
     }
 
-    const channelPolicy = classifyEmailChannelEligibility(row.channel_eligibility as ChannelEligibilityStatus);
     const needsVerification = row.verification_status === "unverified" || row.verification_status === "unknown";
-    if (!channelPolicy.eligible || !needsVerification) {
+    if (!needsVerification) {
       await db.update(schema.verificationJobs).set({
         status: "suppressed",
-        lastError: "Historical verification job is not eligible under current channel and verification policy.",
+        lastError: "Historical verification job no longer needs verification.",
         lockedAt: null,
         lockedBy: null,
         nextAttemptAt: null,
@@ -330,6 +347,8 @@ export async function enqueueVerificationJobs(options: { createdSince?: Date } =
       JOIN accounts a ON a.id = cm.account_id AND a.workspace_id = c.workspace_id
       WHERE cm.stage IN ('qualified', 'contact_selected', 'ready')
         AND c.status = 'active'
+        AND c.autopilot_enabled = true
+        AND a.status IN ('qualified', 'contactable', 'outreach_ready')
         AND cm.contacted_at IS NULL
         AND NOT EXISTS (
           SELECT 1 FROM suppression_entries se
@@ -358,7 +377,8 @@ export async function enqueueVerificationJobs(options: { createdSince?: Date } =
       LEFT JOIN contacts co ON co.id = cp.contact_id AND co.workspace_id = ea.workspace_id
       WHERE cp.type = 'email'
         AND BTRIM(cp.normalized_value) <> ''
-        AND ${emailChannelEligibilitySql(sql`cp.channel_eligibility`)}
+        AND LOWER(TRIM(cp.normalized_value)) ~ '^[^[:space:]@]+@[^[:space:]@]+[.][^[:space:]@]+$'
+        AND cp.channel_eligibility NOT IN ('opted_out', 'blocked')
         AND cp.last_contacted_at IS NULL
         AND (
           cp.verification_status = 'unverified'
@@ -449,7 +469,7 @@ export async function getHistoricalBackfillProgress(): Promise<HistoricalBackfil
         JOIN contact_points cp ON cp.account_id = cm.account_id AND cp.workspace_id = a.workspace_id AND cp.type = 'email'
         WHERE c.status = 'active' AND c.autopilot_enabled = true
           AND cm.stage IN ('qualified', 'contact_selected', 'ready')
-          AND ${emailChannelEligibilitySql(sql`cp.channel_eligibility`)}
+          AND cp.channel_eligibility NOT IN ('opted_out', 'blocked')
           AND cp.verification_status IN ('unverified', 'unknown')
           AND (cp.verification_status <> 'unknown' OR cp.verification_checked_at IS NULL OR cp.verification_checked_at <= NOW() - INTERVAL '3 days')
           AND NOT EXISTS (
@@ -754,6 +774,7 @@ export async function runVerificationCronTick(
   let verificationCatchAll = 0;
   let verificationProviderFailures = 0;
   const verifiedContactPointIds = new Set<string>();
+  const jobsToComplete: Array<{ id: string; costUsd: number }> = [];
 
   for (const [workspaceId, workspaceJobs] of jobsByWorkspace.entries()) {
     const workspaceJobIds = workspaceJobs.map((job) => job.id);
@@ -902,11 +923,6 @@ export async function runVerificationCronTick(
         metadata: { attemptCount: job.attempt_count },
       });
 
-      // Mark job completed
-      await db.update(schema.verificationJobs)
-        .set({ status: "completed", completedAt: new Date(), costUsd: outcome.costUsd, lockedAt: null, lockedBy: null, nextAttemptAt: null, lastError: null })
-        .where(eq(schema.verificationJobs.id, job.id));
-
       totalEmailsVerified++;
 
       // Adjust TTL based on verdict
@@ -920,9 +936,13 @@ export async function runVerificationCronTick(
         .set({ expiresAt: adjustedExpires })
         .where(sql`workspace_id = ${workspaceId} AND normalized_email = ${outcome.email} AND provider = ${provider.providerName}`);
       
-      const { evaluateComplianceForAccount } = await import("@/services/compliance/compliance-evaluator");
+      const { repairVerifiedAutopilotEmailMetadata, evaluateComplianceForAccount } = await import("@/services/compliance/compliance-evaluator");
+      if (outcome.code === "valid") {
+        await repairVerifiedAutopilotEmailMetadata(workspaceId, cp.accountId);
+      }
       await evaluateComplianceForAccount(workspaceId, cp.accountId);
       if (outcome.code === "valid") verifiedContactPointIds.add(cp.id);
+      jobsToComplete.push({ id: job.id, costUsd: outcome.costUsd });
     }
   }
 
@@ -937,6 +957,11 @@ export async function runVerificationCronTick(
           : {}),
     now,
   });
+  for (const job of jobsToComplete) {
+    await db.update(schema.verificationJobs)
+      .set({ status: "completed", completedAt: new Date(), costUsd: job.costUsd, lockedAt: null, lockedBy: null, nextAttemptAt: null, lastError: null })
+      .where(eq(schema.verificationJobs.id, job.id));
+  }
   return {
     jobsClaimed: leased.rows.length,
     emailsVerified: totalEmailsVerified,

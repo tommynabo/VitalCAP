@@ -1,12 +1,60 @@
 import { getDb, schema } from "@/infrastructure/neon/db";
-import { and, eq, isNull } from "drizzle-orm";
+import { and, eq, isNull, sql } from "drizzle-orm";
 import type { ChannelEligibilityStatus, VerificationStatus } from "@/domain/contacts/types";
 import { getEmailComplianceEnv, getVerificationEnv } from "@/lib/config/env";
 import { checkSuppression } from "@/services/compliance/suppression";
+import { actualPriorColdOutreachSql } from "@/infrastructure/neon/repositories/actual-outreach";
 import {
   evaluateB2BEmailCompliance,
   VITALCAP_B2B_EMAIL_POLICY_VERSION,
 } from "@/services/compliance/email-channel-policy";
+
+export async function repairVerifiedAutopilotEmailMetadata(workspaceId: string, accountId: string): Promise<void> {
+  const db = getDb();
+  await db.execute(sql`
+    UPDATE contact_points cp
+    SET channel_eligibility = 'professional_contact', updated_at = NOW()
+    WHERE cp.workspace_id = ${workspaceId}
+      AND cp.account_id = ${accountId}
+      AND cp.type = 'email'
+      AND cp.verification_status = 'valid'
+      AND cp.channel_eligibility = 'unknown'
+      AND cp.last_contacted_at IS NULL
+      AND EXISTS (
+        SELECT 1
+        FROM campaign_memberships cm
+        JOIN campaigns c ON c.id = cm.campaign_id AND c.workspace_id = ${workspaceId}
+        JOIN raw_candidates rc ON rc.campaign_id = c.id AND rc.account_id = cm.account_id AND rc.processed = true
+        WHERE cm.account_id = cp.account_id
+          AND cm.contacted_at IS NULL
+          AND cm.stage IN ('qualified', 'contact_selected', 'ready')
+          AND c.status = 'active'
+          AND c.autopilot_enabled = true
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM suppression_entries se
+        WHERE se.workspace_id = cp.workspace_id
+          AND (se.account_id = cp.account_id OR se.contact_point_id = cp.id)
+      )
+      AND NOT ${actualPriorColdOutreachSql({
+        workspaceId: "cp.workspace_id",
+        accountId: "cp.account_id",
+        contactPointId: "cp.id",
+        normalizedEmail: "cp.normalized_value",
+      })}
+      AND NOT EXISTS (
+        SELECT 1 FROM conversations conv
+        WHERE conv.workspace_id = cp.workspace_id
+          AND conv.account_id = cp.account_id
+          AND conv.state NOT IN ('rejected', 'no_reply_needed', 'suppressed')
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM meetings m
+        JOIN conversations conv ON conv.id = m.conversation_id
+        WHERE conv.workspace_id = cp.workspace_id AND conv.account_id = cp.account_id
+      )
+  `);
+}
 
 export async function evaluateComplianceForAccount(workspaceId: string, accountId: string): Promise<void> {
   const db = getDb();
