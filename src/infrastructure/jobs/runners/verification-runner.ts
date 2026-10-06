@@ -147,7 +147,10 @@ export async function repairProviderDisabledVerificationJobs(
       ORDER BY ev.checked_at DESC
       LIMIT 1
     ) cache ON true
-    WHERE vj.status = 'provider_disabled'
+    WHERE (
+      vj.status = 'provider_disabled'
+      OR (vj.provider = 'disabled' AND vj.status IN ('pending', 'failed'))
+    )
       AND (vj.locked_at IS NULL OR vj.locked_at < ${lockExpiry.toISOString()})
     ORDER BY vj.created_at ASC
     LIMIT ${limit}

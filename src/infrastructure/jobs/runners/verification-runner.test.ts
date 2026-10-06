@@ -258,9 +258,11 @@ describe("enqueueVerificationJobs scope", () => {
     });
   });
 
-  it("reactivates a provider-disabled unverified email with unknown channel eligibility", async () => {
+  it("reactivates a legacy disabled-provider pending job", async () => {
     mocks.execute.mockResolvedValueOnce({ rows: [{
       id: "verification-job-1",
+      provider: "disabled",
+      status: "pending",
       workspace_id: "workspace-1",
       contact_point_id: "contact-point-1",
       account_id: "account-1",
@@ -275,6 +277,7 @@ describe("enqueueVerificationJobs scope", () => {
     const query = sqlParts(mocks.execute.mock.calls[0]?.[0]);
 
     expect(result).toMatchObject({ inspected: 1, reactivated: 1, suppressed: 0 });
+    expect(query.text).toContain("vj.provider = 'disabled' AND vj.status IN ('pending', 'failed')");
     expect(query.text).toContain("cp.channel_eligibility IN ('opted_out', 'blocked')");
     expect(query.text).not.toContain("cp.channel_eligibility = 'unknown'");
     expect(mocks.set).toHaveBeenCalledWith(expect.objectContaining({
@@ -282,6 +285,47 @@ describe("enqueueVerificationJobs scope", () => {
       status: "pending",
       lockedAt: null,
     }));
+  });
+
+  it("reactivates a legacy disabled-provider failed job", async () => {
+    mocks.execute.mockResolvedValueOnce({ rows: [{
+      id: "verification-job-legacy-failed",
+      provider: "disabled",
+      status: "failed",
+      workspace_id: "workspace-1",
+      contact_point_id: "contact-point-1",
+      account_id: "account-1",
+      verification_status: "unverified",
+      verification_checked_at: null,
+      cached_status: null,
+      cache_checked_at: null,
+      obsolete: false,
+    }] });
+
+    const result = await repairProviderDisabledVerificationJobs();
+
+    expect(result).toMatchObject({ inspected: 1, reactivated: 1, suppressed: 0 });
+    expect(mocks.set).toHaveBeenCalledWith(expect.objectContaining({
+      provider: "millionverifier",
+      status: "pending",
+      nextAttemptAt: expect.any(Date),
+      lockedAt: null,
+      lockedBy: null,
+      lastError: null,
+    }));
+  });
+
+  it("keeps completed, suppressed, and dead-letter jobs outside the repair selector", async () => {
+    mocks.execute.mockResolvedValueOnce({ rows: [] });
+
+    await repairProviderDisabledVerificationJobs();
+    const query = sqlParts(mocks.execute.mock.calls[0]?.[0]);
+
+    expect(query.text).toContain("vj.status = 'provider_disabled'");
+    expect(query.text).toContain("vj.provider = 'disabled' AND vj.status IN ('pending', 'failed')");
+    expect(query.text).not.toContain("'dead_letter'");
+    expect(query.text).not.toContain("'completed'");
+    expect(mocks.set).not.toHaveBeenCalled();
   });
 
   it("keeps explicitly opted-out provider-disabled contacts suppressed", async () => {
