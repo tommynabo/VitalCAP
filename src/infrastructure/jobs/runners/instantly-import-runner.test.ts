@@ -228,7 +228,7 @@ describe("runInstantlyImportTick", () => {
 
     expect(result.leadsAttempted).toBe(2);
     expect(result.leadsAdded).toBe(2);
-    expect(mocks.claimImports).toHaveBeenCalledWith(2, expect.any(Date));
+    expect(mocks.claimImports).toHaveBeenCalledWith(2, expect.any(Date), ["contact-point-1", "contact-point-2"]);
     expect(mocks.addLeads).not.toHaveBeenCalled();
     expect(mocks.addLeadToCampaign).toHaveBeenCalledTimes(2);
     for (const [input] of mocks.addLeadToCampaign.mock.calls) {
@@ -353,6 +353,58 @@ describe("runInstantlyImportTick", () => {
       status: "deferred",
       decrementAttemptCount: true,
     }));
+  });
+
+  it("stops scheduling after the provider rejects an invalid campaign", async () => {
+    const candidates = Array.from({ length: 4 }, (_, index) => candidate({
+      account_id: `account-${index}`,
+      contact_point_id: `contact-point-${index}`,
+      normalized_email: `person-${index}@example.com`,
+    }));
+    const jobs = candidates.map((row, index) => ({
+      id: `import-${index}`,
+      account_id: row.account_id,
+      contact_point_id: row.contact_point_id,
+      attempt_count: 1,
+      max_attempts: 8,
+    }));
+    setupWithClaimedJobs(candidates, jobs);
+    let releaseSecondWrite: ((result: {
+      status: "added";
+      providerLeadId: string;
+      httpStatus: number;
+      requestId: string;
+      sanitizedProviderMessage: null;
+    }) => void) | undefined;
+    mocks.addLeadToCampaign
+      .mockResolvedValueOnce({
+        status: "failed",
+        providerLeadId: null,
+        httpStatus: 400,
+        requestId: "invalid-campaign",
+        sanitizedProviderMessage: "Campaign not found",
+      })
+      .mockImplementationOnce(() => new Promise((resolve) => { releaseSecondWrite = resolve; }));
+
+    const pending = runInstantlyImportTick({
+      contactPointIds: candidates.map((row) => String(row.contact_point_id)),
+      maxJobs: 4,
+    });
+    await vi.waitFor(() => expect(mocks.addLeadToCampaign).toHaveBeenCalledTimes(2));
+    releaseSecondWrite?.({
+      status: "added",
+      providerLeadId: "provider-lead-1",
+      httpStatus: 200,
+      requestId: "request-1",
+      sanitizedProviderMessage: null,
+    });
+    const result = await pending;
+
+    expect(result.leadsAttempted).toBe(2);
+    expect(result.leadsDeferred).toBe(2);
+    expect(mocks.addLeadToCampaign).toHaveBeenCalledTimes(2);
+    expect(mocks.addLeads).not.toHaveBeenCalled();
+    expect(mocks.findLeadInCampaign).toHaveBeenCalledOnce();
   });
 
   it("retries failed membership readback without posting the lead again", async () => {
@@ -541,7 +593,7 @@ describe("runInstantlyImportTick", () => {
 
     await runInstantlyImportTick({ contactPointIds: ["contact-point-1"] });
 
-    expect(mocks.claimImports).toHaveBeenCalledWith(1, expect.any(Date));
+    expect(mocks.claimImports).toHaveBeenCalledWith(1, expect.any(Date), ["contact-point-1"]);
   });
 
   it("can rerun the same 48-hour backfill without creating a second import", async () => {

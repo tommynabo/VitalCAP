@@ -240,6 +240,7 @@ interface DirectImportOutcome {
   providerLeadId: string | null;
   diagnostic: string | null;
   authFailure: boolean;
+  stopScheduling?: boolean;
   requestId: string | null;
 }
 
@@ -296,6 +297,7 @@ async function importSingleLead(
       providerLeadId: null,
       diagnostic: error instanceof Error ? error.message : "Instantly single-lead request failed.",
       authFailure: details?.httpStatus === 401 || details?.httpStatus === 403,
+      stopScheduling: details?.httpStatus === 400 || details?.httpStatus === 404,
       requestId: details?.requestId ?? null,
     };
   }
@@ -308,6 +310,8 @@ async function importSingleLead(
       providerLeadId: single.providerLeadId,
       diagnostic: single.sanitizedProviderMessage ?? "Instantly rejected the single-lead request.",
       authFailure,
+      stopScheduling: single.httpStatus === 404
+        || (single.httpStatus === 400 && /campaign/i.test(single.sanitizedProviderMessage ?? "")),
       requestId: single.requestId,
     };
   }
@@ -357,9 +361,9 @@ async function importLeadsDirect(
       if (outcome.authFailure) {
         stopScheduling = true;
         await onAuthorizationFailure(outcome.requestId);
-      } else if (outcome.status === "reconciliation_required") {
+      } else if (outcome.stopScheduling || outcome.status === "reconciliation_required") {
         reconciliationFailures++;
-        if (reconciliationFailures >= 2) stopScheduling = true;
+        if (outcome.stopScheduling || reconciliationFailures >= 2) stopScheduling = true;
       }
     }
   };
@@ -374,6 +378,7 @@ async function importLeadsDirect(
       providerLeadId: null,
       diagnostic: "Import paused after a provider or repeated read-back safety stop.",
       authFailure: false,
+      stopScheduling: false,
       requestId: null,
     }),
   };
@@ -560,7 +565,7 @@ export async function runInstantlyImportTick(options: {
       ? IMPORT_BATCH_SIZE
       : Math.max(1, Math.floor(options.maxJobs));
     const slots = Math.min(IMPORT_BATCH_SIZE, requestedBatchSize, quotaDecision.remaining);
-    const jobs = await claimInstantlyLeadImports(slots, now);
+    const jobs = await claimInstantlyLeadImports(slots, now, options.contactPointIds);
     const currentCandidates = jobs.length > 0 ? await listEligibleCandidates({
         providerCampaignId: env.INSTANTLY_CAMPAIGN_ID,
         contactPointIds: jobs.map((job) => String(job.contact_point_id)),

@@ -28,9 +28,16 @@ export async function enqueueInstantlyLeadImport(candidate: InstantLeadImportCan
   return Boolean(inserted);
 }
 
-export async function claimInstantlyLeadImports(limit: number, now: Date): Promise<Record<string, unknown>[]> {
+export async function claimInstantlyLeadImports(
+  limit: number,
+  now: Date,
+  contactPointIds?: readonly string[],
+): Promise<Record<string, unknown>[]> {
   const db = getDb();
   const lockExpiry = new Date(now.getTime() - 15 * 60_000);
+  const contactPointFilter = contactPointIds
+    ? sql`AND contact_point_id IN ${contactPointIds}`
+    : sql``;
   const claimed = await db.execute(sql`
     WITH available AS (
       SELECT id
@@ -39,6 +46,7 @@ export async function claimInstantlyLeadImports(limit: number, now: Date): Promi
         AND (locked_at IS NULL OR locked_at < ${lockExpiry.toISOString()})
         AND (next_attempt_at IS NULL OR next_attempt_at <= ${now.toISOString()})
         AND attempt_count < max_attempts
+        ${contactPointFilter}
       ORDER BY created_at ASC
       LIMIT ${limit}
       FOR UPDATE SKIP LOCKED
