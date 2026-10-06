@@ -17,11 +17,13 @@
     "smoke:maps": "tsx scripts/smoke/smoke-maps.ts",
     "benchmark:maps": "tsx scripts/benchmark-maps.ts",
     "smoke:serper": "tsx scripts/smoke/smoke-serper.ts",
-    "smoke:email-verification": "tsx scripts/smoke/smoke-email-verification.ts"
+    "smoke:email-verification": "tsx scripts/smoke/smoke-email-verification.ts",
+    "backfill:instantly": "tsx scripts/drain-instantly-backfill.ts"
   },
   "dependencies": {
     "@neondatabase/auth": "^0.5.0-beta",
     "@neondatabase/serverless": "^1.1.0",
+    "@next/env": "^16.3.8",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "drizzle-orm": "^0.45.3",

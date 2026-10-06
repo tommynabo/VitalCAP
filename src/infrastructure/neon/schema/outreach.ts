@@ -145,7 +145,7 @@ export const instantlyLeadImports = pgTable(
     uniqueIndex("uq_instantly_import_email").on(table.workspaceId, table.normalizedEmail, table.providerCampaignId),
     uniqueIndex("uq_instantly_import_active_account")
       .on(table.workspaceId, table.accountId, table.providerCampaignId)
-      .where(sql`${table.status} in ('eligible', 'instantly_queued', 'instantly_added', 'skipped_existing', 'failed', 'deferred', 'deferred_due_to_plan_limit')`),
+      .where(sql`${table.status} in ('eligible', 'instantly_queued', 'instantly_added', 'skipped_existing', 'failed', 'deferred', 'deferred_due_to_plan_limit', 'reconciliation_required')`),
     index("idx_instantly_import_dispatch").on(table.status, table.nextAttemptAt),
     index("idx_instantly_import_workspace_status").on(table.workspaceId, table.status),
   ],

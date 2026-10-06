@@ -20,7 +20,10 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock("drizzle-orm", () => ({
   eq: vi.fn((column, value) => ({ column, value })),
-  sql: (strings: TemplateStringsArray, ...values: unknown[]) => ({ strings, values }),
+  sql: Object.assign(
+    (strings: TemplateStringsArray, ...values: unknown[]) => ({ strings, values }),
+    { join: vi.fn((values: unknown[], separator: unknown) => ({ strings: ["", ""], values: [values, separator] })) },
+  ),
 }));
 vi.mock("@/infrastructure/neon/db", () => ({
   getDb: () => ({

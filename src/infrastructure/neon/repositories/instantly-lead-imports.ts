@@ -58,7 +58,7 @@ export async function claimInstantlyLeadImports(limit: number, now: Date): Promi
 export async function updateInstantlyLeadImport(
   id: string,
   update: {
-    status: "instantly_added" | "skipped_existing" | "needs_campaign_move" | "failed" | "deferred";
+    status: "instantly_added" | "skipped_existing" | "needs_campaign_move" | "reconciliation_required" | "failed" | "deferred";
     now: Date;
     nextAttemptAt?: Date | null;
     lastError?: string | null;

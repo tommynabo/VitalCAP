@@ -5,6 +5,7 @@ import { getNeonSql } from "@/infrastructure/neon/db";
 import { getDatabaseEnv, getDeliveryEnv, getVerificationEnv } from "@/lib/config/env";
 import { logEvent } from "@/lib/observability/structured-logger";
 import { ACTUAL_PRIOR_COLD_OUTREACH_STATES } from "@/services/deduplication/outreach-dedup";
+import { EMAIL_CHANNEL_ELIGIBLE_STATUSES } from "@/services/compliance/email-channel-policy";
 import { isAuthorizedCronRequest, unauthorizedCronResponse } from "../_lib/cron-http";
 
 export const dynamic = "force-dynamic";
@@ -160,8 +161,9 @@ async function readHistoricalFunnel(): Promise<Record<string, number> | null> {
           (conv.id IS NOT NULL OR meeting.id IS NOT NULL) AS active_conversation
         FROM scope s
         LEFT JOIN campaign_memberships cm ON cm.campaign_id = s.campaign_id AND cm.account_id = s.account_id
-        LEFT JOIN contact_points cp ON cp.account_id = s.account_id AND cp.type = 'email'
+        LEFT JOIN contact_points cp ON cp.account_id = s.account_id AND cp.workspace_id = s.workspace_id AND cp.type = 'email'
         LEFT JOIN compliance_decisions cd ON cd.campaign_id = s.campaign_id
+          AND cd.workspace_id = s.workspace_id
           AND cd.account_id = s.account_id
           AND cd.contact_point_id = cp.id
           AND cd.superseded_at IS NULL
@@ -194,13 +196,13 @@ async function readHistoricalFunnel(): Promise<Record<string, number> | null> {
         COUNT(DISTINCT account_id) FILTER (WHERE active_conversation)::int AS active_conversation,
         COUNT(DISTINCT contact_point_id) FILTER (
           WHERE verification_status IN ('unverified', 'unknown')
-            AND channel_eligibility IN ('eligible_email', 'consented_email', 'prior_relationship')
+            AND channel_eligibility = ANY(${[...EMAIL_CHANNEL_ELIGIBLE_STATUSES]}::text[])
             AND NOT suppressed AND NOT prior_outreach AND NOT active_conversation
         )::int AS eligible_for_verification,
         COUNT(DISTINCT contact_point_id) FILTER (
           WHERE contact_point_id = selected_contact_point_id
             AND verification_status = 'valid'
-            AND channel_eligibility IN ('eligible_email', 'consented_email', 'prior_relationship')
+            AND channel_eligibility = ANY(${[...EMAIL_CHANNEL_ELIGIBLE_STATUSES]}::text[])
             AND decision = 'allowed'
             AND NOT suppressed AND NOT prior_outreach AND NOT active_conversation
         )::int AS eligible_for_instantly

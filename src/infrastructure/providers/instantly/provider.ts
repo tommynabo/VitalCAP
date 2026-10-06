@@ -27,7 +27,7 @@ interface InstantlyAddLeadsResponse {
   created_leads?: Array<{ id?: string; index?: number }>;
 }
 
-export type InstantlyLeadImportStatus = "added" | "skipped_existing" | "needs_campaign_move" | "failed";
+export type InstantlyLeadImportStatus = "added" | "skipped_existing" | "needs_campaign_move" | "reconciliation_required" | "failed";
 
 export interface InstantlyLeadImportOutcome {
   index: number;
@@ -252,7 +252,7 @@ export class InstantlyEmailDeliveryProvider implements EmailDeliveryProvider {
   async addLead(input: EmailLeadInput): Promise<{ result: EmailLeadResult; usage: ProviderUsageStats }> {
     const { outcomes, usage } = await this.addLeads([input]);
     const outcome = outcomes[0];
-    if (!outcome || outcome.status === "failed") {
+    if (!outcome || outcome.status === "failed" || outcome.status === "reconciliation_required") {
       throw new Error(outcome?.diagnostic ?? "Instantly leads/add did not return an outcome.");
     }
     return {
@@ -361,11 +361,15 @@ export class InstantlyEmailDeliveryProvider implements EmailDeliveryProvider {
       }
     } else if (uncreated.length > 0 && rejectedCount === uncreated.length && skippedCount === 0 && duplicateRequestCount === 0) {
       for (const outcome of uncreated) {
+        outcome.status = "reconciliation_required";
         outcome.diagnostic = `Instantly leads/add rejected a lead (blocklist=${data.in_blocklist ?? 0}, invalid=${data.invalid_email_count ?? 0}, incomplete=${data.incomplete_count ?? 0}).`;
       }
     } else if (uncreated.length > 0) {
       const diagnostic = `Instantly leads/add returned aggregate-only outcomes (uncreated=${uncreated.length}, duplicate_or_skipped=${skippedCount}, rejected=${aggregateRejectedCount}); individual results are ambiguous.`;
-      for (const outcome of uncreated) outcome.diagnostic = diagnostic;
+      for (const outcome of uncreated) {
+        outcome.status = "reconciliation_required";
+        outcome.diagnostic = diagnostic;
+      }
     }
 
     return {

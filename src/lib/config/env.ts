@@ -160,6 +160,19 @@ const deliveryEnvSchema = z.object({
   INSTANTLY_WEBHOOK_SECRET: z.string().optional(),
   SMS_PROVIDER: z.literal("disabled").default("disabled"),
 });
+
+const emailComplianceEnvSchema = z.object({
+  VITALCAP_B2B_EMAIL_POLICY_APPROVED: z.enum(["true", "false"]).default("false").transform((value) => value === "true"),
+});
+let cachedEmailComplianceEnv: z.infer<typeof emailComplianceEnvSchema> | null = null;
+export function getEmailComplianceEnv() {
+  if (cachedEmailComplianceEnv) return cachedEmailComplianceEnv;
+  cachedEmailComplianceEnv = emailComplianceEnvSchema.parse({
+    VITALCAP_B2B_EMAIL_POLICY_APPROVED: optionalEnvValue(process.env.VITALCAP_B2B_EMAIL_POLICY_APPROVED),
+  });
+  return cachedEmailComplianceEnv;
+}
+
 let cachedDeliveryEnv: z.infer<typeof deliveryEnvSchema> | null = null;
 export function getDeliveryEnv() {
   if (cachedDeliveryEnv) return cachedDeliveryEnv;
@@ -206,6 +219,7 @@ export function resetServerEnvCacheForTests(): void {
   cachedMapsEnv = null;
   cachedSerperEnv = null;
   cachedVerificationEnv = null;
+  cachedEmailComplianceEnv = null;
   cachedDeliveryEnv = null;
   cachedIntelligenceEnv = null;
 }

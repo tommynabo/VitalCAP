@@ -205,9 +205,9 @@ describe("InstantlyEmailDeliveryProvider", () => {
     const result = await provider.addLeads(inputs);
 
     expect(result.outcomes.map(({ index, status }) => [index, status])).toEqual([
-      [0, "failed"],
+      [0, "reconciliation_required"],
       [1, "added"],
-      [2, "failed"],
+      [2, "reconciliation_required"],
     ]);
     expect(result.outcomes[0]?.diagnostic).toContain("individual results are ambiguous");
     expect(result.outcomes[1]?.providerLeadId).toBe("lead-2");
