@@ -400,6 +400,7 @@ describe("enqueueVerificationJobs scope", () => {
     const query = sqlParts(mocks.execute.mock.calls[0]?.[0]);
     expect(query.text).toContain("se.workspace_id = c.workspace_id");
     expect(query.text).toContain("conv.workspace_id = c.workspace_id");
+    expect(query.text).toContain("a.status IN ('qualified', 'contactable', 'outreach_ready')");
     expect(query.text).not.toContain("cm.workspace_id");
   });
 });

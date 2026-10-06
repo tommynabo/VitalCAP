@@ -471,6 +471,7 @@ export async function getHistoricalBackfillProgress(): Promise<HistoricalBackfil
         JOIN accounts a ON a.id = cm.account_id AND a.workspace_id = c.workspace_id
         JOIN contact_points cp ON cp.account_id = cm.account_id AND cp.workspace_id = a.workspace_id AND cp.type = 'email'
         WHERE c.status = 'active' AND c.autopilot_enabled = true
+          AND a.status IN ('qualified', 'contactable', 'outreach_ready')
           AND cm.stage IN ('qualified', 'contact_selected', 'ready')
           AND cp.channel_eligibility NOT IN ('opted_out', 'blocked')
           AND cp.verification_status IN ('unverified', 'unknown')
