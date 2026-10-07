@@ -458,6 +458,12 @@ export async function getAccountById(accountId: string): Promise<Account | null>
   return row ? toAccount(row) : null;
 }
 
+export async function getContactById(contactId: string): Promise<Contact | null> {
+  const db = getDb();
+  const [row] = await db.select().from(contacts).where(eq(contacts.id, contactId)).limit(1);
+  return row ? toContact(row) : null;
+}
+
 export async function updateAccountFields(accountId: string, fields: Partial<InsertAccountInput>): Promise<void> {
   if (Object.keys(fields).length === 0) return;
   const db = getDb();

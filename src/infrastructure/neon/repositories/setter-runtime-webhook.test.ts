@@ -11,8 +11,16 @@ vi.mock("drizzle-orm", () => {
   const sql = Object.assign((strings: TemplateStringsArray, ...values: unknown[]) => ({ strings, values }), {
     raw: (value: string) => value,
   });
-  const expression = (...values: unknown[]) => ({ values });
-  return { and: expression, desc: expression, eq: expression, inArray: expression, lt: expression, or: expression, sql };
+  const expression = (kind: string) => (...values: unknown[]) => ({ kind, values });
+  return {
+    and: expression("and"),
+    desc: expression("desc"),
+    eq: (field: string, value: unknown) => ({ kind: "eq", field, value }),
+    inArray: expression("inArray"),
+    lt: expression("lt"),
+    or: expression("or"),
+    sql,
+  };
 });
 
 vi.mock("@/infrastructure/neon/db", () => {
@@ -37,10 +45,11 @@ vi.mock("@/services/setter/inbound-runtime", () => ({
   SetterInboundRoutingError: class extends Error {},
 }));
 
-const { processInstantlySentEvent } = await import("./setter-runtime");
+const { neonSetterInboundRuntimeStore, processInstantlySentEvent } = await import("./setter-runtime");
 
 function createDatabase() {
   let eventStatus: string | null = null;
+  let eventErrorCode: string | null = null;
   let outreachQueueRows = new Map<string, any>();
   let outreachEventIds = new Set<string>();
   const calls: Array<{ operation: string; table: string; values?: any }> = [];
@@ -51,7 +60,7 @@ function createDatabase() {
       from(table: any) { state.table = table.__table; return current; },
       values(values: any) { state.values = values; return current; },
       set(values: any) { state.values = values; return current; },
-      where() { return current; },
+      where(condition: any) { state.condition = condition; return current; },
       limit() { return current; },
       orderBy() { return current; },
       onConflictDoNothing() { return current; },
@@ -91,11 +100,29 @@ function createDatabase() {
               result = [{ id: "outreach-event-1" }];
             }
           } else if (operation === "update" && state.table === "setterWebhookEvents") {
-            if (state.returning && eventStatus === "failed") {
+            const comparisons: Array<[string, unknown]> = [];
+            const collect = (condition: any) => {
+              if (Array.isArray(condition)) {
+                for (const child of condition) collect(child);
+                return;
+              }
+              if (condition?.kind === "eq") comparisons.push([condition.field, condition.value]);
+              if (Array.isArray(condition?.values)) {
+                for (const child of condition.values) collect(child);
+              }
+            };
+            collect(state.condition);
+            const allowsUnknownCampaignRetry = comparisons.some(([field, value]) => field === "setterWebhookEvents.status" && value === "ignored")
+              && comparisons.some(([field, value]) => field === "setterWebhookEvents.errorCode" && value === "UNKNOWN_CAMPAIGN");
+            const allowsFailedRetry = comparisons.some(([field, value]) => field === "setterWebhookEvents.status" && value === "failed");
+            if (state.returning && (eventStatus === "failed" && allowsFailedRetry
+              || eventStatus === "ignored" && allowsUnknownCampaignRetry && eventErrorCode === "UNKNOWN_CAMPAIGN")) {
               eventStatus = "processing";
+              eventErrorCode = null;
               result = [{ id: "webhook-1" }];
-            } else if (state.values?.status) {
+            } else if (!state.returning && state.values?.status) {
               eventStatus = state.values.status;
+              eventErrorCode = state.values.errorCode ?? eventErrorCode;
             }
           }
           return Promise.resolve(resolve(result));
@@ -113,7 +140,14 @@ function createDatabase() {
     update: (table: any) => builder("update", table),
     transaction: vi.fn(() => { throw new Error("interactive transaction invoked"); }),
   };
-  return { db, calls, get eventStatus() { return eventStatus; }, get outreachQueueRows() { return outreachQueueRows; }, get outreachEventIds() { return outreachEventIds; } };
+  return {
+    db,
+    calls,
+    setWebhookEvent(status: string, errorCode: string | null) { eventStatus = status; eventErrorCode = errorCode; },
+    get eventStatus() { return eventStatus; },
+    get outreachQueueRows() { return outreachQueueRows; },
+    get outreachEventIds() { return outreachEventIds; },
+  };
 }
 
 const sentEvent = {
@@ -155,6 +189,29 @@ describe("Instantly webhook persistence", () => {
     expect(state.outreachEventIds).toEqual(new Set([sentEvent.providerEventId]));
     expect(state.eventStatus).toBe("processed");
     expect(state.db.transaction).not.toHaveBeenCalled();
+  });
+
+  it("reclaims only ignored UNKNOWN_CAMPAIGN events and rejects a replay after reclaim", async () => {
+    state.setWebhookEvent("ignored", "UNKNOWN_CAMPAIGN");
+    const event = {
+      eventType: "reply_received" as const,
+      providerEventId: "missed-reply-event",
+      providerMessageId: "missed-reply-message",
+      providerThreadId: "missed-reply-thread",
+      providerCampaignId: "provider-campaign-1",
+      email: "person@example.com",
+      subject: "Question",
+      body: "Hello",
+      occurredAt: "2026-10-06T12:00:00.000Z",
+    };
+
+    await expect(neonSetterInboundRuntimeStore.claimWebhookEvent(event, "hash")).resolves.toBe(true);
+    expect(state.eventStatus).toBe("processing");
+    await expect(neonSetterInboundRuntimeStore.claimWebhookEvent(event, "hash")).resolves.toBe(false);
+
+    state.setWebhookEvent("ignored", "INVALID_PAYLOAD");
+    await expect(neonSetterInboundRuntimeStore.claimWebhookEvent({ ...event, providerEventId: "other-event" }, "hash")).resolves.toBe(false);
+    expect(state.eventStatus).toBe("ignored");
   });
 
   it("keeps webhook persistence methods free of interactive transactions", () => {

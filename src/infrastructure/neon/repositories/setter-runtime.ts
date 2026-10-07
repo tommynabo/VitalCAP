@@ -8,7 +8,7 @@ import { SetterInboundRoutingError } from "@/services/setter/inbound-runtime";
 import type { ReviewActionResult } from "@/services/setter/review-service";
 import { InstantlyReplyApiError, InstantlyReplyProvider } from "@/infrastructure/providers/instantly/reply-provider";
 import { getDeliveryEnv } from "@/lib/config/env";
-import { listAccountBundles } from "./accounts";
+import { getAccountById, getContactById, listAccountBundles, toContactPoint } from "./accounts";
 import { getDb, schema } from "../db";
 import { getCampaignById } from "./campaigns";
 import { getOfferById } from "./offers";
@@ -31,30 +31,138 @@ export interface SetterWebhookEventSummary {
   processedAt: string | null;
 }
 
-async function resolveInboundContext(event: InboundEmailReply): Promise<{
+export async function resolveInboundContext(event: InboundEmailReply): Promise<{
   context: SetterInboundContext;
   campaignId: string;
   accountId: string;
   contactId: string | null;
 }> {
   const db = getDb();
-  const campaignFilters = [
-    sql`${schema.campaigns.engineConfig} ->> 'instantlyCampaignId' = ${event.providerCampaignId}`,
-    sql`${schema.campaigns.engineConfig} ->> 'providerCampaignId' = ${event.providerCampaignId}`,
-  ];
-  const campaignRows = await db
-    .select({ id: schema.campaigns.id })
-    .from(schema.campaigns)
-    .where(or(...campaignFilters))
+  const importRows = await db
+    .select({
+      workspaceId: schema.instantlyLeadImports.workspaceId,
+      sourceCampaignId: schema.instantlyLeadImports.sourceCampaignId,
+      accountId: schema.instantlyLeadImports.accountId,
+      contactId: schema.instantlyLeadImports.contactId,
+      contactPointId: schema.instantlyLeadImports.contactPointId,
+    })
+    .from(schema.instantlyLeadImports)
+    .where(and(
+      eq(schema.instantlyLeadImports.providerCampaignId, event.providerCampaignId),
+      eq(schema.instantlyLeadImports.normalizedEmail, event.email),
+      inArray(schema.instantlyLeadImports.status, ["instantly_added", "skipped_existing"]),
+    ))
     .limit(2);
-  const campaignRow = campaignRows[0];
-  if (campaignRows.length === 0) throw new SetterInboundRoutingError("UNKNOWN_CAMPAIGN");
-  if (campaignRows.length > 1 || !campaignRow) throw new SetterInboundRoutingError("AMBIGUOUS_CAMPAIGN");
 
-  const campaign = await getCampaignById(campaignRow.id);
+  if (importRows.length > 1) throw new SetterInboundRoutingError("AMBIGUOUS_CAMPAIGN");
+  const importedIdentity = importRows[0] ?? null;
+  let campaignId: string;
+  let expectedWorkspaceId: string;
+
+  if (importedIdentity) {
+    campaignId = importedIdentity.sourceCampaignId;
+    expectedWorkspaceId = importedIdentity.workspaceId;
+  } else {
+    const mappingRows = await db
+      .select({ campaignId: schema.campaignProviderMappings.campaignId, workspaceId: schema.campaignProviderMappings.workspaceId })
+      .from(schema.campaignProviderMappings)
+      .where(and(
+        eq(schema.campaignProviderMappings.provider, "instantly"),
+        eq(schema.campaignProviderMappings.providerCampaignId, event.providerCampaignId),
+        eq(schema.campaignProviderMappings.enabled, true),
+      ))
+      .limit(2);
+
+    if (mappingRows.length > 1) throw new SetterInboundRoutingError("AMBIGUOUS_CAMPAIGN");
+    if (mappingRows[0]) {
+      campaignId = mappingRows[0].campaignId;
+      expectedWorkspaceId = mappingRows[0].workspaceId;
+    } else {
+      const campaignFilters = [
+        sql`${schema.campaigns.engineConfig} ->> 'instantlyCampaignId' = ${event.providerCampaignId}`,
+        sql`${schema.campaigns.engineConfig} ->> 'providerCampaignId' = ${event.providerCampaignId}`,
+      ];
+      const campaignRows = await db
+        .select({ id: schema.campaigns.id, workspaceId: schema.campaigns.workspaceId })
+        .from(schema.campaigns)
+        .where(or(...campaignFilters))
+        .limit(2);
+      if (campaignRows.length === 0) throw new SetterInboundRoutingError("UNKNOWN_CAMPAIGN");
+      if (campaignRows.length > 1 || !campaignRows[0]) throw new SetterInboundRoutingError("AMBIGUOUS_CAMPAIGN");
+      campaignId = campaignRows[0].id;
+      expectedWorkspaceId = campaignRows[0].workspaceId;
+    }
+  }
+
+  const campaign = await getCampaignById(campaignId);
   if (!campaign) throw new Error("Mapped campaign could not be loaded.");
+  if (campaign.workspaceId !== expectedWorkspaceId) throw new SetterInboundRoutingError("AMBIGUOUS_CAMPAIGN");
   const offer = await getOfferById(campaign.workspaceId, campaign.offerId);
   if (!offer) throw new Error("Campaign offer could not be loaded.");
+
+  if (importedIdentity) {
+    const account = await getAccountById(importedIdentity.accountId);
+    if (!account || account.workspaceId !== importedIdentity.workspaceId) {
+      throw new SetterInboundRoutingError("CONTACT_NOT_FOUND", campaign.workspaceId);
+    }
+
+    const contactPointRows = await db
+      .select()
+      .from(schema.contactPoints)
+      .where(and(
+        eq(schema.contactPoints.id, importedIdentity.contactPointId),
+        eq(schema.contactPoints.workspaceId, importedIdentity.workspaceId),
+        eq(schema.contactPoints.accountId, importedIdentity.accountId),
+        eq(schema.contactPoints.type, "email"),
+        eq(schema.contactPoints.normalizedValue, event.email),
+      ))
+      .limit(2);
+    if (contactPointRows.length === 0) throw new SetterInboundRoutingError("CONTACT_NOT_FOUND", campaign.workspaceId);
+    if (contactPointRows.length > 1 || !contactPointRows[0]) {
+      throw new SetterInboundRoutingError("AMBIGUOUS_CONTACT_MATCH", campaign.workspaceId);
+    }
+    const contactPoint = toContactPoint(contactPointRows[0]);
+
+    const [membership] = await db
+      .select()
+      .from(schema.campaignMemberships)
+      .where(and(
+        eq(schema.campaignMemberships.campaignId, campaign.id),
+        eq(schema.campaignMemberships.accountId, account.id),
+      ))
+      .limit(1);
+    if (!membership) throw new SetterInboundRoutingError("CONTACT_NOT_FOUND", campaign.workspaceId);
+
+    if (importedIdentity.contactId && contactPoint.contactId && importedIdentity.contactId !== contactPoint.contactId) {
+      throw new SetterInboundRoutingError("CONTACT_NOT_FOUND", campaign.workspaceId);
+    }
+    const contactId = importedIdentity.contactId ?? membership.contactId ?? contactPoint.contactId;
+    const contact = contactId ? await getContactById(contactId) : null;
+    if (contactId && (!contact || contact.workspaceId !== campaign.workspaceId || contact.accountId !== account.id)) {
+      throw new SetterInboundRoutingError("CONTACT_NOT_FOUND", campaign.workspaceId);
+    }
+    const [source] = await db
+      .select({ sourceType: schema.accountSources.sourceType })
+      .from(schema.accountSources)
+      .where(eq(schema.accountSources.accountId, account.id))
+      .limit(1);
+
+    return {
+      context: {
+        workspaceId: campaign.workspaceId,
+        offer,
+        account,
+        contact,
+        discoverySource: source?.sourceType ?? null,
+        recentFeedback: [],
+        suppressionEntries: await listSuppressionEntries(campaign.workspaceId),
+        contactPointId: contactPoint.id,
+      },
+      campaignId: campaign.id,
+      accountId: account.id,
+      contactId,
+    };
+  }
 
   const bundles = await listAccountBundles(campaign.workspaceId);
   const matches = bundles.flatMap((bundle) => bundle.contactPoints
@@ -148,6 +256,10 @@ async function claimInstantlyWebhookEvent(input: {
     eq(schema.setterWebhookEvents.providerEventId, input.providerEventId),
     or(
       eq(schema.setterWebhookEvents.status, "failed"),
+      and(
+        eq(schema.setterWebhookEvents.status, "ignored"),
+        eq(schema.setterWebhookEvents.errorCode, "UNKNOWN_CAMPAIGN"),
+      ),
       and(
         inArray(schema.setterWebhookEvents.status, ["received", "processing"]),
         lt(schema.setterWebhookEvents.receivedAt, new Date(now.getTime() - INSTANTLY_WEBHOOK_RETRY_AFTER_MS)),
