@@ -109,6 +109,33 @@ export async function safeFetchPage(rawUrl: string, options: SafeFetchOptions = 
         signal: controller.signal,
         headers: { "User-Agent": opts.userAgent },
       });
+
+      if (response.status >= 300 && response.status < 400) {
+        const location = response.headers.get("location");
+        if (!location) return { url: currentUrl.toString(), status: response.status, contentType: null, body: "" };
+        if (redirectCount >= opts.maxRedirects) {
+          throw new SafeFetchError(`Exceeded ${opts.maxRedirects} redirects`, "too_many_redirects");
+        }
+        currentUrl = new URL(location, currentUrl);
+        continue;
+      }
+
+      const contentType = response.headers.get("content-type");
+      if (contentType && !contentType.includes("text/html") && !contentType.includes("text/plain")) {
+        throw new SafeFetchError(`Unsupported content-type: ${contentType}`, "unsupported_content_type");
+      }
+
+      const contentLengthHeader = response.headers.get("content-length");
+      if (contentLengthHeader && Number(contentLengthHeader) > opts.maxContentLengthBytes) {
+        throw new SafeFetchError(`Content-Length ${contentLengthHeader} exceeds cap`, "content_too_large");
+      }
+
+      const body = await response.text();
+      if (body.length > opts.maxContentLengthBytes) {
+        throw new SafeFetchError(`Body exceeds ${opts.maxContentLengthBytes} bytes`, "content_too_large");
+      }
+
+      return { url: currentUrl.toString(), status: response.status, contentType, body };
     } catch (error) {
       if (error instanceof Error && error.name === "AbortError") {
         throw new SafeFetchError(`Timed out fetching ${currentUrl.toString()}`, "timeout");
@@ -117,33 +144,6 @@ export async function safeFetchPage(rawUrl: string, options: SafeFetchOptions = 
     } finally {
       clearTimeout(timer);
     }
-
-    if (response.status >= 300 && response.status < 400) {
-      const location = response.headers.get("location");
-      if (!location) return { url: currentUrl.toString(), status: response.status, contentType: null, body: "" };
-      if (redirectCount >= opts.maxRedirects) {
-        throw new SafeFetchError(`Exceeded ${opts.maxRedirects} redirects`, "too_many_redirects");
-      }
-      currentUrl = new URL(location, currentUrl);
-      continue;
-    }
-
-    const contentType = response.headers.get("content-type");
-    if (contentType && !contentType.includes("text/html") && !contentType.includes("text/plain")) {
-      throw new SafeFetchError(`Unsupported content-type: ${contentType}`, "unsupported_content_type");
-    }
-
-    const contentLengthHeader = response.headers.get("content-length");
-    if (contentLengthHeader && Number(contentLengthHeader) > opts.maxContentLengthBytes) {
-      throw new SafeFetchError(`Content-Length ${contentLengthHeader} exceeds cap`, "content_too_large");
-    }
-
-    const body = await response.text();
-    if (body.length > opts.maxContentLengthBytes) {
-      throw new SafeFetchError(`Body exceeds ${opts.maxContentLengthBytes} bytes`, "content_too_large");
-    }
-
-    return { url: currentUrl.toString(), status: response.status, contentType, body };
   }
 }
 

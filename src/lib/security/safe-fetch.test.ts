@@ -54,6 +54,24 @@ describe("safeFetchPage", () => {
     expect(result.body).toContain("hola");
   });
 
+  it("times out when the response body stalls after headers", async () => {
+    const fetchImpl: typeof fetch = async (_input, init) => new Response(
+      new ReadableStream({
+        start(controller) {
+          init?.signal?.addEventListener("abort", () => {
+            controller.error(new DOMException("Aborted", "AbortError"));
+          }, { once: true });
+        },
+      }),
+      { headers: { "content-type": "text/html" } },
+    );
+
+    await expect(safeFetchPage("https://farmaciadelgado.example.es/contacto", {
+      fetchImpl,
+      timeoutMs: 10,
+    })).rejects.toMatchObject({ name: "SafeFetchError", reason: "timeout" });
+  });
+
   it("follows redirects up to the limit, re-validating each hop", async () => {
     const fetchImpl = vi
       .fn()
