@@ -8,8 +8,11 @@ import {
   PermanentJobError,
   TransientJobError,
   claimDiscoveryJobs,
+  claimProcessingJobs,
   completeDiscoveryJob,
+  completeProcessingJob,
   enqueueDiscoveryJob,
+  enqueueProcessingJob,
   failDiscoveryJob,
 } from "./job-queue";
 
@@ -177,6 +180,47 @@ describeIntegration("job-queue integration (real postgres semantics)", () => {
     const record = row.rows[0] as { status: string; next_attempt_at: string | null };
     expect(record.status).toBe("completed");
     expect(record.next_attempt_at).toBeNull();
+  });
+
+  it("reclaims an expired processing lease and does not claim the completed job again", async () => {
+    const campaign = await makeActiveCampaign();
+    const t0 = new Date(Date.now() + 1000);
+    const jobId = await enqueueProcessingJob({
+      campaignId: campaign.campaignId,
+      type: "process_raw_candidate",
+      payload: { rawCandidateId: randomUUID() },
+    });
+    const workerA = `worker-a-${randomUUID()}`;
+    const workerB = `worker-b-${randomUUID()}`;
+
+    const claimByA = await claimProcessingJobs({
+      workerId: workerA,
+      batchSize: 1,
+      now: t0,
+      leaseMs: 1000,
+      requireAutopilot: false,
+    });
+    expect(claimByA.map((job) => job.id)).toEqual([jobId]);
+
+    const claimByB = await claimProcessingJobs({
+      workerId: workerB,
+      batchSize: 1,
+      now: new Date(t0.getTime() + 2000),
+      leaseMs: 1000,
+      requireAutopilot: false,
+    });
+    expect(claimByB.map((job) => job.id)).toEqual([jobId]);
+
+    await expect(completeProcessingJob({ jobId, workerId: workerA })).rejects.toBeInstanceOf(LostLeaseError);
+    await completeProcessingJob({ jobId, workerId: workerB });
+
+    const afterCompletion = await claimProcessingJobs({
+      workerId: `worker-c-${randomUUID()}`,
+      batchSize: 1,
+      now: new Date(t0.getTime() + 4000),
+      requireAutopilot: false,
+    });
+    expect(afterCompletion).toHaveLength(0);
   });
 
   it("TEST 5/6: transient failure schedules backoff and is only claimable after due time", async () => {

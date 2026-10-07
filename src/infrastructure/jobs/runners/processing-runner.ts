@@ -40,7 +40,11 @@ interface ProcessingJobPayload {
 export interface ProcessingRunnerOptions {
   enrichContacts?: boolean;
   campaignId?: string;
+  timeBudgetMs?: number;
 }
+
+export const PROCESSING_CRON_TIME_BUDGET_MS = 240_000;
+const PROCESSING_JOB_START_RESERVE_MS = 90_000;
 
 const smokeWebsiteFetcher: WebsiteFetcher = {
   fetchPage: async () => {
@@ -476,16 +480,34 @@ export async function runProcessingCronTick(
   options: ProcessingRunnerOptions = {},
 ): Promise<ProcessingRunnerResult> {
   const workerId = `cron-process-${randomUUID()}`;
+  const startedAt = performance.now();
+  const timeBudgetMs = options.timeBudgetMs ?? PROCESSING_CRON_TIME_BUDGET_MS;
+  const startAnotherJobBeforeMs = Math.max(
+    0,
+    timeBudgetMs - Math.min(PROCESSING_JOB_START_RESERVE_MS, timeBudgetMs / 2),
+  );
   let jobsClaimed = 0;
 
-  const jobs = await claimProcessingJobs<ProcessingJobPayload>({
-    workerId,
-    batchSize: maxJobsPerTick,
-    now,
-    campaignId: options.campaignId,
-    requireAutopilot: options.campaignId === undefined,
-  });
-  for (const job of jobs) {
+  while (jobsClaimed < maxJobsPerTick && performance.now() - startedAt < startAnotherJobBeforeMs) {
+    const [job] = await claimProcessingJobs<ProcessingJobPayload>({
+      workerId,
+      batchSize: 1,
+      now,
+      campaignId: options.campaignId,
+      requireAutopilot: options.campaignId === undefined,
+    });
+    if (!job) break;
+
+    if (performance.now() - startedAt >= startAnotherJobBeforeMs) {
+      await deferProcessingJob({
+        jobId: job.id,
+        workerId,
+        nextAttemptAt: now,
+        reason: "Processing cron reached its job-start reserve before execution.",
+      });
+      break;
+    }
+
     jobsClaimed += 1;
     try {
       await executeProcessingJob(job, options);
