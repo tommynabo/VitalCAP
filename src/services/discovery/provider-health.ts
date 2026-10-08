@@ -67,6 +67,62 @@ export interface EngineProviderUsage {
   usage: ProviderUsageStats;
 }
 
+export interface EngineHealthSummary {
+  unhealthyCount: number;
+  totalCount: number;
+}
+
+export interface ProviderUsageAggregate {
+  calls: number;
+  errors: number;
+}
+
+export const ENGINE_TYPES = ["maps_fast", "maps_deep", "google_serp", "linkedin_owner", "hybrid_fill"] as const satisfies readonly EngineType[];
+
+export function engineProviderHealthForType(
+  engineType: EngineType,
+  maps: ProviderHealthStatus,
+  serp: ProviderHealthStatus,
+): ProviderHealthStatus {
+  if (engineType === "maps_fast") return maps;
+  if (engineType === "google_serp" || engineType === "linkedin_owner") return serp;
+  if (engineType === "maps_deep") {
+    if (maps === "paused" || serp === "paused") return "paused";
+    if (maps === "degraded" || serp === "degraded") return "degraded";
+    return maps === "untested" || serp === "untested" ? "untested" : "healthy";
+  }
+  if (maps === "healthy" || serp === "healthy" || maps === "untested" || serp === "untested") return "healthy";
+  return maps === "degraded" || serp === "degraded" ? "degraded" : "paused";
+}
+
+export function summarizeEngineHealthStatuses(statuses: readonly ProviderHealthStatus[]): EngineHealthSummary {
+  return {
+    unhealthyCount: statuses.filter((status) => status === "degraded" || status === "paused").length,
+    totalCount: statuses.length,
+  };
+}
+
+export function computeEngineHealthSummary(input: {
+  mapsConfigured: boolean;
+  serpConfigured: boolean;
+  mapsUsage: ProviderUsageAggregate;
+  serpUsage: ProviderUsageAggregate;
+}): EngineHealthSummary {
+  const healthFor = (configured: boolean, usage: ProviderUsageAggregate): ProviderHealthStatus => configured
+    ? evaluateProviderHealth({
+      calls: usage.calls,
+      errors: usage.errors,
+      items: 0,
+      totalLatencyMs: 0,
+      costUsd: 0,
+      quotaRemaining: null,
+    })
+    : "paused";
+  const maps = healthFor(input.mapsConfigured, input.mapsUsage);
+  const serp = healthFor(input.serpConfigured, input.serpUsage);
+  return summarizeEngineHealthStatuses(ENGINE_TYPES.map((engineType) => engineProviderHealthForType(engineType, maps, serp)));
+}
+
 export function hasUnavailableRequiredDiscoveryProvider(
   engineTypes: readonly EngineType[],
   mapsConfigured: boolean,

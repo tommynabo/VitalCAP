@@ -36,9 +36,11 @@ import { listSearchSeeds } from "@/infrastructure/neon/repositories/discovery";
 import {
   getAutopilotSettings,
   getGlobalAutopilotState,
+  getEngineHealthSummary as getNeonEngineHealthSummary,
   listEngineTargets,
   listRebalanceDecisions,
 } from "@/infrastructure/neon/repositories/autopilot";
+import { summarizeEngineHealthStatuses } from "@/services/discovery/provider-health";
 import { getAutopilotPacingMetrics } from "@/infrastructure/neon/repositories/autopilot-pacing";
 import {
   getProviderRows,
@@ -61,6 +63,7 @@ import { getWeeklyTrend, type WeeklyTrendPoint } from "@/infrastructure/neon/rep
 
 import type { Offer, Campaign } from "@/domain/campaigns/types";
 import type { AutopilotSettings, GlobalAutopilotState, EngineTargetState, RebalanceDecision } from "@/domain/autopilot/types";
+import type { EngineHealthSummary } from "@/services/discovery/provider-health";
 import type {
   OutreachQueueItem,
   OutreachEvent,
@@ -135,6 +138,11 @@ export async function getEngineTargets(): Promise<EngineTargetState[]> {
   if (isDevSeedMode()) return seed.seedEngineTargets;
   const workspaceId = await getCurrentWorkspaceId();
   return listEngineTargets(workspaceId);
+}
+
+export async function getEngineHealthSummary(): Promise<EngineHealthSummary> {
+  if (isDevSeedMode()) return summarizeEngineHealthStatuses(seed.seedEngineTargets.map((target) => target.providerHealth));
+  return getNeonEngineHealthSummary(await getCurrentWorkspaceId());
 }
 
 export async function getRebalanceDecisions(): Promise<RebalanceDecision[]> {

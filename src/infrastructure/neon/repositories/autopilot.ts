@@ -14,7 +14,14 @@ import { getDayBounds } from "@/lib/time/day-bounds";
 import { getAutopilotPacingMetrics } from "./autopilot-pacing";
 import { getRecentProviderUsage, getTodaySpendUsd } from "./provider-runs";
 import { getMapsEnv, getSerperEnv } from "@/lib/config/env";
-import { evaluateProviderHealth, isProviderAvailableForDiscovery } from "@/services/discovery/provider-health";
+import {
+  computeEngineHealthSummary,
+  ENGINE_TYPES,
+  engineProviderHealthForType,
+  evaluateProviderHealth,
+  isProviderAvailableForDiscovery,
+  type EngineHealthSummary,
+} from "@/services/discovery/provider-health";
 import { classifyAutopilotTargetRisk, computeAutopilotPacing } from "@/services/autopilot/pacing-service";
 import { SERPER_ESTIMATED_COST_PER_QUERY_USD } from "@/infrastructure/providers/serp/serper-provider";
 
@@ -97,7 +104,37 @@ export async function updateAutopilotSettings(
   return toAutopilotSettings(updated);
 }
 
-const ENGINE_TYPES: EngineType[] = ["maps_fast", "maps_deep", "google_serp", "linkedin_owner", "hybrid_fill"];
+export function buildEngineHealthUsageSummaryQuery(workspaceId: string, since: Date) {
+  return sql`
+    SELECT provider,
+      count(*) FILTER (WHERE status IN ('succeeded', 'ingested', 'completed', 'failed', 'aborted', 'timed_out'))::int AS calls,
+      count(*) FILTER (WHERE status IN ('failed', 'aborted', 'timed_out'))::int AS errors
+    FROM provider_runs
+    WHERE workspace_id = ${workspaceId}::uuid
+      AND provider IN ('apify', 'serper')
+      AND started_at >= ${since}
+    GROUP BY provider
+  `;
+}
+
+export async function getEngineHealthSummary(workspaceId: string): Promise<EngineHealthSummary> {
+  const db = getDb();
+  const since = new Date(Date.now() - 24 * 60 * 60 * 1000);
+  const result = await db.execute(buildEngineHealthUsageSummaryQuery(workspaceId, since));
+  const usageByProvider = new Map((result.rows as Array<{ provider: string; calls: number; errors: number }>).map((row) => [
+    row.provider,
+    { calls: Number(row.calls), errors: Number(row.errors) },
+  ]));
+  const mapsEnv = getMapsEnv();
+  const serpEnv = getSerperEnv();
+
+  return computeEngineHealthSummary({
+    mapsConfigured: mapsEnv.MAPS_PROVIDER === "apify" && Boolean(mapsEnv.APIFY_API_TOKEN),
+    serpConfigured: serpEnv.SERP_PROVIDER === "serper" && Boolean(serpEnv.SERPER_API_KEY),
+    mapsUsage: usageByProvider.get("apify") ?? { calls: 0, errors: 0 },
+    serpUsage: usageByProvider.get("serper") ?? { calls: 0, errors: 0 },
+  });
+}
 
 async function getEngineProviderHealth(workspaceId: string, engineType: EngineType): Promise<ProviderHealthStatus> {
   const mapsEnv = getMapsEnv();
@@ -108,17 +145,7 @@ async function getEngineProviderHealth(workspaceId: string, engineType: EngineTy
   const serp = serpEnv.SERP_PROVIDER === "serper" && Boolean(serpEnv.SERPER_API_KEY)
     ? evaluateProviderHealth(await getRecentProviderUsage(workspaceId, "serper"))
     : "paused";
-  if (engineType === "maps_fast") return maps;
-  if (engineType === "google_serp" || engineType === "linkedin_owner") return serp;
-  if (engineType === "maps_deep") {
-    if (maps === "paused" || serp === "paused") return "paused";
-    if (maps === "degraded" || serp === "degraded") return "degraded";
-    return maps === "untested" || serp === "untested" ? "untested" : "healthy";
-  }
-  // Hybrid Fill has no provider of its own: expose its actual routing
-  // capacity instead of the misleading historical `unknown` state.
-  if (maps === "healthy" || serp === "healthy" || maps === "untested" || serp === "untested") return "healthy";
-  return maps === "degraded" || serp === "degraded" ? "degraded" : "paused";
+  return engineProviderHealthForType(engineType, maps, serp);
 }
 
 export async function getAutopilotPacingState(workspaceId: string, now = new Date()) {

@@ -1,5 +1,5 @@
 import type { Conversation } from "@/domain/conversations/types";
-import type { EngineTargetState } from "@/domain/autopilot/types";
+import type { EngineHealthSummary } from "@/services/discovery/provider-health";
 import type { SendingDomain, Mailbox } from "@/domain/outreach/types";
 
 /**
@@ -11,14 +11,12 @@ import type { SendingDomain, Mailbox } from "@/domain/outreach/types";
  */
 export function computeNavBadgeCounts(data: {
   conversations: Conversation[];
-  engineTargets: EngineTargetState[];
+  engineHealthSummary: EngineHealthSummary;
   sendingDomains: SendingDomain[];
   mailboxes: Mailbox[];
 }): Record<string, number> {
   const pendingReviews = data.conversations.filter((c) => c.state === "pending_review").length;
-  const degradedEngines = data.engineTargets.filter(
-    (e) => e.providerHealth === "degraded" || e.providerHealth === "paused",
-  ).length;
+  const degradedEngines = data.engineHealthSummary.unhealthyCount;
   const infrastructureAlerts =
     data.sendingDomains.filter((d) => d.status === "degraded" || d.status === "paused").length +
     data.mailboxes.filter((m) => m.pausedReason).length;
