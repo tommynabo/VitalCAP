@@ -1,5 +1,7 @@
 import { createRequire } from "node:module";
-import { and, desc, eq, sql } from "drizzle-orm";
+import { resolve } from "node:path";
+import { pathToFileURL } from "node:url";
+import { and, desc, eq, inArray, or, sql } from "drizzle-orm";
 import { getDb, schema } from "@/infrastructure/neon/db";
 import { toConversation, toFeedback, toMessage } from "@/infrastructure/neon/repositories/conversations";
 import { resolveInboundContext } from "@/infrastructure/neon/repositories/setter-runtime";
@@ -10,17 +12,120 @@ import { processIncomingReply } from "@/services/setter/setter-orchestrator";
 
 const { loadEnvConfig } = createRequire(import.meta.url)("@next/env") as typeof import("@next/env");
 
-interface Candidate {
+export interface Candidate {
   draft: typeof schema.setterDrafts.$inferSelect;
   message: typeof schema.conversationMessages.$inferSelect;
   conversation: typeof schema.conversations.$inferSelect;
 }
 
-interface PreparedDraft {
+export interface PreparedDraft {
   candidate: Candidate;
   output: NonNullable<Awaited<ReturnType<typeof processIncomingReply>>["draft"]>;
   providerMetadata: Record<string, unknown>;
   auditMetadata: Record<string, unknown>;
+}
+
+export interface ReprocessArguments {
+  apply: boolean;
+  draftIds: string[];
+  conversationIds: string[];
+}
+
+export interface TargetSelection {
+  requested: number;
+  validated: number;
+  eligible: Candidate[];
+  skippedSuccessful: number;
+}
+
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+export function setReprocessEnvironmentMode(environment: NodeJS.ProcessEnv = process.env): void {
+  Reflect.set(environment, "NODE_ENV", "production");
+}
+
+export function loadReprocessEnvironment(): void {
+  setReprocessEnvironmentMode();
+  loadEnvConfig(process.cwd(), false);
+}
+
+export function parseReprocessArguments(args: string[]): ReprocessArguments {
+  const result: ReprocessArguments = { apply: false, draftIds: [], conversationIds: [] };
+  for (let index = 0; index < args.length; index += 1) {
+    const argument = args[index];
+    if (argument === "--apply") {
+      result.apply = true;
+      continue;
+    }
+    if (argument !== "--draft-id" && argument !== "--conversation-id") {
+      throw new Error("Usage: npx tsx scripts/reprocess-setter-fallback-drafts.ts (--draft-id <uuid> | --conversation-id <uuid>)... [--apply]");
+    }
+    const value = args[index + 1];
+    if (!value || !UUID_PATTERN.test(value)) throw new Error(`${argument} requires a full UUID.`);
+    const targetIds = argument === "--draft-id" ? result.draftIds : result.conversationIds;
+    if (targetIds.includes(value)) throw new Error("Duplicate target identifier.");
+    targetIds.push(value);
+    index += 1;
+  }
+  if (result.draftIds.length + result.conversationIds.length === 0) {
+    throw new Error("At least one explicit --draft-id or --conversation-id target is required.");
+  }
+  return result;
+}
+
+function isSuccessfulReprocess(candidate: Candidate): boolean {
+  const metadata = candidate.draft.providerMetadata as Record<string, unknown>;
+  return metadata.provider === "anthropic-setter"
+    && metadata.reprocessReason === "anthropic_provider_enabled"
+    && metadata.model === "claude-sonnet-5-5"
+    && !metadata.failureCode
+    && candidate.draft.needsHuman;
+}
+
+export function selectAndValidateTargets(candidates: Candidate[], args: ReprocessArguments): TargetSelection {
+  const selected = new Map<string, Candidate>();
+  for (const id of args.draftIds) {
+    const matches = candidates.filter(({ draft }) => draft.id === id);
+    const [candidate] = matches;
+    if (matches.length !== 1 || !candidate) throw new Error("A requested draft target did not resolve uniquely.");
+    selected.set(candidate.draft.id, candidate);
+  }
+  for (const id of args.conversationIds) {
+    const matches = candidates.filter(({ conversation }) => conversation.id === id);
+    const [candidate] = matches;
+    if (matches.length !== 1 || !candidate) throw new Error("A requested conversation target did not resolve to one draft.");
+    if (selected.has(candidate.draft.id)) throw new Error("Target identifiers overlap.");
+    selected.set(candidate.draft.id, candidate);
+  }
+
+  const rows = [...selected.values()];
+  const eligible: Candidate[] = [];
+  let skippedSuccessful = 0;
+  for (const candidate of rows) {
+    if (isSuccessfulReprocess(candidate)) {
+      skippedSuccessful += 1;
+      continue;
+    }
+    const metadata = candidate.message.metadata as Record<string, unknown>;
+    const providerMessageId = metadata.providerMessageId;
+    const valid = candidate.draft.branch === "HUMAN_REQUIRED"
+      && candidate.draft.needsHuman
+      && (candidate.draft.providerMetadata as Record<string, unknown>).provider === "disabled-llm"
+      && candidate.conversation.state === "pending_review"
+      && candidate.message.direction === "incoming"
+      && (metadata.eventType === "reply_received" || metadata.eventType === "email_replied")
+      && typeof providerMessageId === "string" && providerMessageId.length > 0
+      && typeof metadata.providerEventId === "string" && metadata.providerEventId.length > 0
+      && candidate.message.providerMessageId === `instantly:${providerMessageId}`;
+    if (!valid) throw new Error("A requested target failed fallback, inbound-reply, or human-review validation.");
+    eligible.push(candidate);
+  }
+  return {
+    requested: args.draftIds.length + args.conversationIds.length,
+    validated: rows.length,
+    eligible,
+    skippedSuccessful,
+  };
 }
 
 function requiredMetadataValue(metadata: Record<string, unknown>, key: string): string {
@@ -29,19 +134,16 @@ function requiredMetadataValue(metadata: Record<string, unknown>, key: string): 
   return value;
 }
 
-async function findCandidates(): Promise<Candidate[]> {
+async function findCandidates(args: ReprocessArguments): Promise<Candidate[]> {
   const db = getDb();
+  const targetConditions = [];
+  if (args.draftIds.length) targetConditions.push(inArray(schema.setterDrafts.id, args.draftIds));
+  if (args.conversationIds.length) targetConditions.push(inArray(schema.conversations.id, args.conversationIds));
   return db.select({ draft: schema.setterDrafts, message: schema.conversationMessages, conversation: schema.conversations })
     .from(schema.setterDrafts)
     .innerJoin(schema.conversationMessages, eq(schema.setterDrafts.conversationMessageId, schema.conversationMessages.id))
     .innerJoin(schema.conversations, eq(schema.conversationMessages.conversationId, schema.conversations.id))
-    .where(and(
-      eq(schema.setterDrafts.branch, "HUMAN_REQUIRED"),
-      eq(schema.setterDrafts.needsHuman, true),
-      eq(schema.conversationMessages.direction, "incoming"),
-      eq(schema.conversations.state, "pending_review"),
-      sql`${schema.setterDrafts.providerMetadata}->>'provider' = 'disabled-llm'`,
-    ));
+    .where(or(...targetConditions));
 }
 
 async function prepareReprocess(candidate: Candidate, provider: ReturnType<typeof createSetterLLMProvider>): Promise<PreparedDraft> {
@@ -127,7 +229,7 @@ async function prepareReprocess(candidate: Candidate, provider: ReturnType<typeo
   return { candidate, output: result.draft, providerMetadata, auditMetadata };
 }
 
-async function persistReprocessedDrafts(prepared: PreparedDraft[]): Promise<void> {
+export function buildPersistenceStatement(prepared: PreparedDraft[]) {
   const updates = prepared.map(({ candidate, output, providerMetadata, auditMetadata }) => ({
     draftId: candidate.draft.id,
     messageId: candidate.message.id,
@@ -144,8 +246,7 @@ async function persistReprocessedDrafts(prepared: PreparedDraft[]): Promise<void
     auditMetadata,
   }));
 
-  const db = getDb();
-  const updated = await db.execute(sql`
+  return sql`
     WITH requested AS (
       SELECT * FROM jsonb_to_recordset(${JSON.stringify(updates)}::jsonb) AS item (
         draft_id uuid, message_id uuid, language text, branch text, intent_summary text,
@@ -154,7 +255,7 @@ async function persistReprocessedDrafts(prepared: PreparedDraft[]): Promise<void
         provider_metadata jsonb, audit_metadata jsonb
       )
     ), eligible AS (
-      SELECT count(*) AS total
+      SELECT count(DISTINCT draft.id) AS total
       FROM setter_drafts AS draft
       JOIN conversation_messages AS message ON message.id = draft.conversation_message_id
       JOIN conversations AS conversation ON conversation.id = message.conversation_id
@@ -163,6 +264,8 @@ async function persistReprocessedDrafts(prepared: PreparedDraft[]): Promise<void
         AND draft.needs_human = true
         AND draft.provider_metadata->>'provider' = 'disabled-llm'
         AND conversation.state = 'pending_review'
+        AND message.direction = 'incoming'
+        AND coalesce(message.metadata->>'providerMessageId', '') <> ''
     ), updated AS (
       UPDATE setter_drafts AS draft
       SET language = requested.language,
@@ -180,7 +283,7 @@ async function persistReprocessedDrafts(prepared: PreparedDraft[]): Promise<void
       CROSS JOIN eligible
       JOIN conversation_messages AS message ON message.id = requested.message_id
       JOIN conversations AS conversation ON conversation.id = message.conversation_id
-      WHERE eligible.total = 2
+      WHERE eligible.total = ${updates.length}
         AND draft.id = requested.draft_id
         AND draft.conversation_message_id = requested.message_id
         AND draft.branch = 'HUMAN_REQUIRED'
@@ -188,14 +291,9 @@ async function persistReprocessedDrafts(prepared: PreparedDraft[]): Promise<void
         AND draft.provider_metadata->>'provider' = 'disabled-llm'
         AND message.id = draft.conversation_message_id
         AND conversation.state = 'pending_review'
+        AND message.direction = 'incoming'
+        AND coalesce(message.metadata->>'providerMessageId', '') <> ''
       RETURNING draft.id, draft.conversation_message_id, draft.branch
-    ), updated_conversations AS (
-      UPDATE conversations AS conversation
-      SET latest_intent = updated.branch, updated_at = NOW()
-      FROM updated
-      JOIN conversation_messages AS message ON message.id = updated.conversation_message_id
-      WHERE conversation.id = message.conversation_id AND conversation.state = 'pending_review'
-      RETURNING conversation.id
     ), audited AS (
       INSERT INTO audit_log (workspace_id, actor_user_id, action, entity_type, entity_id, metadata)
       SELECT conversation.workspace_id, NULL, 'setter.draft.reprocessed', 'setter_draft', updated.id::text,
@@ -204,11 +302,15 @@ async function persistReprocessedDrafts(prepared: PreparedDraft[]): Promise<void
       JOIN requested ON requested.draft_id = updated.id
       JOIN conversation_messages AS message ON message.id = updated.conversation_message_id
       JOIN conversations AS conversation ON conversation.id = message.conversation_id
-      JOIN updated_conversations ON updated_conversations.id = conversation.id
       RETURNING entity_id
     )
     SELECT entity_id FROM audited;
-  `);
+  `;
+}
+
+async function persistReprocessedDrafts(prepared: PreparedDraft[]): Promise<void> {
+  const db = getDb();
+  const updated = await db.execute(buildPersistenceStatement(prepared));
 
   if (updated.rows.length !== prepared.length) {
     throw new Error("Draft rows were not updated; safety preconditions no longer hold.");
@@ -219,22 +321,27 @@ async function persistReprocessedDrafts(prepared: PreparedDraft[]): Promise<void
 }
 
 async function main(): Promise<void> {
-  loadEnvConfig(process.cwd(), false);
-  const apply = process.argv.includes("--apply");
-  if (process.argv.some((argument) => argument !== "--apply" && argument !== process.argv[0] && argument !== process.argv[1])) {
-    throw new Error("Usage: npm run reprocess:setter-fallbacks [-- --apply]");
-  }
+  loadReprocessEnvironment();
+  const args = parseReprocessArguments(process.argv.slice(2));
   if (process.env.AUTO_SEND?.toLowerCase() === "true" || process.env.DEFAULT_DELIVERY_MODE === "live") {
     throw new Error("Refusing to run while outbound delivery is enabled.");
   }
 
-  const candidates = await findCandidates();
-  if (candidates.length !== 2) {
-    throw new Error(`Expected exactly 2 disabled-LLM fallback drafts in pending review; found ${candidates.length}. No rows were changed.`);
+  const candidates = await findCandidates(args);
+  const selection = selectAndValidateTargets(candidates, args);
+  console.log(`TARGETS_REQUESTED=${selection.requested}`);
+  console.log(`TARGETS_VALIDATED=${selection.validated}`);
+  console.log(`TARGETS_ELIGIBLE=${selection.eligible.length}`);
+  console.log(`TARGETS_SKIPPED_SUCCESSFUL=${selection.skippedSuccessful}`);
+  if (!args.apply) {
+    console.log(`PREVIEW_WOULD_TOUCH_DRAFTS=${selection.eligible.length}`);
+    console.log("PREVIEW_WOULD_TOUCH_CONVERSATIONS=0");
+    console.log("PREVIEW_WOULD_TOUCH_MESSAGES=0");
+    console.log("PREVIEW_WOULD_SEND_EMAIL=NO");
+    return;
   }
-  console.log(`Found exactly ${candidates.length} eligible drafts: ${candidates.map(({ draft }) => draft.id).join(", ")}.`);
-  if (!apply) {
-    console.log("Preview only. Pass --apply to reprocess these same existing draft rows.");
+  if (selection.eligible.length === 0) {
+    console.log("No eligible drafts remain; successful reprocesses were skipped.");
     return;
   }
 
@@ -246,12 +353,15 @@ async function main(): Promise<void> {
     CLAUDE_WORKSPACE_ID: process.env.CLAUDE_WORKSPACE_ID,
   }, "production");
   const prepared: PreparedDraft[] = [];
-  for (const candidate of candidates) prepared.push(await prepareReprocess(candidate, provider));
+  for (const candidate of selection.eligible) prepared.push(await prepareReprocess(candidate, provider));
   await persistReprocessedDrafts(prepared);
-  console.log("Reprocessing complete. No webhook replay, message insert, conversation insert, or email send occurred.");
+  console.log(`ITEMS_REPROCESSED=${prepared.length}`);
+  console.log("No webhook replay, message insert, conversation insert, or email send occurred.");
 }
 
-main().catch((error: unknown) => {
-  console.error(error instanceof Error ? error.message : "Setter draft reprocessing failed.");
-  process.exitCode = 1;
-});
+if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
+  main().catch((error: unknown) => {
+    console.error(error instanceof Error ? error.message : "Setter draft reprocessing failed.");
+    process.exitCode = 1;
+  });
+}
