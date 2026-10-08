@@ -9,6 +9,7 @@ import type { InboundEmailReply } from "@/domain/providers/types";
 import { createSetterLLMProvider } from "@/infrastructure/providers/llm/factory";
 import { getIntelligenceEnv } from "@/lib/config/env";
 import { processIncomingReply } from "@/services/setter/setter-orchestrator";
+import { validateSetterOutput } from "@/services/setter/setter-output-schema";
 
 const { loadEnvConfig } = createRequire(import.meta.url)("@next/env") as typeof import("@next/env");
 
@@ -27,8 +28,24 @@ export interface PreparedDraft {
 
 export interface ReprocessArguments {
   apply: boolean;
+  diagnose: boolean;
   draftIds: string[];
   conversationIds: string[];
+}
+
+interface TargetDiagnostic {
+  stageReached: string;
+  activeStage: string;
+  errorStage: string | null;
+  errorClass: string | null;
+  errorStatus: number | null;
+  errorCode: string | null;
+  safeErrorMessage: string | null;
+  providerCall: "PASS" | "FAIL" | "NOT_REACHED";
+  schemaValid: boolean | null;
+  branch: string | null;
+  confidencePresent: boolean | null;
+  draftNonempty: boolean | null;
 }
 
 export interface TargetSelection {
@@ -50,15 +67,19 @@ export function loadReprocessEnvironment(): void {
 }
 
 export function parseReprocessArguments(args: string[]): ReprocessArguments {
-  const result: ReprocessArguments = { apply: false, draftIds: [], conversationIds: [] };
+  const result: ReprocessArguments = { apply: false, diagnose: false, draftIds: [], conversationIds: [] };
   for (let index = 0; index < args.length; index += 1) {
     const argument = args[index];
     if (argument === "--apply") {
       result.apply = true;
       continue;
     }
+    if (argument === "--diagnose") {
+      result.diagnose = true;
+      continue;
+    }
     if (argument !== "--draft-id" && argument !== "--conversation-id") {
-      throw new Error("Usage: npx tsx scripts/reprocess-setter-fallback-drafts.ts (--draft-id <uuid> | --conversation-id <uuid>)... [--apply]");
+      throw new Error("Usage: npx tsx scripts/reprocess-setter-fallback-drafts.ts (--draft-id <uuid> | --conversation-id <uuid>)... [--apply | --diagnose]");
     }
     const value = args[index + 1];
     if (!value || !UUID_PATTERN.test(value)) throw new Error(`${argument} requires a full UUID.`);
@@ -70,6 +91,7 @@ export function parseReprocessArguments(args: string[]): ReprocessArguments {
   if (result.draftIds.length + result.conversationIds.length === 0) {
     throw new Error("At least one explicit --draft-id or --conversation-id target is required.");
   }
+  if (result.apply && result.diagnose) throw new Error("--apply and --diagnose cannot be combined.");
   return result;
 }
 
@@ -146,9 +168,14 @@ async function findCandidates(args: ReprocessArguments): Promise<Candidate[]> {
     .where(or(...targetConditions));
 }
 
-async function prepareReprocess(candidate: Candidate, provider: ReturnType<typeof createSetterLLMProvider>): Promise<PreparedDraft> {
+async function prepareReprocess(
+  candidate: Candidate,
+  provider: ReturnType<typeof createSetterLLMProvider>,
+  diagnostic?: TargetDiagnostic,
+): Promise<PreparedDraft> {
   const db = getDb();
   const metadata = candidate.message.metadata as Record<string, unknown>;
+  if (diagnostic) diagnostic.activeStage = "BUILD_INBOUND_EVENT";
   const providerMessageId = requiredMetadataValue(metadata, "providerMessageId");
   const event: InboundEmailReply = {
     eventType: metadata.eventType === "reply_received" ? "reply_received" : "email_replied",
@@ -165,12 +192,18 @@ async function prepareReprocess(candidate: Candidate, provider: ReturnType<typeo
     emailAccount: typeof metadata.emailAccount === "string" ? metadata.emailAccount : null,
   };
   if (!event.providerThreadId) throw new Error(`Conversation ${candidate.conversation.id} has no provider thread identity.`);
+  if (diagnostic) diagnostic.stageReached = "INBOUND_EVENT_BUILT";
 
+  if (diagnostic) diagnostic.activeStage = "HYDRATE_CAMPAIGN_ACCOUNT_CONTEXT";
   const resolved = await resolveInboundContext(event);
+  if (diagnostic) diagnostic.stageReached = "INBOUND_CONTEXT_HYDRATED";
+  if (diagnostic) diagnostic.activeStage = "VERIFY_RESOLVED_CONTEXT";
   if (resolved.context.workspaceId !== candidate.conversation.workspaceId || resolved.accountId !== candidate.conversation.accountId) {
     throw new Error(`Stored context no longer matches conversation ${candidate.conversation.id}.`);
   }
+  if (diagnostic) diagnostic.stageReached = "RESOLVED_CONTEXT_VERIFIED";
 
+  if (diagnostic) diagnostic.activeStage = "LOAD_RECENT_MESSAGES_AND_FEEDBACK";
   const [messageRows, feedbackRows] = await Promise.all([
     db.select().from(schema.conversationMessages)
       .where(eq(schema.conversationMessages.conversationId, candidate.conversation.id))
@@ -187,7 +220,9 @@ async function prepareReprocess(candidate: Candidate, provider: ReturnType<typeo
       .orderBy(desc(schema.setterFeedback.reviewedAt))
       .limit(5),
   ]);
+  if (diagnostic) diagnostic.stageReached = "RECENT_CONTEXT_HYDRATED";
 
+  if (diagnostic) diagnostic.activeStage = "RUN_SETTER_ORCHESTRATOR";
   const result = await processIncomingReply({
     workspaceId: resolved.context.workspaceId,
     conversation: toConversation(candidate.conversation),
@@ -203,12 +238,26 @@ async function prepareReprocess(candidate: Candidate, provider: ReturnType<typeo
     llmProvider: provider,
     now: new Date(),
   });
+  if (diagnostic) diagnostic.stageReached = "SETTER_ORCHESTRATION_COMPLETED";
 
+  if (diagnostic) diagnostic.activeStage = "VALIDATE_SETTER_RESULT";
+  const resultMetadata = result.draft?.providerMetadata;
+  if (diagnostic && resultMetadata?.failureCode === "invalid_llm_output" && diagnostic.errorStage === null) {
+    setDiagnosticError(diagnostic, "SCHEMA_VALIDATION", "SetterSchemaValidationError", null, "INVALID_SETTER_OUTPUT", "Provider output did not match the Setter schema.");
+  }
+  if (diagnostic && !result.draft && diagnostic.errorStage === null) {
+    setDiagnosticError(diagnostic, "SETTER_ORCHESTRATION", "SetterDraftNotProducedError", null, "NO_DRAFT", "Setter orchestration did not produce a review draft.");
+  }
   if (!result.draft) throw new Error(`Setter produced no draft for existing message ${candidate.message.id}.`);
   if (result.draft.providerMetadata?.provider !== "anthropic-setter" || !result.draft.providerMetadata.model || result.draft.providerMetadata.failureCode) {
+    if (diagnostic && diagnostic.errorStage === null) {
+      setDiagnosticError(diagnostic, "VALIDATE_SETTER_RESULT", "SetterProviderOutputError", null, "EXPECTED_ANTHROPIC_OUTPUT", "Expected a successful Anthropic Setter result.");
+    }
     throw new Error(`Expected Anthropic output for existing message ${candidate.message.id}.`);
   }
+  if (diagnostic) diagnostic.stageReached = "SETTER_RESULT_VALIDATED";
 
+  if (diagnostic) diagnostic.activeStage = "PREPARE_REPLACEMENT_AND_AUDIT_METADATA";
   const reprocessedAt = new Date().toISOString();
   const providerMetadata = {
     ...result.draft.providerMetadata,
@@ -226,7 +275,131 @@ async function prepareReprocess(candidate: Candidate, provider: ReturnType<typeo
     needsHuman: true,
   };
 
+  if (diagnostic) {
+    diagnostic.stageReached = "REPLACEMENT_DRAFT_PREPARED";
+    diagnostic.branch = result.draft.branch;
+    diagnostic.confidencePresent = typeof result.draft.confidence === "number";
+    diagnostic.draftNonempty = result.draft.draft.trim().length > 0;
+  }
   return { candidate, output: result.draft, providerMetadata, auditMetadata };
+}
+
+function setDiagnosticError(
+  diagnostic: TargetDiagnostic,
+  stage: string,
+  errorClass: string,
+  status: number | null,
+  code: string | null,
+  safeMessage: string,
+): void {
+  diagnostic.errorStage = stage;
+  diagnostic.errorClass = errorClass;
+  diagnostic.errorStatus = status;
+  diagnostic.errorCode = code;
+  diagnostic.safeErrorMessage = safeMessage;
+}
+
+function diagnosticProvider(
+  provider: ReturnType<typeof createSetterLLMProvider>,
+  diagnostic: TargetDiagnostic,
+): ReturnType<typeof createSetterLLMProvider> {
+  return {
+    providerName: provider.providerName,
+    async classifyAndDraft(context) {
+      diagnostic.activeStage = "ANTHROPIC_PROVIDER_CALL";
+      try {
+        const response = await provider.classifyAndDraft(context);
+        diagnostic.providerCall = "PASS";
+        diagnostic.activeStage = "VALIDATE_STRUCTURED_OUTPUT";
+        const validation = validateSetterOutput(response.output);
+        diagnostic.schemaValid = validation.success;
+        diagnostic.branch = validation.success ? validation.data?.branch ?? null : null;
+        diagnostic.confidencePresent = typeof response.output.confidence === "number";
+        diagnostic.draftNonempty = typeof response.output.draft === "string" && response.output.draft.trim().length > 0;
+        diagnostic.stageReached = validation.success ? "STRUCTURED_OUTPUT_VALIDATED" : "STRUCTURED_OUTPUT_REJECTED";
+        diagnostic.activeStage = "RUN_SETTER_ORCHESTRATOR";
+        return response;
+      } catch (error) {
+        diagnostic.providerCall = "FAIL";
+        const details = error as { name?: unknown; status?: unknown; code?: unknown } | null;
+        const errorClass = typeof details?.name === "string" && /^[A-Za-z][A-Za-z0-9]{0,60}$/.test(details.name)
+          ? details.name
+          : "ProviderError";
+        const status = typeof details?.status === "number" && Number.isInteger(details.status) ? details.status : null;
+        const code = typeof details?.code === "string" && /^[A-Za-z0-9_-]{1,60}$/.test(details.code) ? details.code : null;
+        const safeMessage = status === 429
+          ? "Provider rate limit prevented the request."
+          : status === 401 || status === 403
+            ? "Provider authentication was rejected."
+            : status !== null && status >= 500
+              ? "Provider returned a server error."
+              : errorClass === "APIConnectionTimeoutError" || code === "ETIMEDOUT"
+                ? "Provider request timed out."
+                : "Provider request failed; details redacted.";
+        setDiagnosticError(diagnostic, "ANTHROPIC_PROVIDER_CALL", errorClass, status, code, safeMessage);
+        throw error;
+      }
+    },
+  };
+}
+
+function createTargetDiagnostic(): TargetDiagnostic {
+  return {
+    stageReached: "TARGET_VALIDATED",
+    activeStage: "CREATE_ANTHROPIC_PROVIDER",
+    errorStage: null,
+    errorClass: null,
+    errorStatus: null,
+    errorCode: null,
+    safeErrorMessage: null,
+    providerCall: "NOT_REACHED",
+    schemaValid: null,
+    branch: null,
+    confidencePresent: null,
+    draftNonempty: null,
+  };
+}
+
+function reportTargetDiagnostic(index: number, diagnostic: TargetDiagnostic): void {
+  console.log(`ITEM_${index}_STAGE_REACHED=${diagnostic.stageReached}`);
+  console.log(`ITEM_${index}_ERROR_STAGE=${diagnostic.errorStage ?? "NONE"}`);
+  console.log(`ITEM_${index}_ERROR_CLASS=${diagnostic.errorClass ?? "NONE"}`);
+  console.log(`ITEM_${index}_ERROR_STATUS=${diagnostic.errorStatus ?? "NONE"}`);
+  console.log(`ITEM_${index}_ERROR_CODE=${diagnostic.errorCode ?? "NONE"}`);
+  console.log(`ITEM_${index}_SAFE_ERROR_MESSAGE=${diagnostic.safeErrorMessage ?? "NONE"}`);
+  console.log(`ITEM_${index}_PROVIDER_CALL=${diagnostic.providerCall}`);
+  console.log(`ITEM_${index}_SCHEMA_VALID=${diagnostic.schemaValid === null ? "NOT_REACHED" : diagnostic.schemaValid ? "YES" : "NO"}`);
+  console.log(`ITEM_${index}_BRANCH=${diagnostic.branch ?? "NOT_AVAILABLE"}`);
+  console.log(`ITEM_${index}_CONFIDENCE_PRESENT=${diagnostic.confidencePresent === null ? "NOT_REACHED" : diagnostic.confidencePresent ? "YES" : "NO"}`);
+  console.log(`ITEM_${index}_DRAFT_NONEMPTY=${diagnostic.draftNonempty === null ? "NOT_REACHED" : diagnostic.draftNonempty ? "YES" : "NO"}`);
+}
+
+function recordDiagnosticException(diagnostic: TargetDiagnostic, error: unknown): void {
+  if (diagnostic.errorStage !== null) return;
+  const details = error as { name?: unknown; status?: unknown; code?: unknown } | null;
+  const errorClass = typeof details?.name === "string" && /^[A-Za-z][A-Za-z0-9]{0,60}$/.test(details.name)
+    ? details.name
+    : "Error";
+  const status = typeof details?.status === "number" && Number.isInteger(details.status) ? details.status : null;
+  const code = typeof details?.code === "string" && /^[A-Za-z0-9_-]{1,60}$/.test(details.code) ? details.code : null;
+  const safeMessages: Record<string, string> = {
+    BUILD_INBOUND_EVENT: "Stored inbound reply could not be constructed.",
+    HYDRATE_CAMPAIGN_ACCOUNT_CONTEXT: "Offer or campaign context could not be hydrated.",
+    VERIFY_RESOLVED_CONTEXT: "Resolved context did not match the stored conversation.",
+    LOAD_RECENT_MESSAGES_AND_FEEDBACK: "Recent Setter context could not be loaded.",
+    RUN_SETTER_ORCHESTRATOR: "Setter orchestration failed; details redacted.",
+    VALIDATE_SETTER_RESULT: "Setter did not produce a successful Anthropic result.",
+    PREPARE_REPLACEMENT_AND_AUDIT_METADATA: "Replacement draft metadata could not be prepared.",
+    CREATE_ANTHROPIC_PROVIDER: "Anthropic provider configuration could not be loaded.",
+  };
+  setDiagnosticError(
+    diagnostic,
+    diagnostic.activeStage,
+    errorClass,
+    status,
+    code,
+    safeMessages[diagnostic.activeStage] ?? "Diagnostic stage failed; details redacted.",
+  );
 }
 
 export function buildPersistenceStatement(prepared: PreparedDraft[]) {
@@ -333,7 +506,7 @@ async function main(): Promise<void> {
   console.log(`TARGETS_VALIDATED=${selection.validated}`);
   console.log(`TARGETS_ELIGIBLE=${selection.eligible.length}`);
   console.log(`TARGETS_SKIPPED_SUCCESSFUL=${selection.skippedSuccessful}`);
-  if (!args.apply) {
+  if (!args.apply && !args.diagnose) {
     console.log(`PREVIEW_WOULD_TOUCH_DRAFTS=${selection.eligible.length}`);
     console.log("PREVIEW_WOULD_TOUCH_CONVERSATIONS=0");
     console.log("PREVIEW_WOULD_TOUCH_MESSAGES=0");
@@ -341,17 +514,52 @@ async function main(): Promise<void> {
     return;
   }
   if (selection.eligible.length === 0) {
+    if (args.diagnose) {
+      console.log("No eligible targets require diagnostic processing.");
+      console.log("DB_WRITES=0");
+      console.log("EMAILS_SENT=0");
+      return;
+    }
     console.log("No eligible drafts remain; successful reprocesses were skipped.");
     return;
   }
 
-  const intel = getIntelligenceEnv();
-  const provider = createSetterLLMProvider({
-    ...intel,
-    LLM_PROVIDER: "anthropic",
-    CLAUDE_API_KEY: process.env.CLAUDE_API_KEY,
-    CLAUDE_WORKSPACE_ID: process.env.CLAUDE_WORKSPACE_ID,
-  }, "production");
+  let provider: ReturnType<typeof createSetterLLMProvider>;
+  try {
+    const intel = getIntelligenceEnv();
+    provider = createSetterLLMProvider({
+      ...intel,
+      LLM_PROVIDER: "anthropic",
+      CLAUDE_API_KEY: process.env.CLAUDE_API_KEY,
+      CLAUDE_WORKSPACE_ID: process.env.CLAUDE_WORKSPACE_ID,
+    }, "production");
+  } catch (error) {
+    if (!args.diagnose) throw error;
+    for (const [index] of selection.eligible.entries()) {
+      const diagnostic = createTargetDiagnostic();
+      recordDiagnosticException(diagnostic, error);
+      reportTargetDiagnostic(index + 1, diagnostic);
+    }
+    console.log("DB_WRITES=0");
+    console.log("EMAILS_SENT=0");
+    return;
+  }
+
+  if (args.diagnose) {
+    for (const [index, candidate] of selection.eligible.entries()) {
+      const diagnostic = createTargetDiagnostic();
+      try {
+        await prepareReprocess(candidate, diagnosticProvider(provider, diagnostic), diagnostic);
+      } catch (error) {
+        recordDiagnosticException(diagnostic, error);
+      }
+      reportTargetDiagnostic(index + 1, diagnostic);
+    }
+    console.log("DB_WRITES=0");
+    console.log("EMAILS_SENT=0");
+    return;
+  }
+
   const prepared: PreparedDraft[] = [];
   for (const candidate of selection.eligible) prepared.push(await prepareReprocess(candidate, provider));
   await persistReprocessedDrafts(prepared);

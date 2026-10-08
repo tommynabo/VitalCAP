@@ -72,6 +72,14 @@ describe("guarded Setter fallback reprocessor", () => {
     expect(() => parseReprocessArguments(["--apply"])).toThrow(/explicit .*target/i);
   });
 
+  it("accepts explicit-target diagnosis and refuses diagnosis combined with apply", () => {
+    const args = parseReprocessArguments(["--draft-id", draftIdA, "--diagnose"]);
+
+    expect(args.diagnose).toBe(true);
+    expect(args.apply).toBe(false);
+    expect(() => parseReprocessArguments(["--draft-id", draftIdA, "--diagnose", "--apply"])).toThrow(/cannot be combined/i);
+  });
+
   it("accepts an explicit-ID preview and selects only the requested draft", () => {
     const args = parseReprocessArguments(["--draft-id", draftIdB]);
     const rows = [candidate(0), candidate(1), candidate(2)];
