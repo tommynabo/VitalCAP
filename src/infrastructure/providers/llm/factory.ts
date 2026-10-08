@@ -1,13 +1,18 @@
 import OpenAI from "openai";
+import Anthropic from "@anthropic-ai/sdk";
 import { getCoreEnv, getIntelligenceEnv } from "@/lib/config/env";
 import type { LLMProvider, SetterPromptContext } from "@/domain/providers/types";
 import { MockLLMProvider } from "./mock-provider";
 import { OpenAISetterProvider } from "./openai-setter-provider";
+import { AnthropicSetterProvider } from "./anthropic-setter-provider";
 
 export interface SetterLLMConfig {
-  LLM_PROVIDER: "openai" | "disabled" | "mock";
+  LLM_PROVIDER: "openai" | "anthropic" | "disabled" | "mock";
   LLM_PROVIDER_API_KEY?: string;
   LLM_MODEL: string;
+  CLAUDE_API_KEY?: string;
+  CLAUDE_WORKSPACE_ID?: string;
+  CLAUDE_MODEL?: string;
 }
 
 export function createSetterLLMProvider(
@@ -19,9 +24,19 @@ export function createSetterLLMProvider(
     if (appEnv === "production") throw new Error("LLM_PROVIDER=mock is forbidden in production.");
     return new MockLLMProvider();
   }
-  if (!config.LLM_PROVIDER_API_KEY) {
-    throw new Error("LLM_PROVIDER=openai requires LLM_PROVIDER_API_KEY.");
+  if (config.LLM_PROVIDER === "anthropic") {
+    if (!config.CLAUDE_API_KEY || !config.CLAUDE_WORKSPACE_ID) {
+      throw new Error("LLM_PROVIDER=anthropic requires CLAUDE_API_KEY and CLAUDE_WORKSPACE_ID.");
+    }
+    const client = new Anthropic({
+      apiKey: config.CLAUDE_API_KEY,
+      maxRetries: 0,
+      timeout: 20_000,
+      defaultHeaders: { "anthropic-workspace-id": config.CLAUDE_WORKSPACE_ID },
+    });
+    return new AnthropicSetterProvider(client, config.CLAUDE_MODEL ?? "claude-sonnet-5-5");
   }
+  if (!config.LLM_PROVIDER_API_KEY) throw new Error("LLM_PROVIDER=openai requires LLM_PROVIDER_API_KEY.");
   return new OpenAISetterProvider(new OpenAI({ apiKey: config.LLM_PROVIDER_API_KEY, maxRetries: 0, timeout: 20_000 }), config.LLM_MODEL);
 }
 

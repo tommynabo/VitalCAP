@@ -192,9 +192,12 @@ export function getDeliveryEnv() {
 
 // ── Intelligence Env ───────────────────────────────────────────────────────────
 const intelligenceEnvSchema = z.object({
-  LLM_PROVIDER: z.enum(["openai", "disabled", "mock"]).default("disabled"),
+  LLM_PROVIDER: z.enum(["openai", "anthropic", "disabled", "mock"]).default("disabled"),
   LLM_PROVIDER_API_KEY: z.string().optional(),
   LLM_MODEL: z.string().default("gpt-4.1-mini"),
+  CLAUDE_API_KEY: z.string().optional(),
+  CLAUDE_WORKSPACE_ID: z.string().optional(),
+  CLAUDE_MODEL: z.string().default("claude-sonnet-5-5"),
   PROSPECT_LLM_MODEL: z.string().optional(),
   LLM_DAILY_COST_LIMIT_USD: z.coerce.number().default(10),
   LLM_BATCH_COST_LIMIT_USD: z.coerce.number().default(2),
@@ -206,6 +209,9 @@ export function getIntelligenceEnv() {
     LLM_PROVIDER: process.env.LLM_PROVIDER,
     LLM_PROVIDER_API_KEY: optionalEnvValue(process.env.LLM_PROVIDER_API_KEY),
     LLM_MODEL: optionalEnvValue(process.env.LLM_MODEL),
+    CLAUDE_API_KEY: optionalEnvValue(process.env.CLAUDE_API_KEY),
+    CLAUDE_WORKSPACE_ID: optionalEnvValue(process.env.CLAUDE_WORKSPACE_ID),
+    CLAUDE_MODEL: optionalEnvValue(process.env.CLAUDE_MODEL),
     PROSPECT_LLM_MODEL: optionalEnvValue(process.env.PROSPECT_LLM_MODEL),
     LLM_DAILY_COST_LIMIT_USD: optionalEnvValue(process.env.LLM_DAILY_COST_LIMIT_USD),
     LLM_BATCH_COST_LIMIT_USD: optionalEnvValue(process.env.LLM_BATCH_COST_LIMIT_USD),

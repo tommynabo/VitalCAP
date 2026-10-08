@@ -32,7 +32,16 @@ All three domain-interface mocks share `src/infrastructure/providers/determinist
 
 `runOutreachDryRunCycle` (`src/services/outreach/outreach-orchestrator.ts`) never imports either mock provider — the dry-run orchestrator only ever records planned `OutreachQueueItem`/`OutreachEvent` rows, so a real send requires a separate, explicit live-mode code path that does not exist yet.
 
-## Implemented adapters (Phase 4 — mock only, no real API calls)
+## Implemented adapters (Phase 4 — Setter LLM)
+
+| Interface | Real adapter | Notes |
+|---|---|---|
+| `LLMProvider` | `src/infrastructure/providers/llm/openai-setter-provider.ts` (`OpenAISetterProvider`) | OpenAI Responses API with shared strict Setter validation and token-usage reporting. |
+| `LLMProvider` | `src/infrastructure/providers/llm/anthropic-setter-provider.ts` (`AnthropicSetterProvider`) | Anthropic Messages API with forced strict tool output, `CLAUDE_API_KEY`, `CLAUDE_WORKSPACE_ID`, and `CLAUDE_MODEL` (default `claude-sonnet-5-5`). Both adapters use shared validation, repair, and guardrails; generated drafts remain human-review-only. |
+
+`LLM_PROVIDER` selects the Setter provider (`openai`, `anthropic`, `disabled`, or non-production `mock`). Prospect Intelligence remains OpenAI-only and is deferred when this setting is not `openai`.
+
+## Implemented adapters (Phase 4 — mock, no real API calls)
 
 | Interface | Mock adapter | Notes |
 |---|---|---|
@@ -62,6 +71,5 @@ That folder currently contains only a `README.md` documenting its future ownersh
 - Still unresolved / not yet implemented (deferred to later gates, need business input or further implementation):
   1. Email delivery: real Instantly v2 adapter (Gate F) — only the mock exists today.
   2. SMS: no real vendor will ever be wired per standing product policy; `SMS_PROVIDER` is a hardcoded `"disabled"` literal.
-  3. LLM: real OpenAI-backed `LLMProvider` (Gate F) — only the mock exists today.
-  4. `CalendarProvider` (if needed) — not yet allocated a folder.
+  3. `CalendarProvider` (if needed) — not yet allocated a folder.
 

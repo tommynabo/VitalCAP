@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { getCoreEnv, getSerperEnv, resetServerEnvCacheForTests } from "@/lib/config/env";
+import { getCoreEnv, getIntelligenceEnv, getSerperEnv, resetServerEnvCacheForTests } from "@/lib/config/env";
 
 describe("getCoreEnv", () => {
   function withProductionEnv(run: () => void) {
@@ -47,6 +47,31 @@ describe("getCoreEnv", () => {
     } finally {
       if (original === undefined) delete process.env.SERPER_DAILY_COST_LIMIT_USD;
       else process.env.SERPER_DAILY_COST_LIMIT_USD = original;
+      resetServerEnvCacheForTests();
+    }
+  });
+
+  it("loads Anthropic Setter configuration without changing the default model", () => {
+    const names = ["LLM_PROVIDER", "CLAUDE_API_KEY", "CLAUDE_WORKSPACE_ID", "CLAUDE_MODEL"];
+    const original = Object.fromEntries(names.map((name) => [name, process.env[name]]));
+    try {
+      process.env.LLM_PROVIDER = "anthropic";
+      process.env.CLAUDE_API_KEY = "test-key";
+      process.env.CLAUDE_WORKSPACE_ID = "workspace-test";
+      delete process.env.CLAUDE_MODEL;
+      resetServerEnvCacheForTests();
+
+      expect(getIntelligenceEnv()).toMatchObject({
+        LLM_PROVIDER: "anthropic",
+        CLAUDE_API_KEY: "test-key",
+        CLAUDE_WORKSPACE_ID: "workspace-test",
+        CLAUDE_MODEL: "claude-sonnet-5-5",
+      });
+    } finally {
+      for (const name of names) {
+        if (original[name] === undefined) delete process.env[name];
+        else process.env[name] = original[name];
+      }
       resetServerEnvCacheForTests();
     }
   });
