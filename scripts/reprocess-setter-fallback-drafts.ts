@@ -404,19 +404,19 @@ function recordDiagnosticException(diagnostic: TargetDiagnostic, error: unknown)
 
 export function buildPersistenceStatement(prepared: PreparedDraft[]) {
   const updates = prepared.map(({ candidate, output, providerMetadata, auditMetadata }) => ({
-    draftId: candidate.draft.id,
-    messageId: candidate.message.id,
+    draft_id: candidate.draft.id,
+    message_id: candidate.message.id,
     language: output.language,
     branch: output.branch,
-    intentSummary: output.intentSummary,
+    intent_summary: output.intentSummary,
     confidence: output.confidence,
-    draftText: output.draft,
-    reasonForHuman: output.reasonForHuman,
-    detectedFactsRequested: output.detectedFactsRequested,
-    riskFlags: output.riskFlags,
-    suggestedNextAction: output.suggestedNextAction,
-    providerMetadata,
-    auditMetadata,
+    draft_text: output.draft,
+    reason_for_human: output.reasonForHuman,
+    detected_facts_requested: output.detectedFactsRequested,
+    risk_flags: output.riskFlags,
+    suggested_next_action: output.suggestedNextAction,
+    provider_metadata: providerMetadata,
+    audit_metadata: auditMetadata,
   }));
 
   return sql`
