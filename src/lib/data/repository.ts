@@ -28,11 +28,12 @@ import {
 } from "@/infrastructure/neon/repositories/outreach";
 import {
   countPendingReviewConversations,
+  countSetterQueueMessages,
   getOldestPendingReviewAt,
   listLatestIncomingSetterQueueMessages,
   listPendingReviewConversations,
   listSetterQueueDrafts,
-  listSetterQueueMessages,
+  listSetterConversationHistory,
   listConversations,
   listConversationMessages,
   listSetterDrafts,
@@ -87,6 +88,7 @@ import {
   type SetterQueueCursor,
   type SetterReviewQueuePage,
 } from "@/services/setter/review-queue";
+import { buildConversationHistoryPage, CONVERSATION_HISTORY_PAGE_SIZE, type ConversationHistoryCursor } from "@/services/setter/conversation-history";
 
 export type { AccountBundle, ProviderRowStatus, QueueHealthSnapshot, DeadLetterSample, WeeklyTrendPoint };
 export type { InstantlyPipelineDiagnostics };
@@ -131,12 +133,6 @@ function getSeedSetterReviewQueuePage(cursor: SetterQueueCursor | null): Promise
       .map(({ id, accountId, contactId, campaignId, state, latestIntent, updatedAt }) => ({
         id, accountId, contactId, campaignId, state, latestIntent, updatedAt,
       })),
-    listMessages: async (conversationIds) => {
-      const ids = new Set(conversationIds);
-      return seed.seedConversationMessages
-        .filter((message) => ids.has(message.conversationId))
-        .map(({ id, conversationId, direction, body, createdAt }) => ({ id, conversationId, direction, body, createdAt }));
-    },
     listLatestInboundMessages: async (conversationIds) => {
       const ids = new Set(conversationIds);
       const latestByConversation = new Map();
@@ -150,6 +146,12 @@ function getSeedSetterReviewQueuePage(cursor: SetterQueueCursor | null): Promise
       return [...latestByConversation.values()].map(({ id, conversationId, direction, body, createdAt }) => ({
         id, conversationId, direction, body, createdAt,
       }));
+    },
+    countMessages: async (conversationIds) => {
+      return Object.fromEntries(conversationIds.map((id) => [
+        id,
+        seed.seedConversationMessages.filter((message) => message.conversationId === id).length,
+      ]));
     },
     listDrafts: async (messageIds) => {
       const ids = new Set(messageIds);
@@ -198,13 +200,38 @@ export async function getSetterReviewQueuePageForWorkspace(
   return loadSetterReviewQueuePage({
     listPendingConversations: (limit, pageCursor) => listPendingReviewConversations(workspaceId, limit, pageCursor),
     listLatestInboundMessages: (conversationIds) => listLatestIncomingSetterQueueMessages(workspaceId, conversationIds),
-    listMessages: (conversationIds) => listSetterQueueMessages(workspaceId, conversationIds),
+    countMessages: (conversationIds) => countSetterQueueMessages(workspaceId, conversationIds),
     listDrafts: (messageIds) => listSetterQueueDrafts(workspaceId, messageIds),
     listAccounts: (accountIds, contactIds) => listSetterQueueAccounts(workspaceId, accountIds, contactIds),
     listCampaigns: (campaignIds) => listSetterQueueCampaigns(workspaceId, campaignIds),
     countPendingConversations: () => countPendingReviewConversations(workspaceId),
     getOldestPendingAt: () => getOldestPendingReviewAt(workspaceId),
   }, cursor, SETTER_REVIEW_QUEUE_LIMIT);
+}
+
+export async function getSetterConversationHistoryForWorkspace(
+  workspaceId: string,
+  conversationId: string,
+  cursor: ConversationHistoryCursor | null = null,
+) {
+  const limit = CONVERSATION_HISTORY_PAGE_SIZE + 1;
+  const newestFirst = isDevSeedMode()
+    ? (() => {
+        if (workspaceId !== "ws_demo" || !seed.seedConversations.some((conversation) => conversation.id === conversationId)) return null;
+        return seed.seedConversationMessages
+          .filter((message) => message.conversationId === conversationId)
+          .filter((message) => !cursor
+            || message.createdAt < cursor.createdAt
+            || (message.createdAt === cursor.createdAt && message.id < cursor.id))
+          .sort((left, right) => Date.parse(right.createdAt) - Date.parse(left.createdAt) || right.id.localeCompare(left.id))
+          .slice(0, limit)
+          .map(({ id, conversationId: idOfConversation, direction, body, createdAt }) => ({
+            id, conversationId: idOfConversation, direction, body, createdAt,
+          }));
+      })()
+    : await listSetterConversationHistory(workspaceId, conversationId, cursor, limit);
+  if (!newestFirst) return null;
+  return buildConversationHistoryPage(newestFirst);
 }
 
 export async function getPendingReviewCountData(): Promise<number> {

@@ -10,7 +10,8 @@ describe("SetterClient empty state", () => {
     const markup = renderToStaticMarkup(createElement(SetterClient, {
       initialQueuePage: {
         conversations: [],
-        conversationMessages: [],
+        latestInboundMessages: [],
+        messageCounts: {},
         setterDrafts: [],
         accountBundles: [],
         campaigns: [],

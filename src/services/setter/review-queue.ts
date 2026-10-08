@@ -17,7 +17,8 @@ export type SetterQueueCampaign = Pick<Campaign, "id" | "name">;
 
 export interface SetterReviewQueuePage {
   conversations: SetterQueueConversation[];
-  conversationMessages: SetterQueueMessage[];
+  latestInboundMessages: SetterQueueMessage[];
+  messageCounts: Record<string, number>;
   setterDrafts: SetterQueueDraft[];
   accountBundles: SetterQueueAccount[];
   campaigns: SetterQueueCampaign[];
@@ -38,7 +39,8 @@ export function mergeSetterReviewQueuePages(
 
   return {
     conversations: mergeBy(current.conversations, next.conversations, (item) => item.id),
-    conversationMessages: mergeBy(current.conversationMessages, next.conversationMessages, (item) => item.id),
+    latestInboundMessages: mergeBy(current.latestInboundMessages, next.latestInboundMessages, (item) => item.id),
+    messageCounts: { ...current.messageCounts, ...next.messageCounts },
     setterDrafts: mergeBy(current.setterDrafts, next.setterDrafts, (item) => item.id),
     accountBundles: mergeBy(current.accountBundles, next.accountBundles, (item) => item.account.id),
     campaigns: mergeBy(current.campaigns, next.campaigns, (item) => item.id),
@@ -51,7 +53,7 @@ export function mergeSetterReviewQueuePages(
 export interface SetterReviewQueueDependencies {
   listPendingConversations(limit: number, cursor: SetterQueueCursor | null): Promise<SetterQueueConversation[]>;
   listLatestInboundMessages(conversationIds: string[]): Promise<SetterQueueMessage[]>;
-  listMessages(conversationIds: string[]): Promise<SetterQueueMessage[]>;
+  countMessages(conversationIds: string[]): Promise<Record<string, number>>;
   listDrafts(messageIds: string[]): Promise<SetterQueueDraft[]>;
   listAccounts(accountIds: string[], contactIds: string[]): Promise<SetterQueueAccount[]>;
   listCampaigns(campaignIds: string[]): Promise<SetterQueueCampaign[]>;
@@ -75,7 +77,8 @@ export async function loadSetterReviewQueuePage(
   if (pageConversations.length === 0) {
     return {
       conversations: [],
-      conversationMessages: [],
+      latestInboundMessages: [],
+      messageCounts: {},
       setterDrafts: [],
       accountBundles: [],
       campaigns: [],
@@ -104,10 +107,13 @@ export async function loadSetterReviewQueuePage(
     return latestInbound !== undefined && draftMessageIds.has(latestInbound.id);
   });
   const visibleConversationIds = new Set(visibleConversations.map((conversation) => conversation.id));
-  const messages = visibleConversationIds.size > 0
-    ? await dependencies.listMessages([...visibleConversationIds])
-    : [];
-  const visibleMessages = messages.filter((message) => visibleConversationIds.has(message.conversationId));
+  const visibleLatestInboundMessages = visibleConversations.flatMap((conversation) => {
+    const message = latestInboundByConversation.get(conversation.id);
+    return message ? [message] : [];
+  });
+  const messageCounts = visibleConversationIds.size > 0
+    ? await dependencies.countMessages([...visibleConversationIds])
+    : {};
   const draftByMessageId = new Map(drafts.map((draft) => [draft.conversationMessageId, draft]));
   const visibleDrafts = visibleConversations.flatMap((conversation) => {
     const inbound = latestInboundByConversation.get(conversation.id);
@@ -125,7 +131,8 @@ export async function loadSetterReviewQueuePage(
   const lastConversation = pageConversations.at(-1);
   return {
     conversations: visibleConversations,
-    conversationMessages: visibleMessages,
+    latestInboundMessages: visibleLatestInboundMessages,
+    messageCounts,
     setterDrafts: visibleDrafts,
     accountBundles,
     campaigns,

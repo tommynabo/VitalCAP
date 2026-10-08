@@ -58,7 +58,7 @@ function createDependencies(total: number, withoutDraftAt?: number): SetterRevie
       }
       return [...latestByConversation.values()];
     }),
-    listMessages: vi.fn(async (ids) => messages.filter((message) => ids.includes(message.conversationId))),
+    countMessages: vi.fn(async (ids: string[]) => Object.fromEntries(ids.map((id) => [id, 2]))),
     listDrafts: vi.fn(async (ids) => drafts.filter((draft) => ids.includes(draft.conversationMessageId))),
     listAccounts: vi.fn(async (ids: string[], contactIds: string[]) => ids.map((id) => ({
       account: { id, canonicalName: id },
@@ -81,8 +81,9 @@ describe("Setter review queue loading", () => {
     expect(page.conversations).toHaveLength(25);
     expect(page.pendingCount).toBe(31);
     expect(page.nextCursor?.id).toBe("conversation-24");
-    expect(dependencies.listMessages).toHaveBeenCalledWith(page.conversations.map(({ id }) => id));
-    expect(page.conversationMessages).toHaveLength(50);
+    expect(dependencies.countMessages).toHaveBeenCalledWith(page.conversations.map(({ id }) => id));
+    expect(page.latestInboundMessages).toHaveLength(25);
+    expect(page.messageCounts).toEqual(Object.fromEntries(page.conversations.map(({ id }) => [id, 2])));
     expect(dependencies.listDrafts).toHaveBeenCalledWith(
       page.conversations.map((_, index) => `latest-inbound-${index}`),
     );
@@ -109,13 +110,13 @@ describe("Setter review queue loading", () => {
     expect(merged.nextCursor).toBeNull();
   });
 
-  it("loads histories only for draft-backed items and keeps pagination moving past incomplete candidates", async () => {
+  it("keeps only latest inbound data for draft-backed items and advances past incomplete candidates", async () => {
     const dependencies = createDependencies(4, 0);
     const firstPage = await loadSetterReviewQueuePage(dependencies, null, 2);
 
     expect(firstPage.conversations.map(({ id }) => id)).toEqual(["conversation-1"]);
     expect(firstPage.nextCursor?.id).toBe("conversation-1");
-    expect(dependencies.listMessages).toHaveBeenCalledWith(["conversation-1"]);
+    expect(dependencies.countMessages).toHaveBeenCalledWith(["conversation-1"]);
 
     const selectedDraftId = firstPage.setterDrafts[0]?.id;
     const nextPage = await loadSetterReviewQueuePage(dependencies, firstPage.nextCursor, 2);
@@ -131,12 +132,13 @@ describe("Setter review queue loading", () => {
     const page = await loadSetterReviewQueuePage(dependencies);
 
     expect(page.conversations).toEqual([]);
-    expect(page.conversationMessages).toEqual([]);
+    expect(page.latestInboundMessages).toEqual([]);
+    expect(page.messageCounts).toEqual({});
     expect(page.setterDrafts).toEqual([]);
     expect(page.accountBundles).toEqual([]);
     expect(page.campaigns).toEqual([]);
     expect(page.nextCursor).toBeNull();
-    expect(dependencies.listMessages).not.toHaveBeenCalled();
+    expect(dependencies.countMessages).not.toHaveBeenCalled();
     expect(dependencies.listDrafts).not.toHaveBeenCalled();
     expect(dependencies.listAccounts).not.toHaveBeenCalled();
     expect(dependencies.listCampaigns).not.toHaveBeenCalled();

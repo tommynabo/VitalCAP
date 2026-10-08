@@ -1,12 +1,17 @@
 "use client";
 
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { Check, ChevronDown, ChevronRight, FilePenLine, X } from "lucide-react";
 import { KpiStat } from "@/components/dashboard/kpi-stat";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { mergeSetterReviewQueuePages, type SetterReviewQueuePage } from "@/services/setter/review-queue";
+import {
+  mergeConversationHistoryPages,
+  requestConversationHistoryOnExpand,
+  type ConversationHistoryPage,
+} from "@/services/setter/conversation-history";
 
 function elapsedLabel(timestamp: string | null, now: number): string {
   if (!timestamp) return "—";
@@ -33,6 +38,10 @@ export function SetterClient({
   const [editingDraftId, setEditingDraftId] = useState<string | null>(null);
   const [reviewedDraftIds, setReviewedDraftIds] = useState<string[]>([]);
   const [loadingMore, setLoadingMore] = useState(false);
+  const [historyByConversationId, setHistoryByConversationId] = useState<Record<string, ConversationHistoryPage>>({});
+  const [historyLoadingIds, setHistoryLoadingIds] = useState<string[]>([]);
+  const [historyErrors, setHistoryErrors] = useState<Record<string, string>>({});
+  const historyRequests = useRef(new Map<string, Promise<ConversationHistoryPage>>());
 
   const queuePage = additionalPage
     ? {
@@ -42,23 +51,14 @@ export function SetterClient({
       }
     : initialQueuePage;
 
-  const { conversations, conversationMessages, setterDrafts, accountBundles, campaigns } = queuePage;
+  const { conversations, latestInboundMessages, messageCounts, setterDrafts, accountBundles, campaigns } = queuePage;
   const accountBundleById = new Map(accountBundles.map((bundle) => [bundle.account.id, bundle]));
   const campaignById = new Map(campaigns.map((campaign) => [campaign.id, campaign]));
   const draftByMessageId = new Map(setterDrafts.map((draft) => [draft.conversationMessageId, draft]));
-  const messagesByConversationId = new Map<string, (typeof conversationMessages)[number][]>();
-  for (const message of conversationMessages) {
-    const thread = messagesByConversationId.get(message.conversationId) ?? [];
-    thread.push(message);
-    messagesByConversationId.set(message.conversationId, thread);
-  }
-  for (const thread of messagesByConversationId.values()) {
-    thread.sort((left, right) => Date.parse(left.createdAt) - Date.parse(right.createdAt));
-  }
+  const latestInboundByConversationId = new Map(latestInboundMessages.map((message) => [message.conversationId, message]));
   const queueItems = conversations.flatMap((conversation) => {
     if (conversation.state !== "pending_review") return [];
-    const thread = messagesByConversationId.get(conversation.id) ?? [];
-    const incoming = [...thread].reverse().find((message) => message.direction === "incoming");
+    const incoming = latestInboundByConversationId.get(conversation.id);
     const draft = incoming ? draftByMessageId.get(incoming.id) : null;
     return incoming && draft ? [{ conversation, message: incoming, draft }] : [];
   });
@@ -66,6 +66,48 @@ export function SetterClient({
   const pendingItems = queueItems
     .filter(({ draft }) => !reviewedDraftIds.includes(draft.id))
     .sort((left, right) => Date.parse(left.message.createdAt) - Date.parse(right.message.createdAt));
+
+  async function fetchHistoryPage(conversationId: string, cursor: ConversationHistoryPage["nextCursor"] = null) {
+    const query = cursor ? `?cursor=${encodeURIComponent(JSON.stringify(cursor))}` : "";
+    const response = await fetch(`/api/setter/conversations/${encodeURIComponent(conversationId)}/messages${query}`, { cache: "no-store" });
+    const page = await response.json().catch(() => null) as ConversationHistoryPage | null;
+    if (!response.ok || !page) throw new Error("No se pudo cargar el historial.");
+    return page;
+  }
+
+  async function loadHistory(conversationId: string) {
+    if (historyByConversationId[conversationId] || historyLoadingIds.includes(conversationId)) return;
+    setHistoryLoadingIds((current) => [...current, conversationId]);
+    setHistoryErrors((current) => ({ ...current, [conversationId]: "" }));
+    try {
+      const request = requestConversationHistoryOnExpand(true, conversationId, historyRequests.current, fetchHistoryPage);
+      if (!request) return;
+      const page = await request;
+      setHistoryByConversationId((current) => ({ ...current, [conversationId]: page }));
+    } catch (error) {
+      setHistoryErrors((current) => ({ ...current, [conversationId]: error instanceof Error ? error.message : "No se pudo cargar el historial." }));
+    } finally {
+      setHistoryLoadingIds((current) => current.filter((id) => id !== conversationId));
+    }
+  }
+
+  async function loadOlderHistory(conversationId: string) {
+    const currentPage = historyByConversationId[conversationId];
+    if (!currentPage?.nextCursor || historyLoadingIds.includes(conversationId)) return;
+    setHistoryLoadingIds((current) => [...current, conversationId]);
+    setHistoryErrors((current) => ({ ...current, [conversationId]: "" }));
+    try {
+      const olderPage = await fetchHistoryPage(conversationId, currentPage.nextCursor);
+      setHistoryByConversationId((current) => ({
+        ...current,
+        [conversationId]: mergeConversationHistoryPages(current[conversationId] ?? currentPage, olderPage),
+      }));
+    } catch (error) {
+      setHistoryErrors((current) => ({ ...current, [conversationId]: error instanceof Error ? error.message : "No se pudo cargar el historial." }));
+    } finally {
+      setHistoryLoadingIds((current) => current.filter((id) => id !== conversationId));
+    }
+  }
 
   async function loadMore(): Promise<SetterReviewQueuePage | null> {
     if (!queuePage.nextCursor || loadingMore) return null;
@@ -238,16 +280,28 @@ export function SetterClient({
                         )}
                       </div>
 
-                      <details className="border-t border-border pt-3">
-                        <summary className="cursor-pointer py-2 text-sm font-medium text-text-muted">Ver historial completo ({(messagesByConversationId.get(conversation.id) ?? []).length})</summary>
+                      <details
+                        className="border-t border-border pt-3"
+                        onToggle={(event) => {
+                          if (event.currentTarget.open) void loadHistory(conversation.id);
+                        }}
+                      >
+                        <summary className="cursor-pointer py-2 text-sm font-medium text-text-muted">Ver historial completo ({messageCounts[conversation.id] ?? 0})</summary>
                         <div className="mt-2 space-y-3">
-                          {(messagesByConversationId.get(conversation.id) ?? []).map((threadMessage) => (
+                          {historyLoadingIds.includes(conversation.id) && !historyByConversationId[conversation.id] && <p className="text-sm text-text-muted">Cargando historial...</p>}
+                          {historyErrors[conversation.id] && <div role="alert" className="flex flex-wrap items-center gap-3 text-sm text-danger"><span>{historyErrors[conversation.id]}</span><Button size="sm" variant="secondary" onClick={() => historyByConversationId[conversation.id]?.nextCursor ? loadOlderHistory(conversation.id) : loadHistory(conversation.id)}>Reintentar</Button></div>}
+                          {(historyByConversationId[conversation.id]?.messages ?? []).map((threadMessage) => (
                             <div key={threadMessage.id} className={`max-w-[90%] rounded-md p-3 text-sm ${threadMessage.direction === "incoming" ? "bg-surface-muted text-text" : "ml-auto border border-border bg-surface text-text"}`}>
                               <p className="mb-1 text-xs font-medium text-text-muted">{threadMessage.direction === "incoming" ? "Prospecto" : "Nosotros"}</p>
                               <p className="whitespace-pre-wrap break-words">{threadMessage.body}</p>
                               <time className="mt-2 block text-right text-[11px] text-text-muted" dateTime={threadMessage.createdAt}>{new Date(threadMessage.createdAt).toLocaleString("es-ES")}</time>
                             </div>
                           ))}
+                          {historyByConversationId[conversation.id]?.nextCursor && (
+                            <Button size="sm" variant="secondary" disabled={historyLoadingIds.includes(conversation.id)} onClick={() => loadOlderHistory(conversation.id)}>
+                              {historyLoadingIds.includes(conversation.id) ? "Cargando..." : "Cargar mensajes anteriores"}
+                            </Button>
+                          )}
                         </div>
                       </details>
                     </div>
