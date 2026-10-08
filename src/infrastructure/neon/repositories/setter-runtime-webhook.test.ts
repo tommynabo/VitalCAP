@@ -45,7 +45,7 @@ vi.mock("@/services/setter/inbound-runtime", () => ({
   SetterInboundRoutingError: class extends Error {},
 }));
 
-const { neonSetterInboundRuntimeStore, processInstantlySentEvent } = await import("./setter-runtime");
+const { neonSetterInboundRuntimeStore, persistSetterReviewDecision, processInstantlySentEvent } = await import("./setter-runtime");
 
 function createDatabase() {
   let eventStatus: string | null = null;
@@ -53,6 +53,7 @@ function createDatabase() {
   let outreachQueueRows = new Map<string, any>();
   let outreachEventIds = new Set<string>();
   const calls: Array<{ operation: string; table: string; values?: any }> = [];
+  const execute = vi.fn(async (_statement: { strings: readonly string[]; values: readonly unknown[] }) => ({ rows: [{ id: "feedback-1" }] }));
 
   function builder(operation: string, initialTable?: any) {
     const state: any = { operation, table: initialTable?.__table, values: undefined, returning: false };
@@ -135,6 +136,7 @@ function createDatabase() {
   }
 
   const db = {
+    execute,
     select: () => builder("select"),
     insert: (table: any) => builder("insert", table),
     update: (table: any) => builder("update", table),
@@ -237,5 +239,47 @@ describe("Instantly webhook persistence", () => {
     expect(source.slice(resultStart, resultEnd)).toContain("schema.setterDrafts");
     expect(source.slice(resultStart, resultEnd)).toContain("schema.suppressionEntries");
     expect(source.slice(resultStart, resultEnd)).toContain(".onConflictDoNothing()");
+  });
+
+  it.each([
+    ["approve", "approved_pending_send"],
+    ["reject", "rejected"],
+  ] as const)("persists %s atomically without a Neon HTTP transaction", async (decision, nextState) => {
+    const workspaceId = "00000000-0000-4000-8000-000000000001";
+    const messageId = "00000000-0000-4000-8000-000000000002";
+    const item = {
+      conversation: { id: "00000000-0000-4000-8000-000000000003" },
+      draft: { id: "00000000-0000-4000-8000-000000000004" },
+    } as any;
+    const result = {
+      conversation: { state: nextState, latestIntent: "PRICE", updatedAt: "2026-10-08T12:00:00.000Z" },
+      feedback: {
+        conversationMessageId: messageId,
+        predictedBranch: "PRICE",
+        correctedBranch: null,
+        aiDraft: "Draft",
+        correctedText: null,
+        finalText: decision === "approve" ? "Draft" : null,
+        decision,
+        reasonCategory: null,
+        note: null,
+        meetingOutcome: null,
+        qualified: null,
+        lostReason: null,
+        reviewedAt: "2026-10-08T12:00:00.000Z",
+        reviewerId: "reviewer-1",
+      },
+    } as any;
+
+    await expect(persistSetterReviewDecision(workspaceId, item, result)).resolves.toBe(true);
+
+    expect(state.db.execute).toHaveBeenCalledTimes(1);
+    expect(state.db.transaction).not.toHaveBeenCalled();
+    const statement = state.db.execute.mock.calls[0]![0];
+    expect(statement.strings.join(" ")).toContain("FOR UPDATE OF conversation");
+    expect(statement.strings.join(" ")).toContain("ON CONFLICT (conversation_message_id) DO NOTHING");
+    expect(statement.values).toContain(workspaceId);
+    expect(statement.values).toContain(item.draft.id);
+    expect(statement.values).toContain(messageId);
   });
 });

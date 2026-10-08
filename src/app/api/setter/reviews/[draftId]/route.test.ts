@@ -6,14 +6,12 @@ const persistSetterReviewDecision = vi.fn();
 const sendReviewedSetterReply = vi.fn();
 const insertAuditLog = vi.fn();
 const requireWorkspaceMember = vi.fn();
-const getDeliveryEnv = vi.fn();
 
 class UnauthorizedError extends Error {}
 
 vi.mock("@/infrastructure/neon/repositories/setter-runtime", () => ({ getSetterReviewItem, persistSetterReviewDecision, sendReviewedSetterReply }));
 vi.mock("@/infrastructure/neon/repositories/audit", () => ({ insertAuditLog }));
 vi.mock("@/lib/auth/workspace", () => ({ UnauthorizedError, requireWorkspaceMember }));
-vi.mock("@/lib/config/env", () => ({ getDeliveryEnv }));
 
 const { PATCH } = await import("./route");
 
@@ -75,7 +73,6 @@ describe("PATCH /api/setter/reviews/[draftId]", () => {
     getSetterReviewItem.mockResolvedValue(item);
     persistSetterReviewDecision.mockResolvedValue(true);
     sendReviewedSetterReply.mockResolvedValue({ status: "sent", providerMessageId: "sent-message-1" });
-    getDeliveryEnv.mockReturnValue({ EMAIL_DELIVERY_PROVIDER: "instantly", INSTANTLY_API_KEY: "server-key" });
     insertAuditLog.mockResolvedValue(undefined);
   });
 
@@ -84,7 +81,7 @@ describe("PATCH /api/setter/reviews/[draftId]", () => {
     ["edit_and_send", "Human-edited response", "approved_pending_send", "Human-edited response"],
     ["reject", undefined, "rejected", null],
     ["take_over", undefined, "human_owned", null],
-  ])("handles %s with the expected delivery behavior", async (decision, finalText, state, expectedFinalText) => {
+  ])("persists %s without sending", async (decision, finalText, state, expectedFinalText) => {
     const response = await review(decision, finalText);
     const responseBody = await response.json();
     const [, , result] = persistSetterReviewDecision.mock.calls[0] as [string, typeof item, {
@@ -94,18 +91,14 @@ describe("PATCH /api/setter/reviews/[draftId]", () => {
     }];
 
     expect(response.status).toBe(200);
-    expect(responseBody.delivery).toBe(decision === "approve" || decision === "edit_and_send" ? "sent" : "not_sent");
+    expect(responseBody.delivery).toBe("not_sent");
     expect(getSetterReviewItem).toHaveBeenCalledWith(workspaceId, draft.id);
     expect(result.conversation.state).toBe(state);
     expect(result.feedback.finalText).toBe(expectedFinalText);
     expect(result.feedback.reviewerId).toBe("member-1");
     expect(result.feedback.reasonCategory).toBe("other");
     expect(result.outgoingMessage).toBeNull();
-    if (decision === "approve" || decision === "edit_and_send") {
-      expect(sendReviewedSetterReply).toHaveBeenCalledWith(workspaceId, draft.id);
-    } else {
-      expect(sendReviewedSetterReply).not.toHaveBeenCalled();
-    }
+    expect(sendReviewedSetterReply).not.toHaveBeenCalled();
   });
 
   it("returns not found for a draft outside the authenticated workspace", async () => {
@@ -128,43 +121,19 @@ describe("PATCH /api/setter/reviews/[draftId]", () => {
     expect(outboundFetch).not.toHaveBeenCalled();
   });
 
-  it("does not send if another request already claimed the review", async () => {
+  it("handles a repeated review safely when another request already persisted it", async () => {
     persistSetterReviewDecision.mockResolvedValue(false);
 
     const response = await review("approve");
 
     expect(response.status).toBe(409);
     expect(sendReviewedSetterReply).not.toHaveBeenCalled();
+    expect(insertAuditLog).not.toHaveBeenCalled();
   });
 
-  it("does not mark a rejected provider response as sent", async () => {
-    sendReviewedSetterReply.mockResolvedValue({ status: "failed", errorCode: "INSTANTLY_REPLY_401" });
-
-    const response = await review("approve");
-    const body = await response.json();
-
-    expect(response.status).toBe(502);
-    expect(body).toMatchObject({ state: "send_failed", delivery: "failed", errorCode: "INSTANTLY_REPLY_401" });
-  });
-
-  it("keeps an uncertain prior send held for reconciliation", async () => {
-    sendReviewedSetterReply.mockResolvedValue({
-      status: "reconciliation_required",
-      errorCode: "SEND_UNKNOWN_REQUIRES_RECONCILIATION",
-    });
-
-    const response = await review("approve");
-    const body = await response.json();
-
-    expect(response.status).toBe(409);
-    expect(body).toMatchObject({
-      state: "send_unknown",
-      delivery: "reconciliation_required",
-      errorCode: "SEND_UNKNOWN_REQUIRES_RECONCILIATION",
-    });
-    expect(insertAuditLog).toHaveBeenCalledWith(expect.objectContaining({
-      action: "setter.review.approve",
-      metadata: expect.objectContaining({ delivery: "reconciliation_required" }),
-    }));
+  it("returns 400 for invalid decisions and missing correction text", async () => {
+    expect((await review("approved")).status).toBe(400);
+    expect((await review("edit_and_send")).status).toBe(400);
+    expect(persistSetterReviewDecision).not.toHaveBeenCalled();
   });
 });

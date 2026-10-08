@@ -897,37 +897,59 @@ export async function persistSetterReviewDecision(
   result: ReviewActionResult,
 ): Promise<boolean> {
   const db = getDb();
-  return db.transaction(async (tx) => {
-    const [updated] = await tx.update(schema.conversations).set({
-      state: result.conversation.state,
-      latestIntent: result.conversation.latestIntent,
-      updatedAt: new Date(result.conversation.updatedAt),
-    }).where(and(
-      eq(schema.conversations.id, item.conversation.id),
-      eq(schema.conversations.workspaceId, workspaceId),
-      eq(schema.conversations.state, "pending_review"),
-    )).returning({ id: schema.conversations.id });
-    if (!updated) return false;
-
-    const [feedback] = await tx.insert(schema.setterFeedback).values({
-      conversationMessageId: result.feedback.conversationMessageId,
-      predictedBranch: result.feedback.predictedBranch,
-      correctedBranch: result.feedback.correctedBranch,
-      aiDraft: result.feedback.aiDraft,
-      correctedText: result.feedback.correctedText,
-      finalText: result.feedback.finalText ?? null,
-      decision: result.feedback.decision,
-      reasonCategory: result.feedback.reasonCategory,
-      note: result.feedback.note,
-      meetingOutcome: result.feedback.meetingOutcome,
-      qualified: result.feedback.qualified,
-      lostReason: result.feedback.lostReason,
-      reviewedAt: new Date(result.feedback.reviewedAt),
-      reviewerId: result.feedback.reviewerId,
-    }).onConflictDoNothing().returning({ id: schema.setterFeedback.id });
-    if (!feedback) throw new Error("Setter feedback already exists for this reply.");
-    return true;
-  });
+  const feedback = result.feedback;
+  const saved = await db.execute(sql`
+    WITH eligible_conversation AS (
+      SELECT conversation.id
+      FROM conversations AS conversation
+      INNER JOIN conversation_messages AS message ON message.conversation_id = conversation.id
+      INNER JOIN setter_drafts AS draft ON draft.conversation_message_id = message.id
+      WHERE conversation.id = ${item.conversation.id}::uuid
+        AND conversation.workspace_id = ${workspaceId}::uuid
+        AND conversation.state = 'pending_review'
+        AND draft.id = ${item.draft.id}::uuid
+        AND draft.conversation_message_id = ${feedback.conversationMessageId}::uuid
+        AND NOT EXISTS (
+          SELECT 1 FROM setter_feedback AS existing_feedback
+          WHERE existing_feedback.conversation_message_id = message.id
+        )
+      FOR UPDATE OF conversation
+    ), updated_conversation AS (
+      UPDATE conversations AS conversation
+      SET state = ${result.conversation.state},
+          latest_intent = ${result.conversation.latestIntent},
+          updated_at = ${new Date(result.conversation.updatedAt)}
+      FROM eligible_conversation
+      WHERE conversation.id = eligible_conversation.id
+      RETURNING conversation.id
+    ), inserted_feedback AS (
+      INSERT INTO setter_feedback (
+        conversation_message_id, predicted_branch, corrected_branch, ai_draft,
+        corrected_text, final_text, decision, reason_category, note,
+        meeting_outcome, qualified, lost_reason, reviewed_at, reviewer_id
+      )
+      SELECT
+        ${feedback.conversationMessageId}::uuid,
+        ${feedback.predictedBranch},
+        ${feedback.correctedBranch},
+        ${feedback.aiDraft},
+        ${feedback.correctedText},
+        ${feedback.finalText ?? null},
+        ${feedback.decision},
+        ${feedback.reasonCategory},
+        ${feedback.note},
+        ${feedback.meetingOutcome},
+        ${feedback.qualified},
+        ${feedback.lostReason},
+        ${new Date(feedback.reviewedAt)},
+        ${feedback.reviewerId}
+      FROM updated_conversation
+      ON CONFLICT (conversation_message_id) DO NOTHING
+      RETURNING id
+    )
+    SELECT id FROM inserted_feedback
+  `);
+  return saved.rows.length > 0;
 }
 
 export type SetterReplyDeliveryResult =

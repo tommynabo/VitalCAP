@@ -1,9 +1,8 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
-import { getSetterReviewItem, persistSetterReviewDecision, sendReviewedSetterReply } from "@/infrastructure/neon/repositories/setter-runtime";
+import { getSetterReviewItem, persistSetterReviewDecision } from "@/infrastructure/neon/repositories/setter-runtime";
 import { insertAuditLog } from "@/infrastructure/neon/repositories/audit";
 import { requireWorkspaceMember, UnauthorizedError } from "@/lib/auth/workspace";
-import { getDeliveryEnv } from "@/lib/config/env";
 import { applyReviewDecision } from "@/services/setter/review-service";
 import { setterOutputSchema } from "@/services/setter/setter-output-schema";
 
@@ -27,13 +26,6 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ dr
       return NextResponse.json({ error: "Invalid review request." }, { status: 400 });
     }
     const command = reviewCommandSchema.parse(rawCommand);
-    const shouldSend = command.decision === "approve" || command.decision === "edit_and_send";
-    if (shouldSend) {
-      const deliveryEnv = getDeliveryEnv();
-      if (deliveryEnv.EMAIL_DELIVERY_PROVIDER !== "instantly" || !deliveryEnv.INSTANTLY_API_KEY) {
-        return NextResponse.json({ error: "Approved reply delivery is not configured.", errorCode: "INSTANTLY_REPLY_CONFIGURATION_ERROR" }, { status: 503 });
-      }
-    }
     const { draftId } = await params;
     const item = await getSetterReviewItem(context.workspaceId, draftId);
     if (!item) return NextResponse.json({ error: "Review item not found." }, { status: 404 });
@@ -55,32 +47,6 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ dr
     const saved = await persistSetterReviewDecision(context.workspaceId, item, result);
     if (!saved) return NextResponse.json({ error: "This reply was reviewed by another operator." }, { status: 409 });
 
-    let delivery = "not_sent";
-    let deliveryErrorCode: string | undefined;
-    if (shouldSend) {
-      const sendResult = await sendReviewedSetterReply(context.workspaceId, draftId);
-      if (sendResult.status === "already_claimed") {
-        return NextResponse.json({ state: "sending", delivery: "already_started" }, { status: 409 });
-      }
-      if (sendResult.status === "reconciliation_required") {
-        await insertAuditLog({
-          workspaceId: context.workspaceId,
-          actorUserId: context.user.userId,
-          action: `setter.review.${command.decision}`,
-          entityType: "setter_draft",
-          entityId: item.draft.id,
-          metadata: { branch: item.draft.branch, correctedBranch: command.correctedBranch ?? null, delivery: sendResult.status },
-        });
-        return NextResponse.json({ state: "send_unknown", delivery: "reconciliation_required", errorCode: sendResult.errorCode }, { status: 409 });
-      }
-      if (sendResult.status === "sent") {
-        delivery = "sent";
-      } else {
-        delivery = sendResult.status === "uncertain" ? "uncertain" : "failed";
-        deliveryErrorCode = sendResult.errorCode;
-      }
-    }
-
     await insertAuditLog({
       workspaceId: context.workspaceId,
       actorUserId: context.user.userId,
@@ -89,10 +55,7 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ dr
       entityId: item.draft.id,
       metadata: { branch: item.draft.branch, correctedBranch: command.correctedBranch ?? null },
     });
-    const state = delivery === "sent" ? "sent" : delivery === "not_sent" ? result.conversation.state : delivery === "uncertain" ? "send_unknown" : "send_failed";
-    return NextResponse.json({ state, delivery, ...(deliveryErrorCode ? { errorCode: deliveryErrorCode } : {}), feedback: result.feedback }, {
-      status: delivery === "uncertain" ? 202 : delivery === "failed" ? 502 : 200,
-    });
+    return NextResponse.json({ state: result.conversation.state, delivery: "not_sent", feedback: result.feedback });
   } catch (error) {
     if (error instanceof z.ZodError) return NextResponse.json({ error: "Invalid review decision." }, { status: 400 });
     if (error instanceof UnauthorizedError) return NextResponse.json({ error: "Workspace authorization required." }, { status: 403 });

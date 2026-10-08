@@ -395,10 +395,10 @@ export function SetterClient({
                     />
                     <div className="flex flex-wrap gap-2">
                       <Button size="sm" disabled={busyDraftId === draft.id} onClick={() => submitReview(draft, "approve")}>
-                        <Check size={15} aria-hidden="true" /> Approve &amp; Send
+                        <Check size={15} aria-hidden="true" /> Approve
                       </Button>
                       <Button size="sm" variant="secondary" disabled={busyDraftId === draft.id} onClick={() => submitReview(draft, "edit_and_send")}>
-                        <FilePenLine size={15} aria-hidden="true" /> Edit &amp; Send
+                        <FilePenLine size={15} aria-hidden="true" /> Save Correction
                       </Button>
                       <Button size="sm" variant="danger" disabled={busyDraftId === draft.id} onClick={() => submitReview(draft, "reject")}>
                         <X size={15} aria-hidden="true" /> Reject
