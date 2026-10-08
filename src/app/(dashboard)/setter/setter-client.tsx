@@ -6,9 +6,7 @@ import { Check, ChevronDown, ChevronRight, FilePenLine, X } from "lucide-react";
 import { KpiStat } from "@/components/dashboard/kpi-stat";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import type { Campaign } from "@/domain/campaigns/types";
-import type { Conversation, ConversationMessage, SetterDraft } from "@/domain/conversations/types";
-import type { AccountBundle } from "@/lib/data/repository";
+import { mergeSetterReviewQueuePages, type SetterReviewQueuePage } from "@/services/setter/review-queue";
 
 function elapsedLabel(timestamp: string | null, now: number): string {
   if (!timestamp) return "—";
@@ -20,32 +18,35 @@ function elapsedLabel(timestamp: string | null, now: number): string {
 
 /** Human review queue for incoming replies. */
 export function SetterClient({
-  conversations,
-  conversationMessages,
-  setterDrafts,
-  accountBundles,
-  campaigns,
+  initialQueuePage,
   renderedAt,
 }: {
-  conversations: Conversation[];
-  conversationMessages: ConversationMessage[];
-  setterDrafts: SetterDraft[];
-  accountBundles: AccountBundle[];
-  campaigns: Campaign[];
+  initialQueuePage: SetterReviewQueuePage;
   renderedAt: string;
 }) {
   const router = useRouter();
+  const [additionalPage, setAdditionalPage] = useState<SetterReviewQueuePage | null>(null);
   const [editedDrafts, setEditedDrafts] = useState<Record<string, string>>({});
   const [busyDraftId, setBusyDraftId] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [expandedDraftId, setExpandedDraftId] = useState<string | null>(null);
   const [editingDraftId, setEditingDraftId] = useState<string | null>(null);
   const [reviewedDraftIds, setReviewedDraftIds] = useState<string[]>([]);
+  const [loadingMore, setLoadingMore] = useState(false);
 
+  const queuePage = additionalPage
+    ? {
+        ...mergeSetterReviewQueuePages(initialQueuePage, additionalPage),
+        pendingCount: initialQueuePage.pendingCount,
+        oldestPendingAt: initialQueuePage.oldestPendingAt,
+      }
+    : initialQueuePage;
+
+  const { conversations, conversationMessages, setterDrafts, accountBundles, campaigns } = queuePage;
   const accountBundleById = new Map(accountBundles.map((bundle) => [bundle.account.id, bundle]));
   const campaignById = new Map(campaigns.map((campaign) => [campaign.id, campaign]));
   const draftByMessageId = new Map(setterDrafts.map((draft) => [draft.conversationMessageId, draft]));
-  const messagesByConversationId = new Map<string, ConversationMessage[]>();
+  const messagesByConversationId = new Map<string, (typeof conversationMessages)[number][]>();
   for (const message of conversationMessages) {
     const thread = messagesByConversationId.get(message.conversationId) ?? [];
     thread.push(message);
@@ -66,7 +67,26 @@ export function SetterClient({
     .filter(({ draft }) => !reviewedDraftIds.includes(draft.id))
     .sort((left, right) => Date.parse(left.message.createdAt) - Date.parse(right.message.createdAt));
 
-  async function submitReview(draft: SetterDraft, decision: "approve" | "edit_and_send" | "reject") {
+  async function loadMore(): Promise<SetterReviewQueuePage | null> {
+    if (!queuePage.nextCursor || loadingMore) return null;
+    setLoadingMore(true);
+    setActionError(null);
+    try {
+      const query = new URLSearchParams({ cursor: JSON.stringify(queuePage.nextCursor) });
+      const response = await fetch(`/api/setter/review-queue?${query.toString()}`);
+      const nextPage = await response.json().catch(() => null) as SetterReviewQueuePage | null;
+      if (!response.ok || !nextPage) throw new Error("No se pudieron cargar más conversaciones.");
+      setAdditionalPage((current) => current ? mergeSetterReviewQueuePages(current, nextPage) : nextPage);
+      return nextPage;
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : "No se pudieron cargar más conversaciones.");
+      return null;
+    } finally {
+      setLoadingMore(false);
+    }
+  }
+
+  async function submitReview(draft: (typeof setterDrafts)[number], decision: "approve" | "edit_and_send" | "reject") {
     setBusyDraftId(draft.id);
     setActionError(null);
     try {
@@ -87,7 +107,15 @@ export function SetterClient({
       }
       setReviewedDraftIds((current) => [...current, draft.id]);
       setEditingDraftId(null);
-      setExpandedDraftId(pendingItems.find(({ draft: pendingDraft }) => pendingDraft.id !== draft.id)?.draft.id ?? null);
+      const nextDraft = pendingItems.find(({ draft: pendingDraft }) => pendingDraft.id !== draft.id)?.draft;
+      if (nextDraft) {
+        setExpandedDraftId(nextDraft.id);
+      } else if (queuePage.nextCursor) {
+        const nextPage = await loadMore();
+        setExpandedDraftId(nextPage?.setterDrafts[0]?.id ?? null);
+      } else {
+        setExpandedDraftId(null);
+      }
       router.refresh();
     } catch (error) {
       setActionError(error instanceof Error ? error.message : "Review decision could not be saved.");
@@ -103,10 +131,10 @@ export function SetterClient({
       </header>
 
       <div className="grid max-w-xl grid-cols-2 gap-3">
-        <KpiStat label="Pendientes" value={String(pendingItems.length)} emphasize />
+        <KpiStat label="Pendientes" value={String(queuePage.pendingCount)} emphasize />
         <KpiStat
           label="Más antigua"
-          value={elapsedLabel(pendingItems.at(-1)?.message.createdAt ?? null, now)}
+          value={elapsedLabel(queuePage.oldestPendingAt, now)}
         />
       </div>
 
@@ -227,6 +255,13 @@ export function SetterClient({
                 </article>
               );
             })}
+          </div>
+        )}
+        {queuePage.nextCursor && (
+          <div className="pt-2">
+            <Button size="sm" variant="secondary" className="min-h-11" disabled={loadingMore} onClick={loadMore}>
+              {loadingMore ? "Cargando..." : "Cargar más conversaciones"}
+            </Button>
           </div>
         )}
       </section>

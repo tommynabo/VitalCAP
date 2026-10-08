@@ -16,9 +16,10 @@ import * as seed from "@/lib/seed/dev-seed";
 
 import { getPrimaryOffer, listOffers } from "@/infrastructure/neon/repositories/offers";
 import { listSetterWebhookEvents, type SetterWebhookEventSummary } from "@/infrastructure/neon/repositories/setter-runtime";
-import { listCampaigns } from "@/infrastructure/neon/repositories/campaigns";
-import { listAccountBundles, type AccountBundle } from "@/infrastructure/neon/repositories/accounts";
+import { listCampaigns, listSetterQueueCampaigns } from "@/infrastructure/neon/repositories/campaigns";
+import { listAccountBundles, listSetterQueueAccounts, type AccountBundle } from "@/infrastructure/neon/repositories/accounts";
 import {
+  countInfrastructureAlerts,
   listOutreachQueueItems,
   listOutreachEvents,
   listSendingDomains,
@@ -26,6 +27,12 @@ import {
   listSuppressionEntries,
 } from "@/infrastructure/neon/repositories/outreach";
 import {
+  countPendingReviewConversations,
+  getOldestPendingReviewAt,
+  listLatestIncomingSetterQueueMessages,
+  listPendingReviewConversations,
+  listSetterQueueDrafts,
+  listSetterQueueMessages,
   listConversations,
   listConversationMessages,
   listSetterDrafts,
@@ -74,6 +81,12 @@ import type {
 import type { Conversation, ConversationMessage, SetterDraft, SetterFeedback, Meeting } from "@/domain/conversations/types";
 import type { SearchSeed } from "@/domain/discovery/types";
 import type { ProviderUsageStats } from "@/domain/providers/types";
+import {
+  loadSetterReviewQueuePage,
+  SETTER_REVIEW_QUEUE_LIMIT,
+  type SetterQueueCursor,
+  type SetterReviewQueuePage,
+} from "@/services/setter/review-queue";
 
 export type { AccountBundle, ProviderRowStatus, QueueHealthSnapshot, DeadLetterSample, WeeklyTrendPoint };
 export type { InstantlyPipelineDiagnostics };
@@ -104,6 +117,107 @@ export async function getAccountBundles(): Promise<AccountBundle[]> {
   if (isDevSeedMode()) return seed.seedAccountBundles;
   const workspaceId = await getCurrentWorkspaceId();
   return listAccountBundles(workspaceId);
+}
+
+function getSeedSetterReviewQueuePage(cursor: SetterQueueCursor | null): Promise<SetterReviewQueuePage> {
+  return loadSetterReviewQueuePage({
+    listPendingConversations: async (limit, pageCursor) => seed.seedConversations
+      .filter((conversation) => conversation.state === "pending_review")
+      .filter((conversation) => !pageCursor
+        || conversation.updatedAt < pageCursor.updatedAt
+        || (conversation.updatedAt === pageCursor.updatedAt && conversation.id < pageCursor.id))
+      .sort((left, right) => Date.parse(right.updatedAt) - Date.parse(left.updatedAt) || right.id.localeCompare(left.id))
+      .slice(0, limit)
+      .map(({ id, accountId, contactId, campaignId, state, latestIntent, updatedAt }) => ({
+        id, accountId, contactId, campaignId, state, latestIntent, updatedAt,
+      })),
+    listMessages: async (conversationIds) => {
+      const ids = new Set(conversationIds);
+      return seed.seedConversationMessages
+        .filter((message) => ids.has(message.conversationId))
+        .map(({ id, conversationId, direction, body, createdAt }) => ({ id, conversationId, direction, body, createdAt }));
+    },
+    listLatestInboundMessages: async (conversationIds) => {
+      const ids = new Set(conversationIds);
+      const latestByConversation = new Map();
+      for (const message of seed.seedConversationMessages) {
+        if (!ids.has(message.conversationId) || message.direction !== "incoming") continue;
+        const previous = latestByConversation.get(message.conversationId);
+        if (!previous || Date.parse(message.createdAt) > Date.parse(previous.createdAt)) {
+          latestByConversation.set(message.conversationId, message);
+        }
+      }
+      return [...latestByConversation.values()].map(({ id, conversationId, direction, body, createdAt }) => ({
+        id, conversationId, direction, body, createdAt,
+      }));
+    },
+    listDrafts: async (messageIds) => {
+      const ids = new Set(messageIds);
+      return seed.seedSetterDrafts
+        .filter((draft) => ids.has(draft.conversationMessageId))
+        .map(({ id, conversationMessageId, draft, confidence, riskFlags }) => ({ id, conversationMessageId, draft, confidence, riskFlags }));
+    },
+    listAccounts: async (accountIds, contactIds) => {
+      const ids = new Set(accountIds);
+      const visibleContactIds = new Set(contactIds);
+      return seed.seedAccountBundles
+        .filter((bundle) => ids.has(bundle.account.id))
+        .map(({ account, contacts }) => ({
+          account: { id: account.id, canonicalName: account.canonicalName },
+          contacts: contacts
+            .filter((contact) => visibleContactIds.has(contact.id))
+            .map(({ id, firstName, fullName }) => ({ id, firstName, fullName })),
+        }));
+    },
+    listCampaigns: async (campaignIds) => {
+      const ids = new Set(campaignIds);
+      return seed.seedCampaigns.filter((campaign) => ids.has(campaign.id)).map(({ id, name }) => ({ id, name }));
+    },
+    countPendingConversations: async () => seed.seedConversations.filter((conversation) => conversation.state === "pending_review").length,
+    getOldestPendingAt: async () => {
+      const pendingIds = new Set(seed.seedConversations
+        .filter((conversation) => conversation.state === "pending_review")
+        .map((conversation) => conversation.id));
+      return seed.seedConversationMessages
+        .filter((message) => pendingIds.has(message.conversationId) && message.direction === "incoming")
+        .map((message) => message.createdAt)
+        .sort()[0] ?? null;
+    },
+  }, cursor);
+}
+
+export async function getSetterReviewQueuePage(cursor: SetterQueueCursor | null = null): Promise<SetterReviewQueuePage> {
+  return getSetterReviewQueuePageForWorkspace(await getCurrentWorkspaceId(), cursor);
+}
+
+export async function getSetterReviewQueuePageForWorkspace(
+  workspaceId: string,
+  cursor: SetterQueueCursor | null = null,
+): Promise<SetterReviewQueuePage> {
+  if (isDevSeedMode()) return getSeedSetterReviewQueuePage(cursor);
+  return loadSetterReviewQueuePage({
+    listPendingConversations: (limit, pageCursor) => listPendingReviewConversations(workspaceId, limit, pageCursor),
+    listLatestInboundMessages: (conversationIds) => listLatestIncomingSetterQueueMessages(workspaceId, conversationIds),
+    listMessages: (conversationIds) => listSetterQueueMessages(workspaceId, conversationIds),
+    listDrafts: (messageIds) => listSetterQueueDrafts(workspaceId, messageIds),
+    listAccounts: (accountIds, contactIds) => listSetterQueueAccounts(workspaceId, accountIds, contactIds),
+    listCampaigns: (campaignIds) => listSetterQueueCampaigns(workspaceId, campaignIds),
+    countPendingConversations: () => countPendingReviewConversations(workspaceId),
+    getOldestPendingAt: () => getOldestPendingReviewAt(workspaceId),
+  }, cursor, SETTER_REVIEW_QUEUE_LIMIT);
+}
+
+export async function getPendingReviewCountData(): Promise<number> {
+  if (isDevSeedMode()) return seed.seedConversations.filter((conversation) => conversation.state === "pending_review").length;
+  return countPendingReviewConversations(await getCurrentWorkspaceId());
+}
+
+export async function getInfrastructureAlertCountData(): Promise<number> {
+  if (isDevSeedMode()) {
+    return seed.seedSendingDomains.filter((domain) => domain.status === "degraded" || domain.status === "paused").length
+      + seed.seedMailboxes.filter((mailbox) => mailbox.pausedReason).length;
+  }
+  return countInfrastructureAlerts(await getCurrentWorkspaceId());
 }
 
 export async function getGlobalAutopilotStateData(): Promise<GlobalAutopilotState> {

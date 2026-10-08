@@ -10,10 +10,9 @@ describe("navigation badge engine-health summary", () => {
     const engineHealthSummary = summarizeEngineHealthStatuses(previousEngineHealth);
 
     const badgeCounts = computeNavBadgeCounts({
-      conversations: [],
+      pendingReviewCount: 0,
       engineHealthSummary,
-      sendingDomains: [],
-      mailboxes: [],
+      infrastructureAlertCount: 0,
     });
 
     expect(badgeCounts["/autopilot"]).toBe(expected);

@@ -1,18 +1,17 @@
 import type { ReactNode } from "react";
 import { AppShell } from "@/components/layout/app-shell";
 import { computeNavBadgeCounts } from "@/components/layout/nav-badges";
-import { getConversations, getEngineHealthSummary, getSendingDomains, getMailboxes } from "@/lib/data/repository";
+import { getEngineHealthSummary, getInfrastructureAlertCountData, getPendingReviewCountData } from "@/lib/data/repository";
 
 export const dynamic = "force-dynamic";
 
 export default async function DashboardGroupLayout({ children }: { children: ReactNode }) {
-  const [conversations, engineHealthSummary, sendingDomains, mailboxes] = await Promise.all([
-    getConversations(),
+  const [pendingReviewCount, engineHealthSummary, infrastructureAlertCount] = await Promise.all([
+    getPendingReviewCountData(),
     getEngineHealthSummary(),
-    getSendingDomains(),
-    getMailboxes(),
+    getInfrastructureAlertCountData(),
   ]);
-  const badgeCounts = computeNavBadgeCounts({ conversations, engineHealthSummary, sendingDomains, mailboxes });
+  const badgeCounts = computeNavBadgeCounts({ pendingReviewCount, engineHealthSummary, infrastructureAlertCount });
 
   return <AppShell badgeCounts={badgeCounts}>{children}</AppShell>;
 }

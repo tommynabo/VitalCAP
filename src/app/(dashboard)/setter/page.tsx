@@ -1,28 +1,12 @@
-import {
-  getAccountBundles,
-  getConversationMessages,
-  getConversations,
-  getCampaigns,
-  getSetterDrafts,
-} from "@/lib/data/repository";
+import { getSetterReviewQueuePage } from "@/lib/data/repository";
 import { SetterClient } from "./setter-client";
 
 export default async function SetterPage() {
-  const [conversations, conversationMessages, setterDrafts, accountBundles, campaigns] = await Promise.all([
-    getConversations(),
-    getConversationMessages(),
-    getSetterDrafts(),
-    getAccountBundles(),
-    getCampaigns(),
-  ]);
+  const initialQueuePage = await getSetterReviewQueuePage();
 
   return (
     <SetterClient
-      conversations={conversations}
-      conversationMessages={conversationMessages}
-      setterDrafts={setterDrafts}
-      accountBundles={accountBundles}
-      campaigns={campaigns}
+      initialQueuePage={initialQueuePage}
       renderedAt={new Date().toISOString()}
     />
   );

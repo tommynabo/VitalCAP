@@ -1,7 +1,8 @@
-import { eq } from "drizzle-orm";
+import { and, asc, count, desc, eq, inArray, lt, min, or } from "drizzle-orm";
 import { getDb } from "../db";
 import { conversations, conversationMessages, setterDrafts, setterFeedback, meetings } from "../schema/conversations";
 import type { Conversation, ConversationMessage, SetterDraft, SetterFeedback, Meeting } from "@/domain/conversations/types";
+import type { SetterQueueCursor, SetterQueueConversation, SetterQueueDraft, SetterQueueMessage } from "@/services/setter/review-queue";
 
 export function toConversation(row: typeof conversations.$inferSelect): Conversation {
   return {
@@ -86,6 +87,135 @@ export async function listConversations(workspaceId: string): Promise<Conversati
   const db = getDb();
   const rows = await db.select().from(conversations).where(eq(conversations.workspaceId, workspaceId));
   return rows.map(toConversation);
+}
+
+export async function countPendingReviewConversations(workspaceId: string): Promise<number> {
+  const db = getDb();
+  const [row] = await db
+    .select({ total: count() })
+    .from(conversations)
+    .where(and(eq(conversations.workspaceId, workspaceId), eq(conversations.state, "pending_review")));
+  return row?.total ?? 0;
+}
+
+export async function getOldestPendingReviewAt(workspaceId: string): Promise<string | null> {
+  const db = getDb();
+  const [row] = await db
+    .select({ oldestAt: min(conversations.updatedAt) })
+    .from(conversations)
+    .where(and(eq(conversations.workspaceId, workspaceId), eq(conversations.state, "pending_review")));
+  return row?.oldestAt?.toISOString() ?? null;
+}
+
+export async function listPendingReviewConversations(
+  workspaceId: string,
+  limit: number,
+  cursor: SetterQueueCursor | null,
+): Promise<SetterQueueConversation[]> {
+  const db = getDb();
+  const cursorDate = cursor ? new Date(cursor.updatedAt) : null;
+  const conditions = [eq(conversations.workspaceId, workspaceId), eq(conversations.state, "pending_review")];
+  if (cursor && cursorDate) {
+    conditions.push(or(
+      lt(conversations.updatedAt, cursorDate),
+      and(eq(conversations.updatedAt, cursorDate), lt(conversations.id, cursor.id)),
+    )!);
+  }
+  const rows = await db
+    .select({
+      id: conversations.id,
+      accountId: conversations.accountId,
+      contactId: conversations.contactId,
+      campaignId: conversations.campaignId,
+      state: conversations.state,
+      latestIntent: conversations.latestIntent,
+      updatedAt: conversations.updatedAt,
+    })
+    .from(conversations)
+    .where(and(...conditions))
+    .orderBy(desc(conversations.updatedAt), desc(conversations.id))
+    .limit(limit);
+  return rows.map((row) => ({
+    ...row,
+    state: row.state as Conversation["state"],
+    latestIntent: row.latestIntent as Conversation["latestIntent"],
+    updatedAt: row.updatedAt.toISOString(),
+  }));
+}
+
+export async function listSetterQueueMessages(
+  workspaceId: string,
+  conversationIds: string[],
+): Promise<SetterQueueMessage[]> {
+  if (conversationIds.length === 0) return [];
+  const db = getDb();
+  const rows = await db
+    .select({
+      id: conversationMessages.id,
+      conversationId: conversationMessages.conversationId,
+      direction: conversationMessages.direction,
+      body: conversationMessages.body,
+      createdAt: conversationMessages.createdAt,
+    })
+    .from(conversationMessages)
+    .innerJoin(conversations, eq(conversationMessages.conversationId, conversations.id))
+    .where(and(eq(conversations.workspaceId, workspaceId), inArray(conversations.id, conversationIds)))
+    .orderBy(asc(conversationMessages.createdAt), asc(conversationMessages.id));
+  return rows.map((row) => ({
+    ...row,
+    direction: row.direction as ConversationMessage["direction"],
+    createdAt: row.createdAt.toISOString(),
+  }));
+}
+
+export async function listLatestIncomingSetterQueueMessages(
+  workspaceId: string,
+  conversationIds: string[],
+): Promise<SetterQueueMessage[]> {
+  if (conversationIds.length === 0) return [];
+  const db = getDb();
+  const rows = await db
+    .selectDistinctOn([conversationMessages.conversationId], {
+      id: conversationMessages.id,
+      conversationId: conversationMessages.conversationId,
+      direction: conversationMessages.direction,
+      body: conversationMessages.body,
+      createdAt: conversationMessages.createdAt,
+    })
+    .from(conversationMessages)
+    .innerJoin(conversations, eq(conversationMessages.conversationId, conversations.id))
+    .where(and(
+      eq(conversations.workspaceId, workspaceId),
+      inArray(conversations.id, conversationIds),
+      eq(conversationMessages.direction, "incoming"),
+    ))
+    .orderBy(asc(conversationMessages.conversationId), desc(conversationMessages.createdAt), desc(conversationMessages.id));
+  return rows.map((row) => ({
+    ...row,
+    direction: row.direction as ConversationMessage["direction"],
+    createdAt: row.createdAt.toISOString(),
+  }));
+}
+
+export async function listSetterQueueDrafts(
+  workspaceId: string,
+  inboundMessageIds: string[],
+): Promise<SetterQueueDraft[]> {
+  if (inboundMessageIds.length === 0) return [];
+  const db = getDb();
+  const rows = await db
+    .select({
+      id: setterDrafts.id,
+      conversationMessageId: setterDrafts.conversationMessageId,
+      draft: setterDrafts.draft,
+      confidence: setterDrafts.confidence,
+      riskFlags: setterDrafts.riskFlags,
+    })
+    .from(setterDrafts)
+    .innerJoin(conversationMessages, eq(setterDrafts.conversationMessageId, conversationMessages.id))
+    .innerJoin(conversations, eq(conversationMessages.conversationId, conversations.id))
+    .where(and(eq(conversations.workspaceId, workspaceId), inArray(conversationMessages.id, inboundMessageIds)));
+  return rows.map((row) => ({ ...row, riskFlags: row.riskFlags as string[] }));
 }
 
 export async function listConversationMessages(workspaceId: string): Promise<ConversationMessage[]> {

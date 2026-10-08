@@ -1,6 +1,4 @@
-import type { Conversation } from "@/domain/conversations/types";
 import type { EngineHealthSummary } from "@/services/discovery/provider-health";
-import type { SendingDomain, Mailbox } from "@/domain/outreach/types";
 
 /**
  * Actionable-count badges for the sidebar (Prompt 5 §5.1 "numeric badges for
@@ -10,21 +8,16 @@ import type { SendingDomain, Mailbox } from "@/domain/outreach/types";
  * (the dashboard layout) decides where the data comes from.
  */
 export function computeNavBadgeCounts(data: {
-  conversations: Conversation[];
+  pendingReviewCount: number;
   engineHealthSummary: EngineHealthSummary;
-  sendingDomains: SendingDomain[];
-  mailboxes: Mailbox[];
+  infrastructureAlertCount: number;
 }): Record<string, number> {
-  const pendingReviews = data.conversations.filter((c) => c.state === "pending_review").length;
   const degradedEngines = data.engineHealthSummary.unhealthyCount;
-  const infrastructureAlerts =
-    data.sendingDomains.filter((d) => d.status === "degraded" || d.status === "paused").length +
-    data.mailboxes.filter((m) => m.pausedReason).length;
 
   return {
-    "/reviews": pendingReviews,
+    "/reviews": data.pendingReviewCount,
     "/autopilot": degradedEngines,
-    "/infrastructure": infrastructureAlerts,
+    "/infrastructure": data.infrastructureAlertCount,
   };
 }
 

@@ -1,4 +1,4 @@
-import { and, eq, gte, or, sql } from "drizzle-orm";
+import { and, eq, gte, inArray, isNotNull, or, sql } from "drizzle-orm";
 import { getDb } from "../db";
 import {
   outreachQueue,
@@ -114,6 +114,20 @@ export async function listMailboxes(workspaceId: string): Promise<Mailbox[]> {
     .innerJoin(sendingDomains, eq(mailboxes.sendingDomainId, sendingDomains.id))
     .where(eq(sendingDomains.workspaceId, workspaceId));
   return rows.map(({ mailbox }) => toMailbox(mailbox));
+}
+
+export async function countInfrastructureAlerts(workspaceId: string): Promise<number> {
+  const db = getDb();
+  const [degradedDomains, pausedMailboxes] = await Promise.all([
+    db.select({ total: sql<number>`count(*)` })
+      .from(sendingDomains)
+      .where(and(eq(sendingDomains.workspaceId, workspaceId), inArray(sendingDomains.status, ["degraded", "paused"]))),
+    db.select({ total: sql<number>`count(*)` })
+      .from(mailboxes)
+      .innerJoin(sendingDomains, eq(mailboxes.sendingDomainId, sendingDomains.id))
+      .where(and(eq(sendingDomains.workspaceId, workspaceId), isNotNull(mailboxes.pausedReason))),
+  ]);
+  return Number(degradedDomains[0]?.total ?? 0) + Number(pausedMailboxes[0]?.total ?? 0);
 }
 
 export async function listSuppressionEntries(workspaceId: string): Promise<SuppressionEntry[]> {

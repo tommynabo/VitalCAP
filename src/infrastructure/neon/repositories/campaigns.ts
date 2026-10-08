@@ -1,7 +1,8 @@
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import { getDb } from "../db";
 import { campaigns, campaignMemberships } from "../schema/campaigns";
 import type { Campaign, CampaignMembership, CampaignMembershipStage } from "@/domain/campaigns/types";
+import type { SetterQueueCampaign } from "@/services/setter/review-queue";
 
 export interface CreateCampaignInput {
   workspaceId: string;
@@ -65,6 +66,18 @@ export async function listCampaigns(workspaceId: string): Promise<Campaign[]> {
   const db = getDb();
   const rows = await db.select().from(campaigns).where(eq(campaigns.workspaceId, workspaceId));
   return rows.map(toCampaign);
+}
+
+export async function listSetterQueueCampaigns(
+  workspaceId: string,
+  campaignIds: string[],
+): Promise<SetterQueueCampaign[]> {
+  if (campaignIds.length === 0) return [];
+  const db = getDb();
+  return db
+    .select({ id: campaigns.id, name: campaigns.name })
+    .from(campaigns)
+    .where(and(eq(campaigns.workspaceId, workspaceId), inArray(campaigns.id, campaignIds)));
 }
 
 export async function getCampaignById(campaignId: string): Promise<Campaign | null> {

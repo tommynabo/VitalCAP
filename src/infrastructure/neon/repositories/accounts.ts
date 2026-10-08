@@ -1,4 +1,4 @@
-import { and, eq, gte, lte, or, sql } from "drizzle-orm";
+import { and, eq, gte, inArray, lte, or, sql } from "drizzle-orm";
 import { getDb, getNeonSql } from "../db";
 import { accounts, accountSources } from "../schema/accounts";
 import { contacts, contactPoints } from "../schema/contacts";
@@ -7,6 +7,7 @@ import type { Contact, ContactPoint, ContactPointType, VerificationStatus } from
 import type { AccountIdentitySignals } from "@/services/deduplication/account-dedup";
 import { evaluateAccountDedup } from "@/services/deduplication/account-dedup";
 import { deriveEmailChannelEligibility } from "@/services/compliance/email-channel-policy";
+import type { SetterQueueAccount } from "@/services/setter/review-queue";
 
 export interface AccountBundle {
   account: Account;
@@ -232,6 +233,40 @@ export async function listAccountBundles(workspaceId: string): Promise<AccountBu
       intelligence: intelligenceByAccount.get(account.id) ?? null,
     };
   });
+}
+
+export async function listSetterQueueAccounts(
+  workspaceId: string,
+  accountIds: string[],
+  contactIds: string[],
+): Promise<SetterQueueAccount[]> {
+  if (accountIds.length === 0) return [];
+  const db = getDb();
+  const accountPromise = db
+    .select({ id: accounts.id, canonicalName: accounts.canonicalName })
+    .from(accounts)
+    .where(and(eq(accounts.workspaceId, workspaceId), inArray(accounts.id, accountIds)));
+  const contactPromise = contactIds.length === 0
+    ? Promise.resolve([])
+    : db
+      .select({ id: contacts.id, accountId: contacts.accountId, firstName: contacts.firstName, fullName: contacts.fullName })
+      .from(contacts)
+      .where(and(
+        eq(contacts.workspaceId, workspaceId),
+        inArray(contacts.accountId, accountIds),
+        inArray(contacts.id, contactIds),
+      ));
+  const [accountRows, contactRows] = await Promise.all([accountPromise, contactPromise]);
+  const contactsByAccount = new Map<string, SetterQueueAccount["contacts"]>();
+  for (const contact of contactRows) {
+    const accountContacts = contactsByAccount.get(contact.accountId) ?? [];
+    accountContacts.push({ id: contact.id, firstName: contact.firstName, fullName: contact.fullName });
+    contactsByAccount.set(contact.accountId, accountContacts);
+  }
+  return accountRows.map((account) => ({
+    account,
+    contacts: contactsByAccount.get(account.id) ?? [],
+  }));
 }
 
 /**
