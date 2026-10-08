@@ -80,6 +80,16 @@ export async function listSetterQueueCampaigns(
     .where(and(eq(campaigns.workspaceId, workspaceId), inArray(campaigns.id, campaignIds)));
 }
 
+export async function listOutreachQueueCampaignMetadata(
+  workspaceId: string,
+): Promise<Array<Pick<Campaign, "id" | "name">>> {
+  const db = getDb();
+  return db
+    .select({ id: campaigns.id, name: campaigns.name })
+    .from(campaigns)
+    .where(eq(campaigns.workspaceId, workspaceId));
+}
+
 export async function getCampaignById(campaignId: string): Promise<Campaign | null> {
   const db = getDb();
   const [row] = await db.select().from(campaigns).where(eq(campaigns.id, campaignId));

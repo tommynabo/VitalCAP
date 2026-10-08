@@ -3,16 +3,20 @@
 import { useMemo, useState } from "react";
 import { KpiStat } from "@/components/dashboard/kpi-stat";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { MixBar } from "@/components/ui/charts";
 import { Select } from "@/components/ui/select";
 import { Table, TableBody, TableCell, TableHead, TableHeadCell, TableRow } from "@/components/ui/table";
 import { Tabs } from "@/components/ui/tabs";
-import { summarizeSenderPoolCapacity } from "@/services/outreach/sender-pool-service";
-import type { AccountBundle } from "@/lib/data/repository";
-import type { Campaign } from "@/domain/campaigns/types";
 import type { ContactPointType } from "@/domain/contacts/types";
-import type { OutreachEvent, OutreachEventState, OutreachQueueItem, SendingDomain, Mailbox } from "@/domain/outreach/types";
+import type { OutreachEventState } from "@/domain/outreach/types";
+import {
+  mergeOutreachQueuePageData,
+  type OutreachDashboardData,
+  type OutreachQueuePageData,
+  type OutreachQueueTab,
+} from "@/services/outreach/outreach-dashboard";
 
 const STATE_VARIANT: Record<OutreachEventState, "success" | "warning" | "danger" | "neutral" | "primary"> = {
   queued: "neutral",
@@ -38,57 +42,73 @@ const QUEUE_TABS = [
   { value: "suppressed", label: "Suppressed" },
 ];
 
-const TAB_STATES: Record<string, OutreachEventState[]> = {
-  scheduled: ["scheduled", "queued", "provider_submitted"],
-  sent: ["sent", "delivered"],
-  replies: ["replied"],
-  failed: ["failed", "bounced"],
-  suppressed: ["suppressed", "unsubscribed", "canceled"],
-};
+function getQueuePageKey(tab: OutreachQueueTab, channel: ContactPointType | "all", campaignId: string) {
+  return `${tab}:${campaignId}:${channel}`;
+}
 
-export function OutreachClient({
-  accountBundles,
-  campaigns,
-  mailboxes,
-  outreachEvents,
-  outreachQueueItems,
-  sendingDomains,
-}: {
-  accountBundles: AccountBundle[];
-  campaigns: Campaign[];
-  mailboxes: Mailbox[];
-  outreachEvents: OutreachEvent[];
-  outreachQueueItems: OutreachQueueItem[];
-  sendingDomains: SendingDomain[];
-}) {
+export function OutreachClient({ initialData }: { initialData: OutreachDashboardData }) {
   const [channelFilter, setChannelFilter] = useState<ContactPointType | "all">("all");
   const [campaignFilter, setCampaignFilter] = useState<string>("all");
+  const [activeTab, setActiveTab] = useState<OutreachQueueTab>("scheduled");
+  const [queuePages, setQueuePages] = useState<Record<string, OutreachQueuePageData>>(() => ({
+    [getQueuePageKey("scheduled", "all", "all")]: {
+      items: initialData.items,
+      accounts: initialData.accounts,
+      contactPoints: initialData.contactPoints,
+      nextCursor: initialData.nextCursor,
+    },
+  }));
+  const [loadingPageKeys, setLoadingPageKeys] = useState<string[]>([]);
+  const [queueErrors, setQueueErrors] = useState<Record<string, string>>({});
 
-  const accountsById = useMemo(() => new Map(accountBundles.map((b) => [b.account.id, b.account])), [accountBundles]);
-  const campaignsById = useMemo(() => new Map(campaigns.map((c) => [c.id, c])), [campaigns]);
+  const activePageKey = getQueuePageKey(activeTab, channelFilter, campaignFilter);
+  const activePage = queuePages[activePageKey];
+  const currentItems = activePage?.items;
+  const accountsById = useMemo(() => new Map(activePage?.accounts.map((account) => [account.id, account]) ?? []), [activePage]);
+  const campaignsById = useMemo(() => new Map(initialData.campaigns.map((campaign) => [campaign.id, campaign])), [initialData.campaigns]);
   const contactPointsById = useMemo(
-    () => new Map(accountBundles.flatMap((b) => b.contactPoints).map((cp) => [cp.id, cp])),
-    [accountBundles],
+    () => new Map(activePage?.contactPoints.map((contactPoint) => [contactPoint.id, contactPoint]) ?? []),
+    [activePage],
   );
 
-  const kpis = useMemo(() => {
-    const sentToday = outreachQueueItems.filter((q) => q.state === "sent" || q.state === "delivered").length;
-    const scheduledToday = outreachQueueItems.filter((q) => q.state === "scheduled" || q.state === "queued").length;
-    const emailCount = outreachQueueItems.filter((q) => q.channel === "email").length;
-    const smsCount = outreachQueueItems.filter((q) => q.channel === "phone").length;
-    const bounces = outreachEvents.filter((e) => e.state === "bounced").length;
-    const replies = outreachEvents.filter((e) => e.state === "replied").length;
-    const optOuts = outreachEvents.filter((e) => e.state === "unsubscribed").length;
-    return { sentToday, scheduledToday, emailCount, smsCount, bounces, replies, optOuts };
-  }, [outreachQueueItems, outreachEvents]);
-
-  const capacity = summarizeSenderPoolCapacity({ mailboxes, sendingDomains });
+  async function loadQueuePage(
+    tab: OutreachQueueTab,
+    cursor: OutreachQueuePageData["nextCursor"] = null,
+    filters: { channel: ContactPointType | "all"; campaignId: string } = { channel: channelFilter, campaignId: campaignFilter },
+  ) {
+    const queueKey = getQueuePageKey(tab, filters.channel, filters.campaignId);
+    const pageKey = `${queueKey}:${cursor?.id ?? "first"}`;
+    if (loadingPageKeys.includes(pageKey)) return;
+    setLoadingPageKeys((current) => [...current, pageKey]);
+    setQueueErrors((current) => ({ ...current, [tab]: "" }));
+    try {
+      const params = new URLSearchParams({ tab });
+      if (filters.channel !== "all") params.set("channel", filters.channel);
+      if (filters.campaignId !== "all") params.set("campaignId", filters.campaignId);
+      if (cursor) params.set("cursor", JSON.stringify(cursor));
+      const response = await fetch(`/api/outreach/queue?${params.toString()}`, { cache: "no-store" });
+      const page = await response.json().catch(() => null) as OutreachQueuePageData | null;
+      if (!response.ok || !page) throw new Error("Could not load outreach queue items.");
+      setQueuePages((current) => ({
+        ...current,
+        [queueKey]: cursor && current[queueKey] ? mergeOutreachQueuePageData(current[queueKey]!, page) : page,
+      }));
+    } catch (error) {
+      setQueueErrors((current) => ({ ...current, [queueKey]: error instanceof Error ? error.message : "Could not load outreach queue items." }));
+    } finally {
+      setLoadingPageKeys((current) => current.filter((key) => key !== pageKey));
+    }
+  }
 
   const filtered = useMemo(() => {
-    return outreachQueueItems
+    return (currentItems ?? [])
       .filter((item) => (channelFilter === "all" ? true : item.channel === channelFilter))
       .filter((item) => (campaignFilter === "all" ? true : item.campaignId === campaignFilter));
-  }, [outreachQueueItems, channelFilter, campaignFilter]);
+  }, [currentItems, channelFilter, campaignFilter]);
+
+  const activeFilters = { channel: channelFilter, campaignId: campaignFilter };
+  const pageLoading = loadingPageKeys.includes(`${activePageKey}:first`);
+  const pageLoadingMore = !!activePage?.nextCursor && loadingPageKeys.includes(`${activePageKey}:${activePage.nextCursor.id}`);
 
   return (
     <div className="space-y-6">
@@ -101,19 +121,19 @@ export function OutreachClient({
       </div>
 
       <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-6">
-        <KpiStat label="Scheduled today" value={String(kpis.scheduledToday)} emphasize />
-        <KpiStat label="Sent today" value={String(kpis.sentToday)} />
-        <KpiStat label="Email / SMS" value={`${kpis.emailCount} / ${kpis.smsCount}`} />
-        <KpiStat label="Bounces" value={String(kpis.bounces)} />
-        <KpiStat label="Replies" value={String(kpis.replies)} />
-        <KpiStat label="Opt-outs" value={String(kpis.optOuts)} />
+        <KpiStat label="Scheduled today" value={String(initialData.kpis.scheduledToday)} emphasize />
+        <KpiStat label="Sent today" value={String(initialData.kpis.sentToday)} />
+        <KpiStat label="Email / SMS" value={`${initialData.kpis.emailCount} / ${initialData.kpis.smsCount}`} />
+        <KpiStat label="Bounces" value={String(initialData.kpis.bounces)} />
+        <KpiStat label="Replies" value={String(initialData.kpis.replies)} />
+        <KpiStat label="Opt-outs" value={String(initialData.kpis.optOuts)} />
       </div>
 
-      {(kpis.bounces > 0 || kpis.optOuts > 0) && (
+      {(initialData.kpis.bounces > 0 || initialData.kpis.optOuts > 0) && (
         <Card className="border-warning">
           <CardContent className="py-3 text-sm text-warning">
-            {kpis.bounces} bounce{kpis.bounces === 1 ? "" : "s"} and {kpis.optOuts} opt-out
-            {kpis.optOuts === 1 ? "" : "s"} recorded — suppression list updated automatically, no further sends to
+            {initialData.kpis.bounces} bounce{initialData.kpis.bounces === 1 ? "" : "s"} and {initialData.kpis.optOuts} opt-out
+            {initialData.kpis.optOuts === 1 ? "" : "s"} recorded — suppression list updated automatically, no further sends to
             those endpoints.
           </CardContent>
         </Card>
@@ -127,8 +147,8 @@ export function OutreachClient({
           <CardContent>
             <MixBar
               segments={[
-                { label: "Email", value: kpis.emailCount, colorClassName: "bg-primary" },
-                { label: "SMS", value: kpis.smsCount, colorClassName: "bg-warning" },
+                { label: "Email", value: initialData.kpis.emailCount, colorClassName: "bg-primary" },
+                { label: "SMS", value: initialData.kpis.smsCount, colorClassName: "bg-warning" },
               ]}
             />
           </CardContent>
@@ -139,9 +159,9 @@ export function OutreachClient({
             <CardTitle>Sender pool health</CardTitle>
           </CardHeader>
           <CardContent className="space-y-2 text-sm">
-            <p className="flex justify-between"><span className="text-text-muted">Usable mailboxes</span><span className="font-medium text-text">{capacity.usableMailboxCount}</span></p>
-            <p className="flex justify-between"><span className="text-text-muted">Remaining capacity</span><span className="font-medium text-text">{capacity.totalRemainingCapacity}</span></p>
-            <p className="flex justify-between"><span className="text-text-muted">Paused / unhealthy</span><span className="font-medium text-text">{capacity.pausedOrUnhealthyMailboxCount}</span></p>
+            <p className="flex justify-between"><span className="text-text-muted">Usable mailboxes</span><span className="font-medium text-text">{initialData.senderPool.usableMailboxCount}</span></p>
+            <p className="flex justify-between"><span className="text-text-muted">Remaining capacity</span><span className="font-medium text-text">{initialData.senderPool.totalRemainingCapacity}</span></p>
+            <p className="flex justify-between"><span className="text-text-muted">Paused / unhealthy</span><span className="font-medium text-text">{initialData.senderPool.pausedOrUnhealthyMailboxCount}</span></p>
           </CardContent>
         </Card>
       </div>
@@ -152,7 +172,14 @@ export function OutreachClient({
         </CardHeader>
         <CardContent>
           <div className="mb-4 flex flex-wrap gap-3">
-            <Select value={channelFilter} onChange={(e) => setChannelFilter(e.target.value as ContactPointType | "all")}>
+            <Select value={channelFilter} onChange={(e) => {
+              const channel = e.target.value as ContactPointType | "all";
+              setChannelFilter(channel);
+              const filters = { channel, campaignId: campaignFilter };
+              if (!queuePages[getQueuePageKey(activeTab, filters.channel, filters.campaignId)]) {
+                void loadQueuePage(activeTab, null, filters);
+              }
+            }}>
               <option value="all">All channels</option>
               {ALL_CHANNELS.map((c) => (
                 <option key={c} value={c}>
@@ -161,9 +188,16 @@ export function OutreachClient({
               ))}
             </Select>
 
-            <Select value={campaignFilter} onChange={(e) => setCampaignFilter(e.target.value)}>
+            <Select value={campaignFilter} onChange={(e) => {
+              const campaignId = e.target.value;
+              setCampaignFilter(campaignId);
+              const filters = { channel: channelFilter, campaignId };
+              if (!queuePages[getQueuePageKey(activeTab, filters.channel, filters.campaignId)]) {
+                void loadQueuePage(activeTab, null, filters);
+              }
+            }}>
               <option value="all">All campaigns</option>
-              {campaigns.map((c) => (
+              {initialData.campaigns.map((c) => (
                 <option key={c.id} value={c.id}>
                   {c.name}
                 </option>
@@ -171,10 +205,17 @@ export function OutreachClient({
             </Select>
           </div>
 
-          <Tabs items={QUEUE_TABS} defaultValue="scheduled">
-            {(active) => {
-              const states = TAB_STATES[active] ?? [];
-              const rows = filtered.filter((item) => states.includes(item.state));
+          <Tabs
+            items={QUEUE_TABS}
+            value={activeTab}
+            onValueChange={(value) => {
+              const tab = value as OutreachQueueTab;
+              setActiveTab(tab);
+              if (!queuePages[getQueuePageKey(tab, channelFilter, campaignFilter)]) void loadQueuePage(tab, null, activeFilters);
+            }}
+          >
+            {() => {
+              const rows = filtered;
               return (
                 <Table>
                   <TableHead>
@@ -209,7 +250,12 @@ export function OutreachClient({
                         </TableRow>
                       );
                     })}
-                    {rows.length === 0 && (
+                    {rows.length === 0 && pageLoading && (
+                      <TableRow>
+                        <TableCell colSpan={7} className="py-6 text-center text-text-muted">Loading queue items...</TableCell>
+                      </TableRow>
+                    )}
+                    {rows.length === 0 && !pageLoading && (
                       <TableRow>
                         <TableCell colSpan={7} className="py-6 text-center text-text-muted">
                           No queue items in this bucket.
@@ -221,6 +267,12 @@ export function OutreachClient({
               );
             }}
           </Tabs>
+          {queueErrors[activePageKey] && <p role="alert" className="mt-3 text-sm text-danger">{queueErrors[activePageKey]}</p>}
+          {activePage?.nextCursor && (
+            <Button className="mt-3" size="sm" variant="secondary" disabled={pageLoadingMore} onClick={() => void loadQueuePage(activeTab, activePage.nextCursor, activeFilters)}>
+              {pageLoadingMore ? "Loading..." : "Load more"}
+            </Button>
+          )}
         </CardContent>
       </Card>
     </div>

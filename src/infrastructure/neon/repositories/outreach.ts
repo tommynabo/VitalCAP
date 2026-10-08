@@ -1,4 +1,4 @@
-import { and, eq, gte, inArray, isNotNull, or, sql } from "drizzle-orm";
+import { and, asc, count, eq, gte, gt, inArray, isNotNull, or, sql } from "drizzle-orm";
 import { getDb } from "../db";
 import {
   outreachQueue,
@@ -18,6 +18,8 @@ import type { ContactPoint } from "@/domain/contacts/types";
 import type { OutreachCandidate } from "@/services/outreach/outreach-orchestrator";
 import type { MixChannel } from "@/services/outreach/channel-mix-planner";
 import { canEnterColdOutreach as evaluateColdOutreach } from "@/services/deduplication/outreach-dedup";
+import type { SenderPoolAggregate, OutreachQueueCursor, OutreachQueueFilters, OutreachQueueRow } from "@/services/outreach/outreach-dashboard";
+import { DEFAULT_SENDER_POOL_HEALTH_POLICY } from "@/services/outreach/sender-pool-service";
 
 function toQueueItem(row: typeof outreachQueue.$inferSelect): OutreachQueueItem {
   return {
@@ -87,6 +89,104 @@ export async function listOutreachQueueItems(workspaceId: string): Promise<Outre
     .innerJoin(campaigns, eq(outreachQueue.campaignId, campaigns.id))
     .where(eq(campaigns.workspaceId, workspaceId));
   return rows.map(({ item }) => toQueueItem(item));
+}
+
+export async function listOutreachQueueRows(
+  workspaceId: string,
+  states: OutreachEventState[],
+  limit: number,
+  cursor: OutreachQueueCursor | null,
+  filters: OutreachQueueFilters = {},
+): Promise<OutreachQueueRow[]> {
+  const db = getDb();
+  const conditions = [eq(campaigns.workspaceId, workspaceId), inArray(outreachQueue.state, states)];
+  if (cursor) conditions.push(gt(outreachQueue.id, cursor.id));
+  if (filters.campaignId) conditions.push(eq(outreachQueue.campaignId, filters.campaignId));
+  if (filters.channel) conditions.push(eq(outreachQueue.channel, filters.channel));
+  const rows = await db
+    .select({
+      id: outreachQueue.id,
+      campaignId: outreachQueue.campaignId,
+      accountId: outreachQueue.accountId,
+      contactId: outreachQueue.contactId,
+      contactPointId: outreachQueue.contactPointId,
+      channel: outreachQueue.channel,
+      priority: outreachQueue.priority,
+      scheduledFor: outreachQueue.scheduledFor,
+      state: outreachQueue.state,
+      deliveryMode: outreachQueue.deliveryMode,
+    })
+    .from(outreachQueue)
+    .innerJoin(campaigns, eq(outreachQueue.campaignId, campaigns.id))
+    .where(and(...conditions))
+    .orderBy(asc(outreachQueue.id))
+    .limit(limit);
+  return rows.map((row) => ({
+    item: {
+      ...row,
+      channel: row.channel as OutreachQueueItem["channel"],
+      state: row.state as OutreachQueueItem["state"],
+      deliveryMode: row.deliveryMode as OutreachQueueItem["deliveryMode"],
+      priority: Number(row.priority),
+      scheduledFor: row.scheduledFor?.toISOString() ?? null,
+    },
+  }));
+}
+
+export async function aggregateOutreachQueue(workspaceId: string) {
+  const db = getDb();
+  const rows = await db
+    .select({ state: outreachQueue.state, channel: outreachQueue.channel, total: count() })
+    .from(outreachQueue)
+    .innerJoin(campaigns, eq(outreachQueue.campaignId, campaigns.id))
+    .where(eq(campaigns.workspaceId, workspaceId))
+    .groupBy(outreachQueue.state, outreachQueue.channel);
+  return rows.map((row) => ({
+    state: row.state as OutreachEventState,
+    channel: row.channel,
+    total: Number(row.total),
+  }));
+}
+
+export async function aggregateOutreachEvents(workspaceId: string) {
+  const db = getDb();
+  const rows = await db
+    .select({ state: outreachEvents.state, total: count() })
+    .from(outreachEvents)
+    .innerJoin(outreachQueue, eq(outreachEvents.outreachQueueItemId, outreachQueue.id))
+    .innerJoin(campaigns, eq(outreachQueue.campaignId, campaigns.id))
+    .where(eq(campaigns.workspaceId, workspaceId))
+    .groupBy(outreachEvents.state);
+  return rows.map((row) => ({ state: row.state as OutreachEventState, total: Number(row.total) }));
+}
+
+export async function aggregateSenderPoolCapacity(workspaceId: string): Promise<SenderPoolAggregate> {
+  const db = getDb();
+  const usableMailboxFilter = sql`
+    ${mailboxes.pausedReason} IS NULL
+    AND ${sendingDomains.status} IN ('connected', 'degraded')
+    AND ${mailboxes.bounceRate} <= ${DEFAULT_SENDER_POOL_HEALTH_POLICY.maxBounceRate}
+    AND ${mailboxes.healthScore} >= ${DEFAULT_SENDER_POOL_HEALTH_POLICY.minHealthScore}
+    AND ${mailboxes.dailyCapacity} > ${mailboxes.sentToday}
+  `;
+  const [row] = await db
+    .select({
+      totalMailboxCount: count(),
+      totalDailyCapacity: sql<number>`coalesce(sum(${mailboxes.dailyCapacity}), 0)`,
+      totalSentToday: sql<number>`coalesce(sum(${mailboxes.sentToday}), 0)`,
+      usableMailboxCount: sql<number>`count(*) FILTER (WHERE ${usableMailboxFilter})`,
+      totalRemainingCapacity: sql<number>`coalesce(sum(greatest(${mailboxes.dailyCapacity} - ${mailboxes.sentToday}, 0)) FILTER (WHERE ${usableMailboxFilter}), 0)`,
+    })
+    .from(mailboxes)
+    .innerJoin(sendingDomains, eq(mailboxes.sendingDomainId, sendingDomains.id))
+    .where(eq(sendingDomains.workspaceId, workspaceId));
+  return {
+    totalMailboxCount: Number(row?.totalMailboxCount ?? 0),
+    totalDailyCapacity: Number(row?.totalDailyCapacity ?? 0),
+    totalSentToday: Number(row?.totalSentToday ?? 0),
+    usableMailboxCount: Number(row?.usableMailboxCount ?? 0),
+    totalRemainingCapacity: Number(row?.totalRemainingCapacity ?? 0),
+  };
 }
 
 export async function listOutreachEvents(workspaceId: string): Promise<OutreachEvent[]> {

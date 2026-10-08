@@ -269,6 +269,30 @@ export async function listSetterQueueAccounts(
   }));
 }
 
+export async function listOutreachQueueDisplayData(
+  workspaceId: string,
+  accountIds: string[],
+  contactPointIds: string[],
+): Promise<{
+  accounts: Array<{ id: string; canonicalName: string }>;
+  contactPoints: Array<{ id: string; value: string }>;
+}> {
+  const db = getDb();
+  const [accountRows, contactPointRows] = await Promise.all([
+    accountIds.length === 0
+      ? Promise.resolve([])
+      : db.select({ id: accounts.id, canonicalName: accounts.canonicalName })
+        .from(accounts)
+        .where(and(eq(accounts.workspaceId, workspaceId), inArray(accounts.id, accountIds))),
+    contactPointIds.length === 0
+      ? Promise.resolve([])
+      : db.select({ id: contactPoints.id, value: contactPoints.value })
+        .from(contactPoints)
+        .where(and(eq(contactPoints.workspaceId, workspaceId), inArray(contactPoints.id, contactPointIds))),
+  ]);
+  return { accounts: accountRows, contactPoints: contactPointRows };
+}
+
 /**
  * Bounded, indexed lookup of accounts that could plausibly match `incoming`
  * (Gate E processing cron) — feeds `evaluateAccountDedup` the same way the

@@ -16,12 +16,16 @@ import * as seed from "@/lib/seed/dev-seed";
 
 import { getPrimaryOffer, listOffers } from "@/infrastructure/neon/repositories/offers";
 import { listSetterWebhookEvents, type SetterWebhookEventSummary } from "@/infrastructure/neon/repositories/setter-runtime";
-import { listCampaigns, listSetterQueueCampaigns } from "@/infrastructure/neon/repositories/campaigns";
-import { listAccountBundles, listSetterQueueAccounts, type AccountBundle } from "@/infrastructure/neon/repositories/accounts";
+import { listCampaigns, listOutreachQueueCampaignMetadata, listSetterQueueCampaigns } from "@/infrastructure/neon/repositories/campaigns";
+import { listAccountBundles, listOutreachQueueDisplayData, listSetterQueueAccounts, type AccountBundle } from "@/infrastructure/neon/repositories/accounts";
 import {
   countInfrastructureAlerts,
   listOutreachQueueItems,
   listOutreachEvents,
+  listOutreachQueueRows,
+  aggregateOutreachQueue,
+  aggregateOutreachEvents,
+  aggregateSenderPoolCapacity,
   listSendingDomains,
   listMailboxes,
   listSuppressionEntries,
@@ -89,6 +93,15 @@ import {
   type SetterReviewQueuePage,
 } from "@/services/setter/review-queue";
 import { buildConversationHistoryPage, CONVERSATION_HISTORY_PAGE_SIZE, type ConversationHistoryCursor } from "@/services/setter/conversation-history";
+import {
+  loadOutreachDashboardData,
+  loadOutreachQueuePageData,
+  type OutreachDashboardDependencies,
+  type OutreachQueueFilters,
+  type OutreachQueueTab,
+  type OutreachQueueCursor,
+} from "@/services/outreach/outreach-dashboard";
+import { summarizeSenderPoolCapacity } from "@/services/outreach/sender-pool-service";
 
 export type { AccountBundle, ProviderRowStatus, QueueHealthSnapshot, DeadLetterSample, WeeklyTrendPoint };
 export type { InstantlyPipelineDiagnostics };
@@ -314,6 +327,86 @@ export async function getOutreachQueueItems(): Promise<OutreachQueueItem[]> {
   if (isDevSeedMode()) return seed.seedOutreachQueueItems;
   const workspaceId = await getCurrentWorkspaceId();
   return listOutreachQueueItems(workspaceId);
+}
+
+function createOutreachDashboardDependencies(workspaceId: string): OutreachDashboardDependencies {
+  if (isDevSeedMode()) {
+    const listSeedQueueRows: OutreachDashboardDependencies["listQueueRows"] = async (states, limit, cursor, filters) =>
+      seed.seedOutreachQueueItems
+        .filter((item) => states.includes(item.state))
+        .filter((item) => !filters.channel || item.channel === filters.channel)
+        .filter((item) => !filters.campaignId || item.campaignId === filters.campaignId)
+        .filter((item) => !cursor || item.id > cursor.id)
+        .sort((left, right) => left.id.localeCompare(right.id))
+        .slice(0, limit)
+        .map((item) => ({ item }));
+    const senderPoolSummary = summarizeSenderPoolCapacity({
+      mailboxes: seed.seedMailboxes,
+      sendingDomains: seed.seedSendingDomains,
+    });
+    return {
+      listQueueRows: listSeedQueueRows,
+      listQueueDisplayData: async (accountIds, contactPointIds) => {
+        const accountIdSet = new Set(accountIds);
+        const contactPointIdSet = new Set(contactPointIds);
+        const bundles = seed.seedAccountBundles.filter(({ account }) => accountIdSet.has(account.id));
+        return {
+          accounts: bundles.map(({ account }) => ({ id: account.id, canonicalName: account.canonicalName })),
+          contactPoints: bundles.flatMap(({ contactPoints }) => contactPoints
+            .filter((contactPoint) => contactPointIdSet.has(contactPoint.id))
+            .map(({ id, value }) => ({ id, value }))),
+        };
+      },
+      listCampaignMetadata: async () => seed.seedCampaigns.map(({ id, name }) => ({ id, name })),
+      listQueueAggregates: async () => {
+        const counts = new Map<string, { state: OutreachQueueItem["state"]; channel: string; total: number }>();
+        for (const item of seed.seedOutreachQueueItems) {
+          const key = `${item.state}:${item.channel}`;
+          const previous = counts.get(key);
+          counts.set(key, { state: item.state, channel: item.channel, total: (previous?.total ?? 0) + 1 });
+        }
+        return [...counts.values()];
+      },
+      listEventAggregates: async () => {
+        const counts = new Map<string, number>();
+        for (const event of seed.seedOutreachEvents) counts.set(event.state, (counts.get(event.state) ?? 0) + 1);
+        return [...counts].map(([state, total]) => ({ state: state as OutreachEvent["state"], total }));
+      },
+      getSenderPoolAggregate: async () => ({
+        totalDailyCapacity: senderPoolSummary.totalDailyCapacity,
+        totalSentToday: senderPoolSummary.totalSentToday,
+        totalRemainingCapacity: senderPoolSummary.totalRemainingCapacity,
+        usableMailboxCount: senderPoolSummary.usableMailboxCount,
+        totalMailboxCount: seed.seedMailboxes.length,
+      }),
+    };
+  }
+
+  return {
+    listQueueRows: (states, limit, cursor, filters) => listOutreachQueueRows(workspaceId, states, limit, cursor, filters),
+    listQueueDisplayData: (accountIds, contactPointIds) => listOutreachQueueDisplayData(workspaceId, accountIds, contactPointIds),
+    listCampaignMetadata: () => listOutreachQueueCampaignMetadata(workspaceId),
+    listQueueAggregates: () => aggregateOutreachQueue(workspaceId),
+    listEventAggregates: () => aggregateOutreachEvents(workspaceId),
+    getSenderPoolAggregate: () => aggregateSenderPoolCapacity(workspaceId),
+  };
+}
+
+export async function getOutreachDashboardDataForWorkspace(workspaceId: string) {
+  return loadOutreachDashboardData(createOutreachDashboardDependencies(workspaceId));
+}
+
+export async function getOutreachDashboardData() {
+  return getOutreachDashboardDataForWorkspace(await getCurrentWorkspaceId());
+}
+
+export async function getOutreachQueuePageDataForWorkspace(
+  workspaceId: string,
+  tab: OutreachQueueTab,
+  cursor: OutreachQueueCursor | null = null,
+  filters: OutreachQueueFilters = {},
+) {
+  return loadOutreachQueuePageData(createOutreachDashboardDependencies(workspaceId), tab, cursor, filters);
 }
 
 export async function getOutreachEvents(): Promise<OutreachEvent[]> {
