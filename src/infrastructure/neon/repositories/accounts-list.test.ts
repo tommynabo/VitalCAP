@@ -37,7 +37,7 @@ describe("listAccountSummaryRows", () => {
       province: "Sevilla",
       fit_score: "91.5",
       fit_tier: "high",
-      created_at: new Date("2026-01-01T00:00:00.000Z"),
+      created_at: "2026-01-01 00:00:00.000000+00",
       source_count: "2",
       contact_count: 3,
       analyzed_account_id: "account-1",

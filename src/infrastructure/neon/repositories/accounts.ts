@@ -322,7 +322,7 @@ export async function listAccountSummaryRows(
       province: typeof row.province === "string" ? row.province : null,
       fitScore: safeNumeric(row.fit_score),
       fitTier: String(row.fit_tier) as Account["fitTier"],
-      createdAt: row.created_at instanceof Date ? row.created_at.toISOString() : String(row.created_at),
+      createdAt: row.created_at instanceof Date ? row.created_at.toISOString() : new Date(String(row.created_at)).toISOString(),
     },
     contactCount: safeNumeric(row.contact_count) ?? 0,
     sourceCount: safeNumeric(row.source_count) ?? 0,
