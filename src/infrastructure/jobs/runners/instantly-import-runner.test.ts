@@ -475,6 +475,28 @@ describe("runInstantlyImportTick", () => {
     expect(mocks.addLeadToCampaign).toHaveBeenCalledOnce();
   });
 
+  it("does not queue a second account with an email already reserved for the target campaign", async () => {
+    const first = candidate();
+    const second = candidate({
+      account_id: "account-2",
+      contact_id: "contact-2",
+      contact_point_id: "contact-point-2",
+    });
+    setupWithOneClaimedJob([first, second], [first]);
+    mocks.enqueueImport.mockResolvedValueOnce(true).mockResolvedValueOnce(false);
+
+    const result = await runInstantlyImportTick({ createdSince: new Date("2026-10-02T00:00:00.000Z") });
+
+    expect(result.leadsQueued).toBe(1);
+    expect(mocks.enqueueImport).toHaveBeenCalledTimes(2);
+    expect(mocks.enqueueImport).toHaveBeenNthCalledWith(2, expect.objectContaining({
+      accountId: "account-2",
+      normalizedEmail: first.normalized_email,
+      providerCampaignId: campaignId,
+    }));
+    expect(mocks.addLeadToCampaign).toHaveBeenCalledOnce();
+  });
+
   it("persists provider failures as retryable imports", async () => {
     setupWithOneClaimedJob([candidate()]);
     mocks.addLeadToCampaign.mockResolvedValue({

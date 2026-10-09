@@ -61,7 +61,7 @@ function performance(campaign: Campaign, seeds: readonly SearchSeed[], queueDept
   };
 }
 
-/** Schedules a single global qualified-target deficit across every eligible engine. */
+/** Schedules a single global target deficit across every eligible engine. */
 export async function runAutopilotCronTick(now: Date = new Date()): Promise<AutopilotRunnerResult> {
   const workspaceIds = await listWorkspaceIds();
   let campaignsTicked = 0;
@@ -93,7 +93,7 @@ export async function runAutopilotCronTick(now: Date = new Date()): Promise<Auto
     pacingStates.push(pacing);
     campaignsTicked += campaigns.length;
     // The target and budget are workspace-wide, never multiplied by engines.
-    if (pacing.remainingTarget <= 0 || pacing.qualifiedNeededToPlan <= 0 || pacing.rawNeededToPlan <= 0 || pacing.status !== "behind_pace") continue;
+    if (pacing.remainingTarget <= 0 || pacing.targetNeededToPlan <= 0 || pacing.rawNeededToPlan <= 0 || pacing.status !== "behind_pace") continue;
 
     const mapsEnv = getMapsEnv();
     const serperEnv = getSerperEnv();

@@ -65,4 +65,19 @@ describe("Autopilot controls", () => {
       updatedAt: expect.any(String),
     }));
   });
+
+  it("persists Instantly imports as the target metric without changing send settings", async () => {
+    const result = await executeAutopilotControl({
+      action: "target_change",
+      globalDailyTarget: 250,
+      targetMetric: "instantly_imported",
+    });
+
+    expect(updateAutopilotSettingsWithAudit).toHaveBeenCalledWith(expect.objectContaining({
+      workspaceId,
+      patch: { globalDailyTarget: 250, targetMetric: "instantly_imported" },
+    }));
+    expect(result.targetMetric).toBe("instantly_imported");
+    expect(result.enabled).toBe(false);
+  });
 });

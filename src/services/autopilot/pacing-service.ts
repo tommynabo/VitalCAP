@@ -22,9 +22,14 @@ type LegacyPacingStatus = "behind" | "ahead" | "on_track";
 export interface AutopilotPacingState {
   workspaceId: string;
   timeZone: string;
+  targetMetric: "qualified" | "analyzed_qualified" | "outreach_ready" | "instantly_imported";
   dailyTarget: number;
   targetAchievedToday: number;
   remainingTarget: number;
+  discoveredToday: number;
+  withEmailToday: number;
+  validEmailToday: number;
+  eligibleToday: number;
   operatingStart: string;
   operatingEnd: string;
   now: Date;
@@ -32,7 +37,15 @@ export interface AutopilotPacingState {
   expectedAchievedByNow: number;
   paceDeficit: number;
   qualifiedToday: number;
+  instantlyImportedToday: number;
+  eligibleImportBacklog: number;
+  verificationInFlight: number;
+  expectedImportsFromBacklog: number;
   rawRequestedToday: number;
+  rawRequestCap: number | null;
+  rawRequestsRemaining: number;
+  estimatedRawDemand: number;
+  capacityConstrained: boolean;
   rawReturnedToday: number;
   processingInFlight: number;
   providerRunsInFlight: number;
@@ -42,7 +55,7 @@ export interface AutopilotPacingState {
   apifyDailyBudgetRemaining: number;
   providerHealth: "untested" | "healthy" | "degraded" | "paused" | "unknown";
   status: PacingStatus;
-  qualifiedNeededToPlan: number;
+  targetNeededToPlan: number;
   rawNeededToPlan: number;
   estimatedYield: number;
   yieldSampleSize: number;
@@ -123,13 +136,23 @@ function localWallClock(date: Date, timeZone: string): { hour: number; minute: n
 export interface PacingComputationInput {
   workspaceId: string;
   timeZone: string;
+  targetMetric?: AutopilotPacingState["targetMetric"];
   dailyTarget: number;
   targetAchievedToday: number;
+  discoveredToday?: number;
+  withEmailToday?: number;
+  validEmailToday?: number;
+  eligibleToday?: number;
+  qualifiedToday?: number;
+  instantlyImportedToday?: number;
+  eligibleImportBacklog?: number;
+  verificationInFlight?: number;
   rawRequestedToday: number;
   rawReturnedToday: number;
   processingInFlight: number;
   providerRunsInFlight: number;
   expectedQualifiedFromInFlight: number;
+  expectedImportsFromBacklog?: number;
   apifySpendToday: number;
   apifyDailyBudgetRemaining: number;
   providerHealth: AutopilotPacingState["providerHealth"];
@@ -144,6 +167,7 @@ export interface PacingComputationInput {
 }
 
 export function computeAutopilotPacing(input: PacingComputationInput): AutopilotPacingState {
+  const targetMetric = input.targetMetric ?? "qualified";
   const startHour = input.operatingStartHour ?? DEFAULT_OPERATING_WINDOW.startHour;
   const endHour = input.operatingEndHour ?? DEFAULT_OPERATING_WINDOW.endHour;
   const startMinutes = startHour * 60;
@@ -154,23 +178,35 @@ export function computeAutopilotPacing(input: PacingComputationInput): Autopilot
   const elapsedOperatingFraction = Math.min(1, Math.max(0, (nowMinutes - startMinutes) / windowLength));
   const expectedAchievedByNow = input.dailyTarget * elapsedOperatingFraction;
   const remainingTarget = Math.max(0, input.dailyTarget - input.targetAchievedToday);
-  const paceDeficit = Math.max(0, expectedAchievedByNow - input.targetAchievedToday - input.expectedQualifiedFromInFlight);
-  const minimumYieldFloor = 0.1;
-  const boundedYield = Math.max(minimumYieldFloor, Math.min(1, input.estimatedYield || 0));
+  const expectedImportsFromBacklog = Math.max(0, input.expectedImportsFromBacklog ?? 0);
+  const expectedProgressFromInFlight = targetMetric === "instantly_imported"
+    ? expectedImportsFromBacklog
+    : input.expectedQualifiedFromInFlight;
+  const paceDeficit = Math.max(0, expectedAchievedByNow - input.targetAchievedToday - expectedProgressFromInFlight);
+  const minimumYield = targetMetric === "instantly_imported" ? 0.02 : 0.1;
+  const maximumYield = targetMetric === "instantly_imported" ? 0.5 : 1;
+  const boundedYield = Math.max(minimumYield, Math.min(maximumYield, input.estimatedYield || 0));
   const windowClosed = nowMinutes < startMinutes || nowMinutes >= endMinutes;
   const hasCapacity = input.availableDiscoveryCapacity ?? (input.providerHealth !== "paused" && input.apifyDailyBudgetRemaining > 0);
-  const qualifiedNeededToPlan = windowClosed || !hasCapacity
+  const targetNeededToPlan = windowClosed || !hasCapacity
     ? 0
     : Math.min(remainingTarget, Math.ceil(paceDeficit * 1.1));
   
-  const rawRemainingToday = typeof input.maxDailyRawRequests === "number" 
-    ? Math.max(0, input.maxDailyRawRequests - input.rawRequestedToday) 
+  const rawRequestCap = typeof input.maxDailyRawRequests === "number" ? input.maxDailyRawRequests : null;
+  const rawRemainingToday = rawRequestCap !== null
+    ? Math.max(0, rawRequestCap - input.rawRequestedToday)
     : 1000;
   // Keep the daily guard as the only global raw cap. The target planner then
   // turns this into bounded, idempotent planning-window orders. A fixed 100
   // here made a 250-qualified/day target mathematically unreachable at
   // ordinary yield rates.
-  const rawNeededToPlan = qualifiedNeededToPlan > 0 ? Math.min(rawRemainingToday, Math.ceil(qualifiedNeededToPlan / boundedYield)) : 0;
+  const estimatedRawDemand = targetMetric === "instantly_imported"
+    ? Math.ceil(Math.max(0, remainingTarget - expectedProgressFromInFlight) / boundedYield)
+    : targetNeededToPlan > 0 ? Math.ceil(targetNeededToPlan / boundedYield) : 0;
+  const rawNeededToPlan = targetNeededToPlan > 0
+    ? Math.min(rawRemainingToday, Math.ceil(targetNeededToPlan / boundedYield))
+    : 0;
+  const capacityConstrained = estimatedRawDemand > rawRemainingToday;
   
   const hoursRemaining = Math.max(0, (endMinutes - nowMinutes) / 60);
   const status: PacingStatus = nowMinutes < startMinutes
@@ -182,8 +218,9 @@ export function computeAutopilotPacing(input: PacingComputationInput): Autopilot
           : paceDeficit > 0
             ? "behind_pace"
             : "on_pace";
+  const targetLabel = targetMetric === "instantly_imported" ? "Instantly imports" : "qualified prospects";
   const explanation = status === "behind_pace"
-    ? `Behind pace by ${Math.ceil(paceDeficit)} qualified prospects. Estimated Maps Fast yield ${Math.round(boundedYield * 100)}%.`
+    ? `Behind pace by ${Math.ceil(paceDeficit)} ${targetLabel}. Estimated yield ${Math.round(boundedYield * 100)}%.`
     : status === "on_pace"
       ? "On pace. Existing progress and in-flight work are sufficient for the current checkpoint."
     : status === "budget_paused"
@@ -197,17 +234,30 @@ export function computeAutopilotPacing(input: PacingComputationInput): Autopilot
   return {
     workspaceId: input.workspaceId,
     timeZone: input.timeZone,
+    targetMetric,
     dailyTarget: input.dailyTarget,
     targetAchievedToday: input.targetAchievedToday,
     remainingTarget,
+    discoveredToday: input.discoveredToday ?? 0,
+    withEmailToday: input.withEmailToday ?? 0,
+    validEmailToday: input.validEmailToday ?? 0,
+    eligibleToday: input.eligibleToday ?? 0,
     operatingStart: `${String(startHour).padStart(2, "0")}:00`,
     operatingEnd: `${String(endHour).padStart(2, "0")}:00`,
     now: input.now,
     elapsedOperatingFraction,
     expectedAchievedByNow,
     paceDeficit,
-    qualifiedToday: input.targetAchievedToday,
+    qualifiedToday: input.qualifiedToday ?? input.targetAchievedToday,
+    instantlyImportedToday: input.instantlyImportedToday ?? 0,
+    eligibleImportBacklog: input.eligibleImportBacklog ?? 0,
+    verificationInFlight: input.verificationInFlight ?? 0,
+    expectedImportsFromBacklog,
     rawRequestedToday: input.rawRequestedToday,
+    rawRequestCap,
+    rawRequestsRemaining: rawRemainingToday,
+    estimatedRawDemand,
+    capacityConstrained,
     rawReturnedToday: input.rawReturnedToday,
     processingInFlight: input.processingInFlight,
     providerRunsInFlight: input.providerRunsInFlight,
@@ -217,7 +267,7 @@ export function computeAutopilotPacing(input: PacingComputationInput): Autopilot
     apifyDailyBudgetRemaining: input.apifyDailyBudgetRemaining,
     providerHealth: input.providerHealth,
     status,
-    qualifiedNeededToPlan,
+    targetNeededToPlan,
     rawNeededToPlan,
     estimatedYield: boundedYield,
     yieldSampleSize: input.yieldSampleSize,

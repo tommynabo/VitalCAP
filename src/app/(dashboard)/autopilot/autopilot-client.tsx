@@ -45,13 +45,17 @@ export function AutopilotClient({
   rebalanceDecisions: RebalanceDecision[];
   instantlyPipeline: InstantlyPipelineDiagnostics | null;
 }) {
-  const progressPct = globalProgressPct(state.dailyTarget, state.engines);
   const softTargetTotal = sumSoftTargets(state.engines);
   const [pendingAction, setPendingAction] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const effectiveState = getEffectiveAutopilotState(settings);
   const pacing = state.pacing;
+  const progressPct = settings.targetMetric === "instantly_imported"
+    ? Math.min(100, Math.round(((pacing?.targetAchievedToday ?? 0) / Math.max(1, state.dailyTarget)) * 100))
+    : globalProgressPct(state.dailyTarget, state.engines);
   const [targetInput, setTargetInput] = useState(String(settings.globalDailyTarget));
+  const [targetMetric, setTargetMetric] = useState(settings.targetMetric);
+  const targetLabel = settings.targetMetric === "instantly_imported" ? "Instantly añadidos" : "qualified prospects";
 
   async function control(action: Record<string, unknown>) {
     setPendingAction(String(action.action));
@@ -79,7 +83,7 @@ export function AutopilotClient({
               {effectiveState === "system_paused" ? "SYSTEM PAUSED" : `Autopilot is ${effectiveState === "running" ? "running" : effectiveState === "paused" ? "paused" : "emergency stopped"}`}
             </p>
             <p className="text-xs text-text-muted">
-              {effectiveState === "running" ? `Targeting ${settings.globalDailyTarget} qualified prospects/day across ${state.engines.length} engines · metric ${settings.targetMetric}` : effectiveState === "system_paused" ? (settings.systemPauseReason ?? "Recovery required before new discovery can run.") : effectiveState === "paused" ? "New discovery is paused; existing processing jobs may drain safely." : "Emergency stop blocks new discovery, processing claims, and outreach scheduling."}
+              {effectiveState === "running" ? `Targeting ${settings.globalDailyTarget} ${targetLabel}/day across ${state.engines.length} engines` : effectiveState === "system_paused" ? (settings.systemPauseReason ?? "Recovery required before new discovery can run.") : effectiveState === "paused" ? "New discovery is paused; existing processing jobs may drain safely." : "Emergency stop blocks new discovery, processing claims, and outreach scheduling."}
             </p>
           </div>
           <div className="flex gap-2">
@@ -109,19 +113,26 @@ export function AutopilotClient({
       <Card>
         <CardHeader><CardTitle>Global daily target</CardTitle></CardHeader>
         <CardContent className="flex flex-wrap items-end gap-3">
-          <label className="text-sm text-text-muted">Qualified prospects/day<input className="mt-1 block w-28 rounded border border-border bg-surface px-2 py-1 text-text" type="number" min="1" max="250" value={targetInput} onChange={(event) => setTargetInput(event.target.value)} /></label>
-          <Button size="sm" disabled={pendingAction !== null} onClick={() => void control({ action: "target_change", globalDailyTarget: Number(targetInput) })}>Save target</Button>
+          <label className="text-sm text-text-muted">Target/day<input className="mt-1 block w-28 rounded border border-border bg-surface px-2 py-1 text-text" type="number" min="1" max="250" value={targetInput} onChange={(event) => setTargetInput(event.target.value)} /></label>
+          <label className="text-sm text-text-muted">Target metric<select className="mt-1 block rounded border border-border bg-surface px-2 py-1 text-text" value={targetMetric} onChange={(event) => setTargetMetric(event.target.value as AutopilotSettings["targetMetric"])}>
+            <option value="qualified">Qualified</option>
+            <option value="analyzed_qualified">Analyzed qualified</option>
+            <option value="outreach_ready">Outreach ready</option>
+            <option value="instantly_imported">Instantly added</option>
+          </select></label>
+          <Button size="sm" disabled={pendingAction !== null} onClick={() => void control({ action: "target_change", globalDailyTarget: Number(targetInput), targetMetric })}>Save target</Button>
           <span className="text-xs text-text-muted">Recommended 250 · timezone {settings.timezone}</span>
           {softTargetTotal !== settings.globalDailyTarget && <span className="text-xs text-warning">Campaign soft targets total {softTargetTotal}; allocation is not changed automatically.</span>}
         </CardContent>
       </Card>
 
       <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-6">
-            <KpiStat label="Qualified today" value={`${state.targetAchievedToday ?? state.readyToday}/${state.dailyTarget}`} emphasize />
+            <KpiStat label={settings.targetMetric === "instantly_imported" ? "Instantly añadidos hoy" : "Qualified today"} value={`${pacing?.targetAchievedToday ?? state.targetAchievedToday ?? state.readyToday}/${state.dailyTarget}`} emphasize />
+          <KpiStat label="Qualified today" value={String(pacing?.qualifiedToday ?? state.readyToday)} />
         <KpiStat label="Progress" value={`${progressPct}%`} />
         <KpiStat label="Soft target total" value={String(softTargetTotal)} />
         <KpiStat label="Sent today" value={String(state.sentToday)} />
-        <KpiStat label="Raw candidates" value={pacing ? String(pacing.rawRequestedToday) : "Unavailable"} />
+        <KpiStat label="Raw requests" value={pacing ? String(pacing.rawRequestedToday) : "Unavailable"} />
         <KpiStat label="Processing jobs" value={pacing ? String(pacing.processingInFlight) : "Unavailable"} />
         <KpiStat label="System health" value={state.systemHealth} />
       </div>
@@ -134,9 +145,11 @@ export function AutopilotClient({
               <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
                 <KpiStat label="Expected by now" value={pacing.expectedAchievedByNow.toFixed(1)} />
                 <KpiStat label="Remaining" value={String(pacing.remainingTarget)} />
-                <KpiStat label="Expected in-flight" value={pacing.expectedQualifiedFromInFlight.toFixed(1)} />
+                <KpiStat label={pacing.targetMetric === "instantly_imported" ? "Expected imports from backlog" : "Expected qualified in-flight"} value={(pacing.targetMetric === "instantly_imported" ? pacing.expectedImportsFromBacklog : pacing.expectedQualifiedFromInFlight).toFixed(1)} />
                 <KpiStat label="Pace deficit" value={pacing.paceDeficit.toFixed(1)} />
                 <KpiStat label="Hours remaining" value={pacing.hoursRemaining.toFixed(1)} />
+                <KpiStat label="Raw requests remaining" value={pacing.rawRequestCap === null ? String(pacing.rawRequestsRemaining) : `${pacing.rawRequestsRemaining}/${pacing.rawRequestCap}`} />
+                <KpiStat label="Estimated raw demand" value={String(pacing.estimatedRawDemand)} />
                 <KpiStat label="Apify spend" value={`$${pacing.apifySpendToday.toFixed(2)}`} />
                 <KpiStat label="Budget remaining" value={`$${pacing.apifyDailyBudgetRemaining.toFixed(2)}`} />
                 <KpiStat label="Active provider runs" value={String(pacing.providerRunsInFlight)} />
@@ -144,8 +157,18 @@ export function AutopilotClient({
               <div className="flex flex-wrap items-center gap-2 text-xs text-text-muted">
                 <Badge variant={pacing.status === "behind_pace" ? "warning" : pacing.status === "on_pace" ? "success" : "neutral"}>{pacing.status.replace("_", " ")}</Badge>
                 <span>{pacing.operatingStart}-{pacing.operatingEnd} {pacing.timeZone}</span>
-                <span>Yield {Math.round(pacing.estimatedYield * 100)}% ({pacing.yieldSampleSize} raw)</span>
+                <span>Yield {Math.round(pacing.estimatedYield * 100)}% ({pacing.yieldSampleSize} {pacing.targetMetric === "instantly_imported" ? "source accounts" : "raw"})</span>
+                {pacing.capacityConstrained && <Badge variant="warning">Capacity constrained</Badge>}
               </div>
+              {pacing.targetMetric === "instantly_imported" && <div className="grid grid-cols-2 gap-3 border-y border-border py-3 sm:grid-cols-3 lg:grid-cols-6">
+                <KpiStat label="Discovered" value={String(pacing.discoveredToday)} />
+                <KpiStat label="With email" value={String(pacing.withEmailToday)} />
+                <KpiStat label="MV valid" value={String(pacing.validEmailToday)} />
+                <KpiStat label="Eligible" value={String(pacing.eligibleToday)} />
+                <KpiStat label="Qualified" value={String(pacing.qualifiedToday)} />
+                <KpiStat label="Verification pending" value={String(pacing.verificationInFlight)} />
+                <KpiStat label="Instantly added today" value={String(pacing.instantlyImportedToday)} />
+              </div>}
               <p className="text-xs text-text-muted">{pacing.explanation}</p>
               <div className="flex flex-wrap items-center gap-2 text-xs text-text-muted">
                 <span>Target risk: {state.targetRisk?.replaceAll("_", " ") ?? "Unavailable"}</span>

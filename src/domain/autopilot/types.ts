@@ -10,7 +10,7 @@ import type { EngineType } from "@/domain/campaigns/types";
 import type { AutopilotPacingState } from "@/services/autopilot/pacing-service";
 
 export type ProviderHealthStatus = "untested" | "healthy" | "degraded" | "paused" | "unknown";
-export type AutopilotTargetMetric = "qualified" | "analyzed_qualified" | "outreach_ready";
+export type AutopilotTargetMetric = "qualified" | "analyzed_qualified" | "outreach_ready" | "instantly_imported";
 export type AutopilotTargetRisk = "on_track" | "recoverable" | "target_at_risk_budget" | "target_at_risk_provider" | "target_at_risk_exhaustion" | "target_at_risk_time";
 
 export type AutopilotEffectiveState = "running" | "paused" | "system_paused" | "emergency_stopped";

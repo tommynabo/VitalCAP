@@ -597,7 +597,16 @@ export async function getDeadLetterSamplesData(): Promise<DeadLetterSample[]> {
 export async function getAutopilotPacingMetricsData(now = new Date()) {
   if (isDevSeedMode()) {
     return {
+      discoveredToday: 0,
+      withEmailToday: 0,
+      validEmailToday: 0,
+      eligibleToday: 0,
+      verificationInFlight: 0,
       qualifiedToday: 0,
+      instantlyImportedToday: 0,
+      eligibleImportBacklog: 0,
+      historicalImportCount: 0,
+      historicalImportSourceCount: 0,
       rawRequestedToday: 0,
       rawReturnedToday: 0,
       processingInFlight: 0,

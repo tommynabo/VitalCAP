@@ -41,6 +41,7 @@ describe("computeAutopilotPacing", () => {
   const base = {
     workspaceId: "workspace-1",
     timeZone: "Europe/Madrid",
+    targetMetric: "qualified" as const,
     dailyTarget: 250,
     targetAchievedToday: 7,
     rawRequestedToday: 4, rawReturnedToday: 4,
@@ -70,7 +71,7 @@ describe("computeAutopilotPacing", () => {
   it("calculates production above 100 raws when a 250 target is behind at medium yield", () => {
     const result = computeAutopilotPacing({ ...base, targetAchievedToday: 0, estimatedYield: 0.3, now: new Date("2025-06-15T12:00:00Z") });
     expect(result.status).toBe("behind_pace");
-    expect(result.qualifiedNeededToPlan).toBeGreaterThan(0);
+    expect(result.targetNeededToPlan).toBeGreaterThan(0);
     expect(result.rawNeededToPlan).toBeGreaterThan(100);
   });
 
@@ -101,7 +102,7 @@ describe("computeAutopilotPacing", () => {
   it("stops normal production once the qualified target is reached", () => {
     const result = computeAutopilotPacing({ ...base, targetAchievedToday: 250, now: new Date("2025-06-15T12:00:00Z") });
     expect(result.remainingTarget).toBe(0);
-    expect(result.qualifiedNeededToPlan).toBe(0);
+    expect(result.targetNeededToPlan).toBe(0);
     expect(result.rawNeededToPlan).toBe(0);
   });
 
@@ -109,6 +110,73 @@ describe("computeAutopilotPacing", () => {
     const result = computeAutopilotPacing({ ...base, estimatedYield: 0.001, yieldSampleSize: 2, now: new Date("2025-06-15T12:00:00Z") });
     expect(result.estimatedYield).toBe(0.1);
     expect(result.rawNeededToPlan).toBeGreaterThan(100);
+  });
+
+  it("keeps 249 imports below target and reports 250 as reached", () => {
+    const at249 = computeAutopilotPacing({ ...base, targetMetric: "instantly_imported", targetAchievedToday: 249, now: new Date("2025-06-15T12:00:00Z") });
+    const at250 = computeAutopilotPacing({ ...base, targetMetric: "instantly_imported", targetAchievedToday: 250, now: new Date("2025-06-15T12:00:00Z") });
+
+    expect(at249.remainingTarget).toBe(1);
+    expect(at250.remainingTarget).toBe(0);
+    expect(at250.targetNeededToPlan).toBe(0);
+  });
+
+  it("continues import-target discovery when qualification is high but imports trail", () => {
+    const result = computeAutopilotPacing({
+      ...base,
+      targetMetric: "instantly_imported",
+      targetAchievedToday: 35,
+      qualifiedToday: 300,
+      estimatedYield: 0.107,
+      now: new Date("2025-06-15T12:00:00Z"),
+    });
+
+    expect(result.qualifiedToday).toBe(300);
+    expect(result.remainingTarget).toBe(215);
+    expect(result.status).toBe("behind_pace");
+    expect(result.rawNeededToPlan).toBeGreaterThan(0);
+  });
+
+  it("reduces raw demand for eligible in-flight import backlog", () => {
+    const withoutBacklog = computeAutopilotPacing({ ...base, targetMetric: "instantly_imported", targetAchievedToday: 0, now: new Date("2025-06-15T12:00:00Z") });
+    const withBacklog = computeAutopilotPacing({ ...base, targetMetric: "instantly_imported", targetAchievedToday: 0, expectedImportsFromBacklog: 50, now: new Date("2025-06-15T12:00:00Z") });
+
+    expect(withBacklog.targetNeededToPlan).toBeLessThan(withoutBacklog.targetNeededToPlan);
+    expect(withBacklog.rawNeededToPlan).toBeLessThan(withoutBacklog.rawNeededToPlan);
+  });
+
+  it("bounds tiny import yield and never exceeds the daily raw-request cap", () => {
+    const result = computeAutopilotPacing({
+      ...base,
+      targetMetric: "instantly_imported",
+      targetAchievedToday: 0,
+      estimatedYield: 0.00001,
+      rawRequestedToday: 1490,
+      maxDailyRawRequests: 1500,
+      now: new Date("2025-06-15T12:00:00Z"),
+    });
+
+    expect(result.estimatedYield).toBe(0.02);
+    expect(result.rawNeededToPlan).toBeLessThanOrEqual(10);
+    expect(result.rawRequestsRemaining).toBe(10);
+    expect(result.capacityConstrained).toBe(true);
+  });
+
+  it("reports full-day capacity limits even when the immediate pace deficit fits", () => {
+    const result = computeAutopilotPacing({
+      ...base,
+      targetMetric: "instantly_imported",
+      targetAchievedToday: 120,
+      estimatedYield: 0.1,
+      rawRequestedToday: 1450,
+      maxDailyRawRequests: 1500,
+      now: new Date("2025-06-15T12:00:00Z"),
+    });
+
+    expect(result.targetNeededToPlan).toBe(0);
+    expect(result.rawNeededToPlan).toBe(0);
+    expect(result.estimatedRawDemand).toBeGreaterThan(result.rawRequestsRemaining);
+    expect(result.capacityConstrained).toBe(true);
   });
 
   it("pauses scheduling for exhausted budget or unhealthy provider", () => {

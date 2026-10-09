@@ -23,7 +23,10 @@ export async function executeAutopilotControl(input: unknown) {
     patch = { enabled: false, emergencyStopped: false };
     action = "autopilot_clear_emergency_stop";
   } else {
-    patch = { globalDailyTarget: command.globalDailyTarget };
+    patch = {
+      globalDailyTarget: command.globalDailyTarget,
+      ...(command.targetMetric ? { targetMetric: command.targetMetric } : {}),
+    };
     action = "autopilot_target_change";
   }
 
@@ -31,7 +34,7 @@ export async function executeAutopilotControl(input: unknown) {
     workspaceId: context.workspaceId,
     patch,
     audit: { actorUserId: context.user.userId, action, metadata: {
-      old: { enabled: before.enabled, emergencyStopped: before.emergencyStopped, globalDailyTarget: before.globalDailyTarget },
+      old: { enabled: before.enabled, emergencyStopped: before.emergencyStopped, globalDailyTarget: before.globalDailyTarget, targetMetric: before.targetMetric },
       new: { ...patch },
     } },
   });

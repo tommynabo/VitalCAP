@@ -13,7 +13,7 @@ import type { AutopilotSettings, EngineTargetState, GlobalAutopilotState, Provid
 import { getDayBounds } from "@/lib/time/day-bounds";
 import { getAutopilotPacingMetrics } from "./autopilot-pacing";
 import { getRecentProviderUsage, getTodaySpendUsd } from "./provider-runs";
-import { getMapsEnv, getSerperEnv } from "@/lib/config/env";
+import { getDeliveryEnv, getMapsEnv, getSerperEnv } from "@/lib/config/env";
 import {
   computeEngineHealthSummary,
   ENGINE_TYPES,
@@ -67,7 +67,7 @@ export async function getAutopilotSettings(workspaceId: string): Promise<Autopil
 
 export async function updateAutopilotSettingsWithAudit(input: {
   workspaceId: string;
-  patch: Partial<Pick<AutopilotSettings, "enabled" | "emergencyStopped" | "globalDailyTarget">>;
+  patch: Partial<Pick<AutopilotSettings, "enabled" | "emergencyStopped" | "globalDailyTarget" | "targetMetric">>;
   audit: { actorUserId: string | null; action: string; metadata: Record<string, unknown> };
 }): Promise<AutopilotSettings> {
   const db = getDb();
@@ -95,7 +95,7 @@ export async function updateAutopilotSettingsWithAudit(input: {
 
 export async function updateAutopilotSettings(
   workspaceId: string,
-  patch: Partial<Pick<AutopilotSettings, "enabled" | "emergencyStopped" | "globalDailyTarget">>,
+  patch: Partial<Pick<AutopilotSettings, "enabled" | "emergencyStopped" | "globalDailyTarget" | "targetMetric">>,
 ): Promise<AutopilotSettings> {
   const db = getDb();
   await getAutopilotSettings(workspaceId);
@@ -150,12 +150,18 @@ async function getEngineProviderHealth(workspaceId: string, engineType: EngineTy
 
 export async function getAutopilotPacingState(workspaceId: string, now = new Date()) {
   const settings = await getAutopilotSettings(workspaceId);
-  const metrics = await getAutopilotPacingMetrics(workspaceId, settings.timezone, now);
+  const instantlyCampaignId = getDeliveryEnv().INSTANTLY_CAMPAIGN_ID;
+  const metrics = await getAutopilotPacingMetrics(workspaceId, settings.timezone, now, instantlyCampaignId);
   const providerHealth = evaluateProviderHealth(await getRecentProviderUsage(workspaceId, "apify"));
   const serpHealth = evaluateProviderHealth(await getRecentProviderUsage(workspaceId, "serper"));
-  const estimatedYield = metrics.historicalRawSampleSize >= 20
-    ? Math.min(1, Math.max(0.1, metrics.historicalQualifiedCount / metrics.historicalRawSampleSize))
-    : 0.25;
+  const importTarget = settings.targetMetric === "instantly_imported";
+  const estimatedYield = importTarget
+    ? metrics.historicalImportSourceCount >= 10
+      ? metrics.historicalImportCount / metrics.historicalImportSourceCount
+      : 0.1
+    : metrics.historicalRawSampleSize >= 20
+      ? Math.min(1, Math.max(0.1, metrics.historicalQualifiedCount / metrics.historicalRawSampleSize))
+      : 0.25;
   const env = getMapsEnv();
   const effectiveBudget = Math.min(env.APIFY_DAILY_COST_LIMIT_USD, settings.maxDailyApifySpendUsd ?? Number.POSITIVE_INFINITY);
   const serpEnv = getSerperEnv();
@@ -174,12 +180,23 @@ export async function getAutopilotPacingState(workspaceId: string, now = new Dat
   return computeAutopilotPacing({
     workspaceId,
     timeZone: settings.timezone,
+    targetMetric: settings.targetMetric,
     dailyTarget: settings.globalDailyTarget,
-    targetAchievedToday: metrics.qualifiedToday,
+    targetAchievedToday: importTarget ? metrics.instantlyImportedToday : metrics.qualifiedToday,
+    discoveredToday: metrics.discoveredToday,
+    withEmailToday: metrics.withEmailToday,
+    validEmailToday: metrics.validEmailToday,
+    eligibleToday: metrics.eligibleToday,
+    qualifiedToday: metrics.qualifiedToday,
+    instantlyImportedToday: metrics.instantlyImportedToday,
+    eligibleImportBacklog: metrics.eligibleImportBacklog,
+    verificationInFlight: metrics.verificationInFlight,
     rawRequestedToday: metrics.rawRequestedToday, rawReturnedToday: metrics.rawReturnedToday,
     processingInFlight: metrics.processingInFlight,
     providerRunsInFlight: metrics.providerRunsInFlight,
     expectedQualifiedFromInFlight: (metrics.providerRawItemsInFlight + metrics.processingInFlight) * estimatedYield,
+    expectedImportsFromBacklog: metrics.eligibleImportBacklog
+      + (metrics.providerRawItemsInFlight + metrics.processingInFlight + metrics.verificationInFlight) * estimatedYield,
     apifySpendToday: metrics.apifySpendToday,
     apifyDailyBudgetRemaining: Math.max(0, effectiveBudget - metrics.apifySpendToday),
     providerHealth,
@@ -273,7 +290,7 @@ export async function getGlobalAutopilotState(workspaceId: string): Promise<Glob
       )
     );
 
-  const targetAchievedToday = settings.targetMetric === "outreach_ready" 
+  const qualifiedTargetAchievedToday = settings.targetMetric === "outreach_ready"
     ? (outreachReadyRow?.total ?? 0) 
     : settings.targetMetric === "analyzed_qualified"
       ? (analyzedQualifiedRow?.total ?? 0)
@@ -317,6 +334,9 @@ export async function getGlobalAutopilotState(workspaceId: string): Promise<Glob
         ? "degraded"
         : "paused";
   const pacing = await getAutopilotPacingState(workspaceId);
+  const targetAchievedToday = settings.targetMetric === "instantly_imported"
+    ? pacing.targetAchievedToday
+    : qualifiedTargetAchievedToday;
   const targetRisk = classifyAutopilotTargetRisk(pacing);
 
   return {
