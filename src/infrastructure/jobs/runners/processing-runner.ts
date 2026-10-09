@@ -17,6 +17,7 @@ import {
   getAccountById,
   insertAccountSource,
   insertContactPoint,
+  insertContactPointWithStatus,
   resolveCanonicalAccount,
   updateAccountFields,
 } from "@/infrastructure/neon/repositories/accounts";
@@ -29,7 +30,7 @@ import { processRawCandidate, deriveIncomingIdentitySignals, hasLinkedInEmployer
 import { mergeMissingAccountFields, type IncomingAccountFields } from "@/services/accounts/account-enrichment-merge";
 import { realWebsiteFetcher, providerLabelForEngine } from "./engine-factory";
 import { WebsiteEnrichmentService } from "@/services/enrichment/website-enrichment-service";
-import { getWebsiteEnrichmentStatus, upsertWebsiteEnrichmentStatus, insertWebsiteEvidence } from "@/infrastructure/neon/repositories/enrichment";
+import { getWebsiteEnrichmentStatus, upsertWebsiteEnrichmentStatus, insertWebsiteEvidence, listUnlinkedWebsiteEmailEvidence } from "@/infrastructure/neon/repositories/enrichment";
 import { DomainFetchCache } from "@/lib/security/safe-fetch";
 import { normalizeDomain } from "@/lib/normalization";
 
@@ -349,35 +350,6 @@ async function executeProcessingJob(
           contentHash: result.contentHash ?? "",
         });
 
-        if (fact.evidenceType === "email") {
-          const emailLower = fact.value.toLowerCase();
-          if (!processed.contactPoints.some((cp) => cp.email.toLowerCase() === emailLower)) {
-            const contactPointId = await insertContactPoint({
-              workspaceId: campaign.workspaceId,
-              accountId,
-              type: "email",
-              value: fact.value,
-              normalizedValue: emailLower,
-              label: fact.value.split("@")[0] ?? "",
-              isGeneric: fact.isGeneric ?? true, // use fact metadata
-              isPersonalOrNamed: fact.isPersonalOrNamed ?? false, // use fact metadata
-              priorityScore: 0,
-              verificationStatus: "unverified",
-              verificationProvider: null,
-              sourceUrl: fact.sourceUrl,
-              sourceType: "website_enrichment",
-            });
-            if (contactPointId) {
-              await enqueueVerificationJob({
-                workspaceId: campaign.workspaceId,
-                contactPointId,
-                normalizedEmail: emailLower,
-                provider: getVerificationEnv().EMAIL_VERIFICATION_PROVIDER,
-              });
-            }
-          }
-        }
-        
         if (fact.evidenceType === "phone") {
           const phoneNorm = fact.normalizedValue ?? fact.value;
           // Note: duplicate checking for phones across the account should ideally happen here or rely on DB upsert logic.
@@ -400,10 +372,46 @@ async function executeProcessingJob(
         }
       }
     }
+
+    const unlinkedEmailEvidence = await listUnlinkedWebsiteEmailEvidence(accountId, incoming.normalizedDomain);
+    for (const fact of unlinkedEmailEvidence) {
+      const email = fact.normalizedValue.trim().toLowerCase();
+      if (!email) continue;
+      const contactPoint = await insertContactPointWithStatus({
+        workspaceId: campaign.workspaceId,
+        accountId,
+        type: "email",
+        value: fact.value,
+        normalizedValue: email,
+        label: email.split("@")[0] ?? "",
+        isGeneric: true,
+        isPersonalOrNamed: false,
+        priorityScore: 0,
+        verificationStatus: "unverified",
+        verificationProvider: null,
+        sourceUrl: fact.sourceUrl,
+        sourceType: "website_enrichment",
+      });
+      if (contactPoint.id && (contactPoint.created || contactPoint.verificationStatus === "unverified")) {
+        await enqueueVerificationJob({
+          workspaceId: campaign.workspaceId,
+          contactPointId: contactPoint.id,
+          normalizedEmail: email,
+          provider: getVerificationEnv().EMAIL_VERIFICATION_PROVIDER,
+        });
+      }
+    }
   }
 
+  const serperEmailDiagnostics = {
+    candidatesFound: processed.serperEmailRecovery.candidatesFound,
+    candidatesRelevant: processed.serperEmailRecovery.candidatesRelevant,
+    contactPointsCreated: 0,
+    duplicatesSkipped: processed.serperEmailRecovery.duplicateCandidatesSkipped,
+    verificationQueued: 0,
+  };
   for (const contactPoint of processed.contactPoints) {
-    const contactPointId = await insertContactPoint({
+    const insertedContactPoint = await insertContactPointWithStatus({
       workspaceId: campaign.workspaceId,
       accountId,
       type: "email",
@@ -416,16 +424,33 @@ async function executeProcessingJob(
       verificationStatus: contactPoint.verificationStatus,
       verificationProvider: contactPoint.verificationProvider,
       sourceUrl: contactPoint.sourceUrl,
-      sourceType: raw.engineType,
+      sourceType: contactPoint.sourceType === "serper_snippet" ? "serper_snippet" : raw.engineType,
     });
-    if (options.enrichContacts !== false && contactPointId) {
-      await enqueueVerificationJob({
+    if (contactPoint.sourceType === "serper_snippet") {
+      if (insertedContactPoint.created) serperEmailDiagnostics.contactPointsCreated += 1;
+      else serperEmailDiagnostics.duplicatesSkipped += 1;
+    }
+    if (options.enrichContacts !== false && insertedContactPoint.id && (insertedContactPoint.created || insertedContactPoint.verificationStatus === "unverified")) {
+      const verificationQueued = await enqueueVerificationJob({
         workspaceId: campaign.workspaceId,
-        contactPointId,
+        contactPointId: insertedContactPoint.id,
         normalizedEmail: contactPoint.email.toLowerCase(),
         provider: getVerificationEnv().EMAIL_VERIFICATION_PROVIDER,
       });
+      if (contactPoint.sourceType === "serper_snippet" && verificationQueued) {
+        serperEmailDiagnostics.verificationQueued += 1;
+      }
     }
+  }
+
+  if (serperEmailDiagnostics.candidatesFound > 0) {
+    console.info("SERPER_EMAIL_RECOVERY", {
+      SERPER_EMAIL_CANDIDATES_FOUND: serperEmailDiagnostics.candidatesFound,
+      SERPER_EMAIL_CANDIDATES_RELEVANT: serperEmailDiagnostics.candidatesRelevant,
+      SERPER_EMAIL_CONTACT_POINTS_CREATED: serperEmailDiagnostics.contactPointsCreated,
+      SERPER_EMAIL_DUPLICATES_SKIPPED: serperEmailDiagnostics.duplicatesSkipped,
+      SERPER_EMAIL_VERIFICATION_QUEUED: serperEmailDiagnostics.verificationQueued,
+    });
   }
 
   const membership = resolveMembershipStage(processed);

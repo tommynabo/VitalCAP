@@ -11,6 +11,7 @@ import { normalizeEmail } from "@/lib/normalization";
 export interface ExtractedEmail {
   email: string;
   sourceUrl: string;
+  sourceType: "website" | "serper_snippet";
   /** Short surrounding text snippet, for a human reviewing why this email was picked up. */
   context: string;
   /** Local-part-derived label, e.g. "info", "compras", "maria.garcia". */
@@ -47,6 +48,8 @@ const GENERIC_LOCAL_PARTS = new Set([
 function isFalsePositive(email: string): boolean {
   const [local, domain] = email.split("@");
   if (!local || !domain) return true;
+  if (local.startsWith(".") || local.endsWith(".") || local.includes("..")) return true;
+  if (domain.split(".").some((label) => !/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/i.test(label))) return true;
   const domainExtension = domain.split(".").pop() ?? "";
   if (ASSET_EXTENSIONS.includes(domainExtension.toLowerCase())) return true;
   if (BLOCKED_LOCAL_PARTS.some((blocked) => local.toLowerCase().includes(blocked))) return true;
@@ -60,7 +63,11 @@ function contextAround(html: string, index: number, matchLength: number): string
   return html.slice(start, end).replace(/\s+/g, " ").trim();
 }
 
-export function extractCandidateEmails(html: string, sourceUrl: string): ExtractedEmail[] {
+export function extractCandidateEmails(
+  html: string,
+  sourceUrl: string,
+  sourceType: ExtractedEmail["sourceType"] = "website",
+): ExtractedEmail[] {
   const found = new Map<string, ExtractedEmail>();
 
   for (const match of html.matchAll(MAILTO_RE)) {
@@ -71,6 +78,7 @@ export function extractCandidateEmails(html: string, sourceUrl: string): Extract
     found.set(normalized, {
       email: normalized,
       sourceUrl,
+      sourceType,
       context: contextAround(html, match.index ?? 0, match[0].length),
       label: local,
       isGeneric: GENERIC_LOCAL_PARTS.has(local),
@@ -84,6 +92,7 @@ export function extractCandidateEmails(html: string, sourceUrl: string): Extract
     found.set(normalized, {
       email: normalized,
       sourceUrl,
+      sourceType,
       context: contextAround(html, match.index ?? 0, match[0].length),
       label: local,
       isGeneric: GENERIC_LOCAL_PARTS.has(local),

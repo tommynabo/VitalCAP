@@ -363,6 +363,86 @@ describe("processRawCandidate — maps candidates", () => {
 });
 
 describe("processRawCandidate — serp candidates", () => {
+  it("extracts a relevant mixed-case snippet email as an unverified Serper contact point", async () => {
+    const payload: CandidateRawPayload = {
+      kind: "serp",
+      result: {
+        title: "Farmacia Ejemplo",
+        url: "https://farmacia-ejemplo.es/contacto",
+        snippet: "Farmacia Ejemplo contacto: INFO@FARMACIA-EJEMPLO.ES; malformed: bad..name@farmacia-ejemplo.es",
+        domain: "farmacia-ejemplo.es",
+      },
+      geography: "Madrid",
+    };
+    const result = await processRawCandidate(payload, "google_serp", baseContext({
+      websiteFetcher: fetcherReturning(""),
+      deferVerification: true,
+    }));
+
+    expect(result.contactPoints).toHaveLength(1);
+    expect(result.contactPoints[0]).toMatchObject({
+      email: "info@farmacia-ejemplo.es",
+      sourceUrl: "https://farmacia-ejemplo.es/contacto",
+      sourceType: "serper_snippet",
+      verificationStatus: "unverified",
+      acceptable: false,
+    });
+    expect(result.serperEmailRecovery).toEqual({
+      candidatesFound: 1,
+      candidatesRelevant: 1,
+      duplicateCandidatesSkipped: 0,
+    });
+    expect(result.readyForOutreach).toBe(false);
+  });
+
+  it("rejects an unrelated third-party email when the snippet is not tied to the business", async () => {
+    const result = await processRawCandidate(
+      {
+        kind: "serp",
+        result: {
+          title: "Farmacia Ejemplo",
+          url: "https://farmacia-ejemplo.es/contacto",
+          snippet: "Directorio general: support@directory.example",
+          domain: "farmacia-ejemplo.es",
+        },
+        geography: "Madrid",
+      },
+      "google_serp",
+      baseContext({ websiteFetcher: fetcherReturning(""), deferVerification: true }),
+    );
+
+    expect(result.contactPoints).toHaveLength(0);
+    expect(result.serperEmailRecovery).toEqual({
+      candidatesFound: 1,
+      candidatesRelevant: 0,
+      duplicateCandidatesSkipped: 0,
+    });
+  });
+
+  it("keeps website provenance and skips a duplicate snippet address", async () => {
+    const result = await processRawCandidate(
+      {
+        kind: "serp",
+        result: {
+          title: "Farmacia Ejemplo",
+          url: "https://farmacia-ejemplo.es/contacto",
+          snippet: "Farmacia Ejemplo info@farmacia-ejemplo.es",
+          domain: "farmacia-ejemplo.es",
+        },
+        geography: "Madrid",
+      },
+      "google_serp",
+      baseContext({
+        websiteFetcher: fetcherReturning("info@farmacia-ejemplo.es"),
+        deferVerification: true,
+      }),
+    );
+
+    expect(result.contactPoints).toHaveLength(1);
+    expect(result.contactPoints[0]?.sourceType).toBe("website");
+    expect(result.serperEmailRecovery.duplicateCandidatesSkipped).toBe(1);
+  });
+
   it("processes a google_serp result via domain resolution", async () => {
     const payload: CandidateRawPayload = {
       kind: "serp",

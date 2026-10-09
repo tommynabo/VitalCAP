@@ -720,6 +720,12 @@ export interface InsertContactPointInput {
   sourceType: string | null;
 }
 
+export interface InsertContactPointResult {
+  id: string;
+  created: boolean;
+  verificationStatus: VerificationStatus | null;
+}
+
 /** `ContactPointStatus` and `VerificationStatus` overlap but are not identical enums — `unknown`/`disposable`/`bounced` have no direct status equivalent, so they fall back to `"discovered"` (endpoint exists, verification outcome inconclusive). */
 function verificationToContactPointStatus(verificationStatus: VerificationStatus): ContactPoint["status"] {
   switch (verificationStatus) {
@@ -748,7 +754,7 @@ function verificationToContactPointStatus(verificationStatus: VerificationStatus
  * not something Gate E invents an answer for); `status` mirrors the
  * verification outcome directly, which is the one fact actually known.
  */
-export async function insertContactPoint(input: InsertContactPointInput): Promise<string> {
+export async function insertContactPointWithStatus(input: InsertContactPointInput): Promise<InsertContactPointResult> {
   const db = getDb();
   const [row] = await db
     .insert(contactPoints)
@@ -773,9 +779,9 @@ export async function insertContactPoint(input: InsertContactPointInput): Promis
     })
     .onConflictDoNothing({ target: [contactPoints.workspaceId, contactPoints.accountId, contactPoints.type, contactPoints.normalizedValue] })
     .returning({ id: contactPoints.id });
-  if (row) return row.id;
+  if (row) return { id: row.id, created: true, verificationStatus: input.verificationStatus };
 
-  const [existing] = await db.select({ id: contactPoints.id })
+  const [existing] = await db.select({ id: contactPoints.id, verificationStatus: contactPoints.verificationStatus })
     .from(contactPoints)
     .where(and(
       eq(contactPoints.workspaceId, input.workspaceId),
@@ -784,5 +790,13 @@ export async function insertContactPoint(input: InsertContactPointInput): Promis
       eq(contactPoints.normalizedValue, input.normalizedValue),
     ))
     .limit(1);
-  return existing?.id ?? "";
+  return {
+    id: existing?.id ?? "",
+    created: false,
+    verificationStatus: (existing?.verificationStatus as VerificationStatus | undefined) ?? null,
+  };
+}
+
+export async function insertContactPoint(input: InsertContactPointInput): Promise<string> {
+  return (await insertContactPointWithStatus(input)).id;
 }

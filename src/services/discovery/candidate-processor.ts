@@ -55,7 +55,14 @@ export interface ProcessedContactPoint {
   verificationStatus: VerificationStatus;
   acceptable: boolean;
   sourceUrl: string;
+  sourceType: "website" | "serper_snippet";
   verificationProvider: string | null;
+}
+
+export interface SerperEmailRecoveryDiagnostics {
+  candidatesFound: number;
+  candidatesRelevant: number;
+  duplicateCandidatesSkipped: number;
 }
 
 export interface ProcessedCandidateResult {
@@ -68,6 +75,7 @@ export interface ProcessedCandidateResult {
   businessType: BusinessType;
   icpQualified: boolean;
   contactPoints: ProcessedContactPoint[];
+  serperEmailRecovery: SerperEmailRecoveryDiagnostics;
   readyForOutreach: boolean;
   rejectionReason: string | null;
 }
@@ -198,6 +206,23 @@ function accountKeyFor(incoming: Omit<AccountIdentitySignals, "accountId">, busi
   return `name:${normalizeBusinessName(businessNameGuess)}|geo:${geography.toLowerCase()}`;
 }
 
+function isRelevantSerperEmail(
+  email: string,
+  payload: SerpRawPayload,
+  accountDomain: string | null | undefined,
+): boolean {
+  if (!accountDomain) return false;
+  const emailDomain = normalizeDomain(email.split("@")[1]);
+  if (emailDomain === accountDomain) return true;
+
+  const sourceDomain = normalizeDomain(payload.result.domain) ?? normalizeDomain(payload.result.url);
+  const normalizedTitle = normalizeBusinessName(payload.result.title);
+  const normalizedSnippet = normalizeBusinessName(payload.result.snippet);
+  return sourceDomain === accountDomain
+    && normalizedTitle.length >= 8
+    && normalizedSnippet.includes(normalizedTitle);
+}
+
 export async function processRawCandidate(
   payload: CandidateRawPayload,
   engineType: EngineType,
@@ -226,6 +251,7 @@ export async function processRawCandidate(
       businessType,
       icpQualified: false,
       contactPoints: [],
+      serperEmailRecovery: { candidatesFound: 0, candidatesRelevant: 0, duplicateCandidatesSkipped: 0 },
       readyForOutreach: false,
       rejectionReason: `Rejected: ${spainResult.reason}`,
     };
@@ -244,6 +270,7 @@ export async function processRawCandidate(
       businessType,
       icpQualified: false,
       contactPoints: [],
+      serperEmailRecovery: { candidatesFound: 0, candidatesRelevant: 0, duplicateCandidatesSkipped: 0 },
       readyForOutreach: false,
       rejectionReason: `Rejected ICP: ${businessType} is outside the pharmacy, parapharmacy, and herbal-shop scope`,
     };
@@ -264,6 +291,25 @@ export async function processRawCandidate(
   }
 
   const extractedEmails = pages.flatMap((page) => extractCandidateEmails(page.body, page.url));
+  const serperEmailRecovery: SerperEmailRecoveryDiagnostics = {
+    candidatesFound: 0,
+    candidatesRelevant: 0,
+    duplicateCandidatesSkipped: 0,
+  };
+  if (payload.kind === "serp") {
+    const candidates = extractCandidateEmails(payload.result.snippet, payload.result.url, "serper_snippet");
+    serperEmailRecovery.candidatesFound = candidates.length;
+    const websiteEmails = new Set(extractedEmails.map((candidate) => candidate.email));
+    for (const candidate of candidates) {
+      if (!isRelevantSerperEmail(candidate.email, payload, incoming.normalizedDomain)) continue;
+      serperEmailRecovery.candidatesRelevant += 1;
+      if (websiteEmails.has(candidate.email)) {
+        serperEmailRecovery.duplicateCandidatesSkipped += 1;
+        continue;
+      }
+      extractedEmails.push(candidate);
+    }
+  }
   const uniqueEmails = Array.from(new Map(extractedEmails.map((e) => [e.email, e])).values());
 
   // Prompt 6 §6.1 Flow F (provider outage): a verification-provider failure
@@ -301,6 +347,7 @@ export async function processRawCandidate(
       verificationStatus,
       acceptable: isContactPointAcceptable(verificationStatus, policy),
       sourceUrl: extracted.sourceUrl,
+      sourceType: extracted.sourceType,
       verificationProvider: verification ? context.verificationProvider.providerName : null,
     };
   });
@@ -328,6 +375,7 @@ export async function processRawCandidate(
     businessType,
     icpQualified: true,
     contactPoints,
+    serperEmailRecovery,
     readyForOutreach,
     rejectionReason,
   };
