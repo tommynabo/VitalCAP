@@ -8,6 +8,7 @@ import type { AccountIdentitySignals } from "@/services/deduplication/account-de
 import { evaluateAccountDedup } from "@/services/deduplication/account-dedup";
 import { deriveEmailChannelEligibility } from "@/services/compliance/email-channel-policy";
 import type { SetterQueueAccount } from "@/services/setter/review-queue";
+import type { AccountListCursor, AccountListSummary } from "@/services/accounts/account-list";
 
 export interface AccountBundle {
   account: Account;
@@ -233,6 +234,147 @@ export async function listAccountBundles(workspaceId: string): Promise<AccountBu
       intelligence: intelligenceByAccount.get(account.id) ?? null,
     };
   });
+}
+
+export async function listAccountSummaryRows(
+  workspaceId: string,
+  limit: number,
+  cursor: AccountListCursor | null,
+): Promise<AccountListSummary[]> {
+  const db = getDb();
+  const cursorCondition = cursor
+    ? sql`AND (
+        a.created_at > ${cursor.createdAt}::timestamptz
+        OR (a.created_at = ${cursor.createdAt}::timestamptz AND a.id > ${cursor.id}::uuid)
+      )`
+    : sql``;
+  const result = await db.execute(sql`
+    WITH account_page AS (
+      SELECT
+        a.id,
+        a.canonical_name,
+        a.business_type,
+        a.province,
+        a.fit_score::float8 AS fit_score,
+        a.fit_tier,
+        a.created_at
+      FROM accounts a
+      WHERE a.workspace_id = ${workspaceId}::uuid
+        ${cursorCondition}
+      ORDER BY a.created_at ASC, a.id ASC
+      LIMIT ${limit}
+    ),
+    source_counts AS (
+      SELECT account_id, count(*) AS source_count
+      FROM account_sources
+      WHERE account_id IN (SELECT id FROM account_page)
+      GROUP BY account_id
+    ),
+    contact_counts AS (
+      SELECT account_id, count(*) AS contact_count
+      FROM contacts
+      WHERE workspace_id = ${workspaceId}::uuid
+        AND account_id IN (SELECT id FROM account_page)
+      GROUP BY account_id
+    ),
+    latest_analyses AS (
+      SELECT DISTINCT ON (pa.account_id)
+        pa.account_id,
+        pa.fit_score,
+        pa.fit_tier,
+        pa.confidence::float8 AS confidence,
+        pa.completed_at,
+        pa.analysis_json ->> 'reasonSummary' AS reason_summary
+      FROM prospect_analyses pa
+      WHERE pa.workspace_id = ${workspaceId}::uuid
+        AND pa.status = 'completed'
+        AND pa.account_id IN (SELECT id FROM account_page)
+      ORDER BY pa.account_id, pa.completed_at DESC, pa.created_at DESC
+    )
+    SELECT
+      page.id,
+      page.canonical_name,
+      page.business_type,
+      page.province,
+      page.fit_score,
+      page.fit_tier,
+      page.created_at,
+      COALESCE(source_counts.source_count, 0) AS source_count,
+      COALESCE(contact_counts.contact_count, 0) AS contact_count,
+      latest_analyses.account_id AS analyzed_account_id,
+      latest_analyses.fit_score AS analysis_fit_score,
+      latest_analyses.fit_tier AS analysis_fit_tier,
+      latest_analyses.confidence,
+      latest_analyses.completed_at,
+      latest_analyses.reason_summary
+    FROM account_page page
+    LEFT JOIN source_counts ON source_counts.account_id = page.id
+    LEFT JOIN contact_counts ON contact_counts.account_id = page.id
+    LEFT JOIN latest_analyses ON latest_analyses.account_id = page.id
+    ORDER BY page.created_at ASC, page.id ASC
+  `);
+
+  return (result.rows as Array<Record<string, unknown>>).map((row) => ({
+    account: {
+      id: String(row.id),
+      canonicalName: String(row.canonical_name),
+      businessType: String(row.business_type) as Account["businessType"],
+      province: typeof row.province === "string" ? row.province : null,
+      fitScore: safeNumeric(row.fit_score),
+      fitTier: String(row.fit_tier) as Account["fitTier"],
+      createdAt: row.created_at instanceof Date ? row.created_at.toISOString() : String(row.created_at),
+    },
+    contactCount: safeNumeric(row.contact_count) ?? 0,
+    sourceCount: safeNumeric(row.source_count) ?? 0,
+    intelligence: typeof row.analyzed_account_id === "string"
+      ? {
+          fitScore: safeNumeric(row.analysis_fit_score),
+          fitTier: typeof row.analysis_fit_tier === "string" ? row.analysis_fit_tier : null,
+          confidence: safeNumeric(row.confidence),
+          lastAnalyzedAt: row.completed_at instanceof Date
+            ? row.completed_at.toISOString()
+            : typeof row.completed_at === "string" ? row.completed_at : null,
+          reasonSummary: typeof row.reason_summary === "string" ? row.reason_summary.slice(0, 280) : null,
+        }
+      : null,
+  }));
+}
+
+export async function getAccountBundleById(workspaceId: string, accountId: string): Promise<AccountBundle | null> {
+  const db = getDb();
+  const [accountRow] = await db
+    .select()
+    .from(accounts)
+    .where(and(eq(accounts.workspaceId, workspaceId), eq(accounts.id, accountId)))
+    .limit(1);
+  if (!accountRow) return null;
+
+  const [sourceRows, contactRows, contactPointRows, intelligenceRows] = await Promise.all([
+    db.select({ source: accountSources })
+      .from(accountSources)
+      .innerJoin(accounts, eq(accountSources.accountId, accounts.id))
+      .where(and(eq(accounts.workspaceId, workspaceId), eq(accounts.id, accountId))),
+    db.select().from(contacts).where(and(eq(contacts.workspaceId, workspaceId), eq(contacts.accountId, accountId))),
+    db.select().from(contactPoints).where(and(eq(contactPoints.workspaceId, workspaceId), eq(contactPoints.accountId, accountId))),
+    db.execute(sql`
+      SELECT DISTINCT ON (account_id)
+        account_id, fit_score, fit_tier, confidence, analysis_json, completed_at
+      FROM prospect_analyses
+      WHERE workspace_id = ${workspaceId}::uuid
+        AND account_id = ${accountId}::uuid
+        AND status = 'completed'
+      ORDER BY account_id, completed_at DESC, created_at DESC
+    `),
+  ]);
+
+  const intelligenceRow = (intelligenceRows.rows as Array<Record<string, unknown>>)[0];
+  return {
+    account: toAccount(accountRow),
+    sources: sourceRows.map(({ source }) => toAccountSource(source)),
+    contacts: contactRows.map(toContact),
+    contactPoints: contactPointRows.map(toContactPoint),
+    intelligence: intelligenceRow ? mapIntelligence(intelligenceRow) : null,
+  };
 }
 
 export async function listSetterQueueAccounts(

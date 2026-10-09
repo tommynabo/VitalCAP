@@ -17,7 +17,20 @@ import * as seed from "@/lib/seed/dev-seed";
 import { getPrimaryOffer, listOffers } from "@/infrastructure/neon/repositories/offers";
 import { listSetterWebhookEvents, type SetterWebhookEventSummary } from "@/infrastructure/neon/repositories/setter-runtime";
 import { listCampaigns, listOutreachQueueCampaignMetadata, listSetterQueueCampaigns } from "@/infrastructure/neon/repositories/campaigns";
-import { listAccountBundles, listOutreachQueueDisplayData, listSetterQueueAccounts, type AccountBundle } from "@/infrastructure/neon/repositories/accounts";
+import {
+  getAccountBundleById,
+  listAccountBundles,
+  listAccountSummaryRows,
+  listOutreachQueueDisplayData,
+  listSetterQueueAccounts,
+  type AccountBundle,
+} from "@/infrastructure/neon/repositories/accounts";
+import {
+  loadAccountListPage,
+  type AccountListCursor,
+  type AccountListPageData,
+  type AccountListSummary,
+} from "@/services/accounts/account-list";
 import {
   countInfrastructureAlerts,
   listOutreachQueueItems,
@@ -132,6 +145,60 @@ export async function getAccountBundles(): Promise<AccountBundle[]> {
   if (isDevSeedMode()) return seed.seedAccountBundles;
   const workspaceId = await getCurrentWorkspaceId();
   return listAccountBundles(workspaceId);
+}
+
+function toSeedAccountListSummary(bundle: (typeof seed.seedAccountBundles)[number]): AccountListSummary {
+  return {
+    account: {
+      id: bundle.account.id,
+      canonicalName: bundle.account.canonicalName,
+      businessType: bundle.account.businessType,
+      province: bundle.account.province,
+      fitScore: bundle.account.fitScore,
+      fitTier: bundle.account.fitTier,
+      createdAt: bundle.account.createdAt,
+    },
+    contactCount: bundle.contacts.length,
+    sourceCount: bundle.sources.length,
+    intelligence: null,
+  };
+}
+
+async function getSeedAccountListPage(cursor: AccountListCursor | null): Promise<AccountListPageData> {
+  const bundles = [...seed.seedAccountBundles].sort((left, right) =>
+    left.account.createdAt.localeCompare(right.account.createdAt) || left.account.id.localeCompare(right.account.id),
+  );
+  return loadAccountListPage({
+    listAccountSummaries: async (limit, pageCursor) => bundles
+      .filter(({ account }) => !pageCursor
+        || account.createdAt > pageCursor.createdAt
+        || (account.createdAt === pageCursor.createdAt && account.id > pageCursor.id))
+      .slice(0, limit)
+      .map(toSeedAccountListSummary),
+  }, cursor);
+}
+
+export async function getAccountListPageForWorkspace(
+  workspaceId: string,
+  cursor: AccountListCursor | null = null,
+): Promise<AccountListPageData> {
+  if (isDevSeedMode()) return workspaceId === "ws_demo" ? getSeedAccountListPage(cursor) : { items: [], nextCursor: null };
+  return loadAccountListPage({
+    listAccountSummaries: (limit, pageCursor) => listAccountSummaryRows(workspaceId, limit, pageCursor),
+  }, cursor);
+}
+
+export async function getAccountListPage(cursor: AccountListCursor | null = null): Promise<AccountListPageData> {
+  if (isDevSeedMode()) return getSeedAccountListPage(cursor);
+  return getAccountListPageForWorkspace(await getCurrentWorkspaceId(), cursor);
+}
+
+export async function getAccountBundleForWorkspace(workspaceId: string, accountId: string): Promise<AccountBundle | null> {
+  if (isDevSeedMode()) {
+    if (workspaceId !== "ws_demo") return null;
+    return seed.seedAccountBundles.find(({ account }) => account.id === accountId) ?? null;
+  }
+  return getAccountBundleById(workspaceId, accountId);
 }
 
 function getSeedSetterReviewQueuePage(cursor: SetterQueueCursor | null): Promise<SetterReviewQueuePage> {

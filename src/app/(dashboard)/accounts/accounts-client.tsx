@@ -2,10 +2,16 @@
 
 import { useState } from "react";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Sheet } from "@/components/ui/sheet";
 import { Table, TableBody, TableCell, TableHead, TableHeadCell, TableRow } from "@/components/ui/table";
 import type { AccountBundle } from "@/lib/data/repository";
+import {
+  mergeAccountListPageData,
+  type AccountListPageData,
+  type AccountListSummary,
+} from "@/services/accounts/account-list";
 
 function tierLabel(tier: string) {
   if (tier === "high") return "Tier A";
@@ -112,8 +118,53 @@ function AccountDetail({ bundle }: { bundle: AccountBundle }) {
   );
 }
 
-export function AccountsClient({ accountBundles }: { accountBundles: AccountBundle[] }) {
-  const [selected, setSelected] = useState<AccountBundle | null>(null);
+export function AccountsClient({ initialPage }: { initialPage: AccountListPageData }) {
+  const [accountPage, setAccountPage] = useState(initialPage);
+  const [selected, setSelected] = useState<AccountListSummary | null>(null);
+  const [accountDetails, setAccountDetails] = useState<Record<string, AccountBundle>>({});
+  const [loadingDetailIds, setLoadingDetailIds] = useState<string[]>([]);
+  const [detailErrors, setDetailErrors] = useState<Record<string, string>>({});
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [loadMoreError, setLoadMoreError] = useState("");
+
+  async function openAccount(summary: AccountListSummary) {
+    const accountId = summary.account.id;
+    setSelected(summary);
+    setDetailErrors((current) => ({ ...current, [accountId]: "" }));
+    if (accountDetails[accountId] || loadingDetailIds.includes(accountId)) return;
+
+    setLoadingDetailIds((current) => [...current, accountId]);
+    try {
+      const response = await fetch(`/api/accounts/${encodeURIComponent(accountId)}`, { cache: "no-store" });
+      const bundle = await response.json().catch(() => null) as AccountBundle | null;
+      if (!response.ok || !bundle) throw new Error("Could not load account details.");
+      setAccountDetails((current) => ({ ...current, [accountId]: bundle }));
+    } catch (error) {
+      setDetailErrors((current) => ({
+        ...current,
+        [accountId]: error instanceof Error ? error.message : "Could not load account details.",
+      }));
+    } finally {
+      setLoadingDetailIds((current) => current.filter((id) => id !== accountId));
+    }
+  }
+
+  async function loadMore() {
+    if (!accountPage.nextCursor || loadingMore) return;
+    setLoadingMore(true);
+    setLoadMoreError("");
+    try {
+      const params = new URLSearchParams({ cursor: JSON.stringify(accountPage.nextCursor) });
+      const response = await fetch(`/api/accounts?${params.toString()}`, { cache: "no-store" });
+      const nextPage = await response.json().catch(() => null) as AccountListPageData | null;
+      if (!response.ok || !nextPage) throw new Error("Could not load more accounts.");
+      setAccountPage((current) => mergeAccountListPageData(current, nextPage));
+    } catch (error) {
+      setLoadMoreError(error instanceof Error ? error.message : "Could not load more accounts.");
+    } finally {
+      setLoadingMore(false);
+    }
+  }
 
   return (
     <>
@@ -139,15 +190,15 @@ export function AccountsClient({ accountBundles }: { accountBundles: AccountBund
               </TableRow>
             </TableHead>
             <TableBody>
-              {accountBundles.map((bundle) => {
-                const { account, contacts, sources, intelligence } = bundle;
+              {accountPage.items.map((summary) => {
+                const { account, intelligence } = summary;
                 return (
-                  <TableRow key={account.id} className="cursor-pointer hover:bg-surface-muted" onClick={() => setSelected(bundle)}>
+                  <TableRow key={account.id} className="cursor-pointer hover:bg-surface-muted" onClick={() => void openAccount(summary)}>
                     <TableCell className="font-medium text-text">{account.canonicalName}</TableCell>
                     <TableCell className="text-text-muted">{account.businessType.replace(/_/g, " ")}</TableCell>
                     <TableCell className="text-text-muted">{account.province ?? "—"}</TableCell>
-                    <TableCell className="text-text-muted">{contacts.length}</TableCell>
-                    <TableCell className="text-text-muted">{sources.length}</TableCell>
+                    <TableCell className="text-text-muted">{summary.contactCount}</TableCell>
+                    <TableCell className="text-text-muted">{summary.sourceCount}</TableCell>
                     <TableCell>
                       <div className="flex items-center gap-2">
                         <span className="font-medium text-text">{intelligence?.fitScore ?? account.fitScore ?? "—"}</span>
@@ -167,13 +218,31 @@ export function AccountsClient({ accountBundles }: { accountBundles: AccountBund
                   </TableRow>
                 );
               })}
+              {accountPage.items.length === 0 && (
+                <TableRow>
+                  <TableCell colSpan={7} className="py-6 text-center text-text-muted">No accounts found.</TableCell>
+                </TableRow>
+              )}
             </TableBody>
           </Table>
+          {loadMoreError && <p role="alert" className="mt-3 text-sm text-danger">{loadMoreError}</p>}
+          {accountPage.nextCursor && (
+            <Button className="mt-3" size="sm" variant="secondary" disabled={loadingMore} onClick={() => void loadMore()}>
+              {loadingMore ? "Loading..." : "Load more"}
+            </Button>
+          )}
         </CardContent>
       </Card>
 
       <Sheet open={selected !== null} onClose={() => setSelected(null)} title={selected?.account.canonicalName ?? ""} description="Account detail">
-        {selected ? <AccountDetail bundle={selected} /> : null}
+        {selected ? accountDetails[selected.account.id]
+          ? <AccountDetail bundle={accountDetails[selected.account.id]!} />
+          : loadingDetailIds.includes(selected.account.id)
+            ? <p className="text-sm text-text-muted">Loading account details...</p>
+            : detailErrors[selected.account.id]
+              ? <p role="alert" className="text-sm text-danger">{detailErrors[selected.account.id]}</p>
+              : null
+          : null}
       </Sheet>
     </>
   );
