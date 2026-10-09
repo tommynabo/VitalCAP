@@ -4,6 +4,8 @@
  * an injectable `fetchImpl` so tests never make a real network call.
  */
 
+import { normalizeDomain } from "@/lib/normalization";
+
 const BLOCKED_HOSTNAME_SUFFIXES = [".local", ".internal", ".localhost"];
 const BLOCKED_HOSTNAMES = new Set(["localhost", "0.0.0.0", "metadata.google.internal"]);
 
@@ -39,6 +41,7 @@ export interface SafeFetchOptions {
   maxContentLengthBytes?: number;
   maxRedirects?: number;
   userAgent?: string;
+  allowedDomain?: string;
   /** Injected for tests / DI — defaults to global `fetch`. */
   fetchImpl?: typeof fetch;
   /** Resolves a hostname to IP literals for pre-fetch DNS validation. Defaults to a no-op (skip) when unavailable, e.g. in a browser/edge runtime. */
@@ -62,19 +65,25 @@ export class SafeFetchError extends Error {
       | "too_many_redirects"
       | "content_too_large"
       | "unsupported_content_type"
-      | "timeout",
+      | "timeout"
+      | "http_server_error"
+      | "http_client_error",
+    public readonly statusCode?: number,
   ) {
     super(message);
     this.name = "SafeFetchError";
   }
 }
 
-function assertPublicUrl(url: URL): void {
+function assertPublicUrl(url: URL, allowedDomain?: string): void {
   if (url.protocol !== "http:" && url.protocol !== "https:") {
     throw new SafeFetchError(`Blocked non-http(s) scheme: ${url.protocol}`, "blocked_scheme");
   }
   if (isBlockedHostname(url.hostname) || isPrivateOrLinkLocalIp(url.hostname)) {
     throw new SafeFetchError(`Blocked hostname: ${url.hostname}`, "blocked_hostname");
+  }
+  if (allowedDomain && normalizeDomain(url.hostname) !== allowedDomain) {
+    throw new SafeFetchError(`Blocked cross-domain website redirect`, "blocked_hostname");
   }
 }
 
@@ -90,8 +99,9 @@ export async function safeFetchPage(rawUrl: string, options: SafeFetchOptions = 
   const fetchImpl = options.fetchImpl ?? fetch;
 
   let currentUrl = new URL(rawUrl);
+  const allowedDomain = options.allowedDomain ? normalizeDomain(options.allowedDomain) : undefined;
   for (let redirectCount = 0; ; redirectCount++) {
-    assertPublicUrl(currentUrl);
+    assertPublicUrl(currentUrl, allowedDomain ?? undefined);
 
     if (options.resolveHostname) {
       const ips = await options.resolveHostname(currentUrl.hostname);
@@ -118,6 +128,13 @@ export async function safeFetchPage(rawUrl: string, options: SafeFetchOptions = 
         }
         currentUrl = new URL(location, currentUrl);
         continue;
+      }
+
+      if (response.status >= 500) {
+        throw new SafeFetchError(`HTTP ${response.status} fetching ${currentUrl.toString()}`, "http_server_error", response.status);
+      }
+      if (response.status >= 400) {
+        throw new SafeFetchError(`HTTP ${response.status} fetching ${currentUrl.toString()}`, "http_client_error", response.status);
       }
 
       const contentType = response.headers.get("content-type");

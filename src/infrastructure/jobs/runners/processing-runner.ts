@@ -199,7 +199,7 @@ async function executeProcessingJob(
       const cached = fetchCache.get(url);
       if (cached) return cached;
       const res = await realWebsiteFetcher.fetchPage(url);
-      fetchCache.set(url, res);
+      if (res.status < 400) fetchCache.set(url, res);
       return res;
     },
   };
@@ -297,22 +297,47 @@ async function executeProcessingJob(
     });
   }
 
+  const websiteRecoveryCounters = {
+    accountsAttempted: 0,
+    fetchFailed: 0,
+    internalPagesFetched: 0,
+    emailCandidatesFound: 0,
+    contactPointsCreated: 0,
+    verificationQueued: 0,
+  };
+
   // --- WEBSITE ENRICHMENT ---
   if (accountFields.websiteUrl && incoming.normalizedDomain && options.enrichContacts !== false) {
     const cache = await getWebsiteEnrichmentStatus(accountId, incoming.normalizedDomain);
     const now = new Date();
-    const needsRefresh = !cache || !cache.nextRefreshAt || cache.nextRefreshAt <= now;
+    const transientCacheFailure = cache?.status === "timeout" || cache?.status === "transient_error";
+    const transientRetryAt = transientCacheFailure && cache
+      ? new Date(cache.startedAt.getTime() + 6 * 60 * 60 * 1000)
+      : null;
+    const transientBackoffElapsed = transientRetryAt !== null && transientRetryAt <= now;
+    const needsRefresh = !cache || !cache.nextRefreshAt || cache.nextRefreshAt <= now || transientBackoffElapsed;
 
     if (needsRefresh) {
+      websiteRecoveryCounters.accountsAttempted += 1;
       const service = new WebsiteEnrichmentService(cachedFetcher);
       const result = await service.enrich({
         workspaceId: campaign.workspaceId,
         accountId,
         websiteUrl: accountFields.websiteUrl,
       });
+      if (result.status !== "completed" && result.status !== "no_website") {
+        websiteRecoveryCounters.fetchFailed += 1;
+      }
+      websiteRecoveryCounters.internalPagesFetched += result.internalPagesFetched ?? 0;
+      websiteRecoveryCounters.emailCandidatesFound += result.emailCandidatesFound ?? 0;
 
       const nextRefreshAt = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000); // 30 days
-      const failureRefreshAt = new Date(now.getTime() + 24 * 60 * 60 * 1000); // 1 day
+      const failureBackoffMs = result.status === "timeout" || result.status === "transient_error"
+        ? 6 * 60 * 60 * 1000
+        : result.status === "dns_failure" || result.status === "http_error" || result.status === "parse_error"
+          ? 30 * 24 * 60 * 60 * 1000
+          : 24 * 60 * 60 * 1000;
+      const failureRefreshAt = new Date(now.getTime() + failureBackoffMs);
       
       let finalNextRefreshAt: Date | undefined;
       if (result.status === "completed") {
@@ -392,14 +417,27 @@ async function executeProcessingJob(
         sourceUrl: fact.sourceUrl,
         sourceType: "website_enrichment",
       });
+      if (contactPoint.created) websiteRecoveryCounters.contactPointsCreated += 1;
       if (contactPoint.id && (contactPoint.created || contactPoint.verificationStatus === "unverified")) {
-        await enqueueVerificationJob({
+        const verificationQueued = await enqueueVerificationJob({
           workspaceId: campaign.workspaceId,
           contactPointId: contactPoint.id,
           normalizedEmail: email,
           provider: getVerificationEnv().EMAIL_VERIFICATION_PROVIDER,
         });
+        if (verificationQueued) websiteRecoveryCounters.verificationQueued += 1;
       }
+    }
+
+    if (Object.values(websiteRecoveryCounters).some((count) => count > 0)) {
+      console.info("WEBSITE_EMAIL_RECOVERY", {
+        WEBSITE_RECOVERY_ACCOUNTS_ATTEMPTED: websiteRecoveryCounters.accountsAttempted,
+        WEBSITE_RECOVERY_FETCH_FAILED: websiteRecoveryCounters.fetchFailed,
+        WEBSITE_RECOVERY_INTERNAL_PAGES_FETCHED: websiteRecoveryCounters.internalPagesFetched,
+        WEBSITE_EMAIL_CANDIDATES_FOUND: websiteRecoveryCounters.emailCandidatesFound,
+        WEBSITE_EMAIL_CONTACT_POINTS_CREATED: websiteRecoveryCounters.contactPointsCreated,
+        WEBSITE_EMAIL_VERIFICATION_QUEUED: websiteRecoveryCounters.verificationQueued,
+      });
     }
   }
 

@@ -16,9 +16,11 @@ export interface WebsiteEvidenceFact {
 }
 
 export interface WebsiteEnrichmentResult {
-  status: "completed" | "no_website" | "timeout" | "dns_failure" | "blocked_unsafe_url" | "http_error" | "parse_error";
+  status: "completed" | "no_website" | "timeout" | "transient_error" | "dns_failure" | "blocked_unsafe_url" | "http_error" | "parse_error";
   errorDetails?: string;
   pagesFetched: number;
+  internalPagesFetched: number;
+  emailCandidatesFound: number;
   contentHash: string | null;
   evidence: WebsiteEvidenceFact[];
 }
@@ -56,6 +58,26 @@ const NAMED_ROLES = [
   "gerente",
 ];
 
+const TRANSIENT_NETWORK_CODES = new Set([
+  "ECONNRESET",
+  "ECONNREFUSED",
+  "ETIMEDOUT",
+  "EAI_AGAIN",
+  "UND_ERR_SOCKET",
+  "UND_ERR_CONNECT_TIMEOUT",
+]);
+
+function networkErrorCode(error: unknown): string | null {
+  if (!error || typeof error !== "object") return null;
+  const candidate = error as { code?: unknown; cause?: unknown };
+  if (typeof candidate.code === "string") return candidate.code;
+  if (candidate.cause && typeof candidate.cause === "object") {
+    const causeCode = (candidate.cause as { code?: unknown }).code;
+    if (typeof causeCode === "string") return causeCode;
+  }
+  return null;
+}
+
 function extractVisibleTextContext(html: string, index: number, matchLength: number): string {
   const start = Math.max(0, index - 60);
   const end = Math.min(html.length, index + matchLength + 60);
@@ -67,6 +89,17 @@ function stripBoilerplate(html: string): string {
     .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, " ")
     .replace(/<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>/gi, " ")
     .replace(/<nav\b[^<]*(?:(?!<\/nav>)<[^<]*)*<\/nav>/gi, " ")
+    .replace(/<[^>]+>/g, " ");
+}
+
+function visibleEmailContent(html: string): string {
+  return html
+    .replace(/<!--[\s\S]*?-->/g, " ")
+    .replace(/<(script|style|noscript|template|head|svg)\b[^>]*>[\s\S]*?<\/\1\s*>/gi, " ")
+    .replace(/<([a-z][\w:-]*)\b[^>]*\shidden(?:\s|=|>)[^>]*>[\s\S]*?<\/\1\s*>/gi, " ")
+    .replace(/<([a-z][\w:-]*)\b(?=[^>]*\baria-hidden\s*=\s*(["'])true\2)[^>]*>[\s\S]*?<\/\1\s*>/gi, " ")
+    .replace(/<([a-z][\w:-]*)\b(?=[^>]*\bstyle\s*=\s*(["'])[^"']*(?:display\s*:\s*none|visibility\s*:\s*hidden)[^"']*\2)[^>]*>[\s\S]*?<\/\1\s*>/gi, " ")
+    .replace(/<a\b[^>]*\bhref\s*=\s*(["'])mailto:([^"']+)\1[^>]*>([\s\S]*?)<\/a\s*>/gi, (_match, _quote: string, target: string, text: string) => `mailto:${target} ${text}`)
     .replace(/<[^>]+>/g, " ");
 }
 
@@ -152,7 +185,7 @@ export class WebsiteEnrichmentService {
 
   async enrich(context: WebsiteEnrichmentContext): Promise<WebsiteEnrichmentResult> {
     if (!context.websiteUrl) {
-      return { status: "no_website", pagesFetched: 0, contentHash: null, evidence: [] };
+      return { status: "no_website", pagesFetched: 0, internalPagesFetched: 0, emailCandidatesFound: 0, contentHash: null, evidence: [] };
     }
 
     let pages: CrawledPage[];
@@ -163,14 +196,17 @@ export class WebsiteEnrichmentService {
       if (error instanceof SafeFetchError) {
         if (error.reason === "timeout") status = "timeout";
         else if (error.reason === "blocked_ip" || error.reason === "blocked_hostname") status = "blocked_unsafe_url";
-      } else if (error.code === "ENOTFOUND") {
+        else if (error.reason === "http_server_error") status = "transient_error";
+      } else if (networkErrorCode(error) === "ENOTFOUND") {
         status = "dns_failure";
+      } else if (networkErrorCode(error) && TRANSIENT_NETWORK_CODES.has(networkErrorCode(error)!)) {
+        status = "transient_error";
       }
-      return { status, errorDetails: error.message, pagesFetched: 0, contentHash: null, evidence: [] };
+      return { status, errorDetails: error.message, pagesFetched: 0, internalPagesFetched: 0, emailCandidatesFound: 0, contentHash: null, evidence: [] };
     }
 
     if (pages.length === 0) {
-      return { status: "parse_error", pagesFetched: 0, contentHash: null, evidence: [] };
+      return { status: "parse_error", pagesFetched: 0, internalPagesFetched: 0, emailCandidatesFound: 0, contentHash: null, evidence: [] };
     }
 
     const allContent = pages.map((p) => p.body).join("");
@@ -188,7 +224,7 @@ export class WebsiteEnrichmentService {
     };
 
     for (const page of pages) {
-      const emails = extractCandidateEmails(page.body, page.url);
+      const emails = extractCandidateEmails(visibleEmailContent(page.body), page.url);
       for (const email of emails) {
         addFact({
           evidenceType: "email",
@@ -215,6 +251,8 @@ export class WebsiteEnrichmentService {
     return {
       status: "completed",
       pagesFetched: pages.length,
+      internalPagesFetched: Math.max(0, pages.length - 1),
+      emailCandidatesFound: evidence.filter((fact) => fact.evidenceType === "email").length,
       contentHash,
       evidence,
     };

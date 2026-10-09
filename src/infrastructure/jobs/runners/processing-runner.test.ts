@@ -286,6 +286,122 @@ describe("runProcessingCronTick", () => {
     expect(mocks.completeProcessingJob).toHaveBeenCalledTimes(1);
   });
 
+  it("retries a stale transient website cache and queues recovered email as unverified", async () => {
+    const rawCandidate = {
+      id: "raw-candidate-id",
+      accountId: null,
+      searchSeedRunId: null,
+      engineType: "maps_fast",
+      rawPayload: {
+        kind: "maps",
+        place: {
+          externalPlaceId: "place-id",
+          name: "Farmacia Ejemplo",
+          countryCode: "ES",
+          websiteUrl: "https://farmacia-ejemplo.es",
+          phone: null,
+          sourceUrl: null,
+        },
+      },
+    };
+    const normalJob = { ...makeJob("job-transient-retry"), type: "process_raw_candidate" };
+    mocks.getRawCandidateById.mockResolvedValue(rawCandidate);
+    mocks.getCampaignById.mockResolvedValue({ id: "campaign-id", workspaceId: "workspace-id" });
+    mocks.getWebsiteEnrichmentStatus.mockResolvedValue({
+      status: "timeout",
+      startedAt: new Date(Date.now() - 7 * 60 * 60 * 1000),
+      nextRefreshAt: new Date(Date.now() + 60 * 60 * 1000),
+    });
+    mocks.enrichWebsite.mockResolvedValue({
+      status: "completed",
+      pagesFetched: 2,
+      internalPagesFetched: 1,
+      emailCandidatesFound: 1,
+      contentHash: "content-hash",
+      evidence: [{
+        evidenceType: "email",
+        value: "info@farmacia-ejemplo.es",
+        normalizedValue: "info@farmacia-ejemplo.es",
+        snippet: "Contact information",
+        sourceUrl: "https://farmacia-ejemplo.es/contacto",
+      }],
+    });
+    mocks.listUnlinkedWebsiteEmailEvidence.mockResolvedValue([{
+      value: "info@farmacia-ejemplo.es",
+      normalizedValue: "info@farmacia-ejemplo.es",
+      sourceUrl: "https://farmacia-ejemplo.es/contacto",
+    }]);
+    mocks.claimProcessingJobs.mockResolvedValueOnce([normalJob]).mockResolvedValueOnce([]);
+    const info = vi.spyOn(console, "info").mockImplementation(() => {});
+
+    await runProcessingCronTick(3);
+
+    expect(mocks.enrichWebsite).toHaveBeenCalledTimes(1);
+    expect(mocks.insertContactPointWithStatus).toHaveBeenCalledWith(expect.objectContaining({
+      verificationStatus: "unverified",
+      verificationProvider: null,
+      sourceType: "website_enrichment",
+      sourceUrl: "https://farmacia-ejemplo.es/contacto",
+    }));
+    expect(mocks.enqueueVerificationJob).toHaveBeenCalledWith(expect.objectContaining({
+      contactPointId: "contact-point-id",
+      normalizedEmail: "info@farmacia-ejemplo.es",
+      provider: "millionverifier",
+    }));
+    expect(info).toHaveBeenCalledWith("WEBSITE_EMAIL_RECOVERY", expect.objectContaining({
+      WEBSITE_RECOVERY_ACCOUNTS_ATTEMPTED: 1,
+      WEBSITE_RECOVERY_FETCH_FAILED: 0,
+      WEBSITE_RECOVERY_INTERNAL_PAGES_FETCHED: 1,
+      WEBSITE_EMAIL_CANDIDATES_FOUND: 1,
+      WEBSITE_EMAIL_CONTACT_POINTS_CREATED: 1,
+      WEBSITE_EMAIL_VERIFICATION_QUEUED: 1,
+    }));
+  });
+
+  it("does not requeue an already verified website email", async () => {
+    const rawCandidate = {
+      id: "raw-candidate-id",
+      accountId: null,
+      searchSeedRunId: null,
+      engineType: "maps_fast",
+      rawPayload: {
+        kind: "maps",
+        place: {
+          externalPlaceId: "place-id",
+          name: "Farmacia Ejemplo",
+          countryCode: "ES",
+          websiteUrl: "https://farmacia-ejemplo.es",
+          phone: null,
+          sourceUrl: null,
+        },
+      },
+    };
+    mocks.getRawCandidateById.mockResolvedValue(rawCandidate);
+    mocks.getCampaignById.mockResolvedValue({ id: "campaign-id", workspaceId: "workspace-id" });
+    mocks.getWebsiteEnrichmentStatus.mockResolvedValue({
+      status: "completed",
+      startedAt: new Date(),
+      nextRefreshAt: new Date(Date.now() + 60 * 60 * 1000),
+    });
+    mocks.listUnlinkedWebsiteEmailEvidence.mockResolvedValue([{
+      value: "info@farmacia-ejemplo.es",
+      normalizedValue: "info@farmacia-ejemplo.es",
+      sourceUrl: "https://farmacia-ejemplo.es/contacto",
+    }]);
+    mocks.insertContactPointWithStatus.mockResolvedValue({
+      id: "existing-contact-point-id",
+      created: false,
+      verificationStatus: "valid",
+    });
+    mocks.claimProcessingJobs.mockResolvedValueOnce([{ ...makeJob("job-existing-email"), type: "process_raw_candidate" }])
+      .mockResolvedValueOnce([]);
+
+    await runProcessingCronTick(3);
+
+    expect(mocks.enrichWebsite).not.toHaveBeenCalled();
+    expect(mocks.enqueueVerificationJob).not.toHaveBeenCalled();
+  });
+
   it("persists Serper provenance and queues a new snippet email for MillionVerifier", async () => {
     const email = "info@farmacia-ejemplo.es";
     mocks.getRawCandidateById.mockResolvedValue({

@@ -54,6 +54,18 @@ describe("safeFetchPage", () => {
     expect(result.body).toContain("hola");
   });
 
+  it("classifies temporary server errors as retryable fetch failures", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(new Response("unavailable", { status: 503, headers: { "content-type": "text/html" } }));
+    await expect(safeFetchPage("https://farmaciadelgado.example.es/", { fetchImpl }))
+      .rejects.toMatchObject({ reason: "http_server_error", statusCode: 503 });
+  });
+
+  it("classifies client errors without treating them as transient", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(new Response("not found", { status: 404, headers: { "content-type": "text/html" } }));
+    await expect(safeFetchPage("https://farmaciadelgado.example.es/", { fetchImpl }))
+      .rejects.toMatchObject({ reason: "http_client_error", statusCode: 404 });
+  });
+
   it("times out when the response body stalls after headers", async () => {
     const fetchImpl: typeof fetch = async (_input, init) => new Response(
       new ReadableStream({
@@ -85,6 +97,15 @@ describe("safeFetchPage", () => {
   it("blocks a redirect that hops to a private IP", async () => {
     const fetchImpl = vi.fn().mockResolvedValueOnce(new Response(null, { status: 302, headers: { location: "http://169.254.169.254/latest/meta-data" } }));
     await expect(safeFetchPage("https://farmaciadelgado.example.es/contacto", { fetchImpl })).rejects.toThrow(SafeFetchError);
+  });
+
+  it("blocks a redirect to a different public domain when a website domain is required", async () => {
+    const fetchImpl = vi.fn().mockResolvedValueOnce(new Response(null, { status: 302, headers: { location: "https://other.example/contacto" } }));
+    await expect(safeFetchPage("https://farmaciadelgado.example.es/", {
+      fetchImpl,
+      allowedDomain: "farmaciadelgado.example.es",
+    })).rejects.toMatchObject({ reason: "blocked_hostname" });
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
   });
 
   it("rejects too many redirects", async () => {

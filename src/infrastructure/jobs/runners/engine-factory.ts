@@ -1,4 +1,5 @@
-import { safeFetchPage } from "@/lib/security/safe-fetch";
+import { normalizeDomain } from "@/lib/normalization";
+import { SafeFetchError, safeFetchPage } from "@/lib/security/safe-fetch";
 import type { WebsiteFetcher } from "@/domain/providers/types";
 import type { EngineType } from "@/domain/campaigns/types";
 import type { DiscoveryEngine } from "@/domain/discovery/types";
@@ -11,7 +12,11 @@ import { createMapsDiscoveryProvider, createSerpDiscoveryProvider } from "@/infr
 
 /** `WebsiteFetcher` backed by the real SSRF-safe fetch wrapper (Prompt 2 §2.5) — the only concrete adapter this interface has outside tests. */
 export const realWebsiteFetcher: WebsiteFetcher = {
-  fetchPage: (url) => safeFetchPage(url),
+  fetchPage: (url) => {
+    const allowedDomain = normalizeDomain(url);
+    if (!allowedDomain) throw new SafeFetchError("Website URL does not contain a valid public domain", "blocked_hostname");
+    return safeFetchPage(url, { allowedDomain });
+  },
 };
 
 /**

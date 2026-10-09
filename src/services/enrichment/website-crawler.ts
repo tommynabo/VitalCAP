@@ -1,5 +1,6 @@
 import type { WebsiteFetcher } from "@/domain/providers/types";
 import { normalizeDomain } from "@/lib/normalization";
+import { SafeFetchError } from "@/lib/security/safe-fetch";
 
 /**
  * Targeted internal-page crawl (Prompt 2 §2.4–2.5). Never crawls the whole
@@ -34,17 +35,90 @@ export interface WebsiteCrawlOptions {
 }
 
 const DEFAULT_OPTIONS: WebsiteCrawlOptions = { maxPages: 6 };
+const MAX_FETCH_ATTEMPTS = 2;
+const RETRY_BACKOFF_MS = 250;
 
-function extractLinks(html: string, baseUrl: string, allowedDomain: string): string[] {
-  const links: string[] = [];
-  const hrefRe = /href=["']([^"'#]+)["']/gi;
-  for (const match of html.matchAll(hrefRe)) {
-    const href = match[1];
+const RETRYABLE_NETWORK_CODES = new Set([
+  "ECONNRESET",
+  "ECONNREFUSED",
+  "ETIMEDOUT",
+  "EAI_AGAIN",
+  "UND_ERR_SOCKET",
+  "UND_ERR_CONNECT_TIMEOUT",
+]);
+
+const PATH_PRIORITIES: ReadonlyArray<readonly [string, number]> = [
+  ["contact", 100],
+  ["contacto", 100],
+  ["about", 90],
+  ["nosotros", 90],
+  ["quienes-somos", 90],
+  ["team", 80],
+  ["equipo", 80],
+  ["aviso-legal", 70],
+  ["legal", 70],
+  ["privacy", 60],
+  ["privacidad", 60],
+  ["impressum", 60],
+];
+
+const LINK_LABEL_PRIORITIES: ReadonlyArray<readonly [string, number]> = [
+  ["contact", 100],
+  ["contacto", 100],
+  ["contact us", 100],
+  ["about", 90],
+  ["nosotros", 90],
+  ["quienes somos", 90],
+  ["who we are", 90],
+  ["team", 80],
+  ["equipo", 80],
+  ["legal", 70],
+  ["aviso legal", 70],
+  ["privacy", 60],
+  ["privacidad", 60],
+  ["impressum", 60],
+];
+
+function normalizeLinkLabel(value: string): string {
+  return value
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;|&#160;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
+
+function targetPriority(url: string, label: string): number {
+  const path = new URL(url).pathname.toLowerCase();
+  const normalizedLabel = normalizeLinkLabel(label);
+  const pathPriority = PATH_PRIORITIES.reduce(
+    (highest, [keyword, priority]) => path.includes(keyword) ? Math.max(highest, priority) : highest,
+    0,
+  );
+  const labelPriority = LINK_LABEL_PRIORITIES.reduce(
+    (highest, [keyword, priority]) => normalizedLabel.includes(keyword) ? Math.max(highest, priority) : highest,
+    0,
+  );
+  return Math.max(pathPriority, labelPriority);
+}
+
+function extractLinks(html: string, baseUrl: string, allowedDomain: string): Array<{ url: string; priority: number }> {
+  const links: Array<{ url: string; priority: number }> = [];
+  const anchorRe = /<a\b[^>]*?(?:\s)href\s*=\s*(["'])(.*?)\1[^>]*>([\s\S]*?)<\/a\s*>/gi;
+  for (const match of html.matchAll(anchorRe)) {
+    const href = match[2];
     if (!href) continue;
     try {
       const resolved = new URL(href, baseUrl);
+      if ((resolved.protocol !== "http:" && resolved.protocol !== "https:") || resolved.username || resolved.password) continue;
       const normalizedResolved = normalizeDomain(resolved.hostname);
-      if (allowedDomain && normalizedResolved === allowedDomain) links.push(resolved.toString());
+      if (allowedDomain && normalizedResolved === allowedDomain) {
+        const priority = targetPriority(resolved.toString(), match[3] ?? "");
+        if (priority > 0) links.push({ url: resolved.toString(), priority });
+      }
     } catch {
       // ignore malformed hrefs (mailto:, tel:, javascript:, etc.)
     }
@@ -52,9 +126,42 @@ function extractLinks(html: string, baseUrl: string, allowedDomain: string): str
   return links;
 }
 
-function isTargetPath(url: string): boolean {
-  const path = new URL(url).pathname.toLowerCase();
-  return TARGET_PATH_KEYWORDS.some((keyword) => path.includes(keyword));
+function networkErrorCode(error: unknown): string | null {
+  if (!error || typeof error !== "object") return null;
+  const candidate = error as { code?: unknown; cause?: unknown };
+  if (typeof candidate.code === "string") return candidate.code;
+  if (candidate.cause && typeof candidate.cause === "object") {
+    const causeCode = (candidate.cause as { code?: unknown }).code;
+    if (typeof causeCode === "string") return causeCode;
+  }
+  return null;
+}
+
+function isRetryableFetchError(error: unknown): boolean {
+  if (error instanceof SafeFetchError) {
+    return error.reason === "timeout" || error.reason === "http_server_error";
+  }
+  const code = networkErrorCode(error);
+  return code !== null && RETRYABLE_NETWORK_CODES.has(code);
+}
+
+async function fetchPageWithRetry(fetcher: WebsiteFetcher, url: string): Promise<CrawledPage> {
+  for (let attempt = 1; attempt <= MAX_FETCH_ATTEMPTS; attempt++) {
+    try {
+      const page = await fetcher.fetchPage(url);
+      if (page.status >= 500) {
+        throw new SafeFetchError(`HTTP ${page.status} fetching ${url}`, "http_server_error", page.status);
+      }
+      if (page.status >= 400) {
+        throw new SafeFetchError(`HTTP ${page.status} fetching ${url}`, "http_client_error", page.status);
+      }
+      return { url: page.url, body: page.body };
+    } catch (error) {
+      if (attempt >= MAX_FETCH_ATTEMPTS || !isRetryableFetchError(error)) throw error;
+      await new Promise((resolve) => setTimeout(resolve, RETRY_BACKOFF_MS * attempt));
+    }
+  }
+  throw new Error("WEBSITE_FETCH_RETRY_EXHAUSTED");
 }
 
 /**
@@ -70,7 +177,7 @@ export async function crawlWebsite(fetcher: WebsiteFetcher, rootUrl: string, opt
 
   let home: CrawledPage;
   try {
-    home = await fetcher.fetchPage(rootUrl);
+    home = await fetchPageWithRetry(fetcher, rootUrl);
   } catch (error) {
     throw error;
   }
@@ -79,8 +186,10 @@ export async function crawlWebsite(fetcher: WebsiteFetcher, rootUrl: string, opt
   pages.push({ url: home.url, body: home.body });
 
   const allowedDomain = normalizeDomain(new URL(rootUrl).hostname);
-  const candidateLinks = extractLinks(home.body, home.url, allowedDomain!).filter(isTargetPath).filter((url) => !visited.has(url));
-  const uniqueCandidates = Array.from(new Set(candidateLinks));
+  const candidateLinks = extractLinks(home.body, home.url, allowedDomain!).filter(({ url }) => !visited.has(url));
+  const uniqueCandidates = Array.from(
+    new Map(candidateLinks.map((link) => [link.url, link])).values(),
+  ).sort((left, right) => right.priority - left.priority);
 
   const maxConcurrency = 3;
   let index = 0;
@@ -88,15 +197,15 @@ export async function crawlWebsite(fetcher: WebsiteFetcher, rootUrl: string, opt
   
   const worker = async () => {
     while (index < uniqueCandidates.length && attemptedPages < opts.maxPages) {
-      const link = uniqueCandidates[index++];
-      if (!link) break;
-      if (visited.has(link)) continue;
-      visited.add(link);
+      const candidate = uniqueCandidates[index++];
+      if (!candidate) break;
+      if (visited.has(candidate.url)) continue;
+      visited.add(candidate.url);
       attemptedPages++;
       try {
-        const page = await fetcher.fetchPage(link);
+        const page = await fetchPageWithRetry(fetcher, candidate.url);
         if (pages.length < opts.maxPages) {
-          pages.push({ url: page.url, body: page.body });
+          pages.push(page);
         }
       } catch {
         // if it failed, we could theoretically try another page by decrementing attemptedPages, 

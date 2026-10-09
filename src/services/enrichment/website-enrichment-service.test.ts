@@ -37,6 +37,8 @@ describe("WebsiteEnrichmentService", () => {
     });
 
     expect(result.status).toBe("completed");
+    expect(result.internalPagesFetched).toBe(0);
+    expect(result.emailCandidatesFound).toBe(2);
     
     const emails = result.evidence.filter(e => e.evidenceType === "email");
     expect(emails).toHaveLength(2);
@@ -65,6 +67,40 @@ describe("WebsiteEnrichmentService", () => {
     const roleSignal = roles.find(r => r.evidenceType === "role_signal");
     expect(roleSignal?.value).toBe("gerente");
     expect(roleSignal?.normalizedValue).toBe("gerente");
+  });
+
+  it("extracts a visible email from the prioritized contact page and keeps its source URL", async () => {
+    const fetcher: WebsiteFetcher = {
+      fetchPage: vi.fn(async (url: string) => url.endsWith("/contacto")
+        ? {
+            url,
+            status: 200,
+            contentType: "text/html",
+            body: '<div style="display:none">hidden@farmacia.es</div><script>tracker@thirdparty.es</script><p>Contacta con nosotros: info@farmacia.es</p>',
+          }
+        : {
+            url: "https://farmacia.es/",
+            status: 200,
+            contentType: "text/html",
+            body: '<a href="/contacto">Contacto</a><a href="https://thirdparty.es/contacto">External contact</a>',
+          }),
+    };
+    const result = await new WebsiteEnrichmentService(fetcher).enrich({
+      workspaceId: "ws_1",
+      accountId: "acc_1",
+      websiteUrl: "https://farmacia.es/",
+    });
+    const emails = result.evidence.filter((fact) => fact.evidenceType === "email");
+
+    expect(result.status).toBe("completed");
+    expect(result.pagesFetched).toBe(2);
+    expect(result.internalPagesFetched).toBe(1);
+    expect(result.emailCandidatesFound).toBe(1);
+    expect(emails).toEqual([expect.objectContaining({
+      value: "info@farmacia.es",
+      sourceUrl: "https://farmacia.es/contacto",
+    })]);
+    expect(fetcher.fetchPage).not.toHaveBeenCalledWith("https://thirdparty.es/contacto");
   });
 
   it("should handle blocked unsafe urls as blocked_unsafe_url", async () => {
