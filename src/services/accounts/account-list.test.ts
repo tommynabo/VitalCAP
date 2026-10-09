@@ -3,11 +3,13 @@ import {
   ACCOUNT_LIST_PAGE_SIZE,
   loadAccountListPage,
   mergeAccountListPageData,
-  type AccountListSummary,
+  type AccountListRow,
 } from "./account-list";
 
-function makeSummary(index: number): AccountListSummary {
+function makeSummary(index: number): AccountListRow {
+  const createdAt = new Date(Date.UTC(2026, 0, index + 1)).toISOString();
   return {
+    cursorCreatedAt: createdAt,
     account: {
       id: `account-${index}`,
       canonicalName: `Account ${index}`,
@@ -15,7 +17,7 @@ function makeSummary(index: number): AccountListSummary {
       province: "Sevilla",
       fitScore: 90,
       fitTier: "high",
-      createdAt: new Date(Date.UTC(2026, 0, index + 1)).toISOString(),
+      createdAt,
     },
     contactCount: 2,
     sourceCount: 1,
@@ -37,10 +39,16 @@ describe("account list pages", () => {
 
     expect(listAccountSummaries).toHaveBeenCalledWith(26, null);
     expect(page.items).toHaveLength(25);
-    expect(page.items[0]).toEqual(rows[0]);
+    expect(page.items[0]).toEqual({
+      account: rows[0]!.account,
+      contactCount: rows[0]!.contactCount,
+      sourceCount: rows[0]!.sourceCount,
+      intelligence: rows[0]!.intelligence,
+    });
     expect(page.items[0]).not.toHaveProperty("contacts");
     expect(page.items[0]).not.toHaveProperty("contactPoints");
     expect(page.items[0]).not.toHaveProperty("sources");
+    expect(page.items[0]).not.toHaveProperty("cursorCreatedAt");
     expect(page.nextCursor).toEqual({ createdAt: rows[24]!.account.createdAt, id: "account-24" });
   });
 

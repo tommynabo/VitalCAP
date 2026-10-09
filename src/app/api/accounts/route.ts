@@ -7,7 +7,7 @@ export const dynamic = "force-dynamic";
 
 const cursorSchema = z.object({
   id: z.string().min(1).max(100),
-  createdAt: z.string().datetime(),
+  createdAt: z.string().datetime({ offset: true }),
 }).strict();
 
 function jsonResponse(body: unknown, status = 200) {

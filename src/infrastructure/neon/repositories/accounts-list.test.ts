@@ -60,6 +60,7 @@ describe("listAccountSummaryRows", () => {
         fitTier: "high",
         createdAt: "2026-01-01T00:00:00.000Z",
       },
+      cursorCreatedAt: "2026-01-01T00:00:00.000000+00:00",
       contactCount: 3,
       sourceCount: 2,
       intelligence: {

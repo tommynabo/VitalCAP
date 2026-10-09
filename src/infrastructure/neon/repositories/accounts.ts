@@ -8,7 +8,7 @@ import type { AccountIdentitySignals } from "@/services/deduplication/account-de
 import { evaluateAccountDedup } from "@/services/deduplication/account-dedup";
 import { deriveEmailChannelEligibility } from "@/services/compliance/email-channel-policy";
 import type { SetterQueueAccount } from "@/services/setter/review-queue";
-import type { AccountListCursor, AccountListSummary } from "@/services/accounts/account-list";
+import type { AccountListCursor, AccountListRow } from "@/services/accounts/account-list";
 
 export interface AccountBundle {
   account: Account;
@@ -41,6 +41,18 @@ function safeStringList(value: unknown): string[] {
   return Array.isArray(value)
     ? value.filter((item): item is string => typeof item === "string").slice(0, 8)
     : [];
+}
+
+function toExactCursorTimestamp(value: unknown): string {
+  if (value instanceof Date) return value.toISOString();
+  const timestamp = String(value);
+  const postgresTimestamp = /^(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}:\d{2})(\.\d+)?([+-]\d{2})(?::?(\d{2}))?$/.exec(timestamp);
+  if (postgresTimestamp) {
+    return `${postgresTimestamp[1]}T${postgresTimestamp[2]}${postgresTimestamp[3] ?? ""}${postgresTimestamp[4]}:${postgresTimestamp[5] ?? "00"}`;
+  }
+  const parsed = new Date(timestamp);
+  if (!Number.isFinite(parsed.getTime())) throw new Error("Invalid account cursor timestamp returned by database.");
+  return parsed.toISOString();
 }
 
 function mapIntelligence(row: Record<string, unknown>): AccountIntelligence {
@@ -240,7 +252,7 @@ export async function listAccountSummaryRows(
   workspaceId: string,
   limit: number,
   cursor: AccountListCursor | null,
-): Promise<AccountListSummary[]> {
+): Promise<AccountListRow[]> {
   const db = getDb();
   const cursorCondition = cursor
     ? sql`AND (
@@ -315,6 +327,7 @@ export async function listAccountSummaryRows(
   `);
 
   return (result.rows as Array<Record<string, unknown>>).map((row) => ({
+    cursorCreatedAt: toExactCursorTimestamp(row.created_at),
     account: {
       id: String(row.id),
       canonicalName: String(row.canonical_name),

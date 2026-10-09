@@ -25,8 +25,12 @@ export interface AccountListPageData {
   nextCursor: AccountListCursor | null;
 }
 
+export interface AccountListRow extends AccountListSummary {
+  cursorCreatedAt: string;
+}
+
 export interface AccountListPageDependencies {
-  listAccountSummaries(limit: number, cursor: AccountListCursor | null): Promise<AccountListSummary[]>;
+  listAccountSummaries(limit: number, cursor: AccountListCursor | null): Promise<AccountListRow[]>;
 }
 
 export async function loadAccountListPage(
@@ -36,12 +40,12 @@ export async function loadAccountListPage(
 ): Promise<AccountListPageData> {
   const rows = await dependencies.listAccountSummaries(pageSize + 1, cursor);
   const hasMore = rows.length > pageSize;
-  const items = rows.slice(0, pageSize);
-  const lastItem = items.at(-1);
+  const visibleRows = rows.slice(0, pageSize);
+  const lastRow = visibleRows.at(-1);
   return {
-    items,
-    nextCursor: hasMore && lastItem
-      ? { createdAt: lastItem.account.createdAt, id: lastItem.account.id }
+    items: visibleRows.map(({ cursorCreatedAt: _cursorCreatedAt, ...summary }) => summary),
+    nextCursor: hasMore && lastRow
+      ? { createdAt: lastRow.cursorCreatedAt, id: lastRow.account.id }
       : null,
   };
 }

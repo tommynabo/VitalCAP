@@ -29,6 +29,7 @@ import {
   loadAccountListPage,
   type AccountListCursor,
   type AccountListPageData,
+  type AccountListRow,
   type AccountListSummary,
 } from "@/services/accounts/account-list";
 import {
@@ -147,8 +148,9 @@ export async function getAccountBundles(): Promise<AccountBundle[]> {
   return listAccountBundles(workspaceId);
 }
 
-function toSeedAccountListSummary(bundle: (typeof seed.seedAccountBundles)[number]): AccountListSummary {
+function toSeedAccountListSummary(bundle: (typeof seed.seedAccountBundles)[number]): AccountListRow {
   return {
+    cursorCreatedAt: bundle.account.createdAt,
     account: {
       id: bundle.account.id,
       canonicalName: bundle.account.canonicalName,
