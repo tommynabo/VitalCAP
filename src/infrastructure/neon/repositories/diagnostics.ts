@@ -195,6 +195,16 @@ export function getProviderRows(): Array<{ name: string; status: ProviderRowStat
   return rows;
 }
 
+function toFiniteUsageNumber(value: unknown): number {
+  if (value === null || value === undefined) return 0;
+  try {
+    const number = typeof value === "number" ? value : Number(value);
+    return Number.isFinite(number) ? number : 0;
+  } catch {
+    return 0;
+  }
+}
+
 export async function getEmailVerificationUsage(workspaceId: string): Promise<ProviderUsageStats> {
   const db = getDb();
   const [row] = await db
@@ -209,11 +219,11 @@ export async function getEmailVerificationUsage(workspaceId: string): Promise<Pr
     .where(and(eq(providerRuns.workspaceId, workspaceId), eq(providerRuns.provider, "email_verification")));
 
   return {
-    calls: row?.calls ?? 0,
-    items: row?.items ?? 0,
-    errors: row?.errors ?? 0,
-    totalLatencyMs: row?.totalLatencyMs ?? 0,
-    costUsd: row?.costUsd ?? 0,
+    calls: toFiniteUsageNumber(row?.calls),
+    items: toFiniteUsageNumber(row?.items),
+    errors: toFiniteUsageNumber(row?.errors),
+    totalLatencyMs: toFiniteUsageNumber(row?.totalLatencyMs),
+    costUsd: toFiniteUsageNumber(row?.costUsd),
     quotaRemaining: null,
   };
 }
