@@ -13,6 +13,8 @@ const mocks = vi.hoisted(() => ({
   updateRawCandidateAccountId: vi.fn(),
   findCandidateAccountMatches: vi.fn(),
   resolveCanonicalAccount: vi.fn(),
+  getAccountById: vi.fn(),
+  updateAccountFields: vi.fn(),
   insertAccountSource: vi.fn(),
   insertContactPoint: vi.fn(),
   insertContactPointWithStatus: vi.fn(),
@@ -52,8 +54,8 @@ vi.mock("@/infrastructure/neon/repositories/campaigns", () => ({
 vi.mock("@/infrastructure/neon/repositories/accounts", () => ({
   findCandidateAccountMatches: mocks.findCandidateAccountMatches,
   resolveCanonicalAccount: mocks.resolveCanonicalAccount,
-  getAccountById: vi.fn(),
-  updateAccountFields: vi.fn(),
+  getAccountById: mocks.getAccountById,
+  updateAccountFields: mocks.updateAccountFields,
   insertAccountSource: mocks.insertAccountSource,
   insertContactPoint: mocks.insertContactPoint,
   insertContactPointWithStatus: mocks.insertContactPointWithStatus,
@@ -93,7 +95,30 @@ vi.mock("@/lib/config/env", () => ({
   getVerificationEnv: mocks.getVerificationEnv,
 }));
 
-import { runProcessingCronTick } from "./processing-runner";
+import { evaluateStructuredWebsiteLocation, runProcessingCronTick } from "./processing-runner";
+
+describe("evaluateStructuredWebsiteLocation", () => {
+  it("rejects conflicting structured country evidence even when another fact has a Spanish postcode", () => {
+    const result = evaluateStructuredWebsiteLocation({
+      countryCode: null,
+      postalCode: null,
+      latitude: null,
+      longitude: null,
+      phone: null,
+      normalizedDomain: "farmacia.es",
+      province: "Madrid",
+      city: null,
+    }, [
+      { evidenceType: "location_country", value: "Spain", normalizedValue: "ES", snippet: null, sourceUrl: "https://farmacia.es/" },
+      { evidenceType: "location_country", value: "Portugal", normalizedValue: "PORTUGAL", snippet: null, sourceUrl: "https://farmacia.es/about" },
+      { evidenceType: "location_postal_code", value: "28001", normalizedValue: "28001", snippet: null, sourceUrl: "https://farmacia.es/" },
+    ], "farmacia.es");
+
+    expect(result.verdict.verdict).toBe("rejected");
+    expect(result.accountUpdates.countryCode).toBeUndefined();
+    expect(result.accountUpdates.postalCode).toBe("28001");
+  });
+});
 
 function makeJob(id: string) {
   return {
@@ -125,6 +150,8 @@ beforeEach(() => {
   mocks.updateRawCandidateAccountId.mockResolvedValue(undefined);
   mocks.findCandidateAccountMatches.mockResolvedValue([]);
   mocks.resolveCanonicalAccount.mockResolvedValue({ kind: "createNewAccount", accountId: "account-id" });
+  mocks.getAccountById.mockResolvedValue(null);
+  mocks.updateAccountFields.mockResolvedValue(undefined);
   mocks.insertAccountSource.mockResolvedValue(undefined);
   mocks.insertContactPoint.mockResolvedValue("");
   mocks.insertContactPointWithStatus.mockResolvedValue({ id: "contact-point-id", created: true, verificationStatus: "unverified" });
@@ -473,6 +500,101 @@ describe("runProcessingCronTick", () => {
 
     expect(mocks.enrichWebsite).not.toHaveBeenCalled();
     expect(mocks.enqueueVerificationJob).not.toHaveBeenCalled();
+  });
+
+  it("qualifies a Serper account from persisted structured website evidence through the Spain evaluator", async () => {
+    const email = "info@farmacia-ejemplo.es";
+    const sourceUrl = "https://farmacia-ejemplo.es/contacto";
+    mocks.getRawCandidateById.mockResolvedValue({
+      id: "raw-candidate-id",
+      accountId: null,
+      searchSeedRunId: null,
+      engineType: "google_serp",
+      rawPayload: {
+        kind: "serp",
+        result: { title: "Farmacia Ejemplo", domain: "farmacia-ejemplo.es", url: "https://farmacia-ejemplo.es", snippet: "Farmacia Madrid" },
+        geography: "Madrid",
+      },
+    });
+    mocks.getCampaignById.mockResolvedValue({ id: "campaign-id", workspaceId: "workspace-id" });
+    mocks.getWebsiteEnrichmentStatus.mockResolvedValue(null);
+    mocks.getAccountById.mockResolvedValue({
+      id: "account-id",
+      status: "needs_review",
+      countryCode: null,
+      postalCode: null,
+      latitude: null,
+      longitude: null,
+      phone: null,
+      normalizedDomain: "farmacia-ejemplo.es",
+      province: "Madrid",
+      city: null,
+    });
+    mocks.enrichWebsite.mockResolvedValue({
+      status: "completed",
+      pagesFetched: 1,
+      internalPagesFetched: 0,
+      emailCandidatesFound: 0,
+      contentHash: "structured-content-hash",
+      evidence: [
+        { evidenceType: "location_country", value: "Spain", normalizedValue: "ES", snippet: "Structured JSON-LD location data", sourceUrl },
+        { evidenceType: "location_postal_code", value: "28001", normalizedValue: "28001", snippet: "Structured JSON-LD location data", sourceUrl },
+        { evidenceType: "location_latitude", value: "40.4168", normalizedValue: "40.4168", snippet: "Structured JSON-LD location data", sourceUrl },
+        { evidenceType: "location_longitude", value: "-3.7038", normalizedValue: "-3.7038", snippet: "Structured JSON-LD location data", sourceUrl },
+      ],
+    });
+    mocks.processRawCandidate.mockResolvedValueOnce({
+      engineType: "google_serp",
+      accountKey: "domain:farmacia-ejemplo.es",
+      businessNameGuess: "Farmacia Ejemplo",
+      isDuplicate: false,
+      matchedAccountKey: null,
+      spainVerdict: "needs_review",
+      businessType: "pharmacy",
+      icpQualified: true,
+      contactPoints: [{
+        email,
+        label: "info",
+        isGeneric: true,
+        roleType: "generic_role",
+        priorityScore: 0,
+        verificationStatus: "unverified",
+        acceptable: false,
+        sourceUrl,
+        sourceType: "serper_snippet",
+        verificationProvider: null,
+      }],
+      serperEmailRecovery: { candidatesFound: 1, candidatesRelevant: 1, duplicateCandidatesSkipped: 0 },
+      readyForOutreach: false,
+      rejectionReason: "Awaiting Spain evidence",
+    });
+    mocks.claimProcessingJobs.mockResolvedValueOnce([{ ...makeJob("serper-jsonld-job"), type: "process_raw_candidate" }]).mockResolvedValueOnce([]);
+
+    await runProcessingCronTick(3);
+
+    expect(mocks.insertWebsiteEvidence).toHaveBeenCalledTimes(4);
+    expect(mocks.insertWebsiteEvidence).toHaveBeenCalledWith(expect.objectContaining({
+      evidenceType: "location_postal_code",
+      value: "28001",
+      sourceUrl,
+    }));
+    expect(mocks.updateAccountFields).toHaveBeenCalledWith("account-id", expect.objectContaining({
+      countryCode: "ES",
+      postalCode: "28001",
+      latitude: 40.4168,
+      longitude: -3.7038,
+      status: "no_contact_found",
+    }));
+    expect(mocks.upsertCampaignMembership).toHaveBeenCalledWith(expect.objectContaining({
+      campaignId: "campaign-id",
+      accountId: "account-id",
+      stage: "qualified",
+      rejectionReason: null,
+    }));
+    expect(mocks.enqueueVerificationJob).toHaveBeenCalledWith(expect.objectContaining({
+      normalizedEmail: email,
+      provider: "millionverifier",
+    }));
   });
 
   it("persists Serper provenance and queues a new snippet email for MillionVerifier", async () => {

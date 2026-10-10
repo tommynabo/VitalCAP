@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { AccountStatus } from "@/domain/accounts/types";
+import type { Account, AccountStatus } from "@/domain/accounts/types";
 import { ProviderBudgetExceededError } from "@/domain/providers/errors";
 import type { CampaignMembershipStage } from "@/domain/campaigns/types";
 import { getCampaignById } from "@/infrastructure/neon/repositories/campaigns";
@@ -20,6 +20,7 @@ import {
   insertContactPointWithStatus,
   resolveCanonicalAccount,
   updateAccountFields,
+  type InsertAccountInput,
 } from "@/infrastructure/neon/repositories/accounts";
 import { createSerpDiscoveryProvider } from "@/infrastructure/providers/provider-factory";
 import { createInMemoryVerificationCacheStore } from "@/services/verification/email-verification-cache";
@@ -29,7 +30,8 @@ import { getVerificationEnv } from "@/lib/config/env";
 import { processRawCandidate, deriveIncomingIdentitySignals, hasLinkedInEmployerAccount, type CandidateRawPayload, type ProcessedCandidateResult } from "@/services/discovery/candidate-processor";
 import { mergeMissingAccountFields, type IncomingAccountFields } from "@/services/accounts/account-enrichment-merge";
 import { realWebsiteFetcher, providerLabelForEngine } from "./engine-factory";
-import { WebsiteEnrichmentService } from "@/services/enrichment/website-enrichment-service";
+import { WebsiteEnrichmentService, type WebsiteEvidenceFact } from "@/services/enrichment/website-enrichment-service";
+import { evaluateSpainEligibility } from "@/lib/geography/spain-eligibility";
 import { getWebsiteEnrichmentStatus, upsertWebsiteEnrichmentStatus, insertWebsiteEvidence, listUnlinkedWebsiteEmailEvidence } from "@/infrastructure/neon/repositories/enrichment";
 import { DomainFetchCache } from "@/lib/security/safe-fetch";
 import { normalizeDomain } from "@/lib/normalization";
@@ -80,6 +82,65 @@ function resolveMembershipStage(processed: ProcessedCandidateResult): { stage: C
   if (!processed.icpQualified) return { stage: "rejected", rejectionReason: processed.rejectionReason };
   if (processed.spainVerdict === "needs_review") return { stage: "discovered", rejectionReason: processed.rejectionReason };
   return { stage: "qualified", rejectionReason: processed.rejectionReason };
+}
+
+function uniqueLocationValue(
+  facts: readonly WebsiteEvidenceFact[],
+  evidenceType: WebsiteEvidenceFact["evidenceType"],
+): string | null {
+  const values = new Set(
+    facts
+      .filter((fact) => fact.evidenceType === evidenceType)
+      .map((fact) => (fact.normalizedValue ?? fact.value).trim())
+      .filter(Boolean),
+  );
+  return values.size === 1 ? values.values().next().value ?? null : null;
+}
+
+export function evaluateStructuredWebsiteLocation(
+  account: Pick<Account, "countryCode" | "postalCode" | "latitude" | "longitude" | "phone" | "normalizedDomain" | "province" | "city">,
+  facts: readonly WebsiteEvidenceFact[],
+  fallbackDomain: string | null,
+): {
+  verdict: ReturnType<typeof evaluateSpainEligibility>;
+  accountUpdates: Partial<InsertAccountInput>;
+} {
+  const countryCode = uniqueLocationValue(facts, "location_country");
+  const postalCode = uniqueLocationValue(facts, "location_postal_code");
+  const latitudeValue = uniqueLocationValue(facts, "location_latitude");
+  const longitudeValue = uniqueLocationValue(facts, "location_longitude");
+  const explicitNonSpainCountry = facts
+    .filter((fact) => fact.evidenceType === "location_country")
+    .map((fact) => (fact.normalizedValue ?? fact.value).trim().toUpperCase())
+    .find((value) => value && value !== "ES");
+  const latitude = latitudeValue === null ? null : Number(latitudeValue);
+  const longitude = longitudeValue === null ? null : Number(longitudeValue);
+  const hasUniqueCoordinates = latitude !== null && longitude !== null
+    && Number.isFinite(latitude) && Number.isFinite(longitude);
+  const useStructuredCoordinates = account.latitude === null && account.longitude === null && hasUniqueCoordinates;
+
+  const accountUpdates: Partial<InsertAccountInput> = {};
+  if (account.countryCode === null && countryCode !== null && /^[A-Z]{2}$/i.test(countryCode)) {
+    accountUpdates.countryCode = countryCode;
+  }
+  if (account.postalCode === null && postalCode !== null) accountUpdates.postalCode = postalCode;
+  if (useStructuredCoordinates) {
+    accountUpdates.latitude = latitude;
+    accountUpdates.longitude = longitude;
+  }
+
+  const verdict = evaluateSpainEligibility({
+    providerCountryCode: account.countryCode ?? explicitNonSpainCountry ?? countryCode,
+    postalCode: account.postalCode ?? postalCode,
+    latitude: account.latitude ?? (account.longitude === null && useStructuredCoordinates ? latitude : null),
+    longitude: account.longitude ?? (account.latitude === null && useStructuredCoordinates ? longitude : null),
+    phone: account.phone,
+    websiteDomain: account.normalizedDomain ?? fallbackDomain,
+    province: account.province,
+    city: account.city,
+  });
+
+  return { verdict, accountUpdates };
 }
 
 function extractAccountFields(payload: CandidateRawPayload): {
@@ -402,6 +463,30 @@ async function executeProcessingJob(
             sourceUrl: fact.sourceUrl,
             sourceType: "website_enrichment",
           });
+        }
+      }
+
+      const locationFacts = result.evidence.filter((fact) => fact.evidenceType.startsWith("location_"));
+      if (
+        raw.engineType === "google_serp"
+        && processed.icpQualified
+        && processed.spainVerdict === "needs_review"
+        && locationFacts.length > 0
+      ) {
+        const account = await getAccountById(accountId);
+        if (account?.status === "needs_review") {
+          const reevaluation = evaluateStructuredWebsiteLocation(account, locationFacts, incoming.normalizedDomain ?? null);
+          const accountUpdates = reevaluation.accountUpdates;
+          if (reevaluation.verdict.verdict !== "needs_review") {
+            accountUpdates.status = resolveAccountStatus({ ...processed, spainVerdict: reevaluation.verdict.verdict });
+            processed.spainVerdict = reevaluation.verdict.verdict;
+            processed.rejectionReason = reevaluation.verdict.verdict === "rejected"
+              ? `Rejected: ${reevaluation.verdict.reason}`
+              : null;
+          }
+          if (Object.keys(accountUpdates).length > 0) {
+            await updateAccountFields(accountId, accountUpdates);
+          }
         }
       }
     }

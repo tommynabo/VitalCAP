@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { normalizeDomain, normalizePhoneES } from "@/lib/normalization";
+import { provinceForPostalCode } from "@/lib/geography/spain-provinces";
 import type { WebsiteFetcher } from "@/domain/providers/types";
 import { crawlWebsite, type CrawledPage } from "./website-crawler";
 import { extractCandidateEmails } from "./email-extraction";
@@ -9,7 +10,17 @@ import { createDeadlineSignal, DeadlineExceededError, raceWithAbort } from "@/li
 export const WEBSITE_ENRICHMENT_BUDGET_MS = 90_000;
 
 export interface WebsiteEvidenceFact {
-  evidenceType: "email" | "phone" | "named_role" | "role_signal" | "business_signal" | "supplement_signal";
+  evidenceType:
+    | "email"
+    | "phone"
+    | "named_role"
+    | "role_signal"
+    | "business_signal"
+    | "supplement_signal"
+    | "location_country"
+    | "location_postal_code"
+    | "location_latitude"
+    | "location_longitude";
   value: string;
   normalizedValue?: string;
   snippet: string | null;
@@ -184,6 +195,110 @@ function extractNamedRoles(text: string, sourceUrl: string): WebsiteEvidenceFact
   return facts;
 }
 
+function structuredCountryCode(value: unknown): { value: string; normalizedValue: string } | null {
+  const rawValue = typeof value === "string"
+    ? value.trim()
+    : value && typeof value === "object" && "name" in value && typeof value.name === "string"
+      ? value.name.trim()
+      : "";
+  if (!rawValue) return null;
+
+  const normalizedCountry = rawValue.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
+  if (["es", "esp", "spain", "espana"].includes(normalizedCountry)) {
+    return { value: rawValue, normalizedValue: "ES" };
+  }
+  return { value: rawValue, normalizedValue: rawValue.toUpperCase() };
+}
+
+function structuredNumber(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string" && value.trim() && Number.isFinite(Number(value))) return Number(value);
+  return null;
+}
+
+function extractStructuredLocationFacts(html: string, sourceUrl: string): WebsiteEvidenceFact[] {
+  const facts: WebsiteEvidenceFact[] = [];
+  const factKeys = new Set<string>();
+  const addFact = (evidenceType: WebsiteEvidenceFact["evidenceType"], value: string, normalizedValue = value) => {
+    const key = `${evidenceType}:${normalizedValue}`;
+    if (factKeys.has(key)) return;
+    factKeys.add(key);
+    facts.push({ evidenceType, value, normalizedValue, snippet: "Structured JSON-LD location data", sourceUrl });
+  };
+
+  for (const script of html.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script\s*>/gi)) {
+    const attributes = script[1] ?? "";
+    const type = attributes.match(/\btype\s*=\s*(?:(["'])(.*?)\1|([^\s>]+))/i)?.[2]
+      ?? attributes.match(/\btype\s*=\s*([^\s>]+)/i)?.[1]
+      ?? "";
+    if (!/^application\/ld\+json(?:\s*;|$)/i.test(type.trim())) continue;
+
+    const json = script[2] ?? "";
+    if (json.length > 256_000) continue;
+    let root: unknown;
+    try {
+      root = JSON.parse(json);
+    } catch {
+      continue;
+    }
+
+    const pending: unknown[] = [root];
+    let visited = 0;
+    while (pending.length > 0 && visited < 5_000) {
+      const current = pending.pop();
+      if (!current || typeof current !== "object") continue;
+      visited++;
+      if (Array.isArray(current)) {
+        for (const child of current) {
+          if (pending.length >= 5_000) break;
+          pending.push(child);
+        }
+        continue;
+      }
+
+      const node = current as Record<string, unknown>;
+      const rawTypes = Array.isArray(node["@type"]) ? node["@type"] : [node["@type"]];
+      const types = rawTypes
+        .filter((item): item is string => typeof item === "string")
+        .map((item) => item.split(/[\/#]/).at(-1)?.toLowerCase());
+      const isLocationEntity = types.some((item) => item === "localbusiness" || item === "organization");
+      const isPostalAddress = types.includes("postaladdress");
+
+      if (isLocationEntity || isPostalAddress) {
+        const address = node.address && typeof node.address === "object"
+          ? node.address as Record<string, unknown>
+          : null;
+        const country = structuredCountryCode(node.addressCountry ?? address?.addressCountry);
+        if (country) addFact("location_country", country.value, country.normalizedValue);
+
+        const postalCode = node.postalCode ?? address?.postalCode;
+        if (typeof postalCode === "string" && provinceForPostalCode(postalCode)) {
+          addFact("location_postal_code", postalCode.trim());
+        }
+      }
+
+      let geo = node.geo;
+      if (!geo && types.includes("geocoordinates")) geo = node;
+      if (geo && typeof geo === "object") {
+        const coordinates = geo as Record<string, unknown>;
+        const latitude = structuredNumber(coordinates.latitude);
+        const longitude = structuredNumber(coordinates.longitude);
+        if (latitude !== null && longitude !== null) {
+          addFact("location_latitude", String(latitude));
+          addFact("location_longitude", String(longitude));
+        }
+      }
+
+      for (const child of Object.values(node)) {
+        if (pending.length >= 5_000) break;
+        pending.push(child);
+      }
+    }
+  }
+
+  return facts;
+}
+
 export class WebsiteEnrichmentService {
   constructor(
     private readonly fetcher: WebsiteFetcher,
@@ -234,7 +349,8 @@ export class WebsiteEnrichmentService {
     const seenEvidence = new Set<string>();
 
     const addFact = (fact: WebsiteEvidenceFact) => {
-      const key = `${fact.evidenceType}:${fact.value}`;
+      const provenanceKey = fact.evidenceType.startsWith("location_") ? `:${fact.sourceUrl}` : "";
+      const key = `${fact.evidenceType}:${fact.value}${provenanceKey}`;
       if (!seenEvidence.has(key)) {
         seenEvidence.add(key);
         evidence.push(fact);
@@ -264,6 +380,9 @@ export class WebsiteEnrichmentService {
 
       const roles = extractNamedRoles(text, page.url);
       roles.forEach(addFact);
+
+      const structuredLocation = extractStructuredLocationFacts(page.body, page.url);
+      structuredLocation.forEach(addFact);
     }
 
     return {

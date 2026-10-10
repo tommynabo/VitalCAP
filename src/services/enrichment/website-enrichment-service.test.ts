@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from "vitest";
 import { WebsiteEnrichmentService } from "./website-enrichment-service";
+import { evaluateSpainEligibility } from "@/lib/geography/spain-eligibility";
 import type { FetchedPage, WebsiteFetchOptions, WebsiteFetcher } from "@/domain/providers/types";
 import { SafeFetchError } from "@/lib/security/safe-fetch";
 
@@ -101,6 +102,84 @@ describe("WebsiteEnrichmentService", () => {
       sourceUrl: "https://farmacia.es/contacto",
     })]);
     expect(fetcher.fetchPage).not.toHaveBeenCalledWith("https://thirdparty.es/contacto");
+  });
+
+  it("extracts authoritative JSON-LD location facts from same-domain pages with provenance", async () => {
+    const contactUrl = "https://farmacia.es/contacto";
+    const fetcher: WebsiteFetcher = {
+      fetchPage: vi.fn(async (url: string): Promise<FetchedPage> => url === contactUrl
+        ? {
+            url,
+            status: 200,
+            contentType: "text/html",
+            body: `<script type="application/ld+json">${JSON.stringify({
+              "@context": "https://schema.org",
+              "@type": "Organization",
+              address: {
+                "@type": "PostalAddress",
+                addressCountry: { "@type": "Country", name: "Spain" },
+                postalCode: "28001",
+              },
+              geo: { "@type": "GeoCoordinates", latitude: 40.4168, longitude: -3.7038 },
+            })}</script>`,
+          }
+        : {
+            url: "https://farmacia.es/",
+            status: 200,
+            contentType: "text/html",
+            body: '<a href="/contacto">Contacto</a><a href="https://thirdparty.es/contacto">External</a>',
+          }),
+    };
+
+    const result = await new WebsiteEnrichmentService(fetcher).enrich({
+      workspaceId: "ws_1",
+      accountId: "acc_1",
+      websiteUrl: "https://farmacia.es/",
+    });
+    const locations = result.evidence.filter((fact) => fact.evidenceType.startsWith("location_"));
+
+    expect(locations).toEqual(expect.arrayContaining([
+      expect.objectContaining({ evidenceType: "location_country", value: "Spain", normalizedValue: "ES", sourceUrl: contactUrl }),
+      expect.objectContaining({ evidenceType: "location_postal_code", value: "28001", sourceUrl: contactUrl }),
+      expect.objectContaining({ evidenceType: "location_latitude", normalizedValue: "40.4168", sourceUrl: contactUrl }),
+      expect.objectContaining({ evidenceType: "location_longitude", normalizedValue: "-3.7038", sourceUrl: contactUrl }),
+    ]));
+    expect(fetcher.fetchPage).not.toHaveBeenCalledWith("https://thirdparty.es/contacto");
+    expect(evaluateSpainEligibility({
+      providerCountryCode: locations.find((fact) => fact.evidenceType === "location_country")?.normalizedValue,
+      postalCode: locations.find((fact) => fact.evidenceType === "location_postal_code")?.normalizedValue,
+      latitude: Number(locations.find((fact) => fact.evidenceType === "location_latitude")?.normalizedValue),
+      longitude: Number(locations.find((fact) => fact.evidenceType === "location_longitude")?.normalizedValue),
+    }).verdict).toBe("verified");
+  });
+
+  it("does not qualify weak JSON-LD or a non-Spain country", async () => {
+    const fetcher: WebsiteFetcher = {
+      fetchPage: async () => ({
+        url: "https://farmacia.es/",
+        status: 200,
+        contentType: "text/html",
+        body: `<script type="application/ld+json">${JSON.stringify({
+          "@type": "Organization",
+          name: "Farmacia Madrid",
+          url: "https://farmacia.es/",
+          address: { "@type": "PostalAddress", addressLocality: "Madrid", addressCountry: "PT", postalCode: "99999" },
+        })}</script>`,
+      }),
+    };
+
+    const result = await new WebsiteEnrichmentService(fetcher).enrich({
+      workspaceId: "ws_1",
+      accountId: "acc_1",
+      websiteUrl: "https://farmacia.es/",
+    });
+    const country = result.evidence.find((fact) => fact.evidenceType === "location_country");
+    const postal = result.evidence.find((fact) => fact.evidenceType === "location_postal_code");
+
+    expect(country?.normalizedValue).toBe("PT");
+    expect(postal).toBeUndefined();
+    expect(evaluateSpainEligibility({ providerCountryCode: country?.normalizedValue }).verdict).toBe("rejected");
+    expect(evaluateSpainEligibility({ websiteDomain: "farmacia.es", city: "Madrid" }).verdict).toBe("needs_review");
   });
 
   it("should handle blocked unsafe urls as blocked_unsafe_url", async () => {
