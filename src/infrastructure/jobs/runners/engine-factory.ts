@@ -12,10 +12,10 @@ import { createMapsDiscoveryProvider, createSerpDiscoveryProvider } from "@/infr
 
 /** `WebsiteFetcher` backed by the real SSRF-safe fetch wrapper (Prompt 2 §2.5) — the only concrete adapter this interface has outside tests. */
 export const realWebsiteFetcher: WebsiteFetcher = {
-  fetchPage: (url) => {
+  fetchPage: (url, options) => {
     const allowedDomain = normalizeDomain(url);
     if (!allowedDomain) throw new SafeFetchError("Website URL does not contain a valid public domain", "blocked_hostname");
-    return safeFetchPage(url, { allowedDomain });
+    return safeFetchPage(url, { allowedDomain, signal: options?.signal });
   },
 };
 

@@ -70,7 +70,11 @@ export class SerperDiscoveryProvider implements SerpDiscoveryProvider {
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), this.config.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+      const abortFromParent = () => controller.abort(input.signal?.reason);
+      input.signal?.addEventListener("abort", abortFromParent, { once: true });
+      if (input.signal?.aborted) abortFromParent();
       try {
+        input.signal?.throwIfAborted();
         const response = await this.fetchImpl(SERPER_SEARCH_URL, {
           method: "POST",
           headers: {
@@ -85,8 +89,6 @@ export class SerperDiscoveryProvider implements SerpDiscoveryProvider {
           }),
           signal: controller.signal,
         });
-        clearTimeout(timeout);
-
         if (!response.ok) {
           const body = await response.text().catch(() => "");
           throw new Error(`Serper request failed: HTTP ${response.status} ${body}`.trim());
@@ -114,9 +116,12 @@ export class SerperDiscoveryProvider implements SerpDiscoveryProvider {
         this.cache.set(key, output);
         return output;
       } catch (error) {
-        clearTimeout(timeout);
+        if (input.signal?.aborted) throw input.signal.reason ?? error;
         lastError = error;
         if (attempt === MAX_RETRIES) break;
+      } finally {
+        clearTimeout(timeout);
+        input.signal?.removeEventListener("abort", abortFromParent);
       }
     }
 

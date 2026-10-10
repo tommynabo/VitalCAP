@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import type { WebsiteFetcher } from "@/domain/providers/types";
+import type { FetchedPage, WebsiteFetchOptions, WebsiteFetcher } from "@/domain/providers/types";
 import { SafeFetchError } from "@/lib/security/safe-fetch";
 import { crawlWebsite } from "./website-crawler";
 
@@ -118,5 +118,26 @@ describe("crawlWebsite", () => {
 
     expect(pages).toHaveLength(1);
     expect(fetcher.fetchPage).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not swallow an abort while fetching an internal page", async () => {
+    const controller = new AbortController();
+    const abortReason = new Error("PROCESSING_JOB_TIMEOUT");
+    const fetcher: WebsiteFetcher = {
+      fetchPage: vi.fn(async (url: string, options?: WebsiteFetchOptions): Promise<FetchedPage> => {
+        if (url === "https://farmaciadelgado.es/") {
+          return { url, status: 200, contentType: "text/html", body: '<a href="/contacto">Contacto</a>' };
+        }
+        return new Promise<FetchedPage>((_resolve, reject) => {
+          const rejectOnAbort = () => reject(options?.signal?.reason);
+          options?.signal?.addEventListener("abort", rejectOnAbort, { once: true });
+          if (options?.signal?.aborted) rejectOnAbort();
+          setTimeout(() => controller.abort(abortReason), 0);
+        });
+      }),
+    };
+
+    await expect(crawlWebsite(fetcher, "https://farmaciadelgado.es/", { signal: controller.signal }))
+      .rejects.toBe(abortReason);
   });
 });

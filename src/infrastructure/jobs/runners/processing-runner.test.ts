@@ -227,6 +227,79 @@ describe("runProcessingCronTick", () => {
     expect(mocks.failProcessingJob).not.toHaveBeenCalled();
   });
 
+  it("times out one slow job, preserves retry semantics, and runs a later healthy job on the next tick", async () => {
+    const slowJob = { ...makeJob("slow-job"), type: "process_raw_candidate" };
+    const healthyJob = makeJob("healthy-job");
+    mocks.claimProcessingJobs.mockResolvedValueOnce([slowJob]).mockResolvedValueOnce([]);
+    mocks.processRawCandidate.mockImplementation((_payload, _engineType, context: { signal?: AbortSignal }) =>
+      new Promise((_resolve, reject) => {
+        const signal = context.signal;
+        const rejectOnAbort = () => reject(signal?.reason);
+        signal?.addEventListener("abort", rejectOnAbort, { once: true });
+        if (signal?.aborted) rejectOnAbort();
+      }),
+    );
+
+    const staleTickTime = new Date(Date.now() - 60_000);
+    const firstTick = await runProcessingCronTick(3, staleTickTime, { timeBudgetMs: 1_000, perJobBudgetMs: 40 });
+
+    expect(firstTick.jobsClaimed).toBe(1);
+    expect(firstTick.jobsCompleted).toBe(0);
+    expect(firstTick.jobsTimedOut).toBe(1);
+    expect(mocks.claimProcessingJobs).toHaveBeenCalledTimes(2);
+    expect(mocks.failProcessingJob).toHaveBeenCalledTimes(1);
+    expect(mocks.failProcessingJob).toHaveBeenCalledWith(expect.objectContaining({
+      job: expect.objectContaining({ id: "slow-job", attemptCount: 1, maxAttempts: 5 }),
+      error: expect.objectContaining({ code: "PROCESSING_JOB_TIMEOUT" }),
+      now: expect.any(Date),
+    }));
+    expect((mocks.failProcessingJob.mock.calls[0]?.[0] as { now: Date }).now.getTime()).toBeGreaterThan(staleTickTime.getTime());
+    expect(mocks.completeProcessingJob).not.toHaveBeenCalled();
+
+    mocks.claimProcessingJobs.mockReset().mockResolvedValueOnce([healthyJob]).mockResolvedValueOnce([]);
+    const secondTick = await runProcessingCronTick(3, new Date(), { timeBudgetMs: 1_000 });
+
+    expect(secondTick.jobsCompleted).toBe(1);
+    expect(mocks.completeProcessingJob).toHaveBeenCalledWith(expect.objectContaining({ jobId: "healthy-job" }));
+    expect(mocks.failProcessingJob).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns before the total cron budget when a claim operation stalls", async () => {
+    mocks.claimProcessingJobs.mockReturnValue(new Promise(() => {}));
+    const startedAt = performance.now();
+
+    const result = await runProcessingCronTick(3, new Date(), { timeBudgetMs: 80 });
+
+    expect(result.jobsClaimed).toBe(0);
+    expect(performance.now() - startedAt).toBeLessThan(80);
+  });
+
+  it("propagates claim failures that did not come from the cron deadline", async () => {
+    mocks.claimProcessingJobs.mockRejectedValue(new Error("Neon claim failed"));
+
+    await expect(runProcessingCronTick(3)).rejects.toThrow("Neon claim failed");
+  });
+
+  it("does not retry a job after completion if later seed bookkeeping fails", async () => {
+    const completedJob = makeJob("completed-job");
+    const rawCandidate = {
+      accountId: "account-id",
+      rawPayload: { kind: "maps", place: { websiteUrl: null } },
+      searchSeedRunId: null,
+    };
+    mocks.getRawCandidateById
+      .mockResolvedValueOnce(rawCandidate)
+      .mockRejectedValueOnce(new Error("seed bookkeeping failed"))
+      .mockResolvedValueOnce(rawCandidate);
+    mocks.claimProcessingJobs.mockResolvedValueOnce([completedJob]).mockResolvedValueOnce([]);
+
+    const result = await runProcessingCronTick(3);
+
+    expect(result.jobsCompleted).toBe(1);
+    expect(mocks.completeProcessingJob).toHaveBeenCalledTimes(1);
+    expect(mocks.failProcessingJob).not.toHaveBeenCalled();
+  });
+
   it("recovers persisted website email evidence after a failed handoff without recrawling", async () => {
     const rawCandidate = {
       id: "raw-candidate-id",

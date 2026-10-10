@@ -33,6 +33,7 @@ import { WebsiteEnrichmentService } from "@/services/enrichment/website-enrichme
 import { getWebsiteEnrichmentStatus, upsertWebsiteEnrichmentStatus, insertWebsiteEvidence, listUnlinkedWebsiteEmailEvidence } from "@/infrastructure/neon/repositories/enrichment";
 import { DomainFetchCache } from "@/lib/security/safe-fetch";
 import { normalizeDomain } from "@/lib/normalization";
+import { createDeadlineSignal, DeadlineExceededError, raceWithAbort, runWithDeadlineSignal } from "@/lib/async/deadline";
 
 interface ProcessingJobPayload {
   rawCandidateId: string;
@@ -42,10 +43,14 @@ export interface ProcessingRunnerOptions {
   enrichContacts?: boolean;
   campaignId?: string;
   timeBudgetMs?: number;
+  perJobBudgetMs?: number;
+  signal?: AbortSignal;
 }
 
 export const PROCESSING_CRON_TIME_BUDGET_MS = 240_000;
+export const PROCESSING_JOB_BUDGET_MS = 120_000;
 const PROCESSING_JOB_START_RESERVE_MS = 90_000;
+const PROCESSING_JOB_CLEANUP_RESERVE_MS = 15_000;
 
 const smokeWebsiteFetcher: WebsiteFetcher = {
   fetchPage: async () => {
@@ -152,6 +157,7 @@ async function executeProcessingJob(
   job: { id: string; campaignId: string; type: string; payload: ProcessingJobPayload },
   options: ProcessingRunnerOptions,
 ): Promise<void> {
+  options.signal?.throwIfAborted();
   if (job.type === "maps_deep_owner_enrichment") {
     const raw = await getRawCandidateById(job.payload.rawCandidateId);
     if (!raw || raw.rawPayload === undefined || !raw.accountId) throw new Error(`Maps Deep owner enrichment has no processed account for raw_candidate ${job.payload.rawCandidateId}`);
@@ -164,7 +170,7 @@ async function executeProcessingJob(
 
     const query = `site:${domain} (titular OR propietario OR gerente OR "responsable de compras" OR "farmacéutico titular")`;
     const provider = createSerpDiscoveryProvider(campaign.workspaceId, "maps_deep", campaign.id);
-    const output = await provider.search({ query, maxResults: 5 });
+    const output = await provider.search({ query, maxResults: 5, signal: options.signal });
     for (const result of output.results) {
       if (normalizeDomain(result.domain) !== domain) continue;
       await insertAccountSource({
@@ -198,7 +204,7 @@ async function executeProcessingJob(
     fetchPage: async (url: string) => {
       const cached = fetchCache.get(url);
       if (cached) return cached;
-      const res = await realWebsiteFetcher.fetchPage(url);
+      const res = await realWebsiteFetcher.fetchPage(url, { signal: options.signal });
       if (res.status < 400) fetchCache.set(url, res);
       return res;
     },
@@ -207,6 +213,7 @@ async function executeProcessingJob(
   const processed = await processRawCandidate(payload, raw.engineType, {
     existingAccounts,
     websiteFetcher: options.enrichContacts === false ? smokeWebsiteFetcher : cachedFetcher,
+    signal: options.signal,
     verificationProvider: smokeVerificationProvider,
     verificationCacheStore: createInMemoryVerificationCacheStore(),
     now: new Date(),
@@ -324,6 +331,7 @@ async function executeProcessingJob(
         workspaceId: campaign.workspaceId,
         accountId,
         websiteUrl: accountFields.websiteUrl,
+        signal: options.signal,
       });
       if (result.status !== "completed" && result.status !== "no_website") {
         websiteRecoveryCounters.fetchFailed += 1;
@@ -534,6 +542,10 @@ async function executeProcessingJob(
 
 export interface ProcessingRunnerResult {
   jobsClaimed: number;
+  jobsCompleted: number;
+  jobsTimedOut: number;
+  cleanupFailures: number;
+  durationMs: number;
 }
 
 /** One bounded batch of processing work: claim+execute up to `maxJobsPerTick` `processing_jobs` (claims are global across every workspace's campaigns). Called once per `/api/cron/process` invocation. */
@@ -545,48 +557,124 @@ export async function runProcessingCronTick(
   const workerId = `cron-process-${randomUUID()}`;
   const startedAt = performance.now();
   const timeBudgetMs = options.timeBudgetMs ?? PROCESSING_CRON_TIME_BUDGET_MS;
+  const cronDeadlineMs = Math.max(1, timeBudgetMs - Math.min(PROCESSING_JOB_CLEANUP_RESERVE_MS, timeBudgetMs / 2));
+  const cronDeadline = createDeadlineSignal(
+    cronDeadlineMs,
+    new DeadlineExceededError("PROCESSING_CRON_TIMEOUT", `Processing cron work exceeded ${cronDeadlineMs}ms.`),
+    options.signal,
+  );
   const startAnotherJobBeforeMs = Math.max(
     0,
     timeBudgetMs - Math.min(PROCESSING_JOB_START_RESERVE_MS, timeBudgetMs / 2),
   );
   let jobsClaimed = 0;
+  let jobsCompleted = 0;
+  let jobsTimedOut = 0;
+  let cleanupFailures = 0;
 
-  while (jobsClaimed < maxJobsPerTick && performance.now() - startedAt < startAnotherJobBeforeMs) {
-    const [job] = await claimProcessingJobs<ProcessingJobPayload>({
-      workerId,
-      batchSize: 1,
-      now,
-      campaignId: options.campaignId,
-      requireAutopilot: options.campaignId === undefined,
-    });
-    if (!job) break;
-
-    if (performance.now() - startedAt >= startAnotherJobBeforeMs) {
-      await deferProcessingJob({
-        jobId: job.id,
-        workerId,
-        nextAttemptAt: now,
-        reason: "Processing cron reached its job-start reserve before execution.",
-      });
-      break;
-    }
-
-    jobsClaimed += 1;
-    try {
-      await executeProcessingJob(job, options);
-      await completeProcessingJob({ jobId: job.id, workerId, now });
-      const raw = await getRawCandidateById(job.payload.rawCandidateId);
-      if (raw?.searchSeedRunId) await refreshSearchSeedQualification(raw.searchSeedRunId);
-    } catch (error) {
-      if (error instanceof ProviderBudgetExceededError) {
-        await deferProcessingJob({ jobId: job.id, workerId, nextAttemptAt: error.retryAt, reason: error.message });
-      } else {
-        await failProcessingJob({ workerId, job, error, now });
+  try {
+    while (jobsClaimed < maxJobsPerTick && performance.now() - startedAt < startAnotherJobBeforeMs && !cronDeadline.signal.aborted) {
+      let job: Awaited<ReturnType<typeof claimProcessingJobs<ProcessingJobPayload>>>[number] | undefined;
+      try {
+        [job] = await runWithDeadlineSignal(cronDeadline.signal, () => raceWithAbort(
+          claimProcessingJobs<ProcessingJobPayload>({
+            workerId,
+            batchSize: 1,
+            now,
+            campaignId: options.campaignId,
+            requireAutopilot: options.campaignId === undefined,
+          }),
+          cronDeadline.signal,
+        ));
+      } catch (error) {
+        if (cronDeadline.signal.aborted) break;
+        throw error;
       }
-      const raw = await getRawCandidateById(job.payload.rawCandidateId);
-      if (raw?.searchSeedRunId) await refreshSearchSeedQualification(raw.searchSeedRunId);
+      if (!job) break;
+
+      if (performance.now() - startedAt >= startAnotherJobBeforeMs || cronDeadline.signal.aborted) {
+        await deferProcessingJob({
+          jobId: job.id,
+          workerId,
+          nextAttemptAt: now,
+          reason: "Processing cron reached its job-start reserve before execution.",
+        });
+        break;
+      }
+
+      jobsClaimed += 1;
+      const elapsedMs = performance.now() - startedAt;
+      const remainingCronMs = Math.max(0, timeBudgetMs - elapsedMs);
+      const cronCleanupReserveMs = Math.min(PROCESSING_JOB_CLEANUP_RESERVE_MS, remainingCronMs / 2);
+      const jobBudgetMs = Math.min(options.perJobBudgetMs ?? PROCESSING_JOB_BUDGET_MS, remainingCronMs - cronCleanupReserveMs);
+      if (jobBudgetMs <= 0) {
+        await deferProcessingJob({
+          jobId: job.id,
+          workerId,
+          nextAttemptAt: now,
+          reason: "Processing cron has insufficient time to start another job.",
+        });
+        break;
+      }
+
+      const jobCleanupReserveMs = Math.min(PROCESSING_JOB_CLEANUP_RESERVE_MS, jobBudgetMs / 2);
+      const workBudgetMs = Math.max(1, jobBudgetMs - jobCleanupReserveMs);
+      const timeoutError = new DeadlineExceededError("PROCESSING_JOB_TIMEOUT", `Processing job exceeded ${jobBudgetMs}ms.`);
+      const jobDeadline = createDeadlineSignal(workBudgetMs, timeoutError, cronDeadline.signal);
+      let jobError: unknown;
+      let jobCompletedPersisted = false;
+      try {
+        await runWithDeadlineSignal(jobDeadline.signal, () => raceWithAbort((async () => {
+          await executeProcessingJob(job, { ...options, signal: jobDeadline.signal });
+          await completeProcessingJob({ jobId: job.id, workerId, now });
+          jobCompletedPersisted = true;
+          jobsCompleted += 1;
+          const raw = await getRawCandidateById(job.payload.rawCandidateId);
+          if (raw?.searchSeedRunId) await refreshSearchSeedQualification(raw.searchSeedRunId);
+        })(), jobDeadline.signal));
+      } catch (error) {
+        jobError = jobDeadline.signal.aborted ? jobDeadline.signal.reason ?? error : error;
+        if (jobError instanceof DeadlineExceededError) jobsTimedOut += 1;
+      } finally {
+        jobDeadline.dispose();
+      }
+
+      if (jobError !== undefined) {
+        const cleanupBudget = Math.max(1, Math.min(jobCleanupReserveMs, timeBudgetMs - (performance.now() - startedAt)));
+        const cleanupDeadline = createDeadlineSignal(
+          cleanupBudget,
+          new DeadlineExceededError("PROCESSING_CLEANUP_TIMEOUT", `Processing cleanup exceeded ${cleanupBudget}ms.`),
+          cronDeadline.signal,
+        );
+        try {
+          await runWithDeadlineSignal(cleanupDeadline.signal, async () => {
+            if (!jobCompletedPersisted) {
+              if (jobError instanceof ProviderBudgetExceededError) {
+                await deferProcessingJob({ jobId: job.id, workerId, nextAttemptAt: jobError.retryAt, reason: jobError.message });
+              } else {
+                const failureTime = jobError instanceof DeadlineExceededError ? new Date() : now;
+                await failProcessingJob({ workerId, job, error: jobError, now: failureTime });
+              }
+            }
+            const raw = await getRawCandidateById(job.payload.rawCandidateId);
+            if (raw?.searchSeedRunId) await refreshSearchSeedQualification(raw.searchSeedRunId);
+          });
+        } catch {
+          cleanupFailures += 1;
+        } finally {
+          cleanupDeadline.dispose();
+        }
+      }
     }
+  } finally {
+    cronDeadline.dispose();
   }
 
-  return { jobsClaimed };
+  return {
+    jobsClaimed,
+    jobsCompleted,
+    jobsTimedOut,
+    cleanupFailures,
+    durationMs: Math.round(performance.now() - startedAt),
+  };
 }

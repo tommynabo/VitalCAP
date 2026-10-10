@@ -88,6 +88,28 @@ describe("failJob", () => {
     expect(failed.lastError).toContain("timed out");
   });
 
+  it("backs off processing-job timeouts and does not reclaim them until due", () => {
+    const now = new Date("2025-01-01T01:00:00Z");
+    const job = makeJob({ status: "processing", attemptCount: 2, maxAttempts: 5 });
+    const failed = failJob(job, new Error("PROCESSING_JOB_TIMEOUT"), now);
+
+    expect(failed.status).toBe("pending");
+    expect(failed.attemptCount).toBe(2);
+    expect(failed.nextAttemptAt).toBe("2025-01-01T01:01:00.000Z");
+    expect(claimNextJob([failed], "worker_a", now)).toBeNull();
+    expect(claimNextJob([failed], "worker_a", new Date(failed.nextAttemptAt!))?.attemptCount).toBe(3);
+  });
+
+  it("preserves max-attempt dead-letter behavior for processing-job timeouts", () => {
+    const now = new Date("2025-01-01T01:00:00Z");
+    const job = makeJob({ status: "processing", attemptCount: 5, maxAttempts: 5 });
+    const failed = failJob(job, new Error("PROCESSING_JOB_TIMEOUT"), now);
+
+    expect(failed.status).toBe("dead_letter");
+    expect(failed.attemptCount).toBe(5);
+    expect(failed.nextAttemptAt).toBeNull();
+  });
+
   it("dead-letters once maxAttempts is reached", () => {
     const now = new Date("2025-01-01T01:00:00Z");
     const job = makeJob({ attemptCount: 5, maxAttempts: 5 });

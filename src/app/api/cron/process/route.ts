@@ -12,6 +12,16 @@ export async function GET(request: NextRequest) {
     const result = await runProcessingCronTick(MAX_JOBS_PER_TICK, new Date(), {
       timeBudgetMs: PROCESSING_CRON_TIME_BUDGET_MS,
     });
-    return { itemsProcessed: result.jobsClaimed };
+    console.info("PROCESSING_CRON_RESULT", result);
+    return {
+      itemsProcessed: result.jobsClaimed,
+      metadata: {
+        jobsClaimed: result.jobsClaimed,
+        jobsCompleted: result.jobsCompleted,
+        jobsTimedOut: result.jobsTimedOut,
+        cleanupFailures: result.cleanupFailures,
+        durationMs: result.durationMs,
+      },
+    };
   });
 }

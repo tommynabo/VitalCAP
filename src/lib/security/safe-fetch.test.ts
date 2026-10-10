@@ -84,6 +84,22 @@ describe("safeFetchPage", () => {
     })).rejects.toMatchObject({ name: "SafeFetchError", reason: "timeout" });
   });
 
+  it("aborts an in-flight fetch when the caller signal is aborted", async () => {
+    const controller = new AbortController();
+    const fetchImpl: typeof fetch = async (_input, init) => new Promise((_resolve, reject) => {
+      init?.signal?.addEventListener("abort", () => reject(init.signal?.reason), { once: true });
+    });
+    const abortReason = new Error("PROCESSING_JOB_TIMEOUT");
+    const pending = safeFetchPage("https://farmaciadelgado.example.es/", {
+      fetchImpl,
+      signal: controller.signal,
+    });
+
+    controller.abort(abortReason);
+
+    await expect(pending).rejects.toBe(abortReason);
+  });
+
   it("follows redirects up to the limit, re-validating each hop", async () => {
     const fetchImpl = vi
       .fn()

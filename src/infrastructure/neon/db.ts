@@ -1,7 +1,19 @@
-import { neon } from "@neondatabase/serverless";
+import { neon, neonConfig } from "@neondatabase/serverless";
 import { drizzle } from "drizzle-orm/neon-http";
 import { getDatabaseEnv } from "@/lib/config/env";
+import { getCurrentDeadlineSignal } from "@/lib/async/deadline";
 import * as schema from "./schema";
+
+const defaultFetch = neonConfig.fetchFunction ?? fetch;
+neonConfig.fetchFunction = (input: RequestInfo | URL, init?: RequestInit) => {
+  const deadlineSignal = getCurrentDeadlineSignal();
+  if (!deadlineSignal) return defaultFetch(input, init);
+  deadlineSignal.throwIfAborted();
+  const signal = init?.signal
+    ? AbortSignal.any([init.signal, deadlineSignal])
+    : deadlineSignal;
+  return defaultFetch(input, { ...init, signal });
+};
 
 /**
  * Single shared Drizzle client for Neon (HTTP driver — safe to use from

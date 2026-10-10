@@ -38,6 +38,7 @@ export function isPrivateOrLinkLocalIp(ip: string): boolean {
 
 export interface SafeFetchOptions {
   timeoutMs?: number;
+  signal?: AbortSignal;
   maxContentLengthBytes?: number;
   maxRedirects?: number;
   userAgent?: string;
@@ -101,10 +102,12 @@ export async function safeFetchPage(rawUrl: string, options: SafeFetchOptions = 
   let currentUrl = new URL(rawUrl);
   const allowedDomain = options.allowedDomain ? normalizeDomain(options.allowedDomain) : undefined;
   for (let redirectCount = 0; ; redirectCount++) {
+    options.signal?.throwIfAborted();
     assertPublicUrl(currentUrl, allowedDomain ?? undefined);
 
     if (options.resolveHostname) {
       const ips = await options.resolveHostname(currentUrl.hostname);
+      options.signal?.throwIfAborted();
       if (ips.some((ip) => isPrivateOrLinkLocalIp(ip))) {
         throw new SafeFetchError(`DNS-resolved IP for ${currentUrl.hostname} is private/link-local`, "blocked_ip");
       }
@@ -112,6 +115,9 @@ export async function safeFetchPage(rawUrl: string, options: SafeFetchOptions = 
 
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), opts.timeoutMs);
+    const abortFromParent = () => controller.abort(options.signal?.reason);
+    options.signal?.addEventListener("abort", abortFromParent, { once: true });
+    if (options.signal?.aborted) abortFromParent();
     let response: Response;
     try {
       response = await fetchImpl(currentUrl.toString(), {
@@ -154,12 +160,16 @@ export async function safeFetchPage(rawUrl: string, options: SafeFetchOptions = 
 
       return { url: currentUrl.toString(), status: response.status, contentType, body };
     } catch (error) {
-      if (error instanceof Error && error.name === "AbortError") {
+      if (options.signal?.aborted) {
+        throw options.signal.reason ?? error;
+      }
+      if (controller.signal.aborted || (error instanceof Error && error.name === "AbortError")) {
         throw new SafeFetchError(`Timed out fetching ${currentUrl.toString()}`, "timeout");
       }
       throw error;
     } finally {
       clearTimeout(timer);
+      options.signal?.removeEventListener("abort", abortFromParent);
     }
   }
 }

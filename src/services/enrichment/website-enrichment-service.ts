@@ -4,6 +4,9 @@ import type { WebsiteFetcher } from "@/domain/providers/types";
 import { crawlWebsite, type CrawledPage } from "./website-crawler";
 import { extractCandidateEmails } from "./email-extraction";
 import { SafeFetchError } from "@/lib/security/safe-fetch";
+import { createDeadlineSignal, DeadlineExceededError, raceWithAbort } from "@/lib/async/deadline";
+
+export const WEBSITE_ENRICHMENT_BUDGET_MS = 90_000;
 
 export interface WebsiteEvidenceFact {
   evidenceType: "email" | "phone" | "named_role" | "role_signal" | "business_signal" | "supplement_signal";
@@ -29,6 +32,7 @@ export interface WebsiteEnrichmentContext {
   workspaceId: string;
   accountId: string;
   websiteUrl: string;
+  signal?: AbortSignal;
 }
 
 const PHONE_RE = /(?:\+34|0034)?[ -]*(?:6|7|8|9)(?:[ -]*\d){8}/g;
@@ -181,7 +185,10 @@ function extractNamedRoles(text: string, sourceUrl: string): WebsiteEvidenceFact
 }
 
 export class WebsiteEnrichmentService {
-  constructor(private readonly fetcher: WebsiteFetcher) {}
+  constructor(
+    private readonly fetcher: WebsiteFetcher,
+    private readonly budgetMs = WEBSITE_ENRICHMENT_BUDGET_MS,
+  ) {}
 
   async enrich(context: WebsiteEnrichmentContext): Promise<WebsiteEnrichmentResult> {
     if (!context.websiteUrl) {
@@ -189,9 +196,18 @@ export class WebsiteEnrichmentService {
     }
 
     let pages: CrawledPage[];
+    const deadline = createDeadlineSignal(
+      this.budgetMs,
+      new DeadlineExceededError("WEBSITE_ENRICHMENT_TIMEOUT", `Website crawl exceeded ${this.budgetMs}ms.`),
+      context.signal,
+    );
     try {
-      pages = await crawlWebsite(this.fetcher, context.websiteUrl);
+      pages = await raceWithAbort(
+        crawlWebsite(this.fetcher, context.websiteUrl, { signal: deadline.signal }),
+        deadline.signal,
+      );
     } catch (error: any) {
+      if (error instanceof DeadlineExceededError || context.signal?.aborted) throw error;
       let status: WebsiteEnrichmentResult["status"] = "http_error";
       if (error instanceof SafeFetchError) {
         if (error.reason === "timeout") status = "timeout";
@@ -203,6 +219,8 @@ export class WebsiteEnrichmentService {
         status = "transient_error";
       }
       return { status, errorDetails: error.message, pagesFetched: 0, internalPagesFetched: 0, emailCandidatesFound: 0, contentHash: null, evidence: [] };
+    } finally {
+      deadline.dispose();
     }
 
     if (pages.length === 0) {

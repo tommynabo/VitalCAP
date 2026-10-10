@@ -79,6 +79,7 @@ export interface SerpSearchInput {
   maxResults: number;
   seedId?: string;
   planningWindow?: string;
+  signal?: AbortSignal;
 }
 
 export interface SerpSearchOutput {
@@ -192,8 +193,12 @@ export interface FetchedPage {
   body: string;
 }
 
+export interface WebsiteFetchOptions {
+  signal?: AbortSignal;
+}
+
 export interface WebsiteFetcher {
-  fetchPage(url: string): Promise<FetchedPage>;
+  fetchPage(url: string, options?: WebsiteFetchOptions): Promise<FetchedPage>;
 }
 
 /**

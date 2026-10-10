@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from "vitest";
 import { WebsiteEnrichmentService } from "./website-enrichment-service";
-import type { WebsiteFetcher } from "@/domain/providers/types";
+import type { FetchedPage, WebsiteFetchOptions, WebsiteFetcher } from "@/domain/providers/types";
 import { SafeFetchError } from "@/lib/security/safe-fetch";
 
 describe("WebsiteEnrichmentService", () => {
@@ -135,5 +135,21 @@ describe("WebsiteEnrichmentService", () => {
     });
 
     expect(result.status).toBe("timeout");
+  });
+
+  it("rejects the whole crawl deadline instead of returning partial no-email success", async () => {
+    const fetcher: WebsiteFetcher = {
+      fetchPage: vi.fn(async (_url: string, options?: WebsiteFetchOptions): Promise<FetchedPage> => new Promise<FetchedPage>((_resolve, reject) => {
+        const rejectOnAbort = () => reject(options?.signal?.reason);
+        options?.signal?.addEventListener("abort", rejectOnAbort, { once: true });
+        if (options?.signal?.aborted) rejectOnAbort();
+      })),
+    };
+
+    await expect(new WebsiteEnrichmentService(fetcher, 10).enrich({
+      workspaceId: "ws_1",
+      accountId: "acc_1",
+      websiteUrl: "https://slow.example.es",
+    })).rejects.toMatchObject({ name: "DeadlineExceededError", code: "WEBSITE_ENRICHMENT_TIMEOUT" });
   });
 });

@@ -84,6 +84,7 @@ export interface ProcessingContext {
   /** Accounts already known this campaign, keyed the same way `accountKey` is derived, for global dedup. */
   existingAccounts: AccountIdentitySignals[];
   websiteFetcher: WebsiteFetcher;
+  signal?: AbortSignal;
   verificationProvider: EmailVerificationProvider;
   verificationCacheStore: EmailVerificationCacheStore;
   now: Date;
@@ -283,9 +284,10 @@ export async function processRawCandidate(
     pages.push(...payload.crawledPages);
   } else if (websiteUrl) {
     try {
-      const fetched = await context.websiteFetcher.fetchPage(websiteUrl);
+      const fetched = await context.websiteFetcher.fetchPage(websiteUrl, { signal: context.signal });
       pages.push({ url: fetched.url, body: fetched.body });
     } catch {
+      if (context.signal?.aborted) throw context.signal.reason;
       // A single unreachable/blocked website must not fail the whole candidate — it just yields zero contact points.
     }
   }

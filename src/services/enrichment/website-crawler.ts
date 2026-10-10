@@ -32,6 +32,7 @@ export interface CrawledPage {
 
 export interface WebsiteCrawlOptions {
   maxPages: number;
+  signal?: AbortSignal;
 }
 
 const DEFAULT_OPTIONS: WebsiteCrawlOptions = { maxPages: 6 };
@@ -145,10 +146,11 @@ function isRetryableFetchError(error: unknown): boolean {
   return code !== null && RETRYABLE_NETWORK_CODES.has(code);
 }
 
-async function fetchPageWithRetry(fetcher: WebsiteFetcher, url: string): Promise<CrawledPage> {
+async function fetchPageWithRetry(fetcher: WebsiteFetcher, url: string, signal?: AbortSignal): Promise<CrawledPage> {
   for (let attempt = 1; attempt <= MAX_FETCH_ATTEMPTS; attempt++) {
     try {
-      const page = await fetcher.fetchPage(url);
+      signal?.throwIfAborted();
+      const page = await fetcher.fetchPage(url, { signal });
       if (page.status >= 500) {
         throw new SafeFetchError(`HTTP ${page.status} fetching ${url}`, "http_server_error", page.status);
       }
@@ -157,8 +159,20 @@ async function fetchPageWithRetry(fetcher: WebsiteFetcher, url: string): Promise
       }
       return { url: page.url, body: page.body };
     } catch (error) {
+      if (signal?.aborted) throw signal.reason ?? error;
       if (attempt >= MAX_FETCH_ATTEMPTS || !isRetryableFetchError(error)) throw error;
-      await new Promise((resolve) => setTimeout(resolve, RETRY_BACKOFF_MS * attempt));
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => {
+          signal?.removeEventListener("abort", abort);
+          resolve();
+        }, RETRY_BACKOFF_MS * attempt);
+        const abort = () => {
+          clearTimeout(timer);
+          reject(signal?.reason ?? new DOMException("Aborted", "AbortError"));
+        };
+        signal?.addEventListener("abort", abort, { once: true });
+        if (signal?.aborted) abort();
+      });
     }
   }
   throw new Error("WEBSITE_FETCH_RETRY_EXHAUSTED");
@@ -177,7 +191,7 @@ export async function crawlWebsite(fetcher: WebsiteFetcher, rootUrl: string, opt
 
   let home: CrawledPage;
   try {
-    home = await fetchPageWithRetry(fetcher, rootUrl);
+    home = await fetchPageWithRetry(fetcher, rootUrl, opts.signal);
   } catch (error) {
     throw error;
   }
@@ -197,17 +211,19 @@ export async function crawlWebsite(fetcher: WebsiteFetcher, rootUrl: string, opt
   
   const worker = async () => {
     while (index < uniqueCandidates.length && attemptedPages < opts.maxPages) {
+      opts.signal?.throwIfAborted();
       const candidate = uniqueCandidates[index++];
       if (!candidate) break;
       if (visited.has(candidate.url)) continue;
       visited.add(candidate.url);
       attemptedPages++;
       try {
-        const page = await fetchPageWithRetry(fetcher, candidate.url);
+        const page = await fetchPageWithRetry(fetcher, candidate.url, opts.signal);
         if (pages.length < opts.maxPages) {
           pages.push(page);
         }
-      } catch {
+      } catch (error) {
+        if (opts.signal?.aborted) throw opts.signal.reason ?? error;
         // if it failed, we could theoretically try another page by decrementing attemptedPages, 
         // but for safety we'll just let it count towards the limit.
       }

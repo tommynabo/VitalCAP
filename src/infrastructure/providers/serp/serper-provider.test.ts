@@ -43,4 +43,22 @@ describe("SerperDiscoveryProvider", () => {
     await expect(provider.search({ query: "unique query", maxResults: 5 })).rejects.toThrow(/HTTP 500/);
     expect(fetchImpl).toHaveBeenCalledTimes(3); // 1 initial + 2 retries
   });
+
+  it("aborts the active request without retrying when the caller deadline expires", async () => {
+    const controller = new AbortController();
+    const abortReason = new Error("PROCESSING_JOB_TIMEOUT");
+    const fetchImpl: typeof fetch = vi.fn((_url: RequestInfo | URL, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+      const rejectOnAbort = () => reject(init?.signal?.reason);
+      init?.signal?.addEventListener("abort", rejectOnAbort, { once: true });
+      if (init?.signal?.aborted) rejectOnAbort();
+    }));
+    const provider = new SerperDiscoveryProvider({ apiKey: "key", fetchImpl });
+    const pending = provider.search({ query: "deadline query", maxResults: 5, signal: controller.signal });
+
+    await vi.waitFor(() => expect(fetchImpl).toHaveBeenCalledTimes(1));
+    controller.abort(abortReason);
+
+    await expect(pending).rejects.toBe(abortReason);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
 });
