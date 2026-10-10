@@ -9,6 +9,7 @@ import { WebsiteEnrichmentService } from "@/services/enrichment/website-enrichme
 
 const COHORT_START = new Date("2026-10-10T14:45:35.187Z");
 const MAX_COHORT_ACCOUNTS = 11;
+const EXACT_COHORT_SIZE = 8;
 
 interface CohortAccount {
   account_id: string;
@@ -19,6 +20,20 @@ interface CohortAccount {
 
 async function main() {
   const apply = process.argv.includes("--apply");
+  const accountIdsArgument = process.argv.find((argument) => argument.startsWith("--account-ids="));
+  const exactAccountIds = accountIdsArgument
+    ? accountIdsArgument.slice("--account-ids=".length).split(",").filter(Boolean)
+    : null;
+  if (exactAccountIds && (
+    exactAccountIds.length !== EXACT_COHORT_SIZE
+    || new Set(exactAccountIds).size !== EXACT_COHORT_SIZE
+    || exactAccountIds.some((id) => !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id))
+  )) {
+    throw new Error(`Exact replay requires ${EXACT_COHORT_SIZE} unique account UUIDs.`);
+  }
+  const exactAccountFilter = exactAccountIds
+    ? sql`AND account.id IN (${sql.join(exactAccountIds.map((id) => sql`${id}::uuid`), sql`, `)})`
+    : sql``;
   const rows = await getDb().execute(sql`
     SELECT
       account.id AS account_id,
@@ -28,6 +43,7 @@ async function main() {
     FROM accounts account
     JOIN campaign_memberships membership ON membership.account_id = account.id
     WHERE account.status = 'needs_review'
+      ${exactAccountFilter}
       AND membership.stage = 'discovered'
       AND account.website_url IS NOT NULL
       AND account.normalized_domain IS NOT NULL
@@ -58,11 +74,15 @@ async function main() {
   if (accounts.length > MAX_COHORT_ACCOUNTS) {
     throw new Error(`Refusing to process ${accounts.length} accounts; audited cohort limit is ${MAX_COHORT_ACCOUNTS}.`);
   }
+  if (exactAccountIds && accounts.length !== EXACT_COHORT_SIZE) {
+    throw new Error(`Refusing exact replay: ${accounts.length} of ${EXACT_COHORT_SIZE} requested accounts remain eligible for review.`);
+  }
 
   const ambiguousMemberships = accounts.filter((account) => account.campaign_count !== 1).length;
   console.info(JSON.stringify({
     mode: apply ? "apply" : "dry_run",
     cohortStart: COHORT_START.toISOString(),
+    exactAccountIds: exactAccountIds !== null,
     accountsSelected: accounts.length,
     ambiguousMemberships,
   }));

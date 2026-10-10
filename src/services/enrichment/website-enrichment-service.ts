@@ -216,6 +216,211 @@ function structuredNumber(value: unknown): number | null {
   return null;
 }
 
+interface HtmlElement {
+  tag: string;
+  attributes: Record<string, string>;
+  children: (HtmlElement | string)[];
+}
+
+const VOID_HTML_TAGS = new Set(["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"]);
+const HIDDEN_HTML_TAGS = new Set(["head", "script", "style", "noscript", "template", "svg"]);
+const LOCATION_BLOCK_TAGS = new Set(["address", "footer", "p", "li", "td", "th"]);
+const MAX_HTML_PARSE_LENGTH = 1_000_000;
+const MAX_HTML_NODES = 10_000;
+
+function decodeHtmlEntities(value: string): string {
+  return value.replace(/&(#x[\da-f]+|#\d+|amp|nbsp|quot|apos|lt|gt);/gi, (entity, code: string) => {
+    const normalized = code.toLowerCase();
+    if (normalized === "amp") return "&";
+    if (normalized === "nbsp") return " ";
+    if (normalized === "quot") return '"';
+    if (normalized === "apos") return "'";
+    if (normalized === "lt") return "<";
+    if (normalized === "gt") return ">";
+    const numeric = normalized.startsWith("#x")
+      ? Number.parseInt(normalized.slice(2), 16)
+      : Number.parseInt(normalized.slice(1), 10);
+    return Number.isFinite(numeric) && numeric >= 0 && numeric <= 0x10ffff
+      ? String.fromCodePoint(numeric)
+      : entity;
+  });
+}
+
+function parseHtmlElements(html: string): HtmlElement {
+  const root: HtmlElement = { tag: "#root", attributes: {}, children: [] };
+  const stack = [root];
+  let nodeCount = 0;
+  const parseableHtml = html.slice(0, MAX_HTML_PARSE_LENGTH)
+    .replace(/<(script|style|noscript|template)\b[^>]*>[\s\S]*?<\/\1\s*>/gi, " ");
+  const tokens = parseableHtml.match(/<!--[\s\S]*?-->|<![^>]*>|<\/?[a-z][^>]*>|[^<]+|</gi) ?? [];
+
+  for (const token of tokens) {
+    if (token.startsWith("<!--") || /^<!/i.test(token)) continue;
+    const closing = token.match(/^<\/\s*([a-z][\w:-]*)\s*>$/i);
+    if (closing) {
+      const tag = closing[1]!.toLowerCase();
+      for (let index = stack.length - 1; index > 0; index--) {
+        if (stack[index]!.tag === tag) {
+          stack.length = index;
+          break;
+        }
+      }
+      continue;
+    }
+
+    const opening = token.match(/^<([a-z][\w:-]*)\b([^>]*)>$/i);
+    if (!opening) {
+      if (token && nodeCount < MAX_HTML_NODES) {
+        stack[stack.length - 1]!.children.push(decodeHtmlEntities(token));
+        nodeCount++;
+      }
+      continue;
+    }
+
+    const tag = opening[1]!.toLowerCase();
+    if (["address", "footer", "p", "li", "td", "th"].includes(tag)) {
+      for (let index = stack.length - 1; index > 0; index--) {
+        if (stack[index]!.tag === tag) {
+          stack.length = index;
+          break;
+        }
+      }
+    }
+    const attributeText = opening[2] ?? "";
+    const attributes: Record<string, string> = {};
+    for (const match of attributeText.matchAll(/([^\s=/>]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+)))?/g)) {
+      attributes[match[1]!.toLowerCase()] = decodeHtmlEntities(match[2] ?? match[3] ?? match[4] ?? "");
+    }
+    const element: HtmlElement = { tag, attributes, children: [] };
+    stack[stack.length - 1]!.children.push(element);
+    nodeCount++;
+    if (!VOID_HTML_TAGS.has(tag) && !/\/\s*>$/.test(token)) stack.push(element);
+    if (nodeCount >= MAX_HTML_NODES) break;
+  }
+
+  return root;
+}
+
+function elementText(element: HtmlElement, visibleOnly = false, depth = 0): string {
+  if (depth > 100) return "";
+  if (visibleOnly) {
+    const { attributes, tag } = element;
+    if (HIDDEN_HTML_TAGS.has(tag) || "hidden" in attributes || attributes["aria-hidden"]?.toLowerCase() === "true") return "";
+    if (/display\s*:\s*none|visibility\s*:\s*hidden/i.test(attributes.style ?? "")) return "";
+  }
+  return element.children.map((child) => typeof child === "string"
+    ? child
+    : elementText(child, visibleOnly, depth + 1)).join(" ").replace(/\s+/g, " ").trim();
+}
+
+function descendants(element: HtmlElement): HtmlElement[] {
+  const result: HtmlElement[] = [];
+  const pending = [...element.children].reverse();
+  while (pending.length > 0 && result.length < MAX_HTML_NODES) {
+    const current = pending.pop();
+    if (!current || typeof current === "string") continue;
+    result.push(current);
+    pending.push(...current.children.filter((child): child is HtmlElement => typeof child !== "string").reverse());
+  }
+  return result;
+}
+
+function itemValue(element: HtmlElement): string {
+  for (const attribute of ["content", "datetime", "value", "href", "src"]) {
+    const value = element.attributes[attribute]?.trim();
+    if (value) return value;
+  }
+  if ("itemscope" in element.attributes) {
+    const name = descendants(element).find((child) => (child.attributes.itemprop ?? "").toLowerCase().split(/\s+/).includes("name"));
+    if (name) return itemValue(name);
+  }
+  return elementText(element);
+}
+
+function extractMicrodataLocationFacts(html: string, sourceUrl: string): WebsiteEvidenceFact[] {
+  const root = parseHtmlElements(html);
+  const facts: WebsiteEvidenceFact[] = [];
+  const seen = new Set<string>();
+  const addFact = (evidenceType: WebsiteEvidenceFact["evidenceType"], value: string, normalizedValue = value) => {
+    const key = `${evidenceType}:${normalizedValue}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    facts.push({ evidenceType, value, normalizedValue, snippet: "Schema.org microdata location", sourceUrl });
+  };
+  const scopes = descendants(root).filter((element) => "itemscope" in element.attributes);
+
+  for (const scope of scopes) {
+    const types = (scope.attributes.itemtype ?? "").split(/\s+/).map((type) => type.split(/[\/#]/).at(-1)?.toLowerCase());
+    const isPostalAddress = types.includes("postaladdress");
+    const isGeoCoordinates = types.includes("geocoordinates");
+    if (!isPostalAddress && !isGeoCoordinates) continue;
+
+    const properties = new Map<string, string[]>();
+    const pending = [...scope.children].reverse();
+    let visited = 0;
+    while (pending.length > 0 && visited < MAX_HTML_NODES) {
+      const child = pending.pop();
+      if (!child || typeof child === "string") continue;
+      visited++;
+      for (const property of (child.attributes.itemprop ?? "").toLowerCase().split(/\s+/).filter(Boolean)) {
+        const value = itemValue(child);
+        if (value) properties.set(property, [...(properties.get(property) ?? []), value]);
+      }
+      if (!("itemscope" in child.attributes)) {
+        pending.push(...child.children.filter((item): item is HtmlElement => typeof item !== "string").reverse());
+      }
+    }
+
+    if (isPostalAddress) {
+      const country = structuredCountryCode(properties.get("addresscountry")?.[0]);
+      if (country) addFact("location_country", country.value, country.normalizedValue);
+      const postalCode = properties.get("postalcode")?.[0]?.trim();
+      if (postalCode && provinceForPostalCode(postalCode)) addFact("location_postal_code", postalCode);
+    }
+
+    if (isGeoCoordinates) {
+      const latitude = structuredNumber(properties.get("latitude")?.[0]);
+      const longitude = structuredNumber(properties.get("longitude")?.[0]);
+      if (latitude !== null && longitude !== null) {
+        addFact("location_latitude", String(latitude));
+        addFact("location_longitude", String(longitude));
+      }
+    }
+  }
+
+  return facts;
+}
+
+const SPANISH_STREET_ADDRESS_RE = /\b(?:calle|carrer|carrera|avenida|avda\.?|plaza|paseo|via|ronda|camino|carretera|callejon|c\.|c\/|av\.)\s+[\p{L}\d.'’/-]+(?:\s+[\p{L}\d.'’/-]+){0,4}\s+\d{1,4}[a-z]?\b/iu;
+
+function extractVisibleAddressPostalFacts(html: string, sourceUrl: string): WebsiteEvidenceFact[] {
+  const root = parseHtmlElements(html);
+  const facts: WebsiteEvidenceFact[] = [];
+  const seen = new Set<string>();
+  for (const element of descendants(root)) {
+    const semanticLabel = `${element.attributes.class ?? ""} ${element.attributes.id ?? ""}`;
+    const isLocationBlock = LOCATION_BLOCK_TAGS.has(element.tag)
+      || ((element.tag === "div" || element.tag === "section" || element.tag === "article")
+        && /address|direccion|direcci[oó]n|contact|location|postal/i.test(semanticLabel));
+    if (!isLocationBlock) continue;
+    const text = elementText(element, true);
+    if (text.length === 0 || text.length > 500 || !SPANISH_STREET_ADDRESS_RE.test(text)) continue;
+    for (const match of text.matchAll(/\b\d{5}\b/g)) {
+      const postalCode = match[0];
+      if (!provinceForPostalCode(postalCode) || seen.has(postalCode)) continue;
+      seen.add(postalCode);
+      facts.push({
+        evidenceType: "location_postal_code",
+        value: postalCode,
+        normalizedValue: postalCode,
+        snippet: "Visible Spanish postal address block",
+        sourceUrl,
+      });
+    }
+  }
+  return facts;
+}
+
 function extractStructuredLocationFacts(html: string, sourceUrl: string): WebsiteEvidenceFact[] {
   const facts: WebsiteEvidenceFact[] = [];
   const factKeys = new Set<string>();
@@ -383,6 +588,12 @@ export class WebsiteEnrichmentService {
 
       const structuredLocation = extractStructuredLocationFacts(page.body, page.url);
       structuredLocation.forEach(addFact);
+
+      const microdataLocation = extractMicrodataLocationFacts(page.body, page.url);
+      microdataLocation.forEach(addFact);
+
+      const visibleAddressLocation = extractVisibleAddressPostalFacts(page.body, page.url);
+      visibleAddressLocation.forEach(addFact);
     }
 
     return {

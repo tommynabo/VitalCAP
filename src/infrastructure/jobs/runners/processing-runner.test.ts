@@ -505,6 +505,7 @@ describe("runProcessingCronTick", () => {
   it("qualifies a Serper account from persisted structured website evidence through the Spain evaluator", async () => {
     const email = "info@farmacia-ejemplo.es";
     const sourceUrl = "https://farmacia-ejemplo.es/contacto";
+    mocks.resolveCanonicalAccount.mockResolvedValueOnce({ kind: "existingAccount", existingAccountId: "canonical-account-id" });
     mocks.getRawCandidateById.mockResolvedValue({
       id: "raw-candidate-id",
       accountId: null,
@@ -519,9 +520,9 @@ describe("runProcessingCronTick", () => {
     mocks.getCampaignById.mockResolvedValue({ id: "campaign-id", workspaceId: "workspace-id" });
     mocks.getWebsiteEnrichmentStatus.mockResolvedValue(null);
     mocks.getAccountById.mockResolvedValue({
-      id: "account-id",
+      id: "canonical-account-id",
       status: "needs_review",
-      countryCode: null,
+      countryCode: "ES",
       postalCode: null,
       latitude: null,
       longitude: null,
@@ -578,8 +579,10 @@ describe("runProcessingCronTick", () => {
       value: "28001",
       sourceUrl,
     }));
-    expect(mocks.updateAccountFields).toHaveBeenCalledWith("account-id", expect.objectContaining({
-      countryCode: "ES",
+    expect(mocks.resolveCanonicalAccount).toHaveBeenCalledTimes(1);
+    expect(mocks.insertAccountSource).toHaveBeenCalledTimes(1);
+    expect(mocks.insertAccountSource).toHaveBeenCalledWith(expect.objectContaining({ accountId: "canonical-account-id" }));
+    expect(mocks.updateAccountFields).toHaveBeenCalledWith("canonical-account-id", expect.objectContaining({
       postalCode: "28001",
       latitude: 40.4168,
       longitude: -3.7038,
@@ -587,7 +590,7 @@ describe("runProcessingCronTick", () => {
     }));
     expect(mocks.upsertCampaignMembership).toHaveBeenCalledWith(expect.objectContaining({
       campaignId: "campaign-id",
-      accountId: "account-id",
+      accountId: "canonical-account-id",
       stage: "qualified",
       rejectionReason: null,
     }));

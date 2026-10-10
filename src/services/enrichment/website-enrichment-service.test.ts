@@ -153,6 +153,76 @@ describe("WebsiteEnrichmentService", () => {
     }).verdict).toBe("verified");
   });
 
+  it("extracts Schema.org microdata location facts with page provenance", async () => {
+    const contactUrl = "https://farmacia.es/contacto";
+    const fetcher: WebsiteFetcher = {
+      fetchPage: vi.fn(async (url: string): Promise<FetchedPage> => url === contactUrl
+        ? {
+            url,
+            status: 200,
+            contentType: "text/html",
+            body: `<div itemscope itemtype="https://schema.org/Organization">
+              <div itemprop="address" itemscope itemtype="https://schema.org/PostalAddress">
+                <span itemprop="streetAddress">Calle Mayor 1</span>
+                <span itemprop="postalCode">28001</span>
+                <span itemprop="addressCountry" itemscope itemtype="https://schema.org/Country"><meta itemprop="name" content="España"></span>
+              </div>
+              <div itemprop="geo" itemscope itemtype="https://schema.org/GeoCoordinates">
+                <meta itemprop="latitude" content="40.4168"><meta itemprop="longitude" content="-3.7038">
+              </div>
+            </div>`,
+          }
+        : {
+            url: "https://farmacia.es/",
+            status: 200,
+            contentType: "text/html",
+            body: '<a href="/contacto">Contacto</a>',
+          }),
+    };
+
+    const result = await new WebsiteEnrichmentService(fetcher).enrich({
+      workspaceId: "ws_1",
+      accountId: "acc_1",
+      websiteUrl: "https://farmacia.es/",
+    });
+    const locations = result.evidence.filter((fact) => fact.evidenceType.startsWith("location_"));
+
+    expect(locations).toEqual(expect.arrayContaining([
+      expect.objectContaining({ evidenceType: "location_country", normalizedValue: "ES", sourceUrl: contactUrl }),
+      expect.objectContaining({ evidenceType: "location_postal_code", normalizedValue: "28001", sourceUrl: contactUrl }),
+      expect.objectContaining({ evidenceType: "location_latitude", normalizedValue: "40.4168", sourceUrl: contactUrl }),
+      expect.objectContaining({ evidenceType: "location_longitude", normalizedValue: "-3.7038", sourceUrl: contactUrl }),
+    ]));
+    expect(evaluateSpainEligibility({
+      providerCountryCode: locations.find((fact) => fact.evidenceType === "location_country")?.normalizedValue,
+      postalCode: locations.find((fact) => fact.evidenceType === "location_postal_code")?.normalizedValue,
+      latitude: Number(locations.find((fact) => fact.evidenceType === "location_latitude")?.normalizedValue),
+      longitude: Number(locations.find((fact) => fact.evidenceType === "location_longitude")?.normalizedValue),
+    }).verdict).toBe("verified");
+  });
+
+  it("extracts a Spanish postcode only when it shares a visible address block with a street and number", async () => {
+    const fetcher: WebsiteFetcher = {
+      fetchPage: async () => ({
+        url: "https://farmacia.es/contacto",
+        status: 200,
+        contentType: "text/html",
+        body: `<address>Calle Mayor 1, 28001 Madrid</address>
+          <p>Calle Mayor 1</p><p>28002 Madrid</p><p>Farmacia en Madrid</p>`,
+      }),
+    };
+
+    const result = await new WebsiteEnrichmentService(fetcher).enrich({
+      workspaceId: "ws_1",
+      accountId: "acc_1",
+      websiteUrl: "https://farmacia.es/contacto",
+    });
+    const postcodes = result.evidence.filter((fact) => fact.evidenceType === "location_postal_code");
+
+    expect(postcodes).toEqual([expect.objectContaining({ value: "28001", sourceUrl: "https://farmacia.es/contacto" })]);
+    expect(evaluateSpainEligibility({ websiteDomain: "farmacia.es", city: "Madrid" }).verdict).toBe("needs_review");
+  });
+
   it("does not qualify weak JSON-LD or a non-Spain country", async () => {
     const fetcher: WebsiteFetcher = {
       fetchPage: async () => ({
