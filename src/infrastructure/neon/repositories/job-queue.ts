@@ -21,6 +21,66 @@ export async function getCampaignQueueDepth(campaignId: string): Promise<number>
 
 type QueueTable = "discovery_jobs" | "processing_jobs";
 
+export const STALE_JOB_LOCK_THRESHOLD_MS = 10 * 60 * 1000;
+
+export function buildDeadLetterExpiredJobsQuery(table: QueueTable, leaseSeconds: number, message: string) {
+  return table === "discovery_jobs"
+    ? sql`
+        WITH expired AS (
+          UPDATE discovery_jobs
+          SET status = 'dead_letter', locked_at = NULL, locked_by = NULL
+          WHERE status = 'processing'
+            AND attempt_count >= max_attempts
+            AND locked_at IS NOT NULL
+            AND locked_at + (${leaseSeconds} * interval '1 second') <= NOW()
+          RETURNING id, campaign_id, payload, attempt_count
+        )
+        INSERT INTO dead_letter_jobs (source_table, source_job_id, campaign_id, payload, attempt_count, last_error, created_at)
+        SELECT 'discovery_jobs', id, campaign_id, payload, attempt_count, ${message}, NOW()
+        FROM expired
+        ON CONFLICT (source_table, source_job_id) DO NOTHING
+        RETURNING source_job_id;
+      `
+    : sql`
+        WITH expired AS (
+          UPDATE processing_jobs
+          SET status = 'dead_letter', locked_at = NULL, locked_by = NULL
+          WHERE status = 'processing'
+            AND attempt_count >= max_attempts
+            AND locked_at IS NOT NULL
+            AND locked_at + (${leaseSeconds} * interval '1 second') <= NOW()
+          RETURNING id, campaign_id, payload, attempt_count
+        )
+        INSERT INTO dead_letter_jobs (source_table, source_job_id, campaign_id, payload, attempt_count, last_error, created_at)
+        SELECT 'processing_jobs', id, campaign_id, payload, attempt_count, ${message}, NOW()
+        FROM expired
+        ON CONFLICT (source_table, source_job_id) DO NOTHING
+        RETURNING source_job_id;
+      `;
+}
+
+export function buildRequeueStaleLockedJobsQuery(table: QueueTable, now: Date, staleBefore: Date) {
+  return sql`
+    UPDATE ${sql.raw(table)}
+    SET status = 'pending',
+        locked_at = NULL,
+        locked_by = NULL,
+        updated_at = ${now.toISOString()}::timestamptz
+    WHERE status = 'processing'
+      AND locked_at IS NOT NULL
+      AND locked_at < ${staleBefore.toISOString()}::timestamptz
+      AND attempt_count < max_attempts
+    RETURNING id;
+  `;
+}
+
+export async function requeueStaleLockedJobs(table: QueueTable, now = new Date()): Promise<number> {
+  const db = getDb();
+  const staleBefore = new Date(now.getTime() - STALE_JOB_LOCK_THRESHOLD_MS);
+  const result = await db.execute(buildRequeueStaleLockedJobsQuery(table, now, staleBefore));
+  return result.rows.length;
+}
+
 export type JobFailureClassification = "transient" | "permanent";
 
 export class PermanentJobError extends Error {
@@ -363,7 +423,7 @@ async function fail(table: QueueTable, input: FailJobInput): Promise<void> {
             AND locked_by = ${input.workerId}
           RETURNING id, campaign_id, payload, attempt_count
         )
-        INSERT INTO dead_letter_jobs (source_table, source_job_id, campaign_id, original_payload, attempt_count, final_error, created_at)
+        INSERT INTO dead_letter_jobs (source_table, source_job_id, campaign_id, payload, attempt_count, last_error, created_at)
         SELECT 'discovery_jobs', id, campaign_id, payload, attempt_count, ${message}, ${nowIso}::timestamptz
         FROM moved
         ON CONFLICT (source_table, source_job_id) DO NOTHING
@@ -383,7 +443,7 @@ async function fail(table: QueueTable, input: FailJobInput): Promise<void> {
             AND locked_by = ${input.workerId}
           RETURNING id, campaign_id, payload, attempt_count
         )
-        INSERT INTO dead_letter_jobs (source_table, source_job_id, campaign_id, original_payload, attempt_count, final_error, created_at)
+        INSERT INTO dead_letter_jobs (source_table, source_job_id, campaign_id, payload, attempt_count, last_error, created_at)
         SELECT 'processing_jobs', id, campaign_id, payload, attempt_count, ${message}, ${nowIso}::timestamptz
         FROM moved
         ON CONFLICT (source_table, source_job_id) DO NOTHING
@@ -519,39 +579,7 @@ export async function enqueueProcessingJob(input: EnqueueJobInput): Promise<stri
 export async function deadLetterExpiredJobs(table: QueueTable, leaseMs: number = JOB_LEASE_MS, message: string = "Max attempts exceeded via watchdog"): Promise<number> {
   const db = getDb();
   const leaseSeconds = Math.max(1, Math.ceil(leaseMs / 1000));
-  
-  const query = table === "discovery_jobs" 
-    ? sql`
-        WITH expired AS (
-          UPDATE discovery_jobs
-          SET status = 'dead_letter', locked_at = NULL, locked_by = NULL
-          WHERE status IN ('pending', 'processing')
-            AND attempt_count >= max_attempts
-            AND (status = 'pending' OR locked_at IS NULL OR locked_at + (${leaseSeconds} * interval '1 second') <= NOW())
-          RETURNING id, campaign_id, payload, attempt_count
-        )
-        INSERT INTO dead_letter_jobs (source_table, source_job_id, campaign_id, original_payload, attempt_count, final_error, created_at)
-        SELECT 'discovery_jobs', id, campaign_id, payload, attempt_count, ${message}, NOW()
-        FROM expired
-        ON CONFLICT (source_table, source_job_id) DO NOTHING
-        RETURNING source_job_id;
-      `
-    : sql`
-        WITH expired AS (
-          UPDATE processing_jobs
-          SET status = 'dead_letter', locked_at = NULL, locked_by = NULL
-          WHERE status IN ('pending', 'processing')
-            AND attempt_count >= max_attempts
-            AND (status = 'pending' OR locked_at IS NULL OR locked_at + (${leaseSeconds} * interval '1 second') <= NOW())
-          RETURNING id, campaign_id, payload, attempt_count
-        )
-        INSERT INTO dead_letter_jobs (source_table, source_job_id, campaign_id, original_payload, attempt_count, final_error, created_at)
-        SELECT 'processing_jobs', id, campaign_id, payload, attempt_count, ${message}, NOW()
-        FROM expired
-        ON CONFLICT (source_table, source_job_id) DO NOTHING
-        RETURNING source_job_id;
-      `;
 
-  const result = await db.execute(query);
+  const result = await db.execute(buildDeadLetterExpiredJobsQuery(table, leaseSeconds, message));
   return result.rows.length;
 }

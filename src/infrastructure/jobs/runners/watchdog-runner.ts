@@ -1,10 +1,16 @@
 import { sql } from "drizzle-orm";
 import { getDb } from "../../neon/db";
-import { deadLetterExpiredJobs } from "../../neon/repositories/job-queue";
+import {
+  deadLetterExpiredJobs,
+  requeueStaleLockedJobs,
+  STALE_JOB_LOCK_THRESHOLD_MS,
+} from "../../neon/repositories/job-queue";
 
 export interface WatchdogCronResult {
   failedDiscoveryJobs: number;
   failedProcessingJobs: number;
+  releasedDiscoveryLocks: number;
+  releasedProcessingLocks: number;
   healedProcessingJobs: number;
   stuckProviderRuns: number;
   orphanedSeedRuns: number;
@@ -15,8 +21,10 @@ export async function runWatchdogCronTick(): Promise<WatchdogCronResult> {
   const db = getDb();
 
   // 1. Move over-limit jobs to dead_letter (only if lease expired)
-  const failedDiscoveryJobs = await deadLetterExpiredJobs("discovery_jobs");
-  const failedProcessingJobs = await deadLetterExpiredJobs("processing_jobs");
+  const failedDiscoveryJobs = await deadLetterExpiredJobs("discovery_jobs", STALE_JOB_LOCK_THRESHOLD_MS);
+  const failedProcessingJobs = await deadLetterExpiredJobs("processing_jobs", STALE_JOB_LOCK_THRESHOLD_MS);
+  const releasedDiscoveryLocks = await requeueStaleLockedJobs("discovery_jobs");
+  const releasedProcessingLocks = await requeueStaleLockedJobs("processing_jobs");
 
   // 2. Self-Heal missing processing job
   const healedProcessing = await db.execute(sql`
@@ -108,8 +116,8 @@ export async function runWatchdogCronTick(): Promise<WatchdogCronResult> {
         w.id as workspace_id,
         (SELECT count(*) FROM discovery_jobs dj JOIN campaigns c ON dj.campaign_id = c.id WHERE c.workspace_id = w.id AND dj.status = 'pending' AND (dj.next_attempt_at IS NULL OR dj.next_attempt_at <= NOW()) AND dj.created_at < NOW() - INTERVAL '30 minutes')::int as old_discovery,
         (SELECT count(*) FROM processing_jobs pj JOIN campaigns c ON pj.campaign_id = c.id WHERE c.workspace_id = w.id AND pj.status = 'pending' AND (pj.next_attempt_at IS NULL OR pj.next_attempt_at <= NOW()) AND pj.created_at < NOW() - INTERVAL '30 minutes')::int as old_processing,
-        (SELECT count(*) FROM discovery_jobs dj JOIN campaigns c ON dj.campaign_id = c.id WHERE c.workspace_id = w.id AND dj.status = 'processing' AND dj.locked_at < NOW() - INTERVAL '10 minutes')::int as stuck_discovery,
-        (SELECT count(*) FROM processing_jobs pj JOIN campaigns c ON pj.campaign_id = c.id WHERE c.workspace_id = w.id AND pj.status = 'processing' AND pj.locked_at < NOW() - INTERVAL '10 minutes')::int as stuck_processing,
+        (SELECT count(*) FROM discovery_jobs dj JOIN campaigns c ON dj.campaign_id = c.id WHERE c.workspace_id = w.id AND dj.status = 'processing' AND dj.locked_at < NOW() - (${STALE_JOB_LOCK_THRESHOLD_MS / 60_000} * INTERVAL '1 minute'))::int as stuck_discovery,
+        (SELECT count(*) FROM processing_jobs pj JOIN campaigns c ON pj.campaign_id = c.id WHERE c.workspace_id = w.id AND pj.status = 'processing' AND pj.locked_at < NOW() - (${STALE_JOB_LOCK_THRESHOLD_MS / 60_000} * INTERVAL '1 minute'))::int as stuck_processing,
         (SELECT count(*) FROM provider_runs pr WHERE pr.workspace_id = w.id AND pr.status = 'manual_reconciliation_required')::int as provider_reconciliations
       FROM workspaces w
     )
@@ -156,5 +164,5 @@ export async function runWatchdogCronTick(): Promise<WatchdogCronResult> {
   const pausedCount = await db.execute(sql`SELECT count(*) FROM autopilot_settings WHERE system_paused = true`);
   const systemPaused = Number(pausedCount.rows[0]?.count) > 0;
 
-  return { failedDiscoveryJobs, failedProcessingJobs, healedProcessingJobs, stuckProviderRuns, orphanedSeedRuns, systemPaused };
+  return { failedDiscoveryJobs, failedProcessingJobs, releasedDiscoveryLocks, releasedProcessingLocks, healedProcessingJobs, stuckProviderRuns, orphanedSeedRuns, systemPaused };
 }

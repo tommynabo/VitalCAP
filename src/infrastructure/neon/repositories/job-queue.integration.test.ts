@@ -11,9 +11,13 @@ import {
   claimProcessingJobs,
   completeDiscoveryJob,
   completeProcessingJob,
+  deadLetterExpiredJobs,
   enqueueDiscoveryJob,
   enqueueProcessingJob,
   failDiscoveryJob,
+  failProcessingJob,
+  requeueStaleLockedJobs,
+  STALE_JOB_LOCK_THRESHOLD_MS,
 } from "./job-queue";
 
 function isSafeIntegrationDatabaseUrl(databaseUrl: string): boolean {
@@ -86,6 +90,47 @@ async function createCampaignFixture(status: "active" | "paused" | "draft" | "ar
 async function cleanupWorkspace(workspaceId: string): Promise<void> {
   const db = getDb();
   await db.execute(sql`DELETE FROM workspaces WHERE id = ${workspaceId}::uuid;`);
+}
+
+type QueueTableName = "discovery_jobs" | "processing_jobs";
+
+interface QueueStateOverride {
+  status: string;
+  attemptCount: number;
+  maxAttempts: number;
+  lockedAt: Date | null;
+  lockedBy: string | null;
+  idempotencyKey: string | null;
+  nextAttemptAt: Date;
+  lastError: string | null;
+}
+
+interface QueueStateRow {
+  status: string;
+  attempt_count: number;
+  max_attempts: number;
+  locked_at: string | null;
+  locked_by: string | null;
+  idempotency_key: string | null;
+  next_attempt_at: string | null;
+  last_error: string | null;
+}
+
+async function setQueueState(table: QueueTableName, jobId: string, state: QueueStateOverride): Promise<void> {
+  const db = getDb();
+  const query = table === "discovery_jobs"
+    ? sql`UPDATE discovery_jobs SET status = ${state.status}, attempt_count = ${state.attemptCount}, max_attempts = ${state.maxAttempts}, locked_at = ${state.lockedAt?.toISOString() ?? null}::timestamptz, locked_by = ${state.lockedBy}, idempotency_key = ${state.idempotencyKey}, next_attempt_at = ${state.nextAttemptAt.toISOString()}::timestamptz, last_error = ${state.lastError} WHERE id = ${jobId}::uuid;`
+    : sql`UPDATE processing_jobs SET status = ${state.status}, attempt_count = ${state.attemptCount}, max_attempts = ${state.maxAttempts}, locked_at = ${state.lockedAt?.toISOString() ?? null}::timestamptz, locked_by = ${state.lockedBy}, idempotency_key = ${state.idempotencyKey}, next_attempt_at = ${state.nextAttemptAt.toISOString()}::timestamptz, last_error = ${state.lastError} WHERE id = ${jobId}::uuid;`;
+  await db.execute(query);
+}
+
+async function getQueueState(table: QueueTableName, jobId: string): Promise<QueueStateRow> {
+  const db = getDb();
+  const query = table === "discovery_jobs"
+    ? sql`SELECT status, attempt_count, max_attempts, locked_at, locked_by, idempotency_key, next_attempt_at, last_error FROM discovery_jobs WHERE id = ${jobId}::uuid;`
+    : sql`SELECT status, attempt_count, max_attempts, locked_at, locked_by, idempotency_key, next_attempt_at, last_error FROM processing_jobs WHERE id = ${jobId}::uuid;`;
+  const result = await db.execute(query);
+  return result.rows[0] as unknown as QueueStateRow;
 }
 
 describeIntegration("job-queue integration (real postgres semantics)", () => {
@@ -287,10 +332,17 @@ describeIntegration("job-queue integration (real postgres semantics)", () => {
       FROM dead_letter_jobs
       WHERE source_table = 'discovery_jobs' AND source_job_id = ${permanentJobId}::uuid;
     `);
+    const deadLetterRecord = await db.execute(sql`
+      SELECT payload, last_error
+      FROM dead_letter_jobs
+      WHERE source_table = 'discovery_jobs' AND source_job_id = ${permanentJobId}::uuid;
+    `);
 
     expect((sourceRow.rows[0] as { status: string }).status).toBe("dead_letter");
     expect((sourceRow.rows[0] as { next_attempt_at: string | null }).next_attempt_at).toBeNull();
     expect((deadLetterCount.rows[0] as { total: number }).total).toBe(1);
+    expect((deadLetterRecord.rows[0] as { payload: unknown }).payload).toEqual({ engineType: "maps_fast" });
+    expect((deadLetterRecord.rows[0] as { last_error: string }).last_error).toBe("invalid payload");
 
     await expect(
       failDiscoveryJob({
@@ -424,5 +476,137 @@ describeIntegration("job-queue integration (real postgres semantics)", () => {
 
     expect(laterClaimIds).not.toContain(completedJobId);
     expect(laterClaimIds).not.toContain(deadLetterJobId);
+  });
+
+  it.each(["discovery_jobs", "processing_jobs"] as const)("watchdog dead-letters stale exhausted %s using the current schema", async (table) => {
+    const campaign = await makeActiveCampaign();
+    const payload = table === "discovery_jobs" ? { engineType: "maps_fast" } : { rawCandidateId: randomUUID() };
+    const enqueue = table === "discovery_jobs" ? enqueueDiscoveryJob : enqueueProcessingJob;
+    const jobId = await enqueue({ campaignId: campaign.campaignId, type: "test_job", payload, maxAttempts: 1 });
+    const now = new Date();
+
+    await setQueueState(table, jobId, {
+      status: "processing",
+      attemptCount: 1,
+      maxAttempts: 1,
+      lockedAt: new Date(now.getTime() - STALE_JOB_LOCK_THRESHOLD_MS - 60_000),
+      lockedBy: "expired-worker",
+      idempotencyKey: `dead-letter:${randomUUID()}`,
+      nextAttemptAt: new Date(now.getTime() - 60_000),
+      lastError: "previous failure",
+    });
+
+    await expect(deadLetterExpiredJobs(table, 60_000)).resolves.toBe(1);
+
+    const source = await getQueueState(table, jobId);
+    const db = getDb();
+    const archive = await db.execute(sql`
+      SELECT payload, last_error
+      FROM dead_letter_jobs
+      WHERE source_table = ${table} AND source_job_id = ${jobId}::uuid;
+    `);
+    expect(source.status).toBe("dead_letter");
+    expect(source.locked_at).toBeNull();
+    expect(archive.rows).toHaveLength(1);
+    expect((archive.rows[0] as { payload: unknown }).payload).toEqual(payload);
+    expect((archive.rows[0] as { last_error: string }).last_error).toBe("Max attempts exceeded via watchdog");
+  });
+
+  it.each(["discovery_jobs", "processing_jobs"] as const)("releases only stale active %s locks without changing retry or idempotency state", async (table) => {
+    const campaign = await makeActiveCampaign();
+    const enqueue = table === "discovery_jobs" ? enqueueDiscoveryJob : enqueueProcessingJob;
+    const now = new Date();
+    const staleAt = new Date(now.getTime() - STALE_JOB_LOCK_THRESHOLD_MS - 60_000);
+    const freshAt = new Date(now.getTime() - STALE_JOB_LOCK_THRESHOLD_MS + 60_000);
+    const dueAt = new Date(now.getTime() - 60_000);
+    const createJob = (label: string) => enqueue({
+      campaignId: campaign.campaignId,
+      type: "test_job",
+      payload: { label },
+      idempotencyKey: `recovery:${label}:${randomUUID()}`,
+    });
+    const staleId = await createJob("stale");
+    const freshId = await createJob("fresh");
+    const completedId = await createJob("completed");
+    const deadLetterId = await createJob("dead-letter");
+    const staleKey = `preserve:${randomUUID()}`;
+    const freshKey = `preserve:${randomUUID()}`;
+
+    await setQueueState(table, staleId, {
+      status: "processing", attemptCount: 3, maxAttempts: 5, lockedAt: staleAt, lockedBy: "stale-worker",
+      idempotencyKey: staleKey, nextAttemptAt: dueAt, lastError: "preserve stale error",
+    });
+    await setQueueState(table, freshId, {
+      status: "processing", attemptCount: 2, maxAttempts: 5, lockedAt: freshAt, lockedBy: "fresh-worker",
+      idempotencyKey: freshKey, nextAttemptAt: dueAt, lastError: "preserve fresh error",
+    });
+    await setQueueState(table, completedId, {
+      status: "completed", attemptCount: 2, maxAttempts: 5, lockedAt: staleAt, lockedBy: "completed-worker",
+      idempotencyKey: null, nextAttemptAt: dueAt, lastError: null,
+    });
+    await setQueueState(table, deadLetterId, {
+      status: "dead_letter", attemptCount: 5, maxAttempts: 5, lockedAt: staleAt, lockedBy: "dead-worker",
+      idempotencyKey: null, nextAttemptAt: dueAt, lastError: "terminal error",
+    });
+
+    await expect(requeueStaleLockedJobs(table, now)).resolves.toBe(1);
+    await expect(requeueStaleLockedJobs(table, now)).resolves.toBe(0);
+
+    const stale = await getQueueState(table, staleId);
+    expect(stale.status).toBe("pending");
+    expect(stale.locked_at).toBeNull();
+    expect(stale.locked_by).toBeNull();
+    expect(stale.attempt_count).toBe(3);
+    expect(stale.idempotency_key).toBe(staleKey);
+    expect(new Date(stale.next_attempt_at!).getTime()).toBe(dueAt.getTime());
+    expect(stale.last_error).toBe("preserve stale error");
+
+    const fresh = await getQueueState(table, freshId);
+    expect(fresh.status).toBe("processing");
+    expect(new Date(fresh.locked_at!).getTime()).toBe(freshAt.getTime());
+    expect(fresh.locked_by).toBe("fresh-worker");
+    expect(fresh.attempt_count).toBe(2);
+    expect(fresh.idempotency_key).toBe(freshKey);
+
+    const completed = await getQueueState(table, completedId);
+    expect(completed.status).toBe("completed");
+    expect(new Date(completed.locked_at!).getTime()).toBe(staleAt.getTime());
+    const deadLetter = await getQueueState(table, deadLetterId);
+    expect(deadLetter.status).toBe("dead_letter");
+    expect(new Date(deadLetter.locked_at!).getTime()).toBe(staleAt.getTime());
+
+    const activeCount = table === "discovery_jobs"
+      ? await getDb().execute(sql`SELECT count(*)::int AS total FROM discovery_jobs WHERE idempotency_key = ${staleKey} AND status IN ('pending', 'processing');`)
+      : await getDb().execute(sql`SELECT count(*)::int AS total FROM processing_jobs WHERE idempotency_key = ${staleKey} AND status IN ('pending', 'processing');`);
+    expect((activeCount.rows[0] as { total: number }).total).toBe(1);
+  });
+
+  it("writes processing failure dead letters using the current schema", async () => {
+    const campaign = await makeActiveCampaign();
+    const payload = { rawCandidateId: randomUUID() };
+    const jobId = await enqueueProcessingJob({ campaignId: campaign.campaignId, type: "process_raw_candidate", payload });
+    const now = new Date();
+    const workerId = `worker-fail-${randomUUID()}`;
+    await setQueueState("processing_jobs", jobId, {
+      status: "processing", attemptCount: 1, maxAttempts: 5, lockedAt: now, lockedBy: workerId,
+      idempotencyKey: null, nextAttemptAt: now, lastError: null,
+    });
+
+    await failProcessingJob({
+      workerId,
+      job: { id: jobId, campaignId: campaign.campaignId, type: "process_raw_candidate", payload, attemptCount: 1, maxAttempts: 5 },
+      error: new PermanentJobError("invalid processing payload"),
+      now,
+    });
+
+    const db = getDb();
+    const archive = await db.execute(sql`
+      SELECT payload, last_error
+      FROM dead_letter_jobs
+      WHERE source_table = 'processing_jobs' AND source_job_id = ${jobId}::uuid;
+    `);
+    expect(archive.rows).toHaveLength(1);
+    expect((archive.rows[0] as { payload: unknown }).payload).toEqual(payload);
+    expect((archive.rows[0] as { last_error: string }).last_error).toBe("invalid processing payload");
   });
 });
