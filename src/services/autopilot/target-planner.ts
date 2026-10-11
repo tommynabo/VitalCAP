@@ -10,7 +10,7 @@ export interface DiscoveryOrder {
   reason: string;
   planningWindow: string;
   idempotencyKey: string;
-  origin: "normal" | "rebalance" | "hybrid_fill";
+  origin: "normal" | "rebalance" | "hybrid_fill" | "recovery_probe";
   rebalanceAmount?: number;
 }
 
@@ -51,6 +51,7 @@ export interface EngineWorkAllocationInput extends Omit<MapsFastAllocationInput,
  * work and leaving the daily safety cap to the provider reservation guard.
  */
 export const MAX_RAW_PER_PLANNING_WINDOW = 500;
+export const MAX_APIFY_RECOVERY_PROBE_RAW = 10;
 
 export function planningWindowKey(now: Date, timeZone: string, windowMinutes = 15): string {
   const parts = new Intl.DateTimeFormat("en-CA", {
@@ -65,6 +66,45 @@ export function planningWindowKey(now: Date, timeZone: string, windowMinutes = 1
   const values = Object.fromEntries(parts.filter((part) => part.type !== "literal").map((part) => [part.type, part.value]));
   const minute = Math.floor(Number(values.minute ?? 0) / windowMinutes) * windowMinutes;
   return `${values.year}-${values.month}-${values.day}T${values.hour}:${String(minute).padStart(2, "0")}`;
+}
+
+export function planApifyRecoveryProbe(input: {
+  workspaceId: string;
+  campaigns: readonly Campaign[];
+  rawNeeded: number;
+  eligible: boolean;
+  dailyBudgetAllowed: boolean;
+  cooldownAt: Date | null;
+  now: Date;
+  timeZone: string;
+}): DiscoveryOrder[] {
+  if (!input.eligible || !input.dailyBudgetAllowed || !input.cooldownAt || input.rawNeeded <= 0) return [];
+  const campaign = input.campaigns
+    .filter((item) => item.status === "active" && item.autopilotEnabled && item.dailySoftTarget > 0
+      && (item.engineType === "maps_fast" || item.engineType === "maps_deep"))
+    .sort((left, right) => {
+      const engineOrder = (left.engineType === "maps_fast" ? 0 : 1) - (right.engineType === "maps_fast" ? 0 : 1);
+      return engineOrder || left.id.localeCompare(right.id);
+    })[0];
+  if (!campaign) return [];
+
+  const desiredRawCount = Math.min(
+    MAX_APIFY_RECOVERY_PROBE_RAW,
+    MAX_RAW_PER_PLANNING_WINDOW,
+    Math.ceil(input.rawNeeded),
+  );
+  if (desiredRawCount <= 0) return [];
+  const planningWindow = planningWindowKey(input.now, input.timeZone);
+  return [{
+    workspaceId: input.workspaceId,
+    campaignId: campaign.id,
+    engineType: campaign.engineType,
+    desiredRawCount,
+    reason: "Apify recovery probe after provider cooldown.",
+    planningWindow,
+    idempotencyKey: `apify-recovery-probe:${input.workspaceId}:${campaign.id}:${input.cooldownAt.toISOString()}`,
+    origin: "recovery_probe",
+  }];
 }
 
 export function resolvePlanningWindow(plannedWindow: string | undefined, now: Date, timeZone: string): string {

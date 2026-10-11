@@ -7,11 +7,11 @@ import { getAutopilotSettings, getAutopilotPacingState, insertRebalanceDecision 
 import { enqueueDiscoveryJob, getCampaignQueueDepth } from "@/infrastructure/neon/repositories/job-queue";
 import { bootstrapSearchSeeds, listSearchSeedsForCampaignEngine } from "@/infrastructure/neon/repositories/discovery";
 import { getApifyRecoverySnapshot, getRecentProviderUsage, getTodaySpendUsd } from "@/infrastructure/neon/repositories/provider-runs";
-import { allocateEngineWork, rerouteEngineOrders, type EnginePlanningPerformance } from "@/services/autopilot/target-planner";
+import { allocateEngineWork, MAX_RAW_PER_PLANNING_WINDOW, planApifyRecoveryProbe, rerouteEngineOrders, type EnginePlanningPerformance } from "@/services/autopilot/target-planner";
 import { getAutopilotEnginePerformance } from "@/infrastructure/neon/repositories/autopilot-engine-performance";
 import { decideHybridFill } from "@/services/discovery/hybrid-fill-decision";
 import { buildEngineCapabilities } from "@/services/autopilot/engine-capability";
-import { evaluateProviderHealth } from "@/services/discovery/provider-health";
+import { getApifyAllocationHealth, evaluateProviderHealth } from "@/services/discovery/provider-health";
 import { buildMapsSeedCatalog, buildSerpSeedCatalog, ICP_CATEGORY_TERMS, LINKEDIN_OWNER_ROLE_QUERIES } from "@/services/discovery/spain-search-catalog";
 import { getDeliveryEnv, getMapsEnv, getSerperEnv } from "@/lib/config/env";
 import { SERPER_ESTIMATED_COST_PER_QUERY_USD } from "@/infrastructure/providers/serp/serper-provider";
@@ -91,7 +91,7 @@ export async function runAutopilotCronTick(now: Date = new Date()): Promise<Auto
     const serperSpendToday = await getTodaySpendUsd(workspaceId, "serper", settings.timezone, now);
     const serperBudgetRemaining = Math.max(0, serperEnv.SERPER_DAILY_COST_LIMIT_USD - serperSpendToday);
     const apifyRecovery = await getApifyRecoverySnapshot(workspaceId, now);
-    const mapsHealth = evaluateProviderHealth(apifyRecovery.usage);
+    const mapsHealth = getApifyAllocationHealth(apifyRecovery);
     const serpHealth = evaluateProviderHealth(await getRecentProviderUsage(workspaceId, "serper"));
     const healths = engineHealths(mapsHealth, serpHealth);
     const allTypes: EngineType[] = ["maps_fast", "maps_deep", "google_serp", "linkedin_owner", "hybrid_fill"];
@@ -128,9 +128,21 @@ export async function runAutopilotCronTick(now: Date = new Date()): Promise<Auto
           : 0,
       };
     }));
+    const planningRawLimit = Math.min(MAX_RAW_PER_PLANNING_WINDOW, Math.ceil(pacing.rawNeededToPlan));
+    const recoveryProbeOrders = planApifyRecoveryProbe({
+      workspaceId,
+      campaigns: concreteCampaigns,
+      rawNeeded: planningRawLimit,
+      eligible: apifyRecovery.recoveryProbeEligible,
+      dailyBudgetAllowed: pacing.apifyDailyBudgetRemaining > 0,
+      cooldownAt: apifyRecovery.nextRecoveryAttemptAt,
+      now,
+      timeZone: settings.timezone,
+    });
+    const recoveryProbeRaw = recoveryProbeOrders.reduce((total, order) => total + order.desiredRawCount, 0);
     let orders = allocateEngineWork({
       workspaceId, campaigns: concreteCampaigns, capabilities, performances,
-      rawNeeded: pacing.rawNeededToPlan, reason: pacing.explanation, now, timeZone: settings.timezone, origin: "normal",
+      rawNeeded: planningRawLimit - recoveryProbeRaw, reason: pacing.explanation, now, timeZone: settings.timezone, origin: "normal",
     });
 
     // Hybrid Fill is a policy: it redirects to an alternative campaign and
@@ -171,6 +183,7 @@ export async function runAutopilotCronTick(now: Date = new Date()): Promise<Auto
         }
       }
     }
+    orders = [...orders, ...recoveryProbeOrders];
 
     for (const order of orders) {
       await enqueueDiscoveryJob({

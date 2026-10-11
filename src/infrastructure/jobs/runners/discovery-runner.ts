@@ -27,7 +27,7 @@ import { getEffectiveAutopilotState } from "@/domain/autopilot/types";
 import { buildMapsSeedCatalog, buildSerpSeedCatalog, LINKEDIN_OWNER_ROLE_QUERIES, ICP_CATEGORY_TERMS } from "@/services/discovery/spain-search-catalog";
 import { createDiscoveryEngine } from "./engine-factory";
 import type { SearchSeed } from "@/domain/discovery/types";
-import { evaluateProviderHealth } from "@/services/discovery/provider-health";
+import { evaluateProviderHealth, getApifyAllocationHealth, resolveApifyDiscoveryWorkMode } from "@/services/discovery/provider-health";
 import { createProviderRequestKey, normalizeProviderQuery } from "@/services/discovery/provider-request-key";
 import { resolvePlanningWindow } from "@/services/autopilot/target-planner";
 
@@ -65,7 +65,7 @@ interface DiscoveryJobPayload {
   desiredRawCount: number;
   planningWindow?: string;
   reason?: string;
-  origin?: "normal" | "rebalance" | "hybrid_fill";
+  origin?: "normal" | "rebalance" | "hybrid_fill" | "recovery_probe";
   seedQuery?: string;
   seedGeography?: string;
 }
@@ -79,6 +79,27 @@ async function executeDiscoveryJob(job: { id: string; campaignId: string; payloa
   const settings = await getAutopilotSettings(campaign.workspaceId);
   if (getEffectiveAutopilotState(settings) !== "running") return 0;
 
+  const provider = job.payload.engineType === "maps_fast" || job.payload.engineType === "maps_deep" ? "apify" : "serper";
+  const apifyRecovery = provider === "apify" ? await getApifyRecoverySnapshot(campaign.workspaceId) : null;
+  const providerHealth = apifyRecovery
+    ? getApifyAllocationHealth(apifyRecovery)
+    : evaluateProviderHealth(await getRecentProviderUsage(campaign.workspaceId, provider));
+  const requestedRecoveryProbe = job.payload.origin === "recovery_probe";
+  const recoveryWorkMode = provider === "apify" && apifyRecovery
+    ? resolveApifyDiscoveryWorkMode({
+      providerHealth,
+      recoveryProbeEligible: apifyRecovery.recoveryProbeEligible,
+      recoveryProbeRequested: requestedRecoveryProbe,
+    })
+    : "normal";
+  if (recoveryWorkMode === "skip") return 0;
+  if (recoveryWorkMode === "defer") {
+    const retryAt = apifyRecovery?.nextRecoveryAttemptAt;
+    if (!retryAt) throw new ProviderConfigurationError("Apify is paused without an eligible recovery time.");
+    throw new ProviderFailureError("Apify provider is in recovery cooldown.", "transient", retryAt);
+  }
+  const recoveryProbe = recoveryWorkMode === "recovery_probe";
+
   const engine = createDiscoveryEngine(campaign.workspaceId, job.payload.engineType, campaign.id);
   // Every concrete engine owns a persisted, idempotent seed catalog. Hybrid
   // Fill is intentionally excluded: it routes work to one of these engines
@@ -89,14 +110,10 @@ async function executeDiscoveryJob(job: { id: string; campaignId: string; payloa
   const persistedSeeds = await listSearchSeedsForCampaignEngine(campaign.id, job.payload.engineType);
   if ("seeds" in engine) (engine as { seeds: SearchSeed[] }).seeds = persistedSeeds;
 
-  const provider = job.payload.engineType === "maps_fast" || job.payload.engineType === "maps_deep" ? "apify" : "serper";
-  const apifyRecovery = provider === "apify" ? await getApifyRecoverySnapshot(campaign.workspaceId) : null;
-  const providerHealth = evaluateProviderHealth(apifyRecovery?.usage ?? await getRecentProviderUsage(campaign.workspaceId, provider));
   // The first provider run stays deliberately small. Once one terminal
   // success establishes health, a job can use the full five-seed planning
   // window (5 × 100 raw), still subject to the per-workspace daily raw and
   // spend guards in reserveApifyProviderRun.
-  const recoveryProbe = provider === "apify" && apifyRecovery?.recoveryProbeEligible === true;
   const bootstrapCap = recoveryProbe || providerHealth === "untested" ? 10 : MAX_SEEDS_PER_JOB * MAX_RAW_PER_SEED;
   const desiredRawCount = Math.min(bootstrapCap, Math.max(0, Math.floor(job.payload.desiredRawCount)));
   if (desiredRawCount <= 0) return 0;
@@ -147,7 +164,7 @@ async function executeDiscoveryJob(job: { id: string; campaignId: string; payloa
         readyCount: 0,
         error: null,
       });
-      await updateProviderRun(reservationId, { metadata: { engineType: job.payload.engineType, seedId: seed.id, seedRunId, discoveryJobId: job.id, query: seed.query, normalizedQuery, geography: seed.geography, planningWindow } });
+      await updateProviderRun(reservationId, { metadata: { engineType: job.payload.engineType, seedId: seed.id, seedRunId, discoveryJobId: job.id, query: seed.query, normalizedQuery, geography: seed.geography, planningWindow, recoveryProbe } });
     }
 
     let result;
@@ -177,7 +194,7 @@ async function executeDiscoveryJob(job: { id: string; campaignId: string; payloa
         externalDatasetId: result.providerRun.externalDatasetId,
         status: result.providerRun.status,
         costUsd: result.providerRun.costUsd,
-        metadata: { ...result.providerRun.metadata, engineType: job.payload.engineType, seedId: seed.id, seedRunId, discoveryJobId: job.id, query: seed.query, geography: seed.geography },
+        metadata: { ...result.providerRun.metadata, engineType: job.payload.engineType, seedId: seed.id, seedRunId, discoveryJobId: job.id, query: seed.query, geography: seed.geography, recoveryProbe },
       });
       continue;
     }

@@ -36,6 +36,24 @@ export interface ApifyRecoverySnapshot {
   nextRecoveryAttemptAt: Date | null;
 }
 
+export type ApifyDiscoveryWorkMode = "normal" | "recovery_probe" | "defer" | "skip";
+
+export function getApifyAllocationHealth(snapshot: ApifyRecoverySnapshot): ProviderHealthStatus {
+  return snapshot.recoveryProbeEligible || snapshot.nextRecoveryAttemptAt !== null
+    ? "paused"
+    : evaluateProviderHealth(snapshot.usage);
+}
+
+export function resolveApifyDiscoveryWorkMode(input: {
+  providerHealth: ProviderHealthStatus;
+  recoveryProbeEligible: boolean;
+  recoveryProbeRequested: boolean;
+}): ApifyDiscoveryWorkMode {
+  if (input.recoveryProbeEligible) return input.recoveryProbeRequested ? "recovery_probe" : "skip";
+  if (input.providerHealth === "paused") return "defer";
+  return input.recoveryProbeRequested ? "skip" : "normal";
+}
+
 function runDate(value: Date | string | null): Date | null {
   if (value === null) return null;
   const date = value instanceof Date ? value : new Date(value);
@@ -73,7 +91,8 @@ export function evaluateApifyRecovery(
     if (["failed", "aborted", "timed_out"].includes(run.status)) usage.errors += 1;
   }
 
-  if (!latestFailure || successAfterFailure || blockedBySafetyGate || latestFailure.failureKind === "configuration" || evaluateProviderHealth(usage) !== "paused") {
+  const providerPaused = evaluateProviderHealth(usage) === "paused" || (latestFailure !== null && !successAfterFailure);
+  if (!latestFailure || successAfterFailure || blockedBySafetyGate || latestFailure.failureKind === "configuration" || !providerPaused) {
     return { usage, recoveryProbeEligible: false, nextRecoveryAttemptAt: null };
   }
 
@@ -93,7 +112,7 @@ export function evaluateApifyRecovery(
     };
   }
 
-  return { usage: emptyUsage, recoveryProbeEligible: true, nextRecoveryAttemptAt: now };
+  return { usage: emptyUsage, recoveryProbeEligible: true, nextRecoveryAttemptAt };
 }
 
 export const DEFAULT_PROVIDER_HEALTH_THRESHOLDS: ProviderHealthThresholds = {

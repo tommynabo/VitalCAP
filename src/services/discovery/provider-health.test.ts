@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { evaluateApifyRecovery, evaluateProviderHealth, hasUnavailableRequiredDiscoveryProvider, isProviderAvailableForDiscovery } from "./provider-health";
+import { evaluateApifyRecovery, evaluateProviderHealth, getApifyAllocationHealth, hasUnavailableRequiredDiscoveryProvider, isProviderAvailableForDiscovery, resolveApifyDiscoveryWorkMode } from "./provider-health";
 
 describe("provider health cold start", () => {
   it("reports zero historical calls as untested", () => {
@@ -87,5 +87,29 @@ describe("Apify recovery health", () => {
 
     const blocked = evaluateApifyRecovery([...priorFailures, failedProbe], failedProbe, null, false, true, new Date("2026-10-11T13:00:00.000Z"));
     expect(blocked.recoveryProbeEligible).toBe(false);
+  });
+
+  it("retains a failed provider outage beyond the recent-usage window until a success or probe", () => {
+    const oldFailure = {
+      ...failedRun,
+      startedAt: "2026-10-08T10:00:00.000Z",
+      finishedAt: "2026-10-08T10:01:00.000Z",
+    };
+    const beforeCooldown = evaluateApifyRecovery([], oldFailure, null, false, false, new Date("2026-10-08T10:15:00.000Z"));
+    expect(beforeCooldown.recoveryProbeEligible).toBe(false);
+    expect(getApifyAllocationHealth(beforeCooldown)).toBe("paused");
+    expect(resolveApifyDiscoveryWorkMode({
+      providerHealth: getApifyAllocationHealth(beforeCooldown),
+      recoveryProbeEligible: beforeCooldown.recoveryProbeEligible,
+      recoveryProbeRequested: false,
+    })).toBe("defer");
+
+    const afterCooldown = evaluateApifyRecovery([], oldFailure, null, false, false, new Date("2026-10-08T10:31:00.000Z"));
+    expect(afterCooldown.recoveryProbeEligible).toBe(true);
+    expect(getApifyAllocationHealth(afterCooldown)).toBe("paused");
+
+    const afterSuccess = evaluateApifyRecovery([], oldFailure, "2026-10-08T10:32:00.000Z", false, false, new Date("2026-10-08T10:33:00.000Z"));
+    expect(afterSuccess.recoveryProbeEligible).toBe(false);
+    expect(getApifyAllocationHealth(afterSuccess)).toBe("untested");
   });
 });

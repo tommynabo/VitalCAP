@@ -1,4 +1,4 @@
-import { and, asc, eq, gte, inArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gte, inArray, sql } from "drizzle-orm";
 import { getDayBounds } from "@/lib/time/day-bounds";
 import { getDb } from "../db";
 import { providerRuns } from "../schema/providers";
@@ -159,19 +159,39 @@ export function buildReserveApifyProviderRunQuery(
 export async function getApifyRecoverySnapshot(workspaceId: string, now = new Date()) {
   const db = getDb();
   const since = new Date(now.getTime() - 24 * 60 * 60 * 1000);
-  const rows = await db.select({
-    status: providerRuns.status,
-    startedAt: providerRuns.startedAt,
-    finishedAt: providerRuns.finishedAt,
-    itemsReturned: providerRuns.itemsReturned,
-    costUsd: providerRuns.costUsd,
-    error: providerRuns.error,
-    metadata: providerRuns.metadata,
-  }).from(providerRuns).where(and(
-    eq(providerRuns.workspaceId, workspaceId),
-    eq(providerRuns.provider, "apify"),
-    gte(providerRuns.startedAt, since),
-  ));
+  const [rows, failureRows, successRows] = await Promise.all([
+    db.select({
+      status: providerRuns.status,
+      startedAt: providerRuns.startedAt,
+      finishedAt: providerRuns.finishedAt,
+      itemsReturned: providerRuns.itemsReturned,
+      costUsd: providerRuns.costUsd,
+      error: providerRuns.error,
+      metadata: providerRuns.metadata,
+    }).from(providerRuns).where(and(
+      eq(providerRuns.workspaceId, workspaceId),
+      eq(providerRuns.provider, "apify"),
+      gte(providerRuns.startedAt, since),
+    )),
+    db.select({
+      status: providerRuns.status,
+      startedAt: providerRuns.startedAt,
+      finishedAt: providerRuns.finishedAt,
+      metadata: providerRuns.metadata,
+    }).from(providerRuns).where(and(
+      eq(providerRuns.workspaceId, workspaceId),
+      eq(providerRuns.provider, "apify"),
+      inArray(providerRuns.status, ["failed", "aborted", "timed_out"]),
+    )).orderBy(desc(sql`COALESCE(${providerRuns.finishedAt}, ${providerRuns.startedAt})`)).limit(1),
+    db.select({
+      startedAt: providerRuns.startedAt,
+      finishedAt: providerRuns.finishedAt,
+    }).from(providerRuns).where(and(
+      eq(providerRuns.workspaceId, workspaceId),
+      eq(providerRuns.provider, "apify"),
+      inArray(providerRuns.status, ["succeeded", "ingested", "completed"]),
+    )).orderBy(desc(sql`COALESCE(${providerRuns.finishedAt}, ${providerRuns.startedAt})`)).limit(1),
+  ]);
   const runs: ApifyRecoveryRun[] = rows.map((row) => {
     const metadata = (row.metadata ?? {}) as Record<string, unknown>;
     const failureKind = metadata.failureKind;
@@ -187,12 +207,19 @@ export async function getApifyRecoverySnapshot(workspaceId: string, now = new Da
         : {}),
     };
   });
-  const failedRuns = runs.filter((run) => ["failed", "aborted", "timed_out"].includes(run.status));
-  const latestFailure = failedRuns.sort((left, right) =>
-    (new Date(right.finishedAt ?? right.startedAt).getTime()) - (new Date(left.finishedAt ?? left.startedAt).getTime()),
-  )[0] ?? null;
-  const latestSuccess = runs.filter((run) => ["succeeded", "ingested", "completed"].includes(run.status))
-    .sort((left, right) => new Date(right.finishedAt ?? right.startedAt).getTime() - new Date(left.finishedAt ?? left.startedAt).getTime())[0];
+  const failureRow = failureRows[0];
+  const failureMetadata = (failureRow?.metadata ?? {}) as Record<string, unknown>;
+  const failureKind = failureMetadata.failureKind;
+  const latestFailure: ApifyRecoveryRun | null = failureRow ? {
+    status: failureRow.status,
+    startedAt: failureRow.startedAt,
+    finishedAt: failureRow.finishedAt,
+    itemsReturned: 0,
+    costUsd: 0,
+    ...(failureKind === "transient" || failureKind === "billing" || failureKind === "authentication" || failureKind === "configuration" || failureKind === "safety"
+      ? { failureKind }
+      : {}),
+  } : null;
   const probeInFlight = runs.some((run) => run.recoveryProbe && ["starting", "queued", "running", "succeeded", "ingesting"].includes(run.status));
   const unreconciled = await db.select({ id: providerRuns.id }).from(providerRuns).where(and(
     eq(providerRuns.workspaceId, workspaceId),
@@ -201,7 +228,7 @@ export async function getApifyRecoverySnapshot(workspaceId: string, now = new Da
   return evaluateApifyRecovery(
     runs,
     latestFailure,
-    latestSuccess?.finishedAt ?? null,
+    successRows[0]?.finishedAt ?? successRows[0]?.startedAt ?? null,
     probeInFlight,
     unreconciled.length > 0,
     now,

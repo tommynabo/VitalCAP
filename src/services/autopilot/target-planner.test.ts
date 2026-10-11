@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import type { Campaign } from "@/domain/campaigns/types";
-import { allocateEngineWork, allocateMapsFastRawNeed, MAX_RAW_PER_PLANNING_WINDOW, planningWindowKey, rerouteEngineOrders, resolvePlanningWindow } from "./target-planner";
+import { buildEngineCapabilities } from "./engine-capability";
+import { getApifyAllocationHealth, resolveApifyDiscoveryWorkMode, evaluateApifyRecovery, evaluateProviderHealth, type ApifyRecoveryRun } from "@/services/discovery/provider-health";
+import { allocateEngineWork, allocateMapsFastRawNeed, MAX_RAW_PER_PLANNING_WINDOW, planApifyRecoveryProbe, planningWindowKey, rerouteEngineOrders, resolvePlanningWindow } from "./target-planner";
 
 function campaign(id: string, target: number, overrides: Partial<Campaign> = {}): Campaign {
   return {
@@ -257,5 +259,121 @@ describe("target planner", () => {
     });
 
     expect(orders.find((order) => order.campaignId === "maps"))?.toMatchObject({ origin: "normal" });
+  });
+});
+
+describe("Apify recovery allocation integration", () => {
+  const originalFailures: ApifyRecoveryRun[] = ["10:00:00", "10:00:01", "10:00:02"].map((time) => ({
+    status: "failed",
+    startedAt: `2026-10-11T${time}.000Z`,
+    finishedAt: `2026-10-11T${time}.000Z`,
+    itemsReturned: 0,
+    costUsd: 0,
+    failureKind: "billing" as const,
+  }));
+  const campaigns = [
+    campaign("maps-fast", 100),
+    campaign("maps-deep", 100, { engineType: "maps_deep" }),
+    campaign("serper", 100, { engineType: "google_serp" }),
+  ];
+  const now = new Date("2026-10-11T12:00:00.000Z");
+
+  function plan(runs: ApifyRecoveryRun[], latestFailure: ApifyRecoveryRun, time: Date) {
+    const latestSuccess = runs
+      .filter((run) => ["succeeded", "ingested", "completed"].includes(run.status))
+      .sort((left, right) => new Date(right.finishedAt ?? right.startedAt).getTime() - new Date(left.finishedAt ?? left.startedAt).getTime())[0];
+    const snapshot = evaluateApifyRecovery(runs, latestFailure, latestSuccess?.finishedAt ?? null, false, false, time);
+    const mapsHealth = getApifyAllocationHealth(snapshot);
+    const capabilities = buildEngineCapabilities({
+      mapsProvider: "apify",
+      mapsProviderConfigured: true,
+      serpProvider: "serper",
+      serpProviderConfigured: true,
+      mapsFastHealth: mapsHealth,
+      providerHealth: {
+        maps_fast: mapsHealth,
+        maps_deep: mapsHealth === "paused" ? "paused" : "healthy",
+        google_serp: "healthy",
+      },
+      costAllowed: true,
+      mapsCostAllowed: true,
+      serperCostAllowed: true,
+      campaignCounts: { maps_fast: 1, maps_deep: 1, google_serp: 1 },
+    });
+    const planningLimit = Math.min(MAX_RAW_PER_PLANNING_WINDOW, 100);
+    const probes = planApifyRecoveryProbe({
+      workspaceId: "workspace-1",
+      campaigns,
+      rawNeeded: planningLimit,
+      eligible: snapshot.recoveryProbeEligible,
+      dailyBudgetAllowed: true,
+      cooldownAt: snapshot.nextRecoveryAttemptAt,
+      now: time,
+      timeZone: "Europe/Madrid",
+    });
+    const normalOrders = allocateEngineWork({
+      workspaceId: "workspace-1",
+      campaigns,
+      capabilities,
+      rawNeeded: planningLimit - probes.reduce((total, order) => total + order.desiredRawCount, 0),
+      reason: "behind pace",
+      now: time,
+      timeZone: "Europe/Madrid",
+    });
+    return { snapshot, mapsHealth, capabilities, probes, normalOrders, planningLimit };
+  }
+
+  it("keeps normal Maps allocation paused while allowing one capped probe, then restores normal allocation only after success", () => {
+    const cooldown = plan(originalFailures, originalFailures[2]!, new Date("2026-10-11T10:15:00.000Z"));
+    expect(cooldown.mapsHealth).toBe("paused");
+    expect(cooldown.capabilities.find((item) => item.engineType === "maps_fast")?.available).toBe(false);
+    expect(cooldown.normalOrders.map((order) => order.engineType)).toEqual(["google_serp"]);
+    expect(cooldown.probes).toHaveLength(0);
+    expect(resolveApifyDiscoveryWorkMode({ providerHealth: "paused", recoveryProbeEligible: false, recoveryProbeRequested: false })).toBe("defer");
+
+    const eligible = plan(originalFailures, originalFailures[2]!, now);
+    expect(eligible.snapshot.recoveryProbeEligible).toBe(true);
+    expect(eligible.snapshot.nextRecoveryAttemptAt?.toISOString()).toBe("2026-10-11T10:30:02.000Z");
+    expect(eligible.mapsHealth).toBe("paused");
+    expect(eligible.capabilities.find((item) => item.engineType === "maps_fast")?.available).toBe(false);
+    expect(eligible.probes).toHaveLength(1);
+    expect(eligible.probes[0]).toMatchObject({ engineType: "maps_fast", desiredRawCount: 10, origin: "recovery_probe" });
+    expect(resolveApifyDiscoveryWorkMode({ providerHealth: "paused", recoveryProbeEligible: true, recoveryProbeRequested: false })).toBe("skip");
+    expect(resolveApifyDiscoveryWorkMode({ providerHealth: "paused", recoveryProbeEligible: true, recoveryProbeRequested: true })).toBe("recovery_probe");
+    expect([...eligible.normalOrders, ...eligible.probes].reduce((sum, order) => sum + order.desiredRawCount, 0)).toBe(eligible.planningLimit);
+    expect(planApifyRecoveryProbe({
+      workspaceId: "workspace-1", campaigns, rawNeeded: 100, eligible: true, dailyBudgetAllowed: true,
+      cooldownAt: eligible.snapshot.nextRecoveryAttemptAt, now, timeZone: "Europe/Madrid",
+    })[0]?.idempotencyKey).toBe(eligible.probes[0]?.idempotencyKey);
+
+    const failedProbe = {
+      status: "failed",
+      startedAt: "2026-10-11T11:59:00.000Z",
+      finishedAt: "2026-10-11T11:59:30.000Z",
+      itemsReturned: 0,
+      costUsd: 0.05,
+      recoveryProbe: true,
+      failureKind: "transient" as const,
+    };
+    const afterProbeFailure = plan([...originalFailures, failedProbe], failedProbe, now);
+    expect(afterProbeFailure.snapshot.recoveryProbeEligible).toBe(false);
+    expect(afterProbeFailure.probes).toHaveLength(0);
+    expect(afterProbeFailure.normalOrders.map((order) => order.engineType)).toEqual(["google_serp"]);
+    expect(resolveApifyDiscoveryWorkMode({ providerHealth: "paused", recoveryProbeEligible: false, recoveryProbeRequested: true })).toBe("defer");
+
+    const successfulProbe = {
+      status: "ingested",
+      startedAt: "2026-10-11T11:59:40.000Z",
+      finishedAt: "2026-10-11T11:59:50.000Z",
+      itemsReturned: 8,
+      costUsd: 0.05,
+      recoveryProbe: true,
+    };
+    const recovered = plan([...originalFailures, failedProbe, successfulProbe], failedProbe, now);
+    expect(evaluateProviderHealth(recovered.snapshot.usage)).toBe("healthy");
+    expect(recovered.mapsHealth).toBe("healthy");
+    expect(recovered.probes).toHaveLength(0);
+    expect(recovered.normalOrders.some((order) => order.engineType === "maps_fast" || order.engineType === "maps_deep")).toBe(true);
+    expect(recovered.normalOrders.reduce((sum, order) => sum + order.desiredRawCount, 0)).toBeLessThanOrEqual(recovered.planningLimit);
   });
 });
