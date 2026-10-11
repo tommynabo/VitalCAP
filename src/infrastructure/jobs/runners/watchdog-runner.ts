@@ -1,4 +1,6 @@
 import { sql } from "drizzle-orm";
+import { PROVIDER_DEFERRED_JOB_ERROR_PREFIX } from "@/domain/discovery/types";
+import { evaluateWatchdogPause } from "@/services/autopilot/watchdog-pause-policy";
 import { getDb } from "../../neon/db";
 import {
   deadLetterExpiredJobs,
@@ -110,56 +112,64 @@ export async function runWatchdogCronTick(): Promise<WatchdogCronResult> {
   const orphanedSeedRuns = orphanedSeeds.rows.length;
 
   // 6. Autopilot System Pause Check (Queue Health) - Workspace Scoped
-  await db.execute(sql`
+  const healthRows = await db.execute(sql`
     WITH workspace_health AS (
-      SELECT 
-        w.id as workspace_id,
-        (SELECT count(*) FROM discovery_jobs dj JOIN campaigns c ON dj.campaign_id = c.id WHERE c.workspace_id = w.id AND dj.status = 'pending' AND (dj.next_attempt_at IS NULL OR dj.next_attempt_at <= NOW()) AND dj.created_at < NOW() - INTERVAL '30 minutes')::int as old_discovery,
-        (SELECT count(*) FROM processing_jobs pj JOIN campaigns c ON pj.campaign_id = c.id WHERE c.workspace_id = w.id AND pj.status = 'pending' AND (pj.next_attempt_at IS NULL OR pj.next_attempt_at <= NOW()) AND pj.created_at < NOW() - INTERVAL '30 minutes')::int as old_processing,
-        (SELECT count(*) FROM discovery_jobs dj JOIN campaigns c ON dj.campaign_id = c.id WHERE c.workspace_id = w.id AND dj.status = 'processing' AND dj.locked_at < NOW() - (${STALE_JOB_LOCK_THRESHOLD_MS / 60_000} * INTERVAL '1 minute'))::int as stuck_discovery,
-        (SELECT count(*) FROM processing_jobs pj JOIN campaigns c ON pj.campaign_id = c.id WHERE c.workspace_id = w.id AND pj.status = 'processing' AND pj.locked_at < NOW() - (${STALE_JOB_LOCK_THRESHOLD_MS / 60_000} * INTERVAL '1 minute'))::int as stuck_processing,
-        (SELECT count(*) FROM provider_runs pr WHERE pr.workspace_id = w.id AND pr.status = 'manual_reconciliation_required')::int as provider_reconciliations
+      SELECT
+        w.id AS workspace_id,
+        (SELECT count(*) FROM discovery_jobs dj JOIN campaigns c ON dj.campaign_id = c.id
+          WHERE c.workspace_id = w.id AND dj.status = 'pending'
+            AND (dj.next_attempt_at IS NULL OR dj.next_attempt_at <= NOW())
+            AND LEFT(COALESCE(dj.last_error, ''), ${PROVIDER_DEFERRED_JOB_ERROR_PREFIX.length}) <> ${PROVIDER_DEFERRED_JOB_ERROR_PREFIX}
+            AND dj.created_at < NOW() - INTERVAL '30 minutes')::int AS old_due_discovery,
+        (SELECT count(*) FROM discovery_jobs dj JOIN campaigns c ON dj.campaign_id = c.id
+          WHERE c.workspace_id = w.id AND dj.status = 'pending'
+            AND (dj.next_attempt_at > NOW() OR LEFT(COALESCE(dj.last_error, ''), ${PROVIDER_DEFERRED_JOB_ERROR_PREFIX.length}) = ${PROVIDER_DEFERRED_JOB_ERROR_PREFIX}))::int AS deferred_discovery,
+        (SELECT count(*) FROM processing_jobs pj JOIN campaigns c ON pj.campaign_id = c.id
+          WHERE c.workspace_id = w.id AND pj.status = 'pending'
+            AND (pj.next_attempt_at IS NULL OR pj.next_attempt_at <= NOW())
+            AND pj.created_at < NOW() - INTERVAL '30 minutes')::int AS old_processing,
+        (SELECT count(*) FROM discovery_jobs dj JOIN campaigns c ON dj.campaign_id = c.id
+          WHERE c.workspace_id = w.id AND dj.status = 'processing'
+            AND dj.locked_at < NOW() - (${STALE_JOB_LOCK_THRESHOLD_MS / 60_000} * INTERVAL '1 minute'))::int AS stuck_discovery,
+        (SELECT count(*) FROM processing_jobs pj JOIN campaigns c ON pj.campaign_id = c.id
+          WHERE c.workspace_id = w.id AND pj.status = 'processing'
+            AND pj.locked_at < NOW() - (${STALE_JOB_LOCK_THRESHOLD_MS / 60_000} * INTERVAL '1 minute'))::int AS stuck_processing,
+        (SELECT count(*) FROM provider_runs pr
+          WHERE pr.workspace_id = w.id AND pr.status = 'manual_reconciliation_required')::int AS provider_reconciliations
       FROM workspaces w
     )
-    UPDATE autopilot_settings aps
-    SET 
-      system_paused = CASE 
-        WHEN aps.system_paused = true AND aps.system_pause_reason NOT IN ('Queue health deteriorated (watchdog)', 'provider_reconciliation') THEN true
-        WHEN wh.provider_reconciliations > 0 THEN true
-        WHEN (wh.old_discovery > 0 OR wh.old_processing > 0 OR wh.stuck_discovery > 0 OR wh.stuck_processing > 0) THEN true 
-        ELSE false 
-      END,
-      system_pause_reason = CASE 
-        WHEN aps.system_paused = true AND aps.system_pause_reason NOT IN ('Queue health deteriorated (watchdog)', 'provider_reconciliation') THEN aps.system_pause_reason
-        WHEN wh.provider_reconciliations > 0 THEN 'provider_reconciliation'
-        WHEN (wh.old_discovery > 0 OR wh.old_processing > 0 OR wh.stuck_discovery > 0 OR wh.stuck_processing > 0) THEN 'Queue health deteriorated (watchdog)' 
-        ELSE NULL 
-      END,
-      system_paused_at = CASE 
-        WHEN aps.system_paused = true AND aps.system_pause_reason NOT IN ('Queue health deteriorated (watchdog)', 'provider_reconciliation') THEN aps.system_paused_at
-        WHEN wh.provider_reconciliations > 0 AND aps.system_paused = false THEN NOW()
-        WHEN (wh.old_discovery > 0 OR wh.old_processing > 0 OR wh.stuck_discovery > 0 OR wh.stuck_processing > 0) AND aps.system_paused = false THEN NOW()
-        WHEN wh.provider_reconciliations = 0 AND NOT (wh.old_discovery > 0 OR wh.old_processing > 0 OR wh.stuck_discovery > 0 OR wh.stuck_processing > 0) THEN NULL
-        ELSE aps.system_paused_at
-      END
+    SELECT wh.*, aps.system_paused, aps.system_pause_reason, aps.system_paused_at
     FROM workspace_health wh
-    WHERE aps.workspace_id = wh.workspace_id
-      AND aps.enabled = true
-      AND (
-        aps.system_paused != CASE 
-          WHEN aps.system_paused = true AND aps.system_pause_reason NOT IN ('Queue health deteriorated (watchdog)', 'provider_reconciliation') THEN true
-          WHEN wh.provider_reconciliations > 0 THEN true 
-          WHEN (wh.old_discovery > 0 OR wh.old_processing > 0 OR wh.stuck_discovery > 0 OR wh.stuck_processing > 0) THEN true 
-          ELSE false 
-        END
-        OR (aps.system_paused = true AND aps.system_pause_reason != CASE 
-          WHEN aps.system_paused = true AND aps.system_pause_reason NOT IN ('Queue health deteriorated (watchdog)', 'provider_reconciliation') THEN aps.system_pause_reason
-          WHEN wh.provider_reconciliations > 0 THEN 'provider_reconciliation' 
-          WHEN (wh.old_discovery > 0 OR wh.old_processing > 0 OR wh.stuck_discovery > 0 OR wh.stuck_processing > 0) THEN 'Queue health deteriorated (watchdog)'
-          ELSE NULL 
-        END)
-      )
+    JOIN autopilot_settings aps ON aps.workspace_id = wh.workspace_id AND aps.enabled = true
   `);
+
+  for (const row of healthRows.rows as Array<Record<string, unknown>>) {
+    const current = {
+      systemPaused: row.system_paused === true,
+      systemPauseReason: typeof row.system_pause_reason === "string" ? row.system_pause_reason : null,
+      systemPausedAt: row.system_paused_at ? new Date(String(row.system_paused_at)) : null,
+    };
+    const decision = evaluateWatchdogPause(current, {
+      oldDueDiscovery: Number(row.old_due_discovery ?? 0),
+      deferredDiscovery: Number(row.deferred_discovery ?? 0),
+      oldProcessing: Number(row.old_processing ?? 0),
+      staleDiscoveryLocks: Number(row.stuck_discovery ?? 0),
+      staleProcessingLocks: Number(row.stuck_processing ?? 0),
+      manualReconciliations: Number(row.provider_reconciliations ?? 0),
+    }, new Date());
+
+    if (decision.systemPaused !== current.systemPaused
+      || decision.systemPauseReason !== current.systemPauseReason
+      || decision.systemPausedAt?.getTime() !== current.systemPausedAt?.getTime()) {
+      await db.execute(sql`
+        UPDATE autopilot_settings
+        SET system_paused = ${decision.systemPaused},
+            system_pause_reason = ${decision.systemPauseReason},
+            system_paused_at = ${decision.systemPausedAt?.toISOString() ?? null}::timestamptz
+        WHERE workspace_id = ${String(row.workspace_id)}::uuid AND enabled = true
+      `);
+    }
+  }
 
   const pausedCount = await db.execute(sql`SELECT count(*) FROM autopilot_settings WHERE system_paused = true`);
   const systemPaused = Number(pausedCount.rows[0]?.count) > 0;

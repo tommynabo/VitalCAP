@@ -44,6 +44,32 @@ describe("evaluateQueueHealth", () => {
     expect(snapshot.healthy).toBe(false);
   });
 
+  it("excludes future-deferred discovery from unhealthy backlog age", () => {
+    const now = new Date("2025-01-01T02:00:00Z");
+    const deferred = job({
+      createdAt: "2025-01-01T00:00:00Z",
+      nextAttemptAt: "2025-01-01T03:00:00Z",
+    });
+    const snapshot = evaluateQueueHealth([deferred], now, { maxHealthyOldestPendingMs: 60 * 60 * 1000 });
+
+    expect(snapshot.pendingCount).toBe(1);
+    expect(snapshot.oldestPendingAgeMs).toBeNull();
+    expect(snapshot.healthy).toBe(true);
+  });
+
+  it("does not treat provider-specific discovery deferral as workspace queue failure", () => {
+    const now = new Date("2025-01-01T02:00:00Z");
+    const deferred = job({
+      createdAt: "2025-01-01T00:00:00Z",
+      lastError: "provider_deferred:Apify billing unavailable",
+    });
+    const snapshot = evaluateQueueHealth([deferred], now, { maxHealthyOldestPendingMs: 60 * 60 * 1000 });
+
+    expect(snapshot.pendingCount).toBe(1);
+    expect(snapshot.oldestPendingAgeMs).toBeNull();
+    expect(snapshot.healthy).toBe(true);
+  });
+
   it("counts dead-letter jobs separately from pending/processing", () => {
     const now = new Date("2025-01-01T00:05:00Z");
     const snapshot = evaluateQueueHealth([job({ status: "dead_letter" }), job()], now);

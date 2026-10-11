@@ -1,4 +1,4 @@
-import type { JobRecord } from "@/domain/discovery/types";
+import { PROVIDER_DEFERRED_JOB_ERROR_PREFIX, type JobRecord } from "@/domain/discovery/types";
 
 /**
  * Queue health signals (Prompt 2 §2.12) derived purely from job records —
@@ -30,11 +30,15 @@ export function evaluateQueueHealth(jobs: readonly JobRecord[], now: Date, optio
   const opts = { ...DEFAULT_OPTIONS, ...options };
 
   const pending = jobs.filter((job) => job.status === "pending");
+  const duePending = pending.filter((job) =>
+    (!job.nextAttemptAt || new Date(job.nextAttemptAt).getTime() <= now.getTime())
+    && !job.lastError?.startsWith(PROVIDER_DEFERRED_JOB_ERROR_PREFIX),
+  );
   const processing = jobs.filter((job) => job.status === "processing");
   const deadLetter = jobs.filter((job) => job.status === "dead_letter");
 
-  const oldestPendingAgeMs = pending.length
-    ? Math.max(...pending.map((job) => now.getTime() - new Date(job.createdAt).getTime()))
+  const oldestPendingAgeMs = duePending.length
+    ? Math.max(...duePending.map((job) => now.getTime() - new Date(job.createdAt).getTime()))
     : null;
 
   const stuckProcessingCount = processing.filter(
