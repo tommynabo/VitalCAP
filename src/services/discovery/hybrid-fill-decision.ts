@@ -12,101 +12,101 @@ import { globalDeficit } from "@/lib/autopilot/targets";
  * job's narrow `{ seed, dryRun }` shape.
  */
 
-export type HybridFillActionType =
-  | "extra_maps_fast_seeds"
-  | "broaden_retail_category"
-  | "expand_google_regions"
-  | "deepen_incomplete_accounts"
-  | "search_owner_high_fit"
-  | "retry_transient_failures"
-  | "switch_healthy_provider";
+export type HybridFillTrigger = "provider_unhealthy" | "engine_unavailable" | "low_end_to_end_yield" | "seed_exhausted" | "queue_saturated";
 
-export interface HybridFillAction {
-  type: HybridFillActionType;
-  targetEngine: EngineType;
-  amount: number;
+export interface HybridFillCandidate {
+  campaignId: string;
+  engineType: EngineType;
+  eligible: boolean;
+  available: boolean;
+  providerHealthy: boolean;
+  yield: number;
+  queueDepth: number;
+  seedExhaustion: number;
+}
+
+export interface HybridFillDecision {
+  sourceCampaignId: string;
+  sourceEngine: EngineType;
+  destinationCampaignIds: string[];
+  trigger: HybridFillTrigger;
   reason: string;
 }
 
-const LOW_YIELD_THRESHOLD = 0.1;
+export interface HybridFillDecisionInput {
+  enabled: boolean;
+  rawDeficit: number;
+  candidates: readonly HybridFillCandidate[];
+}
+
+export interface HybridFillAction extends HybridFillDecision {
+  targetEngine: EngineType;
+  amount: 0;
+}
+
+export const HYBRID_FILL_LOW_YIELD_RATIO = 0.5;
+export const HYBRID_FILL_SEED_EXHAUSTION_THRESHOLD = 0.8;
+export const HYBRID_FILL_QUEUE_SATURATION_THRESHOLD = 1_000;
+
+export function decideHybridFill(input: HybridFillDecisionInput): HybridFillDecision[] {
+  if (!input.enabled || input.rawDeficit <= 0) return [];
+
+  const decisions: HybridFillDecision[] = [];
+  for (const source of input.candidates) {
+    if (!source.eligible || source.engineType === "hybrid_fill") continue;
+    const destinations = input.candidates.filter((candidate) =>
+      candidate.eligible
+      && candidate.campaignId !== source.campaignId
+      && candidate.engineType !== source.engineType
+      && candidate.available
+      && candidate.providerHealthy,
+    );
+    if (!destinations.length) continue;
+
+    const bestAlternativeYield = Math.max(...destinations.map((candidate) => candidate.yield));
+    const trigger: HybridFillTrigger | null = !source.providerHealthy
+      ? "provider_unhealthy"
+      : !source.available
+        ? "engine_unavailable"
+        : source.seedExhaustion >= HYBRID_FILL_SEED_EXHAUSTION_THRESHOLD
+          ? "seed_exhausted"
+          : source.queueDepth >= HYBRID_FILL_QUEUE_SATURATION_THRESHOLD
+            ? "queue_saturated"
+            : source.yield < bestAlternativeYield * HYBRID_FILL_LOW_YIELD_RATIO
+              ? "low_end_to_end_yield"
+              : null;
+    if (!trigger) continue;
+
+    decisions.push({
+      sourceCampaignId: source.campaignId,
+      sourceEngine: source.engineType,
+      destinationCampaignIds: destinations.map((candidate) => candidate.campaignId),
+      trigger,
+      reason: `hybrid_fill: ${source.engineType} ${trigger.replaceAll("_", " ")}; reallocating only this campaign's normal allocation to healthy concrete alternatives.`,
+    });
+  }
+  return decisions;
+}
 
 export function planHybridFillActions(state: GlobalAutopilotState): HybridFillAction[] {
-  const deficit = globalDeficit(state.dailyTarget, state.engines);
-  const actions: HybridFillAction[] = [];
-  const byType = new Map(state.engines.map((engine) => [engine.engineType, engine]));
-
-  for (const engine of state.engines) {
-    if (engine.providerHealth === "degraded") {
-      actions.push({
-        type: "retry_transient_failures",
-        targetEngine: engine.engineType,
-        amount: 0,
-        reason: `${engine.engineType} provider is degraded — retrying transient failures before reallocating its share elsewhere.`,
-      });
-    }
-    if (engine.providerHealth === "paused") {
-      actions.push({
-        type: "switch_healthy_provider",
-        targetEngine: engine.engineType,
-        amount: 0,
-        reason: `${engine.engineType} provider is paused (out of credits or unhealthy) — routing its remaining share to a healthy alternative engine.`,
-      });
-    }
-  }
-
-  if (deficit <= 0) return actions;
-
-  const mapsFast = byType.get("maps_fast");
-  if (mapsFast && mapsFast.providerHealth === "healthy") {
-    if (mapsFast.currentYield < LOW_YIELD_THRESHOLD) {
-      actions.push({
-        type: "broaden_retail_category",
-        targetEngine: "maps_fast",
-        amount: deficit,
-        reason: `Maps Fast yield has dropped to ${mapsFast.currentYield.toFixed(2)} — broadening retail category within campaign scope instead of running more of the same exhausted seeds.`,
-      });
-    } else {
-      const amount = Math.max(1, Math.ceil(deficit * 0.5));
-      actions.push({
-        type: "extra_maps_fast_seeds",
-        targetEngine: "maps_fast",
-        amount,
-        reason: `Global deficit of ${deficit} — Maps Fast is healthy at yield ${mapsFast.currentYield.toFixed(2)}, running ${amount} extra high-yield seeds.`,
-      });
-    }
-  }
-
-  const googleSerp = byType.get("google_serp");
-  if (googleSerp && googleSerp.providerHealth === "healthy") {
-    const amount = Math.max(1, Math.ceil(deficit * 0.3));
-    actions.push({
-      type: "expand_google_regions",
-      targetEngine: "google_serp",
-      amount,
-      reason: `Expanding Google SERP region/category coverage by ${amount} to help close the remaining ${deficit} deficit.`,
+  const candidates: HybridFillCandidate[] = state.engines
+    .filter((engine) => engine.engineType !== "hybrid_fill")
+    .map((engine) => {
+      const healthy = engine.providerHealth === "healthy" || engine.providerHealth === "untested";
+      return {
+        campaignId: engine.engineType,
+        engineType: engine.engineType,
+        eligible: engine.softTarget > 0 && engine.campaignActive !== false && engine.autopilotEnabled !== false,
+        available: healthy && engine.providerConfigured !== false,
+        providerHealthy: healthy && engine.providerConfigured !== false,
+        yield: engine.currentYield,
+        queueDepth: engine.rawQueueDepth + engine.processingQueueDepth,
+        seedExhaustion: 0,
+      };
     });
-  }
-
-  const mapsDeep = byType.get("maps_deep");
-  if (mapsDeep && mapsDeep.rawQueueDepth > 0) {
-    actions.push({
-      type: "deepen_incomplete_accounts",
-      targetEngine: "maps_deep",
-      amount: mapsDeep.rawQueueDepth,
-      reason: `${mapsDeep.rawQueueDepth} accounts already have a website but no verified email — deepening those before spending on new discovery.`,
-    });
-  }
-
-  const linkedinOwner = byType.get("linkedin_owner");
-  if (linkedinOwner && linkedinOwner.providerHealth !== "paused") {
-    const amount = Math.min(deficit, 5);
-    actions.push({
-      type: "search_owner_high_fit",
-      targetEngine: "linkedin_owner",
-      amount,
-      reason: `Searching for owner/titular contacts on ${amount} high-fit accounts to help close the ${deficit} deficit.`,
-    });
-  }
-
-  return actions;
+  return decideHybridFill({
+    enabled: state.engines.some((engine) => engine.engineType === "hybrid_fill"),
+    rawDeficit: globalDeficit(state.dailyTarget, state.engines),
+    candidates,
+  }).map((decision) => ({ ...decision, targetEngine: decision.sourceEngine, amount: 0 }));
 }

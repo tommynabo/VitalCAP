@@ -8,10 +8,12 @@ import { enqueueDiscoveryJob, getCampaignQueueDepth } from "@/infrastructure/neo
 import { bootstrapSearchSeeds, listSearchSeedsForCampaignEngine } from "@/infrastructure/neon/repositories/discovery";
 import { getRecentProviderUsage, getTodaySpendUsd } from "@/infrastructure/neon/repositories/provider-runs";
 import { allocateEngineWork, rerouteEngineOrders, type EnginePlanningPerformance } from "@/services/autopilot/target-planner";
+import { getAutopilotEnginePerformance } from "@/infrastructure/neon/repositories/autopilot-engine-performance";
+import { decideHybridFill } from "@/services/discovery/hybrid-fill-decision";
 import { buildEngineCapabilities } from "@/services/autopilot/engine-capability";
 import { evaluateProviderHealth } from "@/services/discovery/provider-health";
 import { buildMapsSeedCatalog, buildSerpSeedCatalog, ICP_CATEGORY_TERMS, LINKEDIN_OWNER_ROLE_QUERIES } from "@/services/discovery/spain-search-catalog";
-import { getMapsEnv, getSerperEnv } from "@/lib/config/env";
+import { getDeliveryEnv, getMapsEnv, getSerperEnv } from "@/lib/config/env";
 import { SERPER_ESTIMATED_COST_PER_QUERY_USD } from "@/infrastructure/providers/serp/serper-provider";
 import type { SearchSeed } from "@/domain/discovery/types";
 
@@ -47,17 +49,6 @@ function engineHealths(maps: ProviderHealthStatus, serp: ProviderHealthStatus): 
     google_serp: serp,
     linkedin_owner: serp,
     hybrid_fill: maps === "healthy" || serp === "healthy" || maps === "untested" || serp === "untested" ? "healthy" : weakestHealth(maps, serp),
-  };
-}
-
-function performance(campaign: Campaign, seeds: readonly SearchSeed[], queueDepth: number): EnginePlanningPerformance {
-  const raw = seeds.reduce((sum, seed) => sum + seed.totalRaw, 0);
-  const qualified = seeds.reduce((sum, seed) => sum + seed.totalReady, 0);
-  return {
-    campaignId: campaign.id,
-    yield: raw > 0 ? qualified / raw : 0.25,
-    queueDepth,
-    seedExhaustion: seeds.length ? seeds.reduce((sum, seed) => sum + seed.exhaustionScore, 0) / seeds.length : 0,
   };
 }
 
@@ -118,8 +109,24 @@ export async function runAutopilotCronTick(now: Date = new Date()): Promise<Auto
 
     const concreteCampaigns = campaigns.filter((campaign) => campaign.engineType !== "hybrid_fill");
     const seedSets = await Promise.all(concreteCampaigns.map((campaign) => listSearchSeedsForCampaignEngine(campaign.id, campaign.engineType)));
-    const performances = await Promise.all(concreteCampaigns.map(async (campaign, index) =>
-      performance(campaign, seedSets[index] ?? [], await getCampaignQueueDepth(campaign.id))));
+    const enginePerformanceByCampaign = await getAutopilotEnginePerformance(workspaceId, getDeliveryEnv().INSTANTLY_CAMPAIGN_ID, now);
+    const performances: EnginePlanningPerformance[] = await Promise.all(concreteCampaigns.map(async (campaign, index) => {
+      const measured = enginePerformanceByCampaign.get(campaign.id);
+      return {
+        campaignId: campaign.id,
+        yield: measured?.yield ?? 0.1,
+        yieldTier: measured?.yieldTier ?? "neutral_prior",
+        rawCount: measured?.rawCount ?? 0,
+        confirmedImportCount: measured?.confirmedImportCount ?? 0,
+        importRawYield: measured?.importRawYield ?? null,
+        estimatedProviderCostUsd: measured?.estimatedProviderCostUsd ?? null,
+        costPerConfirmedImportUsd: measured?.costPerConfirmedImportUsd ?? null,
+        queueDepth: await getCampaignQueueDepth(campaign.id),
+        seedExhaustion: seedSets[index]?.length
+          ? seedSets[index].reduce((sum, seed) => sum + seed.exhaustionScore, 0) / seedSets[index].length
+          : 0,
+      };
+    }));
     let orders = allocateEngineWork({
       workspaceId, campaigns: concreteCampaigns, capabilities, performances,
       rawNeeded: pacing.rawNeededToPlan, reason: pacing.explanation, now, timeZone: settings.timezone, origin: "normal",
@@ -127,15 +134,41 @@ export async function runAutopilotCronTick(now: Date = new Date()): Promise<Auto
 
     // Hybrid Fill is a policy: it redirects to an alternative campaign and
     // keeps that engine's real source/metrics, avoiding duplicate accounts.
-    const hasHybridPolicy = campaigns.some((campaign) => campaign.engineType === "hybrid_fill");
-    const mapsPerformance = performances.find((item) => concreteCampaigns.find((campaign) => campaign.id === item.campaignId)?.engineType === "maps_fast");
-    if (hasHybridPolicy && ((mapsPerformance?.yield ?? 0.25) < 0.1 || (mapsPerformance?.seedExhaustion ?? 0) >= 0.8)) {
-      orders = rerouteEngineOrders({
-        workspaceId, campaigns: concreteCampaigns, capabilities, performances, orders,
-        rawNeeded: pacing.rawNeededToPlan,
-        reason: "hybrid_fill: Maps Fast underperformed or exhausted; routing only its allocation to a healthy configured alternative.",
-        now, timeZone: settings.timezone, fromEngine: "maps_fast",
-      });
+    const hybridDecisions = decideHybridFill({
+      enabled: campaigns.some((campaign) => campaign.engineType === "hybrid_fill"),
+      rawDeficit: pacing.rawNeededToPlan,
+      candidates: concreteCampaigns.map((campaign) => {
+        const capability = capabilities.find((item) => item.engineType === campaign.engineType);
+        const measured = performances.find((item) => item.campaignId === campaign.id);
+        return {
+          campaignId: campaign.id,
+          engineType: campaign.engineType,
+          eligible: campaign.status === "active" && campaign.autopilotEnabled && campaign.dailySoftTarget > 0,
+          available: Boolean(capability?.available),
+          providerHealthy: Boolean(capability?.providerHealthy),
+          yield: measured?.yield ?? 0.1,
+          queueDepth: measured?.queueDepth ?? 0,
+          seedExhaustion: measured?.seedExhaustion ?? 0,
+        };
+      }),
+    });
+    const hybridRebalances: Array<{ decision: (typeof hybridDecisions)[number]; order: (typeof orders)[number]; amount: number }> = [];
+    if (hybridDecisions.length) {
+      for (const decision of hybridDecisions) {
+        const previousRebalance = new Map(orders.map((order) => [order.campaignId, order.rebalanceAmount ?? 0]));
+        orders = rerouteEngineOrders({
+          workspaceId, campaigns: concreteCampaigns, capabilities, performances, orders,
+          rawNeeded: pacing.rawNeededToPlan,
+          reason: decision.reason,
+          now, timeZone: settings.timezone,
+          fromCampaignIds: [decision.sourceCampaignId],
+          alternativeCampaignIds: decision.destinationCampaignIds,
+        });
+        for (const order of orders) {
+          const amount = (order.rebalanceAmount ?? 0) - (previousRebalance.get(order.campaignId) ?? 0);
+          if (amount > 0) hybridRebalances.push({ decision, order, amount });
+        }
+      }
     }
 
     for (const order of orders) {
@@ -146,15 +179,27 @@ export async function runAutopilotCronTick(now: Date = new Date()): Promise<Auto
         idempotencyKey: order.idempotencyKey,
       });
       ordersScheduled += order.desiredRawCount;
-      if (order.origin === "hybrid_fill") {
-        await insertRebalanceDecision(workspaceId, {
-          fromEngine: "maps_fast", toEngine: order.engineType, amount: order.rebalanceAmount ?? order.desiredRawCount, reason: order.reason,
-          fromCampaignId: null, toCampaignId: order.campaignId,
-          metricSnapshot: { remainingTarget: pacing.remainingTarget, healths },
-          idempotencyKey: `hybrid:${workspaceId}:${order.engineType}:${order.campaignId}:${order.planningWindow}`,
-        });
-        rebalanceDecisionsRecorded += 1;
-      }
+    }
+    for (const rebalance of hybridRebalances) {
+      const { decision, order, amount } = rebalance;
+      const baseKey = `hybrid:${workspaceId}:${order.engineType}:${order.campaignId}:${order.planningWindow}`;
+      await insertRebalanceDecision(workspaceId, {
+        fromEngine: decision.sourceEngine,
+        toEngine: order.engineType,
+        amount,
+        reason: decision.reason,
+        fromCampaignId: decision.sourceCampaignId,
+        toCampaignId: order.campaignId,
+        metricSnapshot: {
+          remainingTarget: pacing.remainingTarget,
+          globalRawDeficit: pacing.rawNeededToPlan,
+          healths,
+          decision,
+          enginePerformance: performances,
+        },
+        idempotencyKey: decision.sourceEngine === "maps_fast" ? baseKey : `${baseKey}:${decision.sourceCampaignId}`,
+      });
+      rebalanceDecisionsRecorded += 1;
     }
   }
   return { campaignsTicked, rebalanceDecisionsRecorded, pausedWorkspaces, emergencyStoppedWorkspaces, systemPausedWorkspaces, pacingStates, ordersScheduled };
