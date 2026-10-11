@@ -50,6 +50,47 @@ describe("target planner", () => {
     expect(orders).toHaveLength(1);
     expect(orders[0]?.desiredRawCount).toBe(MAX_RAW_PER_PLANNING_WINDOW);
     expect(orders[0]?.desiredRawCount).toBeGreaterThan(100);
+    expect(MAX_RAW_PER_PLANNING_WINDOW).toBe(500);
+  });
+
+  it("keeps 250 as one workspace-global raw deficit across engines", () => {
+    const campaigns = [campaign("maps", 250), campaign("serp", 250, { engineType: "google_serp" }), campaign("owner", 250, { engineType: "linkedin_owner" })];
+    const capabilities = campaigns.map((item) => ({
+      engineType: item.engineType,
+      available: true,
+      providerConfigured: true,
+      providerHealthy: true,
+      providerUntested: false,
+      costAllowed: true,
+      campaignCount: 1,
+      reasonUnavailable: null,
+      reason: null,
+    }));
+    const orders = allocateEngineWork({
+      workspaceId: "workspace-1", campaigns, capabilities, rawNeeded: 250, reason: "behind pace",
+      now: new Date("2025-01-01T13:00:00Z"), timeZone: "Europe/Madrid",
+    });
+
+    expect(orders.reduce((total, order) => total + order.desiredRawCount, 0)).toBe(250);
+  });
+
+  it("allocates proportionally to observed confirmed-import/raw yield", () => {
+    const orders = allocateEngineWork({
+      workspaceId: "workspace-1",
+      campaigns: [campaign("high", 100), campaign("low", 100, { engineType: "google_serp" })],
+      capabilities: ["maps_fast", "google_serp"].map((engineType) => ({
+        engineType: engineType as Campaign["engineType"], available: true, providerConfigured: true,
+        providerHealthy: true, providerUntested: false, costAllowed: true, campaignCount: 1,
+        reasonUnavailable: null, reason: null,
+      })),
+      performances: [
+        { campaignId: "high", yield: 0.2, yieldTier: "confirmed_instantly", queueDepth: 0, seedExhaustion: 0 },
+        { campaignId: "low", yield: 0.05, yieldTier: "confirmed_instantly", queueDepth: 0, seedExhaustion: 0 },
+      ],
+      rawNeeded: 100, reason: "behind pace", now: new Date("2025-01-01T13:00:00Z"), timeZone: "Europe/Madrid",
+    });
+
+    expect(orders.find((order) => order.campaignId === "high")?.desiredRawCount).toBeGreaterThan(orders.find((order) => order.campaignId === "low")?.desiredRawCount ?? 0);
   });
 
   it("allocates the one global deficit across configured healthy engines by observed yield", () => {
@@ -82,7 +123,7 @@ describe("target planner", () => {
       campaigns: [campaign("active", 250, { engineType: "maps_deep" }), campaign("paused", 250, { engineType: "google_serp", status: "paused" }), campaign("draft", 250, { engineType: "linkedin_owner", status: "draft" })],
       capabilities: [
         { engineType: "maps_deep", available: true, providerConfigured: true, providerHealthy: true, providerUntested: false, costAllowed: true, campaignCount: 1, reasonUnavailable: null, reason: null },
-        { engineType: "google_serp", available: false, providerConfigured: false, providerHealthy: false, providerUntested: false, costAllowed: true, campaignCount: 1, reasonUnavailable: "provider_not_configured", reason: "provider_not_configured" },
+        { engineType: "google_serp", available: false, providerConfigured: true, providerHealthy: false, providerUntested: false, costAllowed: true, campaignCount: 1, reasonUnavailable: "provider_paused", reason: "provider_paused" },
       ],
       rawNeeded: 500,
       reason: "behind pace",
@@ -153,5 +194,68 @@ describe("target planner", () => {
     expect(rerouted.reduce((total, order) => total + (order.rebalanceAmount ?? 0), 0))
       .toBe(original.find((order) => order.engineType === "maps_fast")?.desiredRawCount);
     expect(rerouted.some((order) => order.origin === "hybrid_fill")).toBe(true);
+  });
+
+  it("reroutes only the Maps campaign selected by Hybrid Fill", () => {
+    const campaigns = [campaign("maps-selected", 100), campaign("maps-competitive", 100), campaign("serp", 100, { engineType: "google_serp" })];
+    const capabilities = ["maps_fast", "google_serp"].map((engineType) => ({
+      engineType: engineType as Campaign["engineType"], available: true, providerConfigured: true,
+      providerHealthy: true, providerUntested: false, costAllowed: true, campaignCount: 1,
+      reasonUnavailable: null, reason: null,
+    }));
+    const input = {
+      workspaceId: "workspace-1", campaigns, capabilities, rawNeeded: 120, reason: "behind pace",
+      now: new Date("2025-01-01T13:00:00Z"), timeZone: "Europe/Madrid",
+    };
+    const original = allocateEngineWork(input);
+    const selectedMapRaw = original.find((order) => order.campaignId === "maps-selected")?.desiredRawCount ?? 0;
+    const rerouted = rerouteEngineOrders({
+      ...input, orders: original, fromEngine: "maps_fast", fromCampaignIds: ["maps-selected"],
+      alternativeCampaignIds: ["serp"], reason: "Maps source underperformed",
+    });
+
+    expect(rerouted.find((order) => order.campaignId === "maps-selected")).toBeUndefined();
+    expect(rerouted.find((order) => order.campaignId === "maps-competitive")).toMatchObject({ origin: "normal" });
+    expect(rerouted.find((order) => order.campaignId === "serp")?.desiredRawCount).toBeGreaterThan(0);
+    expect(rerouted.reduce((sum, order) => sum + order.desiredRawCount, 0)).toBe(120);
+    expect(rerouted.reduce((sum, order) => sum + (order.rebalanceAmount ?? 0), 0)).toBe(selectedMapRaw);
+  });
+
+  it("preserves queue-depth and seed-exhaustion allocation penalties", () => {
+    const orders = allocateEngineWork({
+      workspaceId: "workspace-1",
+      campaigns: [campaign("congested", 100), campaign("clear", 100, { engineType: "google_serp" })],
+      capabilities: ["maps_fast", "google_serp"].map((engineType) => ({
+        engineType: engineType as Campaign["engineType"], available: true, providerConfigured: true,
+        providerHealthy: true, providerUntested: false, costAllowed: true, campaignCount: 1,
+        reasonUnavailable: null, reason: null,
+      })),
+      performances: [
+        { campaignId: "congested", yield: 0.2, queueDepth: 1_000, seedExhaustion: 0.8 },
+        { campaignId: "clear", yield: 0.2, queueDepth: 0, seedExhaustion: 0 },
+      ],
+      rawNeeded: 100, reason: "behind pace", now: new Date("2025-01-01T13:00:00Z"), timeZone: "Europe/Madrid",
+    });
+
+    expect(orders.find((order) => order.campaignId === "clear")?.desiredRawCount).toBeGreaterThan(orders.find((order) => order.campaignId === "congested")?.desiredRawCount ?? 0);
+  });
+
+  it("allows recovered Maps Fast to re-enter normal allocation when its yield is competitive", () => {
+    const orders = allocateEngineWork({
+      workspaceId: "workspace-1",
+      campaigns: [campaign("maps", 100), campaign("serp", 100, { engineType: "google_serp" })],
+      capabilities: ["maps_fast", "google_serp"].map((engineType) => ({
+        engineType: engineType as Campaign["engineType"], available: true, providerConfigured: true,
+        providerHealthy: true, providerUntested: false, costAllowed: true, campaignCount: 1,
+        reasonUnavailable: null, reason: null,
+      })),
+      performances: [
+        { campaignId: "maps", yield: 0.2, yieldTier: "confirmed_instantly", queueDepth: 0, seedExhaustion: 0 },
+        { campaignId: "serp", yield: 0.3, yieldTier: "confirmed_instantly", queueDepth: 0, seedExhaustion: 0 },
+      ],
+      rawNeeded: 100, reason: "behind pace", now: new Date("2025-01-01T13:00:00Z"), timeZone: "Europe/Madrid",
+    });
+
+    expect(orders.find((order) => order.campaignId === "maps"))?.toMatchObject({ origin: "normal" });
   });
 });

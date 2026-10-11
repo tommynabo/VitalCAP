@@ -1,5 +1,6 @@
 import type { Campaign, EngineType } from "@/domain/campaigns/types";
 import type { EngineCapability } from "./engine-capability";
+import { SAFE_ENGINE_YIELD_PRIOR, type EngineYieldTier } from "./engine-performance";
 
 export interface DiscoveryOrder {
   workspaceId: string;
@@ -25,8 +26,14 @@ export interface MapsFastAllocationInput {
 
 export interface EnginePlanningPerformance {
   campaignId: string;
-  /** Historical qualified/raw yield, bounded by the planner. */
+  /** Recent end-to-end yield selected from the engine performance hierarchy. */
   yield: number;
+  yieldTier?: EngineYieldTier;
+  rawCount?: number;
+  confirmedImportCount?: number;
+  importRawYield?: number | null;
+  estimatedProviderCostUsd?: number | null;
+  costPerConfirmedImportUsd?: number | null;
   queueDepth: number;
   seedExhaustion: number;
 }
@@ -86,18 +93,29 @@ export function allocateEngineWork(input: EngineWorkAllocationInput): DiscoveryO
 
   const weighted = eligible.map((campaign) => {
     const performance = performanceByCampaign.get(campaign.id);
-    const yieldWeight = Math.max(0.1, Math.min(1, performance?.yield ?? 0.25));
+    const yieldWeight = Math.max(0, Math.min(1, performance?.yield ?? SAFE_ENGINE_YIELD_PRIOR));
     const queuePenalty = Math.min(0.75, (performance?.queueDepth ?? 0) / 1_000);
     const exhaustionPenalty = Math.min(0.75, performance?.seedExhaustion ?? 0);
     return { campaign, weight: campaign.dailySoftTarget * yieldWeight * (1 - queuePenalty) * (1 - exhaustionPenalty) };
-  }).filter((item) => item.weight > 0);
-  const totalWeight = weighted.reduce((sum, item) => sum + item.weight, 0);
+  });
+  let totalWeight = weighted.reduce((sum, item) => sum + item.weight, 0);
+  if (totalWeight <= 0) {
+    for (const item of weighted) {
+      const performance = performanceByCampaign.get(item.campaign.id);
+      const queuePenalty = Math.min(0.75, (performance?.queueDepth ?? 0) / 1_000);
+      const exhaustionPenalty = Math.min(0.75, performance?.seedExhaustion ?? 0);
+      item.weight = item.campaign.dailySoftTarget * (1 - queuePenalty) * (1 - exhaustionPenalty);
+    }
+    totalWeight = weighted.reduce((sum, item) => sum + item.weight, 0);
+  }
   if (totalWeight <= 0) return [];
+  const allocationWeights = weighted.filter((item) => item.weight > 0);
+  totalWeight = allocationWeights.reduce((sum, item) => sum + item.weight, 0);
 
   const window = planningWindowKey(input.now, input.timeZone);
   let remaining = Math.min(MAX_RAW_PER_PLANNING_WINDOW, Math.ceil(input.rawNeeded));
-  return weighted.flatMap((item, index) => {
-    const share = index === weighted.length - 1 ? remaining : Math.min(remaining, Math.floor((Math.min(MAX_RAW_PER_PLANNING_WINDOW, input.rawNeeded) * item.weight) / totalWeight));
+  return allocationWeights.flatMap((item, index) => {
+    const share = index === allocationWeights.length - 1 ? remaining : Math.min(remaining, Math.floor((Math.min(MAX_RAW_PER_PLANNING_WINDOW, input.rawNeeded) * item.weight) / totalWeight));
     if (share <= 0) return [];
     remaining -= share;
     return [{
@@ -115,17 +133,26 @@ export function allocateEngineWork(input: EngineWorkAllocationInput): DiscoveryO
 
 export function rerouteEngineOrders(input: EngineWorkAllocationInput & {
   orders: readonly DiscoveryOrder[];
-  fromEngine: EngineType;
+  fromEngine?: EngineType;
+  fromCampaignIds?: readonly string[];
+  alternativeCampaignIds?: readonly string[];
   reason: string;
 }): DiscoveryOrder[] {
+  const fromCampaignIds = input.fromCampaignIds ? new Set(input.fromCampaignIds) : null;
+  const alternativeCampaignIds = input.alternativeCampaignIds ? new Set(input.alternativeCampaignIds) : null;
+  const shouldReroute = (order: DiscoveryOrder) => fromCampaignIds
+    ? fromCampaignIds.has(order.campaignId)
+    : order.engineType === input.fromEngine;
   const divertedRaw = input.orders
-    .filter((order) => order.engineType === input.fromEngine)
+    .filter(shouldReroute)
     .reduce((total, order) => total + order.desiredRawCount, 0);
   if (divertedRaw <= 0) return [...input.orders];
 
   const alternatives = allocateEngineWork({
     workspaceId: input.workspaceId,
-    campaigns: input.campaigns.filter((campaign) => campaign.engineType !== input.fromEngine),
+    campaigns: input.campaigns.filter((campaign) => campaign.engineType !== "hybrid_fill"
+      && (!fromCampaignIds ? campaign.engineType !== input.fromEngine : !fromCampaignIds.has(campaign.id))
+      && (!alternativeCampaignIds || alternativeCampaignIds.has(campaign.id))),
     capabilities: input.capabilities,
     performances: input.performances,
     rawNeeded: divertedRaw,
@@ -136,7 +163,7 @@ export function rerouteEngineOrders(input: EngineWorkAllocationInput & {
   });
   const combined = new Map<string, DiscoveryOrder>();
   for (const order of [
-    ...input.orders.filter((item) => item.engineType !== input.fromEngine),
+    ...input.orders.filter((item) => !shouldReroute(item)),
     ...alternatives.map((item) => ({ ...item, rebalanceAmount: item.desiredRawCount })),
   ]) {
     const existing = combined.get(order.campaignId);

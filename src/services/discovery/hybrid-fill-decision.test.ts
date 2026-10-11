@@ -1,70 +1,79 @@
 import { describe, expect, it } from "vitest";
 import type { GlobalAutopilotState } from "@/domain/autopilot/types";
-import { planHybridFillActions } from "./hybrid-fill-decision";
+import { decideHybridFill, planHybridFillActions, type HybridFillCandidate } from "./hybrid-fill-decision";
 
-function state(overrides: Partial<GlobalAutopilotState> = {}): GlobalAutopilotState {
+function candidate(overrides: Partial<HybridFillCandidate> = {}): HybridFillCandidate {
   return {
-    dailyTarget: 250,
-    readyToday: 200,
-    sentToday: 0,
-    repliesToday: 0,
-    meetingsToday: 0,
-    readyBufferDays: 1,
-    systemHealth: "healthy",
-    engines: [
-      { engineType: "maps_fast", softTarget: 50, readyToday: 50, rawQueueDepth: 0, processingQueueDepth: 0, currentYield: 0.4, providerHealth: "healthy", lastRunAt: null, nextPlannedAction: null },
-      { engineType: "maps_deep", softTarget: 50, readyToday: 50, rawQueueDepth: 0, processingQueueDepth: 0, currentYield: 0.3, providerHealth: "healthy", lastRunAt: null, nextPlannedAction: null },
-      { engineType: "google_serp", softTarget: 50, readyToday: 50, rawQueueDepth: 0, processingQueueDepth: 0, currentYield: 0.2, providerHealth: "healthy", lastRunAt: null, nextPlannedAction: null },
-      { engineType: "linkedin_owner", softTarget: 50, readyToday: 32, rawQueueDepth: 0, processingQueueDepth: 0, currentYield: 0.1, providerHealth: "healthy", lastRunAt: null, nextPlannedAction: null },
-      { engineType: "hybrid_fill", softTarget: 50, readyToday: 18, rawQueueDepth: 0, processingQueueDepth: 0, currentYield: 0, providerHealth: "healthy", lastRunAt: null, nextPlannedAction: null },
-    ],
+    campaignId: "maps-campaign",
+    engineType: "maps_fast",
+    eligible: true,
+    available: true,
+    providerHealthy: true,
+    yield: 0.04,
+    queueDepth: 0,
+    seedExhaustion: 0,
     ...overrides,
   };
 }
 
-describe("planHybridFillActions", () => {
-  it("returns no fill actions when the global target is already met", () => {
-    const s = state();
-    for (const engine of s.engines) engine.readyToday = engine.softTarget; // sum(ready) === dailyTarget (250)
-    const actions = planHybridFillActions(s);
-    expect(actions.filter((a) => a.amount > 0 && a.type !== "retry_transient_failures")).toHaveLength(0);
+const alternative = candidate({ campaignId: "serper-campaign", engineType: "google_serp", yield: 0.3 });
+
+describe("canonical Hybrid Fill decision", () => {
+  it("reroutes underperforming Maps work to a healthy concrete campaign", () => {
+    const [decision] = decideHybridFill({ enabled: true, rawDeficit: 100, candidates: [candidate(), alternative] });
+
+    expect(decision).toMatchObject({
+      sourceCampaignId: "maps-campaign",
+      sourceEngine: "maps_fast",
+      destinationCampaignIds: ["serper-campaign"],
+      trigger: "low_end_to_end_yield",
+    });
   });
 
-  it("runs extra Maps Fast seeds when behind target and Maps Fast is healthy with good yield", () => {
-    const actions = planHybridFillActions(state());
-    const mapsFastAction = actions.find((a) => a.targetEngine === "maps_fast");
-    expect(mapsFastAction?.type).toBe("extra_maps_fast_seeds");
-    expect(mapsFastAction?.reason).toContain("deficit");
+  it("reacts to provider health, engine availability, seed exhaustion, and queue saturation", () => {
+    expect(decideHybridFill({ enabled: true, rawDeficit: 10, candidates: [candidate({ providerHealthy: false, available: false }), alternative] })[0]?.trigger).toBe("provider_unhealthy");
+    expect(decideHybridFill({ enabled: true, rawDeficit: 10, candidates: [candidate({ available: false }), alternative] })[0]?.trigger).toBe("engine_unavailable");
+    expect(decideHybridFill({ enabled: true, rawDeficit: 10, candidates: [candidate({ seedExhaustion: 0.8 }), alternative] })[0]?.trigger).toBe("seed_exhausted");
+    expect(decideHybridFill({ enabled: true, rawDeficit: 10, candidates: [candidate({ queueDepth: 1_000, yield: 0.3 }), alternative] })[0]?.trigger).toBe("queue_saturated");
   });
 
-  it("broadens retail category instead of extra seeds when Maps Fast yield is exhausted", () => {
-    const s = state();
-    s.engines[0]!.currentYield = 0.02;
-    const actions = planHybridFillActions(s);
-    expect(actions.find((a) => a.targetEngine === "maps_fast")?.type).toBe("broaden_retail_category");
+  it("lets recovered Maps re-enter when its yield is competitive and inventory is healthy", () => {
+    const decisions = decideHybridFill({
+      enabled: true,
+      rawDeficit: 100,
+      candidates: [candidate({ yield: 0.2 }), alternative],
+    });
+
+    expect(decisions).toEqual([]);
   });
 
-  it("logs a retry action for a degraded provider and a switch action for a paused one", () => {
-    const s = state();
-    s.engines[2]!.providerHealth = "degraded";
-    s.engines[3]!.providerHealth = "paused";
-    const actions = planHybridFillActions(s);
-    expect(actions.some((a) => a.targetEngine === "google_serp" && a.type === "retry_transient_failures")).toBe(true);
-    expect(actions.some((a) => a.targetEngine === "linkedin_owner" && a.type === "switch_healthy_provider")).toBe(true);
+  it("does not create demand when the target is met or no healthy alternative exists", () => {
+    expect(decideHybridFill({ enabled: true, rawDeficit: 0, candidates: [candidate(), alternative] })).toEqual([]);
+    expect(decideHybridFill({
+      enabled: true,
+      rawDeficit: 10,
+      candidates: [candidate({ available: false, providerHealthy: false }), { ...alternative, available: false, providerHealthy: false }],
+    })).toEqual([]);
   });
 
-  it("prioritizes deepening incomplete accounts when Maps Deep has a raw queue backlog", () => {
-    const s = state();
-    s.engines[1]!.rawQueueDepth = 12;
-    const actions = planHybridFillActions(s);
-    const deepenAction = actions.find((a) => a.type === "deepen_incomplete_accounts");
-    expect(deepenAction?.amount).toBe(12);
-  });
+  it("keeps the legacy scheduler adapter demand-neutral", () => {
+    const state: GlobalAutopilotState = {
+      dailyTarget: 250,
+      readyToday: 0,
+      sentToday: 0,
+      repliesToday: 0,
+      meetingsToday: 0,
+      readyBufferDays: 1,
+      systemHealth: "healthy",
+      engines: [
+        { engineType: "maps_fast", softTarget: 100, readyToday: 0, rawQueueDepth: 0, processingQueueDepth: 0, currentYield: 0.01, providerHealth: "healthy", lastRunAt: null, nextPlannedAction: null },
+        { engineType: "google_serp", softTarget: 100, readyToday: 0, rawQueueDepth: 0, processingQueueDepth: 0, currentYield: 0.3, providerHealth: "healthy", lastRunAt: null, nextPlannedAction: null },
+        { engineType: "hybrid_fill", softTarget: 0, readyToday: 0, rawQueueDepth: 0, processingQueueDepth: 0, currentYield: 0, providerHealth: "healthy", lastRunAt: null, nextPlannedAction: null },
+      ],
+    };
+    const [action] = planHybridFillActions(state);
 
-  it("every action carries a non-empty, specific reason string", () => {
-    const actions = planHybridFillActions(state());
-    for (const action of actions) {
-      expect(action.reason.length).toBeGreaterThan(10);
-    }
+    expect(action?.amount).toBe(0);
+    expect(action?.reason).toContain("low end to end yield");
   });
 });

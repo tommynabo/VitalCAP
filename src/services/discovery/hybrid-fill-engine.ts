@@ -8,9 +8,8 @@ import type { EngineType } from "@/domain/campaigns/types";
  * for — this class only satisfies that contract so `DiscoveryRouter` can
  * dispatch `hybrid_fill` seeds uniformly: it delegates the actual raw
  * discovery to whichever underlying engine the seed already targets
- * (`seed.engineType`), then re-tags the resulting candidates as
- * `hybrid_fill` to preserve the fact that Hybrid Fill is what chose to run
- * them, not the engine's own regular schedule.
+ * `seed.engineType`) and preserves that concrete engine type on every
+ * returned candidate.
  */
 export class HybridFillEngine implements DiscoveryEngine {
   readonly engineType = "hybrid_fill" as const;
@@ -38,10 +37,6 @@ export class HybridFillEngine implements DiscoveryEngine {
       return { rawCandidates: [], providerCalls: 0, providerErrors: 0, latencyMs: 0 };
     }
 
-    const result = await delegate.executeDiscovery(input);
-    return {
-      ...result,
-      rawCandidates: result.rawCandidates.map((candidate) => ({ ...candidate, engineType: this.engineType })),
-    };
+      return delegate.executeDiscovery(input);
   }
 }

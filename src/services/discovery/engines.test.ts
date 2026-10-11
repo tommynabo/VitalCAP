@@ -164,12 +164,12 @@ describe("LinkedInOwnerEngine", () => {
 });
 
 describe("HybridFillEngine", () => {
-  it("delegates to the underlying engine matching the seed's engineType and re-tags candidates as hybrid_fill", async () => {
+  it("delegates to the underlying engine matching the seed and preserves concrete source attribution", async () => {
     const mapsFast = new MapsFastEngine(new MockMapsDiscoveryProvider());
     const hybrid = new HybridFillEngine({ maps_fast: mapsFast });
     const result = await hybrid.executeDiscovery({ seed: seed({ engineType: "maps_fast" }), dryRun: true });
     expect(result.rawCandidates.length).toBeGreaterThan(0);
-    expect(result.rawCandidates.every((c) => c.engineType === "hybrid_fill")).toBe(true);
+    expect(result.rawCandidates.every((c) => c.engineType === "maps_fast")).toBe(true);
   });
 
   it("returns an empty result when no delegate is registered for the seed's engine", async () => {
