@@ -1,14 +1,16 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-const { mockListWorkspaceIds, mockGetRecentProviderUsage, mockGetActiveAutopilotDiscoveryEngineTypes } = vi.hoisted(() => ({
+const { mockListWorkspaceIds, mockGetRecentProviderUsage, mockGetActiveAutopilotDiscoveryEngineTypes, mockGetSystemHealthDiagnostics } = vi.hoisted(() => ({
   mockListWorkspaceIds: vi.fn(),
   mockGetRecentProviderUsage: vi.fn(),
   mockGetActiveAutopilotDiscoveryEngineTypes: vi.fn(),
+  mockGetSystemHealthDiagnostics: vi.fn(),
 }));
 
 vi.mock("@/infrastructure/neon/repositories/workspace", () => ({ listWorkspaceIds: mockListWorkspaceIds }));
 vi.mock("@/infrastructure/neon/repositories/provider-runs", () => ({ getRecentProviderUsage: mockGetRecentProviderUsage }));
 vi.mock("@/infrastructure/neon/repositories/diagnostics", () => ({ getActiveAutopilotDiscoveryEngineTypes: mockGetActiveAutopilotDiscoveryEngineTypes }));
+vi.mock("@/infrastructure/neon/repositories/health-diagnostics", () => ({ getSystemHealthDiagnostics: mockGetSystemHealthDiagnostics }));
 
 import { GET } from "./route";
 import { resetServerEnvCacheForTests } from "@/lib/config/env";
@@ -22,6 +24,7 @@ describe("GET /api/health", () => {
     mockListWorkspaceIds.mockReset();
     mockGetRecentProviderUsage.mockReset();
     mockGetActiveAutopilotDiscoveryEngineTypes.mockReset();
+    mockGetSystemHealthDiagnostics.mockReset();
     resetServerEnvCacheForTests();
     resetAuthEnvCacheForTests();
   });
@@ -82,5 +85,99 @@ describe("GET /api/health", () => {
 
     expect(body.serp).toMatchObject({ provider: "serper", configured: true, health: "untested", status: "untested" });
     expect(JSON.stringify(body)).not.toContain("test-secret");
+  });
+
+  it("exposes Maps and Serper health separately with safe failure categories", async () => {
+    process.env.APP_ENV = "development";
+    process.env.DATABASE_URL = "postgresql://health-secret";
+    process.env.MAPS_PROVIDER = "apify";
+    process.env.APIFY_API_TOKEN = "apify-secret";
+    process.env.SERP_PROVIDER = "serper";
+    process.env.SERPER_API_KEY = "serper-secret";
+    mockListWorkspaceIds.mockResolvedValue(["workspace-1"]);
+    mockGetActiveAutopilotDiscoveryEngineTypes.mockResolvedValue(["maps_fast", "google_serp"]);
+    mockGetRecentProviderUsage.mockImplementation(async (_workspaceId: string, provider: string) => ({
+      calls: 3,
+      items: provider === "serper" ? 9 : 1,
+      errors: provider === "serper" ? 0 : 2,
+      totalLatencyMs: 0,
+      costUsd: 0,
+      quotaRemaining: null,
+    }));
+    mockGetSystemHealthDiagnostics.mockResolvedValue({
+      providers: {
+        apify: {
+          recentTerminalCalls: 3,
+          recentErrors: 2,
+          lastSuccessAt: "2026-10-10T10:00:00.000Z",
+          lastFailureAt: "2026-10-11T10:00:00.000Z",
+          lastFailureClass: "billing",
+          budgetAllowed: false,
+        },
+        serper: {
+          recentTerminalCalls: 3,
+          recentErrors: 0,
+          lastSuccessAt: "2026-10-11T10:00:00.000Z",
+          lastFailureAt: null,
+          lastFailureClass: null,
+          budgetAllowed: true,
+        },
+      },
+      autopilotEffectiveState: "running",
+      systemPaused: false,
+      systemPauseReason: null,
+      queue: {
+        duePendingDiscovery: 2,
+        deferredDiscovery: 5,
+        processingPending: 1,
+        staleLocks: 0,
+        manualProviderReconciliations: 0,
+      },
+    });
+    resetServerEnvCacheForTests();
+    resetAuthEnvCacheForTests();
+
+    const response = await GET();
+    const body = await response.json();
+
+    expect(body.maps).toMatchObject({
+      provider: "apify",
+      configured: true,
+      health: "paused",
+      recentTerminalCalls: 3,
+      recentErrors: 2,
+      lastFailureClass: "billing",
+      budgetAllowed: false,
+      providerAvailable: false,
+    });
+    expect(body.serp).toMatchObject({
+      provider: "serper",
+      configured: true,
+      health: "healthy",
+      recentTerminalCalls: 3,
+      recentErrors: 0,
+      budgetAllowed: true,
+      providerAvailable: true,
+    });
+    expect(body).toMatchObject({
+      autopilotEffectiveState: "running",
+      systemPaused: false,
+      queue: { duePendingDiscovery: 2, deferredDiscovery: 5, staleLocks: 0 },
+    });
+    const serialized = JSON.stringify(body);
+    expect(serialized).not.toContain("apify-secret");
+    expect(serialized).not.toContain("serper-secret");
+    expect(serialized).not.toContain("health-secret");
+    expect(serialized).not.toContain("raw provider payload");
+  });
+
+  it("reports mock Maps as configured but not implicitly healthy", async () => {
+    process.env.MAPS_PROVIDER = "mock";
+    resetServerEnvCacheForTests();
+
+    const response = await GET();
+    const body = await response.json();
+
+    expect(body.maps).toMatchObject({ configured: true, health: "untested", providerAvailable: true });
   });
 });

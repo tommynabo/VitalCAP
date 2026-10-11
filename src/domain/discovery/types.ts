@@ -15,6 +15,8 @@ export type JobStatus =
   | "failed"
   | "dead_letter";
 
+export const PROVIDER_DEFERRED_JOB_ERROR_PREFIX = "provider_deferred:";
+
 export interface JobRecord<TPayload = Record<string, unknown>> {
   id: string;
   campaignId: string;

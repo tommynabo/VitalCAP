@@ -33,6 +33,11 @@ export function EngineCard({ engine, timeZone = "Europe/Madrid" }: { engine: Eng
   const status = !providerConfigured ? "NOT CONFIGURED" : engine.providerHealth === "unknown" ? "UNTESTED" : engine.providerHealth.toUpperCase();
   const statusVariant = providerConfigured ? HEALTH_VARIANT[engine.providerHealth] : "danger";
   const queueDepth = engine.rawQueueDepth + engine.processingQueueDepth;
+  const providerName = engine.engineType === "maps_fast"
+    ? "Apify Maps"
+    : engine.engineType === "google_serp" || engine.engineType === "linkedin_owner"
+      ? "Serper"
+      : "Apify Maps + Serper";
 
   return (
     <Card>
@@ -60,8 +65,12 @@ export function EngineCard({ engine, timeZone = "Europe/Madrid" }: { engine: Eng
             <dd className="font-medium text-text">{autopilotEnabled ? "ON" : "OFF"}</dd>
           </div>
           <div>
-            <dt className="text-text-muted">Provider configured</dt>
-            <dd className="font-medium text-text">{providerConfigured ? "YES" : "NO"}</dd>
+            <dt className="text-text-muted">Provider</dt>
+            <dd className="font-medium text-text">{providerName}</dd>
+          </div>
+          <div>
+            <dt className="text-text-muted">Provider health</dt>
+            <dd className="font-medium text-text">{providerConfigured ? engine.providerHealth.toUpperCase() : "NOT CONFIGURED"}</dd>
           </div>
           <div>
             <dt className="text-text-muted">Last run</dt>

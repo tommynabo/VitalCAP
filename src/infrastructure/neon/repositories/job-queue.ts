@@ -1,5 +1,6 @@
 import { and, eq, inArray, sql } from "drizzle-orm";
 import { getDb } from "../db";
+import { PROVIDER_DEFERRED_JOB_ERROR_PREFIX } from "@/domain/discovery/types";
 import { discoveryJobs, processingJobs } from "../schema/discovery";
 import { deadLetterJobs } from "../schema/outreach";
 import type { JobRecord, JobStatus } from "@/domain/discovery/types";
@@ -378,7 +379,10 @@ async function defer(table: QueueTable, input: DeferJobInput): Promise<void> {
 }
 
 export async function deferDiscoveryJob(input: DeferJobInput): Promise<void> {
-  return defer("discovery_jobs", input);
+  return defer("discovery_jobs", {
+    ...input,
+    reason: `${PROVIDER_DEFERRED_JOB_ERROR_PREFIX}${input.reason}`,
+  });
 }
 
 export async function deferProcessingJob(input: DeferJobInput): Promise<void> {
