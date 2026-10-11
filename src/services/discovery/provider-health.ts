@@ -18,6 +18,84 @@ export interface ProviderHealthThresholds {
   minCallsForJudgement: number;
 }
 
+export const APIFY_RECOVERY_COOLDOWN_MS = 30 * 60 * 1000;
+
+export interface ApifyRecoveryRun {
+  status: string;
+  startedAt: Date | string;
+  finishedAt: Date | string | null;
+  itemsReturned: number;
+  costUsd: number;
+  recoveryProbe?: boolean;
+  failureKind?: "transient" | "billing" | "authentication" | "configuration" | "safety";
+}
+
+export interface ApifyRecoverySnapshot {
+  usage: ProviderUsageStats;
+  recoveryProbeEligible: boolean;
+  nextRecoveryAttemptAt: Date | null;
+}
+
+function runDate(value: Date | string | null): Date | null {
+  if (value === null) return null;
+  const date = value instanceof Date ? value : new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+export function evaluateApifyRecovery(
+  recentRuns: readonly ApifyRecoveryRun[],
+  latestFailure: ApifyRecoveryRun | null,
+  latestSuccessAt: Date | string | null,
+  recoveryProbeInFlight: boolean,
+  blockedBySafetyGate: boolean,
+  now = new Date(),
+): ApifyRecoverySnapshot {
+  const emptyUsage: ProviderUsageStats = { calls: 0, items: 0, errors: 0, totalLatencyMs: 0, costUsd: 0, quotaRemaining: null };
+  const successAt = runDate(latestSuccessAt);
+  const failureAt = latestFailure ? runDate(latestFailure.finishedAt) ?? runDate(latestFailure.startedAt) : null;
+  const successAfterFailure = successAt !== null && failureAt !== null && successAt > failureAt;
+  const usageRuns = successAfterFailure
+    ? recentRuns.filter((run) => (runDate(run.finishedAt)?.getTime() ?? runDate(run.startedAt)?.getTime() ?? 0) >= successAt.getTime())
+    : recentRuns;
+  const usage: ProviderUsageStats = {
+    calls: 0,
+    items: 0,
+    errors: 0,
+    totalLatencyMs: 0,
+    costUsd: 0,
+    quotaRemaining: null,
+  };
+  for (const run of usageRuns) {
+    if (!["succeeded", "ingested", "completed", "failed", "aborted", "timed_out"].includes(run.status)) continue;
+    usage.calls += 1;
+    usage.items += run.itemsReturned;
+    usage.costUsd += run.costUsd;
+    if (["failed", "aborted", "timed_out"].includes(run.status)) usage.errors += 1;
+  }
+
+  if (!latestFailure || successAfterFailure || blockedBySafetyGate || latestFailure.failureKind === "configuration" || evaluateProviderHealth(usage) !== "paused") {
+    return { usage, recoveryProbeEligible: false, nextRecoveryAttemptAt: null };
+  }
+
+  const cooldownMs = latestFailure.failureKind === "authentication"
+    ? 6 * 60 * 60 * 1000
+    : latestFailure.failureKind === "safety"
+      ? 60 * 60 * 1000
+      : APIFY_RECOVERY_COOLDOWN_MS;
+  const nextRecoveryAttemptAt = failureAt ? new Date(failureAt.getTime() + cooldownMs) : null;
+  if (!nextRecoveryAttemptAt || now < nextRecoveryAttemptAt || recoveryProbeInFlight) {
+    return {
+      usage,
+      recoveryProbeEligible: false,
+      nextRecoveryAttemptAt: recoveryProbeInFlight && nextRecoveryAttemptAt && nextRecoveryAttemptAt <= now
+        ? new Date(now.getTime() + 5 * 60 * 1000)
+        : nextRecoveryAttemptAt,
+    };
+  }
+
+  return { usage: emptyUsage, recoveryProbeEligible: true, nextRecoveryAttemptAt: now };
+}
+
 export const DEFAULT_PROVIDER_HEALTH_THRESHOLDS: ProviderHealthThresholds = {
   degradedErrorRate: 0.2,
   pausedErrorRate: 0.5,

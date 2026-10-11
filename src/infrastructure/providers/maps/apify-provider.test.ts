@@ -86,6 +86,22 @@ describe("ApifyMapsDiscoveryProvider", () => {
     expect(startActorRun).toHaveBeenCalledWith(expect.any(String), expect.any(Object), { maxTotalChargeUsd: 0.09999999999999964 });
   });
 
+  it("does not count its own idempotent reservation twice during provider budget preflight", async () => {
+    const getTodaySpendUsd = vi.fn().mockResolvedValue(0);
+    const startActorRun = vi.fn().mockResolvedValue({ ...SUCCEEDED_RUN, status: "READY", defaultDatasetId: null });
+    const provider = new ApifyMapsDiscoveryProvider({
+      apiToken: "token",
+      actorId: "compass/crawler-google-places",
+      dailyCostLimitUsd: 10,
+      batchCostLimitUsd: 2,
+      getTodaySpendUsd,
+      client: { runAndWait: vi.fn(), startActorRun, getDatasetItems: vi.fn() },
+    });
+
+    await provider.startAsync({ query: "farmacia", geography: "Madrid", pageToken: null, requestKey: "apify:request-1", maxResults: 10 });
+    expect(getTodaySpendUsd).toHaveBeenCalledWith("apify:request-1");
+  });
+
   it("uses the lower workspace daily cap", async () => {
     const startActorRun = vi.fn();
     const provider = new ApifyMapsDiscoveryProvider({

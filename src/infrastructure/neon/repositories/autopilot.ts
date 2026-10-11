@@ -12,7 +12,7 @@ import type { EngineType } from "@/domain/campaigns/types";
 import type { AutopilotSettings, EngineTargetState, GlobalAutopilotState, ProviderHealthStatus, RebalanceDecision } from "@/domain/autopilot/types";
 import { getDayBounds } from "@/lib/time/day-bounds";
 import { getAutopilotPacingMetrics } from "./autopilot-pacing";
-import { getRecentProviderUsage, getTodaySpendUsd } from "./provider-runs";
+import { getApifyRecoverySnapshot, getRecentProviderUsage, getTodaySpendUsd } from "./provider-runs";
 import { getDeliveryEnv, getMapsEnv, getSerperEnv } from "@/lib/config/env";
 import {
   computeEngineHealthSummary,
@@ -152,7 +152,7 @@ export async function getAutopilotPacingState(workspaceId: string, now = new Dat
   const settings = await getAutopilotSettings(workspaceId);
   const instantlyCampaignId = getDeliveryEnv().INSTANTLY_CAMPAIGN_ID;
   const metrics = await getAutopilotPacingMetrics(workspaceId, settings.timezone, now, instantlyCampaignId);
-  const providerHealth = evaluateProviderHealth(await getRecentProviderUsage(workspaceId, "apify"));
+  const providerHealth = evaluateProviderHealth((await getApifyRecoverySnapshot(workspaceId, now)).usage);
   const serpHealth = evaluateProviderHealth(await getRecentProviderUsage(workspaceId, "serper"));
   const importTarget = settings.targetMetric === "instantly_imported";
   const estimatedYield = importTarget

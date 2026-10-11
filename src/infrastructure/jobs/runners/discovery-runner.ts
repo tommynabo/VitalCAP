@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { EngineType } from "@/domain/campaigns/types";
-import { ProviderBudgetExceededError } from "@/domain/providers/errors";
+import { getProviderFailureRetryAt, ProviderBudgetExceededError, ProviderConfigurationError, ProviderFailureError } from "@/domain/providers/errors";
 import { getCampaignById, listActiveCampaigns } from "@/infrastructure/neon/repositories/campaigns";
 import { listWorkspaceIds } from "@/infrastructure/neon/repositories/workspace";
 import {
@@ -21,7 +21,7 @@ import {
   getRemainingDiscoveryTarget,
   updateSearchSeedRun,
 } from "@/infrastructure/neon/repositories/discovery";
-import { getRecentProviderUsage, reserveApifyProviderRun, updateProviderRun } from "@/infrastructure/neon/repositories/provider-runs";
+import { getApifyRecoverySnapshot, getRecentProviderUsage, reserveApifyProviderRun, updateProviderRun } from "@/infrastructure/neon/repositories/provider-runs";
 import { getAutopilotSettings } from "@/infrastructure/neon/repositories/autopilot";
 import { getEffectiveAutopilotState } from "@/domain/autopilot/types";
 import { buildMapsSeedCatalog, buildSerpSeedCatalog, LINKEDIN_OWNER_ROLE_QUERIES, ICP_CATEGORY_TERMS } from "@/services/discovery/spain-search-catalog";
@@ -90,12 +90,14 @@ async function executeDiscoveryJob(job: { id: string; campaignId: string; payloa
   if ("seeds" in engine) (engine as { seeds: SearchSeed[] }).seeds = persistedSeeds;
 
   const provider = job.payload.engineType === "maps_fast" || job.payload.engineType === "maps_deep" ? "apify" : "serper";
-  const providerHealth = evaluateProviderHealth(await getRecentProviderUsage(campaign.workspaceId, provider));
+  const apifyRecovery = provider === "apify" ? await getApifyRecoverySnapshot(campaign.workspaceId) : null;
+  const providerHealth = evaluateProviderHealth(apifyRecovery?.usage ?? await getRecentProviderUsage(campaign.workspaceId, provider));
   // The first provider run stays deliberately small. Once one terminal
   // success establishes health, a job can use the full five-seed planning
   // window (5 × 100 raw), still subject to the per-workspace daily raw and
   // spend guards in reserveApifyProviderRun.
-  const bootstrapCap = providerHealth === "untested" ? 10 : MAX_SEEDS_PER_JOB * MAX_RAW_PER_SEED;
+  const recoveryProbe = provider === "apify" && apifyRecovery?.recoveryProbeEligible === true;
+  const bootstrapCap = recoveryProbe || providerHealth === "untested" ? 10 : MAX_SEEDS_PER_JOB * MAX_RAW_PER_SEED;
   const desiredRawCount = Math.min(bootstrapCap, Math.max(0, Math.floor(job.payload.desiredRawCount)));
   if (desiredRawCount <= 0) return 0;
   const maxSeeds = Math.min(MAX_SEEDS_PER_JOB, Math.max(1, Math.ceil(desiredRawCount / 10)));
@@ -131,7 +133,8 @@ async function executeDiscoveryJob(job: { id: string; campaignId: string; payloa
         requestKey,
         seedId: seed.id,
         itemsRequested: requestedItems,
-        metadata: { engineType: job.payload.engineType, seedId: seed.id, discoveryJobId: job.id, query: seed.query, normalizedQuery, geography: seed.geography, planningWindow },
+        recoveryProbe,
+        metadata: { engineType: job.payload.engineType, seedId: seed.id, discoveryJobId: job.id, query: seed.query, normalizedQuery, geography: seed.geography, planningWindow, recoveryProbe },
       });
       if (!reservation.created) continue;
       reservationId = reservation.providerRun.id;
@@ -153,7 +156,13 @@ async function executeDiscoveryJob(job: { id: string; campaignId: string; payloa
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       if (reservationId) {
-        await updateProviderRun(reservationId, { status: "failed", finishedAt: new Date(), error: `Provider startup failed: ${message}` });
+        const failureKind = error instanceof ProviderFailureError ? error.kind : null;
+        await updateProviderRun(reservationId, {
+          status: "failed",
+          finishedAt: new Date(),
+          error: `Provider startup failed: ${message}`,
+          metadata: { engineType: job.payload.engineType, seedId: seed.id, seedRunId, discoveryJobId: job.id, query: seed.query, normalizedQuery, geography: seed.geography, planningWindow, recoveryProbe, ...(failureKind ? { failureKind } : {}) },
+        });
       }
       if (seedRunId) await updateSearchSeedRun(seedRunId, { finishedAt: new Date().toISOString(), error: `Provider startup failed: ${message}` });
       throw error;
@@ -257,6 +266,10 @@ export async function runDiscoveryCronTick(maxJobsPerTick: number, now: Date = n
     } catch (error) {
       if (error instanceof ProviderBudgetExceededError) {
         await deferDiscoveryJob({ jobId: job.id, workerId, nextAttemptAt: error.retryAt, reason: error.message });
+      } else if (error instanceof ProviderFailureError && error.retryAt) {
+        await deferDiscoveryJob({ jobId: job.id, workerId, nextAttemptAt: getProviderFailureRetryAt(error, now)!, reason: error.message });
+      } else if (error instanceof ProviderConfigurationError) {
+        await failDiscoveryJob({ workerId, job, error, now, classification: "permanent" });
       } else {
         await failDiscoveryJob({ workerId, job, error, now });
       }

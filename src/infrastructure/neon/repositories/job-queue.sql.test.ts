@@ -1,10 +1,27 @@
 import { PgDialect } from "drizzle-orm/pg-core";
 import { describe, expect, it } from "vitest";
-import { buildDeadLetterExpiredJobsQuery, buildRequeueStaleLockedJobsQuery } from "./job-queue";
+import { buildDeadLetterExpiredJobsQuery, buildDeferJobQuery, buildRequeueStaleLockedJobsQuery } from "./job-queue";
 
 const dialect = new PgDialect();
 
 describe("job queue SQL builders", () => {
+  it("defers a discovery job without retaining a lock or consuming an attempt", () => {
+    const query = dialect.sqlToQuery(buildDeferJobQuery("discovery_jobs", {
+      jobId: "job-1",
+      workerId: "worker-1",
+      nextAttemptAt: new Date("2026-10-11T12:30:00.000Z"),
+      reason: "Apify billing unavailable",
+    }, new Date("2026-10-11T12:00:00.000Z")));
+
+    expect(query.sql).toContain("SET status = 'pending'");
+    expect(query.sql).toContain("locked_at = NULL");
+    expect(query.sql).toContain("locked_by = NULL");
+    expect(query.sql).toContain("GREATEST(attempt_count - 1, 0)");
+    expect(query.sql).toContain("next_attempt_at =");
+    expect(query.params).toContain("2026-10-11T12:30:00.000Z");
+    expect(query.sql).not.toContain("dead_letter");
+  });
+
   it.each(["discovery_jobs", "processing_jobs"] as const)("writes %s dead letters using the current schema", (table) => {
     const query = dialect.sqlToQuery(buildDeadLetterExpiredJobsQuery(table, 300, "Max attempts exceeded"));
 

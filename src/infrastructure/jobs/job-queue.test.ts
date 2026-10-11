@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { JobRecord } from "@/domain/discovery/types";
+import { getProviderFailureRetryAt, ProviderAuthenticationError, ProviderBillingError, ProviderTransientError } from "@/domain/providers/errors";
 import { claimNextJob, completeJob, computeBackoffMs, failJob, isPermanentError } from "./job-queue";
 
 function makeJob(overrides: Partial<JobRecord> = {}): JobRecord {
@@ -75,6 +76,35 @@ describe("isPermanentError", () => {
 
   it("classifies a generic/transient error as non-permanent", () => {
     expect(isPermanentError(new Error("Connection timed out"))).toBe(false);
+  });
+
+  it("does not classify typed Apify auth failures as permanent message-shaped errors", () => {
+    expect(isPermanentError(new ProviderAuthenticationError("Apify HTTP 401 unauthorized", new Date("2026-10-11T12:00:00.000Z")))).toBe(false);
+  });
+});
+
+describe("provider failure retry cooldown", () => {
+  const now = new Date("2026-10-11T12:01:00.000Z");
+
+  it("defers transient HTTP 500 failures beyond the consumed request-key window", () => {
+    const retryAt = getProviderFailureRetryAt(new ProviderTransientError("Apify HTTP 500", now), now);
+    expect(retryAt?.toISOString()).toBe("2026-10-11T12:15:00.000Z");
+  });
+
+  it("defers billing failures for the provider recovery cooldown", () => {
+    const retryAt = getProviderFailureRetryAt(new ProviderBillingError("Apify HTTP 402", now), now);
+    expect(retryAt?.toISOString()).toBe("2026-10-11T12:31:00.000Z");
+  });
+
+  it("defers authentication failures for a long operator-visible cooldown", () => {
+    const retryAt = getProviderFailureRetryAt(new ProviderAuthenticationError("Apify HTTP 403", now), now);
+    expect(retryAt?.toISOString()).toBe("2026-10-11T18:01:00.000Z");
+  });
+
+  it("keeps temporary provider failures retryable even at the logical attempt ceiling", () => {
+    const error = new ProviderBillingError("Apify credits unavailable", now);
+    expect(isPermanentError(error)).toBe(false);
+    expect(failJob(makeJob({ attemptCount: 4, maxAttempts: 5 }), error, now).status).toBe("pending");
   });
 });
 

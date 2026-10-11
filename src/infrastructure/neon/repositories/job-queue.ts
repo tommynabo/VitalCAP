@@ -1,8 +1,10 @@
 import { and, eq, inArray, sql } from "drizzle-orm";
 import { getDb } from "../db";
+import { PROVIDER_DEFERRED_JOB_ERROR_PREFIX } from "@/domain/discovery/types";
 import { discoveryJobs, processingJobs } from "../schema/discovery";
 import { deadLetterJobs } from "../schema/outreach";
 import type { JobRecord, JobStatus } from "@/domain/discovery/types";
+import { ProviderFailureError } from "@/domain/providers/errors";
 import { computeBackoffMs, isPermanentError } from "@/infrastructure/jobs/job-queue";
 
 export const JOB_LEASE_MS = 5 * 60 * 1000;
@@ -165,6 +167,7 @@ function classifyFailure(error: unknown, explicit?: JobFailureClassification): J
   if (explicit) return explicit;
   if (error instanceof PermanentJobError) return "permanent";
   if (error instanceof TransientJobError) return "transient";
+  if (error instanceof ProviderFailureError) return error.kind === "configuration" ? "permanent" : "transient";
   return isPermanentError(error) ? "permanent" : "transient";
 }
 
@@ -345,12 +348,11 @@ interface DeferJobInput {
   reason: string;
 }
 
-async function defer(table: QueueTable, input: DeferJobInput): Promise<void> {
-  const db = getDb();
+export function buildDeferJobQuery(table: QueueTable, input: DeferJobInput, now: Date) {
   const nextAttemptAt = input.nextAttemptAt.toISOString();
-  const now = new Date().toISOString();
-  const result = table === "discovery_jobs"
-    ? await db.execute(sql`
+  const nowIso = now.toISOString();
+  return table === "discovery_jobs"
+    ? sql`
         UPDATE discovery_jobs
         SET status = 'pending',
             locked_at = NULL,
@@ -358,11 +360,11 @@ async function defer(table: QueueTable, input: DeferJobInput): Promise<void> {
             attempt_count = GREATEST(attempt_count - 1, 0),
             next_attempt_at = ${nextAttemptAt}::timestamptz,
             last_error = ${input.reason},
-            updated_at = ${now}::timestamptz
+            updated_at = ${nowIso}::timestamptz
         WHERE id = ${input.jobId}::uuid AND status = 'processing' AND locked_by = ${input.workerId}
         RETURNING id;
-      `)
-    : await db.execute(sql`
+      `
+    : sql`
         UPDATE processing_jobs
         SET status = 'pending',
             locked_at = NULL,
@@ -370,15 +372,23 @@ async function defer(table: QueueTable, input: DeferJobInput): Promise<void> {
             attempt_count = GREATEST(attempt_count - 1, 0),
             next_attempt_at = ${nextAttemptAt}::timestamptz,
             last_error = ${input.reason},
-            updated_at = ${now}::timestamptz
+            updated_at = ${nowIso}::timestamptz
         WHERE id = ${input.jobId}::uuid AND status = 'processing' AND locked_by = ${input.workerId}
         RETURNING id;
-      `);
+      `;
+}
+
+async function defer(table: QueueTable, input: DeferJobInput): Promise<void> {
+  const db = getDb();
+  const result = await db.execute(buildDeferJobQuery(table, input, new Date()));
   if (result.rows.length === 0) throw new LostLeaseError(table, input.jobId, input.workerId);
 }
 
 export async function deferDiscoveryJob(input: DeferJobInput): Promise<void> {
-  return defer("discovery_jobs", input);
+  return defer("discovery_jobs", {
+    ...input,
+    reason: `${PROVIDER_DEFERRED_JOB_ERROR_PREFIX}${input.reason}`,
+  });
 }
 
 export async function deferProcessingJob(input: DeferJobInput): Promise<void> {

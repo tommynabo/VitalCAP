@@ -1,4 +1,5 @@
 import type { JobRecord } from "@/domain/discovery/types";
+import { ProviderFailureError } from "@/domain/providers/errors";
 
 /**
  * Durable job runner primitives (Prompt 2 §2.12): atomic claim/lease,
@@ -54,6 +55,7 @@ export function completeJob<T>(job: JobRecord<T>, now: Date): JobRecord<T> {
 
 /** Classifies whether an error is worth retrying. Permanent errors (bad input, 4xx-shaped) dead-letter immediately. */
 export function isPermanentError(error: unknown): boolean {
+  if (error instanceof ProviderFailureError) return error.kind === "configuration";
   const message = error instanceof Error ? error.message : String(error);
   return /invalid|not[_ ]?found|unauthorized|forbidden|bad[_ ]?request/i.test(message);
 }
