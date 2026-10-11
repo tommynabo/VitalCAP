@@ -3,6 +3,8 @@ import { getDayBounds } from "@/lib/time/day-bounds";
 import { getDb } from "../db";
 import { providerRuns } from "../schema/providers";
 import type { ProviderUsageStats } from "@/domain/providers/types";
+import { ProviderBudgetExceededError, ProviderFailureError, ProviderSafetyError } from "@/domain/providers/errors";
+import { evaluateApifyRecovery, type ApifyRecoveryRun } from "@/services/discovery/provider-health";
 
 export interface RecordProviderRunInput {
   workspaceId: string;
@@ -113,11 +115,102 @@ export interface ReserveApifyProviderRunInput {
   seedId: string;
   itemsRequested: number;
   metadata?: Record<string, unknown>;
+  recoveryProbe?: boolean;
+}
+
+export function buildReserveApifyProviderRunQuery(
+  input: ReserveApifyProviderRunInput,
+  maxRequests: number,
+  maxCost: number,
+  dayStart: Date,
+  expectedCostUsd: number,
+) {
+  return sql`
+    WITH safety AS (
+      SELECT
+        (SELECT COUNT(*) FROM provider_runs WHERE workspace_id = ${input.workspaceId}::uuid AND status = 'manual_reconciliation_required')::int as unreconciled_count,
+        (SELECT COALESCE(SUM(items_requested), 0) FROM provider_runs WHERE workspace_id = ${input.workspaceId}::uuid AND provider = 'apify' AND started_at >= ${dayStart.toISOString()}::timestamptz)::int as requested_today,
+        (SELECT COALESCE(SUM(cost_usd), 0) FROM provider_runs WHERE workspace_id = ${input.workspaceId}::uuid AND provider = 'apify' AND started_at >= ${dayStart.toISOString()}::timestamptz)::numeric as cost_today,
+        (SELECT COUNT(*) FROM provider_runs WHERE workspace_id = ${input.workspaceId}::uuid AND provider = 'apify' AND status IN ('starting', 'queued', 'running', 'succeeded', 'ingesting') AND COALESCE((metadata->>'recoveryProbe')::boolean, false) = true)::int as recovery_probe_count
+    ),
+    inserted AS (
+      INSERT INTO provider_runs (
+        workspace_id, campaign_id, provider, operation, request_key, actor_id, seed_id, status, items_requested, items_returned, cost_usd, metadata, started_at
+      )
+      SELECT
+        ${input.workspaceId}::uuid, ${input.campaignId}::uuid, 'apify', ${input.operation}, ${input.requestKey},
+        ${input.actorId ?? null}, ${input.seedId}::uuid, 'starting', ${input.itemsRequested}, 0, ${expectedCostUsd},
+        ${JSON.stringify({ ...(input.metadata ?? {}), recoveryProbe: input.recoveryProbe ?? false })}::jsonb, NOW()
+      FROM safety
+      WHERE safety.unreconciled_count = 0
+        AND safety.requested_today + ${input.itemsRequested} <= ${maxRequests}
+        AND safety.cost_today + ${expectedCostUsd} <= ${maxCost}
+        AND (${input.recoveryProbe ?? false} = false OR safety.recovery_probe_count = 0)
+      ON CONFLICT (request_key) DO NOTHING
+      RETURNING *
+    )
+    SELECT
+      (SELECT row_to_json(inserted.*) FROM inserted) AS inserted_row,
+      (SELECT row_to_json(safety.*) FROM safety) AS safety_row,
+      (SELECT row_to_json(existing.*) FROM provider_runs existing WHERE existing.request_key = ${input.requestKey}) AS existing_row
+  `;
+}
+
+export async function getApifyRecoverySnapshot(workspaceId: string, now = new Date()) {
+  const db = getDb();
+  const since = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+  const rows = await db.select({
+    status: providerRuns.status,
+    startedAt: providerRuns.startedAt,
+    finishedAt: providerRuns.finishedAt,
+    itemsReturned: providerRuns.itemsReturned,
+    costUsd: providerRuns.costUsd,
+    error: providerRuns.error,
+    metadata: providerRuns.metadata,
+  }).from(providerRuns).where(and(
+    eq(providerRuns.workspaceId, workspaceId),
+    eq(providerRuns.provider, "apify"),
+    gte(providerRuns.startedAt, since),
+  ));
+  const runs: ApifyRecoveryRun[] = rows.map((row) => {
+    const metadata = (row.metadata ?? {}) as Record<string, unknown>;
+    const failureKind = metadata.failureKind;
+    return {
+      status: row.status,
+      startedAt: row.startedAt,
+      finishedAt: row.finishedAt,
+      itemsReturned: row.itemsReturned,
+      costUsd: row.costUsd,
+      recoveryProbe: metadata.recoveryProbe === true,
+      ...(failureKind === "transient" || failureKind === "billing" || failureKind === "authentication" || failureKind === "configuration" || failureKind === "safety"
+        ? { failureKind }
+        : {}),
+    };
+  });
+  const failedRuns = runs.filter((run) => ["failed", "aborted", "timed_out"].includes(run.status));
+  const latestFailure = failedRuns.sort((left, right) =>
+    (new Date(right.finishedAt ?? right.startedAt).getTime()) - (new Date(left.finishedAt ?? left.startedAt).getTime()),
+  )[0] ?? null;
+  const latestSuccess = runs.filter((run) => ["succeeded", "ingested", "completed"].includes(run.status))
+    .sort((left, right) => new Date(right.finishedAt ?? right.startedAt).getTime() - new Date(left.finishedAt ?? left.startedAt).getTime())[0];
+  const probeInFlight = runs.some((run) => run.recoveryProbe && ["starting", "queued", "running", "succeeded", "ingesting"].includes(run.status));
+  const unreconciled = await db.select({ id: providerRuns.id }).from(providerRuns).where(and(
+    eq(providerRuns.workspaceId, workspaceId),
+    eq(providerRuns.status, "manual_reconciliation_required"),
+  )).limit(1);
+  return evaluateApifyRecovery(
+    runs,
+    latestFailure,
+    latestSuccess?.finishedAt ?? null,
+    probeInFlight,
+    unreconciled.length > 0,
+    now,
+  );
 }
 
 export async function reserveApifyProviderRun(input: ReserveApifyProviderRunInput): Promise<{ providerRun: typeof providerRuns.$inferSelect; created: boolean }> {
   const db = getDb();
-  
+
   // 1. Get settings and limits
   const { autopilotSettings } = await import("../schema/autopilot");
   const [settings] = await db.select({
@@ -129,42 +222,16 @@ export async function reserveApifyProviderRun(input: ReserveApifyProviderRunInpu
   const env = await import("@/lib/config/env");
   const maxRequests = env.getCoreEnv().ACTIVATION_MAX_DAILY_RAW_REQUESTS;
   const maxCost = Math.min(env.getMapsEnv().APIFY_DAILY_COST_LIMIT_USD, settings.maxDailySpend ?? Number.POSITIVE_INFINITY);
-  
+
   const { start } = getDayBounds(settings.timezone);
   const expectedCostUsd = input.itemsRequested * 0.005; // conservative
 
   // 2. Atomic insertion with guard conditions in one Neon HTTP statement.
-  const result = await db.execute(sql`
-    WITH safety AS (
-      SELECT
-        (SELECT COUNT(*) FROM provider_runs WHERE workspace_id = ${input.workspaceId}::uuid AND status = 'manual_reconciliation_required')::int as unreconciled_count,
-        (SELECT COALESCE(SUM(items_requested), 0) FROM provider_runs WHERE workspace_id = ${input.workspaceId}::uuid AND provider = 'apify' AND started_at >= ${start.toISOString()}::timestamptz)::int as requested_today,
-        (SELECT COALESCE(SUM(cost_usd), 0) FROM provider_runs WHERE workspace_id = ${input.workspaceId}::uuid AND provider = 'apify' AND started_at >= ${start.toISOString()}::timestamptz)::numeric as cost_today
-    ),
-    inserted AS (
-      INSERT INTO provider_runs (
-        workspace_id, campaign_id, provider, operation, request_key, actor_id, seed_id, status, items_requested, items_returned, cost_usd, metadata, started_at
-      )
-      SELECT
-        ${input.workspaceId}::uuid, ${input.campaignId}::uuid, 'apify', ${input.operation}, ${input.requestKey}, 
-        ${input.actorId ?? null}, ${input.seedId}::uuid, 'starting', ${input.itemsRequested}, 0, ${expectedCostUsd}, 
-        ${JSON.stringify(input.metadata ?? {})}::jsonb, NOW()
-      FROM safety
-      WHERE safety.unreconciled_count = 0
-        AND safety.requested_today + ${input.itemsRequested} <= ${maxRequests}
-        AND safety.cost_today + ${expectedCostUsd} <= ${maxCost}
-      ON CONFLICT (request_key) DO NOTHING
-      RETURNING *
-    )
-    SELECT
-      (SELECT row_to_json(inserted.*) FROM inserted) AS inserted_row,
-      (SELECT row_to_json(safety.*) FROM safety) AS safety_row,
-      (SELECT row_to_json(existing.*) FROM provider_runs existing WHERE existing.request_key = ${input.requestKey}) AS existing_row
-  `);
+  const result = await db.execute(buildReserveApifyProviderRunQuery(input, maxRequests, maxCost, start, expectedCostUsd));
 
   const row = result.rows[0] as {
     inserted_row: unknown;
-    safety_row: { unreconciled_count: number; requested_today: number; cost_today: number } | null;
+    safety_row: { unreconciled_count: number; requested_today: number; cost_today: number; recovery_probe_count: number } | null;
     existing_row: unknown;
   } | undefined;
   if (row?.inserted_row) {
@@ -180,13 +247,18 @@ export async function reserveApifyProviderRun(input: ReserveApifyProviderRunInpu
 
   const safety = row?.safety_row;
   if (safety?.unreconciled_count) {
-    throw new Error(`Provider run reservation rejected: unresolved manual reconciliation required for workspace ${input.workspaceId}`);
+    throw new ProviderSafetyError(`Provider run reservation rejected: unresolved manual reconciliation required for workspace ${input.workspaceId}`);
   }
   if (safety && safety.requested_today + input.itemsRequested > maxRequests) {
-    throw new Error(`Provider run reservation rejected: max daily requests exceeded for workspace ${input.workspaceId}`);
+    const { end: retryAt } = getDayBounds(settings.timezone);
+    throw new ProviderBudgetExceededError(`Provider run reservation rejected: max daily requests exceeded for workspace ${input.workspaceId}`, retryAt, "raw_request_cap");
   }
   if (safety && safety.cost_today + expectedCostUsd > maxCost) {
-    throw new Error(`Provider run reservation rejected: daily cost limit exceeded for workspace ${input.workspaceId}`);
+    const { end: retryAt } = getDayBounds(settings.timezone);
+    throw new ProviderBudgetExceededError(`Provider run reservation rejected: daily cost limit exceeded for workspace ${input.workspaceId}`, retryAt);
+  }
+  if (input.recoveryProbe && safety?.recovery_probe_count) {
+    throw new ProviderSafetyError(`Apify recovery probe is already in progress for workspace ${input.workspaceId}`);
   }
   throw new Error(`Unable to resolve provider run reservation for workspace ${input.workspaceId}`);
 }
@@ -210,12 +282,20 @@ export async function getProviderRunByRequestKey(requestKey: string) {
   return row ?? null;
 }
 
-export async function listApifyRunsForPolling(limit: number) {
+export function buildApifyPollingDuePredicate(now = new Date()) {
+  return sql`(metadata->>'pollRetryAt' IS NULL OR (metadata->>'pollRetryAt')::timestamptz <= ${now.toISOString()}::timestamptz)`;
+}
+
+export async function listApifyRunsForPolling(limit: number, now = new Date()) {
   const db = getDb();
   return db
     .select()
     .from(providerRuns)
-    .where(and(eq(providerRuns.provider, "apify"), inArray(providerRuns.status, ["starting", "queued", "running", "succeeded"])))
+    .where(and(
+      eq(providerRuns.provider, "apify"),
+      inArray(providerRuns.status, ["starting", "queued", "running", "succeeded"]),
+      buildApifyPollingDuePredicate(now),
+    ))
     .orderBy(asc(providerRuns.startedAt), asc(providerRuns.id))
     .limit(limit);
 }
@@ -291,14 +371,20 @@ export async function recoverFailedIngestion(id: string, token: string, workspac
  * - Represents the actual final cost afterward.
  * This budget query accounts conservatively without double-counting.
  */
-export async function getTodaySpendUsd(workspaceId: string, provider: string, timeZone = "Europe/Madrid", now = new Date()): Promise<number> {
+export async function getTodaySpendUsd(workspaceId: string, provider: string, timeZone = "Europe/Madrid", now = new Date(), excludeRequestKey?: string): Promise<number> {
   const db = getDb();
   const { start, end } = getDayBounds(timeZone, now);
 
   const [row] = await db
     .select({ total: sql<number>`coalesce(sum(${providerRuns.costUsd}), 0)` })
     .from(providerRuns)
-    .where(and(eq(providerRuns.workspaceId, workspaceId), eq(providerRuns.provider, provider), gte(providerRuns.startedAt, start), sql`${providerRuns.startedAt} < ${end}`));
+    .where(and(
+      eq(providerRuns.workspaceId, workspaceId),
+      eq(providerRuns.provider, provider),
+      gte(providerRuns.startedAt, start),
+      sql`${providerRuns.startedAt} < ${end}`,
+      ...(excludeRequestKey ? [sql`${providerRuns.requestKey} IS DISTINCT FROM ${excludeRequestKey}`] : []),
+    ));
 
   return row?.total ?? 0;
 }

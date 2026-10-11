@@ -14,6 +14,8 @@
  * shape when mapping results back.
  */
 
+import { ProviderAuthenticationError, ProviderBillingError, ProviderConfigurationError, ProviderFailureError, ProviderTransientError } from "@/domain/providers/errors";
+
 const APIFY_API_BASE_URL = "https://api.apify.com/v2";
 
 export type ApifyRunStatus =
@@ -34,14 +36,39 @@ export interface ApifyRun {
   usageTotalUsd: number | null;
   startedAt: string;
   finishedAt: string | null;
+  statusMessage?: string | null;
 }
 
-export class ApifyRequestError extends Error {
+export function classifyApifyRunFailure(run: Pick<ApifyRun, "id" | "status" | "statusMessage">): ProviderFailureError {
+  const detail = run.statusMessage?.trim() ?? "";
+  const message = `Apify Actor run ${run.id} ended with status ${run.status}${detail ? `: ${detail}` : ""}`;
+  if (/credit|billing|payment|402/i.test(detail)) return new ProviderBillingError(message);
+  if (/unauthori[sz]ed|forbidden|invalid token|authentication|401|403/i.test(detail)) return new ProviderAuthenticationError(message);
+  if (/invalid input|input schema|validation|configuration|bad request/i.test(detail)) return new ProviderConfigurationError(message);
+  return new ProviderTransientError(message);
+}
+
+export class ApifyRequestError extends ProviderFailureError {
   constructor(
     message: string,
     readonly status: number,
   ) {
-    super(message);
+    const now = Date.now();
+    const retryDelay = status === 402
+      ? 30 * 60 * 1000
+      : status === 401 || status === 403
+        ? 6 * 60 * 60 * 1000
+        : status === 408 || status === 425 || status === 429 || status >= 500
+          ? 2 * 60 * 1000
+          : null;
+    const kind = status === 402
+      ? "billing"
+      : status === 401 || status === 403
+        ? "authentication"
+        : retryDelay === null
+          ? "configuration"
+          : "transient";
+    super(message, kind, retryDelay === null ? null : new Date(now + retryDelay));
     this.name = "ApifyRequestError";
   }
 }
@@ -68,12 +95,26 @@ export class ApifyClient {
     return { Authorization: `Bearer ${this.apiToken}`, "Content-Type": "application/json" };
   }
 
+  private async fetch(url: string, init: RequestInit): Promise<Response> {
+    try {
+      return await this.fetchImpl(url, init);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new ProviderTransientError(`Apify network request failed: ${message}`);
+    }
+  }
+
   private async parseOrThrow(response: Response, action: string): Promise<unknown> {
     if (!response.ok) {
       const body = await response.text().catch(() => "");
       throw new ApifyRequestError(`Apify ${action} failed: HTTP ${response.status} ${body}`.trim(), response.status);
     }
-    return response.json();
+    try {
+      return await response.json();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new ProviderTransientError(`Apify ${action} returned invalid JSON: ${message}`);
+    }
   }
 
   /**
@@ -87,7 +128,7 @@ export class ApifyClient {
     if (options.timeoutSecs !== undefined) params.set("timeout", String(options.timeoutSecs));
     const query = params.toString() ? `?${params.toString()}` : "";
 
-    const response = await this.fetchImpl(`${this.baseUrl}/acts/${encodeURIComponent(actorId)}/runs${query}`, {
+    const response = await this.fetch(`${this.baseUrl}/acts/${encodeURIComponent(actorId)}/runs${query}`, {
       method: "POST",
       headers: this.authHeaders(),
       body: JSON.stringify(input),
@@ -97,7 +138,7 @@ export class ApifyClient {
   }
 
   async getActorRun(runId: string): Promise<ApifyRun> {
-    const response = await this.fetchImpl(`${this.baseUrl}/actor-runs/${encodeURIComponent(runId)}`, {
+    const response = await this.fetch(`${this.baseUrl}/actor-runs/${encodeURIComponent(runId)}`, {
       method: "GET",
       headers: this.authHeaders(),
     });
@@ -118,7 +159,7 @@ export class ApifyClient {
     if (options.offset !== undefined) params.set("offset", String(options.offset));
     if (options.limit !== undefined) params.set("limit", String(options.limit));
 
-    const response = await this.fetchImpl(`${this.baseUrl}/datasets/${encodeURIComponent(datasetId)}/items?${params.toString()}`, {
+    const response = await this.fetch(`${this.baseUrl}/datasets/${encodeURIComponent(datasetId)}/items?${params.toString()}`, {
       method: "GET",
       headers: this.authHeaders(),
     });
@@ -126,7 +167,12 @@ export class ApifyClient {
       const body = await response.text().catch(() => "");
       throw new ApifyRequestError(`Apify get dataset items failed: HTTP ${response.status} ${body}`.trim(), response.status);
     }
-    return (await response.json()) as unknown[];
+    try {
+      return (await response.json()) as unknown[];
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new ProviderTransientError(`Apify dataset response returned invalid JSON: ${message}`);
+    }
   }
 
   static readonly TERMINAL_STATUSES: readonly ApifyRunStatus[] = ["SUCCEEDED", "FAILED", "TIMED-OUT", "ABORTED"];

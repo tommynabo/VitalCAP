@@ -2,9 +2,10 @@ import { listWorkspaceIds } from "@/infrastructure/neon/repositories/workspace";
 import { getTodaySpendUsd, listApifyRunsForPolling, updateProviderRun, claimProviderRunForIngestion } from "@/infrastructure/neon/repositories/provider-runs";
 import { getMapsEnv } from "@/lib/config/env";
 import { getAutopilotSettings } from "@/infrastructure/neon/repositories/autopilot";
-import { ApifyClient } from "@/infrastructure/providers/maps/apify-client";
+import { ApifyClient, classifyApifyRunFailure } from "@/infrastructure/providers/maps/apify-client";
 import { mapCompassItemToPlaceResult } from "@/infrastructure/providers/maps/apify-actors/compass-adapter";
 import { ingestApifyProviderRun } from "@/infrastructure/neon/repositories/provider-run-ingestion";
+import { ProviderFailureError } from "@/domain/providers/errors";
 
 const MONITORED_PROVIDERS = ["apify", "serper", "email_verification"] as const;
 const MAX_RUNS_PER_TICK = 20;
@@ -70,12 +71,14 @@ export async function runProviderRunsCronTick(maxRuns = MAX_RUNS_PER_TICK): Prom
 
       if (run.status !== "SUCCEEDED") {
         const terminalStatus = run.status === "ABORTED" ? "aborted" : run.status === "TIMED-OUT" ? "timed_out" : "failed";
+        const failure = classifyApifyRunFailure(run);
         await updateProviderRun(providerRun.id, {
           status: terminalStatus,
           externalDatasetId: run.defaultDatasetId ?? providerRun.externalDatasetId,
           costUsd: usageCost,
           finishedAt: run.finishedAt ? new Date(run.finishedAt) : new Date(),
-          error: `Apify run ended with status ${run.status}`,
+          error: failure.message,
+          metadata: { ...((providerRun.metadata ?? {}) as Record<string, unknown>), failureKind: failure.kind },
         });
         continue;
       }
@@ -143,9 +146,20 @@ export async function runProviderRunsCronTick(maxRuns = MAX_RUNS_PER_TICK): Prom
         candidatesInserted += ingestion.rawCandidatesInserted;
       }
     } catch (error) {
-      warnings.push(`provider_run ${providerRun.id}: ${error instanceof Error ? error.message : String(error)}`);
+      const message = error instanceof Error ? error.message : String(error);
+      warnings.push(`provider_run ${providerRun.id}: ${message}`);
+      if (error instanceof ProviderFailureError && error.retryAt) {
+        await updateProviderRun(providerRun.id, {
+          metadata: {
+            ...((providerRun.metadata ?? {}) as Record<string, unknown>),
+            pollRetryAt: error.retryAt.toISOString(),
+            pollFailureKind: error.kind,
+            lastPollingError: message,
+          },
+        });
+      }
       if (token) {
-        await import("@/infrastructure/neon/repositories/provider-runs").then(m => m.recoverFailedIngestion(providerRun.id, token, providerRun.workspaceId, error instanceof Error ? error.message : String(error)));
+        await import("@/infrastructure/neon/repositories/provider-runs").then(m => m.recoverFailedIngestion(providerRun.id, token, providerRun.workspaceId, message));
       }
     }
   }

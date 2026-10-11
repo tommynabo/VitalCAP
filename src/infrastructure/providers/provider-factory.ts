@@ -1,6 +1,6 @@
 import type { EmailVerificationProvider, MapsDiscoveryProvider, SerpDiscoveryProvider } from "@/domain/providers/types";
 import type { EngineType } from "@/domain/campaigns/types";
-import { ProviderBudgetExceededError } from "@/domain/providers/errors";
+import { ProviderBudgetExceededError, ProviderConfigurationError } from "@/domain/providers/errors";
 import { getMapsEnv, getSerperEnv, getVerificationEnv } from "@/lib/config/env";
 import { MockMapsDiscoveryProvider } from "./maps/mock-provider";
 import { ApifyMapsDiscoveryProvider } from "./maps/apify-provider";
@@ -45,7 +45,7 @@ export function createMapsDiscoveryProvider(workspaceId: string, role: MapsEngin
   if (env.MAPS_PROVIDER === "mock") return new MockMapsDiscoveryProvider();
 
   if (!env.APIFY_API_TOKEN) {
-    throw new Error("MAPS_PROVIDER=apify requires APIFY_API_TOKEN to be set.");
+    throw new ProviderConfigurationError("MAPS_PROVIDER=apify requires APIFY_API_TOKEN to be set.");
   }
 
   const actorId = role === "maps_fast" ? (env.APIFY_MAPS_FAST_ACTOR || "compass/crawler-google-places") : role === "maps_deep" ? (env.APIFY_MAPS_DEEP_ACTOR || "compass/crawler-google-places") : (env.APIFY_MAPS_FALLBACK_ACTOR || "compass/crawler-google-places");
@@ -55,10 +55,11 @@ export function createMapsDiscoveryProvider(workspaceId: string, role: MapsEngin
     actorId,
     dailyCostLimitUsd: env.APIFY_DAILY_COST_LIMIT_USD,
     batchCostLimitUsd: env.APIFY_BATCH_COST_LIMIT_USD,
-    getTodaySpendUsd: async () => {
+    getTodaySpendUsd: async (excludeRequestKey) => {
       const settings = await getAutopilotSettings(workspaceId);
-      return getTodaySpendUsd(workspaceId, "apify", settings.timezone);
+      return getTodaySpendUsd(workspaceId, "apify", settings.timezone, new Date(), excludeRequestKey);
     },
+    getBudgetRetryAt: async () => getDayBounds((await getAutopilotSettings(workspaceId)).timezone).end,
     getAutopilotState: async () => getEffectiveAutopilotState(await getAutopilotSettings(workspaceId)),
     getWorkspaceDailyCostLimitUsd: async () => (await getAutopilotSettings(workspaceId)).maxDailyApifySpendUsd,
     recordRun: (run) =>

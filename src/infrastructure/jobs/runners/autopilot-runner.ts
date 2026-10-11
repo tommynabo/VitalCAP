@@ -6,7 +6,7 @@ import { listWorkspaceIds } from "@/infrastructure/neon/repositories/workspace";
 import { getAutopilotSettings, getAutopilotPacingState, insertRebalanceDecision } from "@/infrastructure/neon/repositories/autopilot";
 import { enqueueDiscoveryJob, getCampaignQueueDepth } from "@/infrastructure/neon/repositories/job-queue";
 import { bootstrapSearchSeeds, listSearchSeedsForCampaignEngine } from "@/infrastructure/neon/repositories/discovery";
-import { getRecentProviderUsage, getTodaySpendUsd } from "@/infrastructure/neon/repositories/provider-runs";
+import { getApifyRecoverySnapshot, getRecentProviderUsage, getTodaySpendUsd } from "@/infrastructure/neon/repositories/provider-runs";
 import { allocateEngineWork, rerouteEngineOrders, type EnginePlanningPerformance } from "@/services/autopilot/target-planner";
 import { buildEngineCapabilities } from "@/services/autopilot/engine-capability";
 import { evaluateProviderHealth } from "@/services/discovery/provider-health";
@@ -99,7 +99,8 @@ export async function runAutopilotCronTick(now: Date = new Date()): Promise<Auto
     const serperEnv = getSerperEnv();
     const serperSpendToday = await getTodaySpendUsd(workspaceId, "serper", settings.timezone, now);
     const serperBudgetRemaining = Math.max(0, serperEnv.SERPER_DAILY_COST_LIMIT_USD - serperSpendToday);
-    const mapsHealth = evaluateProviderHealth(await getRecentProviderUsage(workspaceId, "apify"));
+    const apifyRecovery = await getApifyRecoverySnapshot(workspaceId, now);
+    const mapsHealth = evaluateProviderHealth(apifyRecovery.usage);
     const serpHealth = evaluateProviderHealth(await getRecentProviderUsage(workspaceId, "serper"));
     const healths = engineHealths(mapsHealth, serpHealth);
     const allTypes: EngineType[] = ["maps_fast", "maps_deep", "google_serp", "linkedin_owner", "hybrid_fill"];
