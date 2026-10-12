@@ -9,9 +9,8 @@ import {
   getDeliveryEnv,
 } from "@/lib/config/env";
 import { getAuthEnv } from "@/lib/config/auth-env";
-import { listWorkspaceIds } from "@/infrastructure/neon/repositories/workspace";
 import { getRecentProviderUsage } from "@/infrastructure/neon/repositories/provider-runs";
-import { getActiveAutopilotDiscoveryEngineTypes } from "@/infrastructure/neon/repositories/diagnostics";
+import { getActiveAutopilotDiscoveryEngineTypes, getHealthWorkspaceId } from "@/infrastructure/neon/repositories/diagnostics";
 import { getSystemHealthDiagnostics } from "@/infrastructure/neon/repositories/health-diagnostics";
 import { emptyProviderUsageStats } from "@/domain/providers/types";
 import { accumulateUsage, evaluateProviderHealth, hasUnavailableRequiredDiscoveryProvider } from "@/services/discovery/provider-health";
@@ -54,26 +53,23 @@ export async function GET() {
   let diagnostics: Awaited<ReturnType<typeof getSystemHealthDiagnostics>> | null = null;
   if (dbEnv?.DATABASE_URL) {
     try {
-      const [workspaceIds, engineTypes, systemDiagnostics] = await Promise.all([
-        listWorkspaceIds(),
-        getActiveAutopilotDiscoveryEngineTypes(),
+      const workspaceId = await getHealthWorkspaceId(deliveryEnv?.INSTANTLY_CAMPAIGN_ID ?? "");
+      if (!workspaceId) throw new Error("Unable to resolve a unique health workspace.");
+      const [engineTypes, systemDiagnostics, mapsUsage, serpUsage] = await Promise.all([
+        getActiveAutopilotDiscoveryEngineTypes(workspaceId),
         getSystemHealthDiagnostics({
+          workspaceId,
           now: new Date(),
           mapsDailyBudgetUsd: mapsEnv?.APIFY_DAILY_COST_LIMIT_USD ?? 0,
           serperDailyBudgetUsd: serpEnv?.SERPER_DAILY_COST_LIMIT_USD ?? 0,
         }),
+        getRecentProviderUsage(workspaceId, "apify"),
+        getRecentProviderUsage(workspaceId, "serper"),
       ]);
       diagnostics = systemDiagnostics;
       if (hasUnavailableRequiredDiscoveryProvider(engineTypes, mapsConfigured, serpConfigured)) status = "degraded";
-      const [mapsUsages, serpUsages] = await Promise.all([
-        Promise.all(workspaceIds.map((workspaceId) => getRecentProviderUsage(workspaceId, "apify"))),
-        Promise.all(workspaceIds.map((workspaceId) => getRecentProviderUsage(workspaceId, "serper"))),
-      ]);
-      if (mapsConfigured) mapsHealth = evaluateProviderHealth(mapsUsages.reduce(accumulateUsage, emptyProviderUsageStats()));
-      if (serpConfigured) {
-        const usage = serpUsages.reduce(accumulateUsage, emptyProviderUsageStats());
-        serpHealth = evaluateProviderHealth(usage);
-      }
+      if (mapsConfigured) mapsHealth = evaluateProviderHealth(mapsUsage);
+      if (serpConfigured) serpHealth = evaluateProviderHealth(serpUsage);
     } catch {
       status = "degraded";
       if (mapsConfigured) mapsHealth = "unknown";
@@ -129,8 +125,11 @@ export async function GET() {
     queue: diagnostics?.queue ?? {
       duePendingDiscovery: 0,
       deferredDiscovery: 0,
+      discoveryProcessing: 0,
+      discoveryStaleLocks: 0,
       processingPending: 0,
-      staleLocks: 0,
+      processingProcessing: 0,
+      processingStaleLocks: 0,
       manualProviderReconciliations: 0,
     },
     intelligence: {

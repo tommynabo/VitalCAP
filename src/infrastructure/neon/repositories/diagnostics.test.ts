@@ -2,21 +2,25 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const query = vi.hoisted(() => ({
   select: vi.fn(),
+  selectDistinct: vi.fn(),
   from: vi.fn(),
+  innerJoin: vi.fn(),
   where: vi.fn(),
 }));
 
 vi.mock("../db", () => ({
-  getDb: () => ({ select: query.select }),
+  getDb: () => ({ select: query.select, selectDistinct: query.selectDistinct }),
 }));
 
-import { getEmailVerificationUsage } from "./diagnostics";
+import { getEmailVerificationUsage, getHealthWorkspaceId } from "./diagnostics";
 
 describe("getEmailVerificationUsage", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     query.select.mockReturnValue({ from: query.from });
-    query.from.mockReturnValue({ where: query.where });
+    query.selectDistinct.mockReturnValue({ from: query.from });
+    query.from.mockReturnValue({ where: query.where, innerJoin: query.innerJoin });
+    query.innerJoin.mockReturnValue({ where: query.where });
   });
 
   it.each([
@@ -60,5 +64,30 @@ describe("getEmailVerificationUsage", () => {
       costUsd: 12.34,
       quotaRemaining: null,
     });
+  });
+
+  it("resolves the workspace from a configured Instantly provider mapping first", async () => {
+    query.where.mockResolvedValueOnce([{ workspaceId: "mapped-workspace" }]);
+
+    await expect(getHealthWorkspaceId("provider-campaign-id")).resolves.toBe("mapped-workspace");
+    expect(query.selectDistinct).toHaveBeenCalledTimes(1);
+  });
+
+  it("falls back to the unique workspace in target import history", async () => {
+    query.where
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([{ workspaceId: "import-workspace" }]);
+
+    await expect(getHealthWorkspaceId("provider-campaign-id")).resolves.toBe("import-workspace");
+    expect(query.selectDistinct).toHaveBeenCalledTimes(2);
+  });
+
+  it("fails closed when target imports span multiple workspaces", async () => {
+    query.where
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([{ workspaceId: "workspace-a" }, { workspaceId: "workspace-b" }]);
+
+    await expect(getHealthWorkspaceId("provider-campaign-id")).resolves.toBeNull();
+    expect(query.selectDistinct).toHaveBeenCalledTimes(2);
   });
 });

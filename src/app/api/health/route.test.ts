@@ -1,27 +1,26 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-const { mockListWorkspaceIds, mockGetRecentProviderUsage, mockGetActiveAutopilotDiscoveryEngineTypes, mockGetSystemHealthDiagnostics } = vi.hoisted(() => ({
-  mockListWorkspaceIds: vi.fn(),
+const { mockGetHealthWorkspaceId, mockGetRecentProviderUsage, mockGetActiveAutopilotDiscoveryEngineTypes, mockGetSystemHealthDiagnostics } = vi.hoisted(() => ({
+  mockGetHealthWorkspaceId: vi.fn(),
   mockGetRecentProviderUsage: vi.fn(),
   mockGetActiveAutopilotDiscoveryEngineTypes: vi.fn(),
   mockGetSystemHealthDiagnostics: vi.fn(),
 }));
 
-vi.mock("@/infrastructure/neon/repositories/workspace", () => ({ listWorkspaceIds: mockListWorkspaceIds }));
 vi.mock("@/infrastructure/neon/repositories/provider-runs", () => ({ getRecentProviderUsage: mockGetRecentProviderUsage }));
-vi.mock("@/infrastructure/neon/repositories/diagnostics", () => ({ getActiveAutopilotDiscoveryEngineTypes: mockGetActiveAutopilotDiscoveryEngineTypes }));
+vi.mock("@/infrastructure/neon/repositories/diagnostics", () => ({ getHealthWorkspaceId: mockGetHealthWorkspaceId, getActiveAutopilotDiscoveryEngineTypes: mockGetActiveAutopilotDiscoveryEngineTypes }));
 vi.mock("@/infrastructure/neon/repositories/health-diagnostics", () => ({ getSystemHealthDiagnostics: mockGetSystemHealthDiagnostics }));
 
 import { GET } from "./route";
 import { resetServerEnvCacheForTests } from "@/lib/config/env";
 import { resetAuthEnvCacheForTests } from "@/lib/config/auth-env";
 
-const environmentNames = ["APP_ENV", "VERCEL_ENV", "DEV_SEED_MODE", "DATABASE_URL", "MAPS_PROVIDER", "SERP_PROVIDER", "SERPER_API_KEY", "SERPER_COUNTRY", "SERPER_LANGUAGE", "SERPER_DAILY_COST_LIMIT_USD", "DEFAULT_DELIVERY_MODE", "NEON_AUTH_BASE_URL", "NEON_AUTH_COOKIE_SECRET", "APIFY_API_TOKEN"];
+const environmentNames = ["APP_ENV", "VERCEL_ENV", "DEV_SEED_MODE", "DATABASE_URL", "MAPS_PROVIDER", "SERP_PROVIDER", "SERPER_API_KEY", "SERPER_COUNTRY", "SERPER_LANGUAGE", "SERPER_DAILY_COST_LIMIT_USD", "DEFAULT_DELIVERY_MODE", "INSTANTLY_CAMPAIGN_ID", "NEON_AUTH_BASE_URL", "NEON_AUTH_COOKIE_SECRET", "APIFY_API_TOKEN"];
 
 describe("GET /api/health", () => {
   afterEach(() => {
     for (const name of environmentNames) delete process.env[name];
-    mockListWorkspaceIds.mockReset();
+    mockGetHealthWorkspaceId.mockReset();
     mockGetRecentProviderUsage.mockReset();
     mockGetActiveAutopilotDiscoveryEngineTypes.mockReset();
     mockGetSystemHealthDiagnostics.mockReset();
@@ -61,7 +60,7 @@ describe("GET /api/health", () => {
     process.env.APP_ENV = "development";
     process.env.DATABASE_URL = "postgresql://health-test";
     process.env.SERP_PROVIDER = "disabled";
-    mockListWorkspaceIds.mockResolvedValue(["workspace-1"]);
+    mockGetHealthWorkspaceId.mockResolvedValue("workspace-1");
     mockGetActiveAutopilotDiscoveryEngineTypes.mockResolvedValue(["google_serp"]);
     resetServerEnvCacheForTests();
     resetAuthEnvCacheForTests();
@@ -94,7 +93,8 @@ describe("GET /api/health", () => {
     process.env.APIFY_API_TOKEN = "apify-secret";
     process.env.SERP_PROVIDER = "serper";
     process.env.SERPER_API_KEY = "serper-secret";
-    mockListWorkspaceIds.mockResolvedValue(["workspace-1"]);
+    process.env.INSTANTLY_CAMPAIGN_ID = "055534c5-c3e3-414f-b140-f4770b293c00";
+    mockGetHealthWorkspaceId.mockResolvedValue("workspace-1");
     mockGetActiveAutopilotDiscoveryEngineTypes.mockResolvedValue(["maps_fast", "google_serp"]);
     mockGetRecentProviderUsage.mockImplementation(async (_workspaceId: string, provider: string) => ({
       calls: 3,
@@ -139,6 +139,12 @@ describe("GET /api/health", () => {
 
     const response = await GET();
     const body = await response.json();
+
+    expect(mockGetHealthWorkspaceId).toHaveBeenCalledWith("055534c5-c3e3-414f-b140-f4770b293c00");
+    expect(mockGetActiveAutopilotDiscoveryEngineTypes).toHaveBeenCalledWith("workspace-1");
+    expect(mockGetSystemHealthDiagnostics).toHaveBeenCalledWith(expect.objectContaining({ workspaceId: "workspace-1" }));
+    expect(mockGetRecentProviderUsage).toHaveBeenCalledWith("workspace-1", "apify");
+    expect(mockGetRecentProviderUsage).toHaveBeenCalledWith("workspace-1", "serper");
 
     expect(body.maps).toMatchObject({
       provider: "apify",

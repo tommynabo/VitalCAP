@@ -19,8 +19,11 @@ export interface SystemHealthDiagnostics {
   queue: {
     duePendingDiscovery: number;
     deferredDiscovery: number;
+    discoveryProcessing: number;
+    discoveryStaleLocks: number;
     processingPending: number;
-    staleLocks: number;
+    processingProcessing: number;
+    processingStaleLocks: number;
     manualProviderReconciliations: number;
   };
 }
@@ -49,6 +52,7 @@ function emptyProviderDiagnostics(budgetAllowed: boolean): ProviderHealthDiagnos
 }
 
 export async function getSystemHealthDiagnostics(input: {
+  workspaceId: string;
   now: Date;
   mapsDailyBudgetUsd: number;
   serperDailyBudgetUsd: number;
@@ -75,13 +79,14 @@ export async function getSystemHealthDiagnostics(input: {
             ELSE 'provider_error'
           END
           FROM provider_runs failure
-          WHERE failure.provider = run.provider AND failure.status IN ('failed', 'aborted', 'timed_out')
+          WHERE failure.workspace_id = run.workspace_id AND failure.provider = run.provider
+            AND failure.status IN ('failed', 'aborted', 'timed_out')
           ORDER BY COALESCE(failure.finished_at, failure.started_at) DESC
           LIMIT 1
         ) AS last_failure_class
       FROM provider_runs run
-      WHERE run.provider IN ('apify', 'serper')
-      GROUP BY run.provider
+      WHERE run.provider IN ('apify', 'serper') AND run.workspace_id = ${input.workspaceId}::uuid
+      GROUP BY run.provider, run.workspace_id
     `),
     db.execute(sql`
       SELECT settings.workspace_id,
@@ -94,6 +99,7 @@ export async function getSystemHealthDiagnostics(input: {
         AND run.provider IN ('apify', 'serper')
         AND run.started_at >= ((date_trunc('day', ${input.now.toISOString()}::timestamptz AT TIME ZONE settings.timezone)) AT TIME ZONE settings.timezone)
         AND run.started_at < ${input.now.toISOString()}::timestamptz
+      WHERE settings.workspace_id = ${input.workspaceId}::uuid
       GROUP BY settings.workspace_id, settings.max_daily_apify_spend_usd, settings.timezone
     `),
     db.execute(sql`
@@ -111,6 +117,7 @@ export async function getSystemHealthDiagnostics(input: {
             ELSE 'other'
           END AS pause_reason
         FROM autopilot_settings
+        WHERE workspace_id = ${input.workspaceId}::uuid
       )
       SELECT COUNT(*)::int AS settings_count,
         COUNT(DISTINCT effective_state)::int AS effective_state_count,
@@ -127,18 +134,28 @@ export async function getSystemHealthDiagnostics(input: {
     db.execute(sql`
       SELECT
         (SELECT COUNT(*) FROM discovery_jobs job JOIN campaigns campaign ON campaign.id = job.campaign_id
-          WHERE job.status = 'pending' AND (job.next_attempt_at IS NULL OR job.next_attempt_at <= ${input.now.toISOString()}::timestamptz)
+          WHERE job.status = 'pending' AND campaign.workspace_id = ${input.workspaceId}::uuid
+            AND (job.next_attempt_at IS NULL OR job.next_attempt_at <= ${input.now.toISOString()}::timestamptz)
             AND LEFT(COALESCE(job.last_error, ''), ${PROVIDER_DEFERRED_JOB_ERROR_PREFIX.length}) <> ${PROVIDER_DEFERRED_JOB_ERROR_PREFIX})::int AS due_pending_discovery,
-        (SELECT COUNT(*) FROM discovery_jobs job
-          WHERE job.status = 'pending' AND (job.next_attempt_at > ${input.now.toISOString()}::timestamptz
-            OR LEFT(COALESCE(job.last_error, ''), ${PROVIDER_DEFERRED_JOB_ERROR_PREFIX.length}) = ${PROVIDER_DEFERRED_JOB_ERROR_PREFIX}))::int AS deferred_discovery,
-        (SELECT COUNT(*) FROM processing_jobs job
-          WHERE job.status = 'pending' AND (job.next_attempt_at IS NULL OR job.next_attempt_at <= ${input.now.toISOString()}::timestamptz))::int AS processing_pending,
-        ((SELECT COUNT(*) FROM discovery_jobs job WHERE job.status = 'processing'
-            AND job.locked_at < ${new Date(input.now.getTime() - 15 * 60_000).toISOString()}::timestamptz)
-          + (SELECT COUNT(*) FROM processing_jobs job WHERE job.status = 'processing'
-            AND job.locked_at < ${new Date(input.now.getTime() - 15 * 60_000).toISOString()}::timestamptz))::int AS stale_locks,
-        (SELECT COUNT(*) FROM provider_runs run WHERE run.status = 'manual_reconciliation_required')::int AS manual_provider_reconciliations
+        (SELECT COUNT(*) FROM discovery_jobs job JOIN campaigns campaign ON campaign.id = job.campaign_id
+          WHERE job.status = 'pending' AND campaign.workspace_id = ${input.workspaceId}::uuid
+            AND (job.next_attempt_at > ${input.now.toISOString()}::timestamptz
+              OR LEFT(COALESCE(job.last_error, ''), ${PROVIDER_DEFERRED_JOB_ERROR_PREFIX.length}) = ${PROVIDER_DEFERRED_JOB_ERROR_PREFIX}))::int AS deferred_discovery,
+        (SELECT COUNT(*) FROM discovery_jobs job JOIN campaigns campaign ON campaign.id = job.campaign_id
+          WHERE job.status = 'processing' AND campaign.workspace_id = ${input.workspaceId}::uuid)::int AS discovery_processing,
+        (SELECT COUNT(*) FROM discovery_jobs job JOIN campaigns campaign ON campaign.id = job.campaign_id
+          WHERE job.status = 'processing' AND campaign.workspace_id = ${input.workspaceId}::uuid
+            AND job.locked_at < ${new Date(input.now.getTime() - 15 * 60_000).toISOString()}::timestamptz)::int AS discovery_stale_locks,
+        (SELECT COUNT(*) FROM processing_jobs job JOIN campaigns campaign ON campaign.id = job.campaign_id
+          WHERE job.status = 'pending' AND campaign.workspace_id = ${input.workspaceId}::uuid
+            AND (job.next_attempt_at IS NULL OR job.next_attempt_at <= ${input.now.toISOString()}::timestamptz))::int AS processing_pending,
+        (SELECT COUNT(*) FROM processing_jobs job JOIN campaigns campaign ON campaign.id = job.campaign_id
+          WHERE job.status = 'processing' AND campaign.workspace_id = ${input.workspaceId}::uuid)::int AS processing_processing,
+        (SELECT COUNT(*) FROM processing_jobs job JOIN campaigns campaign ON campaign.id = job.campaign_id
+          WHERE job.status = 'processing' AND campaign.workspace_id = ${input.workspaceId}::uuid
+            AND job.locked_at < ${new Date(input.now.getTime() - 15 * 60_000).toISOString()}::timestamptz)::int AS processing_stale_locks,
+        (SELECT COUNT(*) FROM provider_runs run WHERE run.workspace_id = ${input.workspaceId}::uuid
+          AND run.status = 'manual_reconciliation_required')::int AS manual_provider_reconciliations
     `),
   ]);
 
@@ -200,8 +217,11 @@ export async function getSystemHealthDiagnostics(input: {
     queue: {
       duePendingDiscovery: count(queue?.due_pending_discovery),
       deferredDiscovery: count(queue?.deferred_discovery),
+      discoveryProcessing: count(queue?.discovery_processing),
+      discoveryStaleLocks: count(queue?.discovery_stale_locks),
       processingPending: count(queue?.processing_pending),
-      staleLocks: count(queue?.stale_locks),
+      processingProcessing: count(queue?.processing_processing),
+      processingStaleLocks: count(queue?.processing_stale_locks),
       manualProviderReconciliations: count(queue?.manual_provider_reconciliations),
     },
   };

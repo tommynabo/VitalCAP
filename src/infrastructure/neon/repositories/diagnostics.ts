@@ -123,13 +123,41 @@ export async function getInstantlyPipelineDiagnostics(
   };
 }
 
-export async function getActiveAutopilotDiscoveryEngineTypes(): Promise<EngineType[]> {
+export async function getHealthWorkspaceId(providerCampaignId: string): Promise<string | null> {
+  const db = getDb();
+  const mappedWorkspaces = await db.selectDistinct({ workspaceId: campaignProviderMappings.workspaceId })
+    .from(campaignProviderMappings)
+    .where(and(
+      eq(campaignProviderMappings.provider, "instantly"),
+      eq(campaignProviderMappings.providerCampaignId, providerCampaignId),
+    ));
+  if (mappedWorkspaces.length > 1) return null;
+  if (mappedWorkspaces[0]) return mappedWorkspaces[0].workspaceId;
+
+  const importedWorkspaces = await db.selectDistinct({ workspaceId: instantlyLeadImports.workspaceId })
+    .from(instantlyLeadImports)
+    .innerJoin(campaigns, eq(instantlyLeadImports.sourceCampaignId, campaigns.id))
+    .where(and(
+      eq(instantlyLeadImports.providerCampaignId, providerCampaignId),
+      eq(instantlyLeadImports.workspaceId, campaigns.workspaceId),
+    ));
+  if (importedWorkspaces.length > 1) return null;
+  if (importedWorkspaces[0]) return importedWorkspaces[0].workspaceId;
+
+  const activeCampaignWorkspaces = await db.selectDistinct({ workspaceId: campaigns.workspaceId })
+    .from(campaigns)
+    .where(and(eq(campaigns.status, "active"), eq(campaigns.autopilotEnabled, true)));
+  return activeCampaignWorkspaces.length === 1 ? activeCampaignWorkspaces[0]!.workspaceId : null;
+}
+
+export async function getActiveAutopilotDiscoveryEngineTypes(workspaceId: string): Promise<EngineType[]> {
   const db = getDb();
   const rows = await db
     .select({ engineType: campaigns.engineType })
     .from(campaigns)
     .innerJoin(autopilotSettings, eq(autopilotSettings.workspaceId, campaigns.workspaceId))
     .where(and(
+      eq(campaigns.workspaceId, workspaceId),
       eq(campaigns.status, "active"),
       eq(campaigns.autopilotEnabled, true),
       eq(autopilotSettings.enabled, true),
