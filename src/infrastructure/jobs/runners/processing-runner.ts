@@ -51,6 +51,7 @@ export interface ProcessingRunnerOptions {
 
 export const PROCESSING_CRON_TIME_BUDGET_MS = 240_000;
 export const PROCESSING_JOB_BUDGET_MS = 120_000;
+export const PROCESSING_MAX_JOBS_PER_TICK = 8;
 const PROCESSING_JOB_START_RESERVE_MS = 90_000;
 const PROCESSING_JOB_CLEANUP_RESERVE_MS = 15_000;
 

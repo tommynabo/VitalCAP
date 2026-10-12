@@ -258,6 +258,7 @@ describeIntegration("job-queue integration (real postgres semantics)", () => {
 
     await expect(completeProcessingJob({ jobId, workerId: workerA })).rejects.toBeInstanceOf(LostLeaseError);
     await completeProcessingJob({ jobId, workerId: workerB });
+    await expect(completeProcessingJob({ jobId, workerId: workerB })).rejects.toBeInstanceOf(LostLeaseError);
 
     const afterCompletion = await claimProcessingJobs({
       workerId: `worker-c-${randomUUID()}`,
@@ -266,6 +267,82 @@ describeIntegration("job-queue integration (real postgres semantics)", () => {
       requireAutopilot: false,
     });
     expect(afterCompletion).toHaveLength(0);
+  });
+
+  it("TEST 15/16: two workers cannot double-claim a processing row, even while system-paused", async () => {
+    const campaign = await makeActiveCampaign();
+    const db = getDb();
+    await db.execute(sql`UPDATE campaigns SET autopilot_enabled = true WHERE id = ${campaign.campaignId}::uuid;`);
+    await db.execute(sql`
+      INSERT INTO autopilot_settings (workspace_id, enabled, emergency_stopped, system_paused)
+      VALUES (${campaign.workspaceId}::uuid, true, false, true);
+    `);
+    const jobId = await enqueueProcessingJob({
+      campaignId: campaign.campaignId,
+      type: "process_raw_candidate",
+      payload: { rawCandidateId: randomUUID() },
+      idempotencyKey: `raw_candidate:${randomUUID()}`,
+    });
+    const now = new Date();
+    const [claimA, claimB] = await Promise.all([
+      claimProcessingJobs({ workerId: `processing-a-${randomUUID()}`, batchSize: 1, now, requireAutopilot: true }),
+      claimProcessingJobs({ workerId: `processing-b-${randomUUID()}`, batchSize: 1, now, requireAutopilot: true }),
+    ]);
+    const claims = [...claimA, ...claimB];
+    expect(claims.map((job) => job.id)).toEqual([jobId]);
+
+    const owner = claims[0]!;
+    await completeProcessingJob({ jobId, workerId: owner.lockedBy! });
+    const afterCompletion = await claimProcessingJobs({
+      workerId: `processing-c-${randomUUID()}`,
+      batchSize: 1,
+      now: new Date(now.getTime() + 1000),
+      requireAutopilot: true,
+    });
+    expect(afterCompletion).toHaveLength(0);
+  });
+
+  it("processing idempotency key allows only one in-flight Maps Deep owner job", async () => {
+    const campaign = await makeActiveCampaign();
+    const idempotencyKey = `maps_deep_owner:${randomUUID()}`;
+    const input = {
+      campaignId: campaign.campaignId,
+      type: "maps_deep_owner_enrichment",
+      payload: { rawCandidateId: randomUUID() },
+      idempotencyKey,
+    };
+
+    const [jobA, jobB] = await Promise.all([enqueueProcessingJob(input), enqueueProcessingJob(input)]);
+
+    expect(jobA).toBe(jobB);
+    const result = await getDb().execute(sql`
+      SELECT count(*)::int AS total
+      FROM processing_jobs
+      WHERE idempotency_key = ${idempotencyKey} AND status IN ('pending', 'processing');
+    `);
+    expect((result.rows[0] as { total: number }).total).toBe(1);
+  });
+
+  it("raw-candidate processing idempotency key allows only one in-flight job", async () => {
+    const campaign = await makeActiveCampaign();
+    const rawCandidateId = randomUUID();
+    const idempotencyKey = `raw_candidate:${rawCandidateId}`;
+    const input = {
+      campaignId: campaign.campaignId,
+      type: "process_raw_candidate",
+      payload: { rawCandidateId },
+      idempotencyKey,
+    };
+
+    const [jobA, jobB] = await Promise.all([enqueueProcessingJob(input), enqueueProcessingJob(input)]);
+
+    expect(jobA).toBe(jobB);
+    const result = await getDb().execute(sql`
+      SELECT count(*)::int AS total
+      FROM processing_jobs
+      WHERE idempotency_key = ${idempotencyKey} AND status IN ('pending', 'processing');
+    `);
+    expect((result.rows[0] as { total: number }).total).toBe(1);
   });
 
   it("TEST 5/6: transient failure schedules backoff and is only claimable after due time", async () => {

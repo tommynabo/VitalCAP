@@ -1,4 +1,6 @@
+import { readFileSync } from "node:fs";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { ProviderBudgetExceededError } from "@/domain/providers/errors";
 
 const mocks = vi.hoisted(() => ({
   claimProcessingJobs: vi.fn(),
@@ -95,7 +97,11 @@ vi.mock("@/lib/config/env", () => ({
   getVerificationEnv: mocks.getVerificationEnv,
 }));
 
-import { evaluateStructuredWebsiteLocation, runProcessingCronTick } from "./processing-runner";
+import {
+  evaluateStructuredWebsiteLocation,
+  PROCESSING_MAX_JOBS_PER_TICK,
+  runProcessingCronTick,
+} from "./processing-runner";
 
 describe("evaluateStructuredWebsiteLocation", () => {
   it("rejects conflicting structured country evidence even when another fact has a Spanish postcode", () => {
@@ -241,9 +247,31 @@ describe("runProcessingCronTick", () => {
   });
 
   it("completes a normal batch serially", async () => {
+    let activeJobs = 0;
+    let maximumActiveJobs = 0;
+    mocks.processRawCandidate.mockImplementation(async () => {
+      activeJobs += 1;
+      maximumActiveJobs = Math.max(maximumActiveJobs, activeJobs);
+      await new Promise((resolve) => setTimeout(resolve, 1));
+      activeJobs -= 1;
+      return {
+        engineType: "maps_fast",
+        accountKey: "domain:farmacia-ejemplo.es",
+        businessNameGuess: "Farmacia Ejemplo",
+        isDuplicate: false,
+        matchedAccountKey: null,
+        spainVerdict: "needs_review",
+        businessType: "pharmacy",
+        icpQualified: true,
+        contactPoints: [],
+        serperEmailRecovery: { candidatesFound: 0, candidatesRelevant: 0, duplicateCandidatesSkipped: 0 },
+        readyForOutreach: false,
+        rejectionReason: "Awaiting Spain eligibility review",
+      };
+    });
     mocks.claimProcessingJobs
-      .mockResolvedValueOnce([makeJob("job-1")])
-      .mockResolvedValueOnce([makeJob("job-2")])
+      .mockResolvedValueOnce([{ ...makeJob("job-1"), type: "process_raw_candidate" }])
+      .mockResolvedValueOnce([{ ...makeJob("job-2"), type: "process_raw_candidate" }])
       .mockResolvedValueOnce([]);
 
     const result = await runProcessingCronTick(3);
@@ -251,7 +279,144 @@ describe("runProcessingCronTick", () => {
     expect(result.jobsClaimed).toBe(2);
     expect(mocks.claimProcessingJobs).toHaveBeenCalledTimes(3);
     expect(mocks.completeProcessingJob.mock.calls.map(([input]) => input.jobId)).toEqual(["job-1", "job-2"]);
+    expect(maximumActiveJobs).toBe(1);
     expect(mocks.failProcessingJob).not.toHaveBeenCalled();
+  });
+
+  it("meets the capacity target with eight sequential P90-duration jobs", async () => {
+    const config = JSON.parse(readFileSync(new URL("../../../../vercel.json", import.meta.url), "utf8")) as {
+      crons: Array<{ path: string; schedule: string }>;
+    };
+    const processSchedule = config.crons.find((cron) => cron.path === "/api/cron/process")?.schedule;
+    expect(processSchedule).toBe("*/5 * * * *");
+
+    const runsPerDay = 24 * 60 / 5;
+    const designCapacityPerDay = PROCESSING_MAX_JOBS_PER_TICK * runsPerDay;
+    const observedJobsPerRawCandidate = 124 / 117;
+    const requiredWithHeadroom = 1500 * observedJobsPerRawCandidate * 1.25;
+    expect(PROCESSING_MAX_JOBS_PER_TICK).toBe(8);
+    expect(designCapacityPerDay).toBe(2304);
+    expect(designCapacityPerDay).toBeGreaterThan(requiredWithHeadroom);
+
+    let elapsedMs = 0;
+    let claimed = 0;
+    const p90CronDurationMs = 37_542;
+    const representativeJobDurationMs = p90CronDurationMs / 3;
+    vi.spyOn(performance, "now").mockImplementation(() => elapsedMs);
+    mocks.claimProcessingJobs.mockImplementation(async () => {
+      if (claimed >= PROCESSING_MAX_JOBS_PER_TICK) return [];
+      claimed += 1;
+      return [makeJob(`capacity-job-${claimed}`)];
+    });
+    mocks.getRawCandidateById.mockImplementation(async () => {
+      elapsedMs += representativeJobDurationMs / 2;
+      return {
+        accountId: "account-id",
+        rawPayload: { kind: "maps", place: { websiteUrl: null } },
+        searchSeedRunId: null,
+      };
+    });
+
+    const result = await runProcessingCronTick(PROCESSING_MAX_JOBS_PER_TICK, new Date(), { timeBudgetMs: 240_000 });
+
+    expect(result.jobsClaimed).toBe(8);
+    expect(result.jobsCompleted).toBe(8);
+    expect(result.durationMs).toBe(100_112);
+    expect(result.durationMs).toBeLessThan(240_000 - 90_000);
+    expect(mocks.completeProcessingJob).toHaveBeenCalledTimes(8);
+    expect(mocks.failProcessingJob).not.toHaveBeenCalled();
+  });
+
+  it("continues with a healthy job when the previous job times out", async () => {
+    const slowJob = { ...makeJob("slow-job"), type: "process_raw_candidate" };
+    const healthyJob = { ...makeJob("healthy-job"), type: "process_raw_candidate" };
+    mocks.claimProcessingJobs
+      .mockResolvedValueOnce([slowJob])
+      .mockResolvedValueOnce([healthyJob])
+      .mockResolvedValueOnce([]);
+    mocks.processRawCandidate
+      .mockImplementationOnce((_payload, _engineType, context: { signal?: AbortSignal }) =>
+        new Promise((_resolve, reject) => {
+          const rejectOnAbort = () => reject(context.signal?.reason);
+          context.signal?.addEventListener("abort", rejectOnAbort, { once: true });
+          if (context.signal?.aborted) rejectOnAbort();
+        }),
+      )
+      .mockResolvedValueOnce({
+        engineType: "maps_fast",
+        accountKey: "domain:farmacia-ejemplo.es",
+        businessNameGuess: "Farmacia Ejemplo",
+        isDuplicate: false,
+        matchedAccountKey: null,
+        spainVerdict: "needs_review",
+        businessType: "pharmacy",
+        icpQualified: true,
+        contactPoints: [],
+        serperEmailRecovery: { candidatesFound: 0, candidatesRelevant: 0, duplicateCandidatesSkipped: 0 },
+        readyForOutreach: false,
+        rejectionReason: "Awaiting Spain eligibility review",
+      });
+
+    const result = await runProcessingCronTick(3, new Date(), { timeBudgetMs: 1_000, perJobBudgetMs: 40 });
+
+    expect(result.jobsClaimed).toBe(2);
+    expect(result.jobsTimedOut).toBe(1);
+    expect(result.jobsCompleted).toBe(1);
+    expect(mocks.failProcessingJob).toHaveBeenCalledTimes(1);
+    expect(mocks.failProcessingJob).toHaveBeenCalledWith(expect.objectContaining({ job: expect.objectContaining({ id: "slow-job" }) }));
+    expect(mocks.completeProcessingJob).toHaveBeenCalledWith(expect.objectContaining({ jobId: "healthy-job" }));
+  });
+
+  it("defers provider-budget errors without consuming retry attempts", async () => {
+    const job = { ...makeJob("budget-job"), type: "process_raw_candidate" };
+    const retryAt = new Date("2026-10-12T15:00:00.000Z");
+    mocks.claimProcessingJobs.mockResolvedValueOnce([job]).mockResolvedValueOnce([]);
+    mocks.processRawCandidate.mockRejectedValueOnce(new ProviderBudgetExceededError("Serper daily budget exhausted", retryAt));
+
+    const result = await runProcessingCronTick(3);
+
+    expect(result.jobsClaimed).toBe(1);
+    expect(result.jobsTimedOut).toBe(0);
+    expect(mocks.deferProcessingJob).toHaveBeenCalledWith(expect.objectContaining({
+      jobId: "budget-job",
+      nextAttemptAt: retryAt,
+      reason: "Serper daily budget exhausted",
+    }));
+    expect(mocks.failProcessingJob).not.toHaveBeenCalled();
+    expect(mocks.completeProcessingJob).not.toHaveBeenCalled();
+  });
+
+  it("enqueues the Maps Deep owner job with a raw-candidate idempotency key", async () => {
+    const rawCandidate = {
+      id: "raw-candidate-id",
+      accountId: null,
+      searchSeedRunId: null,
+      engineType: "maps_deep",
+      rawPayload: {
+        kind: "maps",
+        place: {
+          externalPlaceId: "place-id",
+          name: "Farmacia Ejemplo",
+          countryCode: "ES",
+          websiteUrl: "https://farmacia-ejemplo.es",
+          phone: null,
+          sourceUrl: null,
+        },
+      },
+    };
+    mocks.getRawCandidateById.mockResolvedValue(rawCandidate);
+    mocks.getCampaignById.mockResolvedValue({ id: "campaign-id", workspaceId: "workspace-id" });
+    mocks.claimProcessingJobs.mockResolvedValueOnce([{ ...makeJob("maps-deep-job"), type: "process_raw_candidate" }])
+      .mockResolvedValueOnce([]);
+
+    await runProcessingCronTick(2);
+
+    expect(mocks.enqueueProcessingJob).toHaveBeenCalledWith(expect.objectContaining({
+      campaignId: "campaign-id",
+      type: "maps_deep_owner_enrichment",
+      payload: { rawCandidateId: "raw-candidate-id" },
+      idempotencyKey: "maps_deep_owner:raw-candidate-id",
+    }));
   });
 
   it("times out one slow job, preserves retry semantics, and runs a later healthy job on the next tick", async () => {
