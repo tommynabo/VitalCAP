@@ -15,7 +15,7 @@ import { GET } from "./route";
 import { resetServerEnvCacheForTests } from "@/lib/config/env";
 import { resetAuthEnvCacheForTests } from "@/lib/config/auth-env";
 
-const environmentNames = ["APP_ENV", "VERCEL_ENV", "DEV_SEED_MODE", "DATABASE_URL", "MAPS_PROVIDER", "SERP_PROVIDER", "SERPER_API_KEY", "SERPER_COUNTRY", "SERPER_LANGUAGE", "SERPER_DAILY_COST_LIMIT_USD", "DEFAULT_DELIVERY_MODE", "INSTANTLY_CAMPAIGN_ID", "NEON_AUTH_BASE_URL", "NEON_AUTH_COOKIE_SECRET", "APIFY_API_TOKEN"];
+const environmentNames = ["APP_ENV", "VERCEL_ENV", "DEV_SEED_MODE", "DATABASE_URL", "MAPS_PROVIDER", "SERP_PROVIDER", "SERPER_API_KEY", "SERPER_COUNTRY", "SERPER_LANGUAGE", "SERPER_DAILY_COST_LIMIT_USD", "DEFAULT_DELIVERY_MODE", "EMAIL_DELIVERY_PROVIDER", "INSTANTLY_API_KEY", "INSTANTLY_CAMPAIGN_ID", "NEON_AUTH_BASE_URL", "NEON_AUTH_COOKIE_SECRET", "APIFY_API_TOKEN"];
 
 describe("GET /api/health", () => {
   afterEach(() => {
@@ -49,7 +49,7 @@ describe("GET /api/health", () => {
       serp: { provider: "disabled", configured: false, health: "missing_configuration", status: "missing_configuration" },
       intelligence: { provider: "disabled", configured: true },
       verification: { provider: "disabled" },
-      delivery: { mode: "dry_run", provider: "disabled" }
+      delivery: { mode: "dry_run", provider: "disabled", instantlyConfigured: false }
     });
     expect(body).not.toHaveProperty("DATABASE_URL");
     expect(body).not.toHaveProperty("APIFY_API_TOKEN");
@@ -84,6 +84,25 @@ describe("GET /api/health", () => {
 
     expect(body.serp).toMatchObject({ provider: "serper", configured: true, health: "untested", status: "untested" });
     expect(JSON.stringify(body)).not.toContain("test-secret");
+  });
+
+  it("reports Instantly configuration without exposing its key", async () => {
+    process.env.APP_ENV = "development";
+    process.env.EMAIL_DELIVERY_PROVIDER = "instantly";
+    process.env.INSTANTLY_API_KEY = "instantly-secret";
+    process.env.DEFAULT_DELIVERY_MODE = "dry_run";
+    resetServerEnvCacheForTests();
+    resetAuthEnvCacheForTests();
+
+    const response = await GET();
+    const body = await response.json();
+
+    expect(body.delivery).toMatchObject({
+      mode: "dry_run",
+      provider: "instantly",
+      instantlyConfigured: true,
+    });
+    expect(JSON.stringify(body)).not.toContain("instantly-secret");
   });
 
   it("exposes Maps and Serper health separately with safe failure categories", async () => {

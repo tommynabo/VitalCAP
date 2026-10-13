@@ -142,6 +142,7 @@ export async function GET() {
     delivery: {
       mode: coreEnv?.DEFAULT_DELIVERY_MODE || process.env.DEFAULT_DELIVERY_MODE || "dry_run",
       provider: deliveryEnv?.EMAIL_DELIVERY_PROVIDER || process.env.EMAIL_DELIVERY_PROVIDER || "disabled",
+      instantlyConfigured: deliveryEnv?.EMAIL_DELIVERY_PROVIDER === "instantly" && Boolean(deliveryEnv.INSTANTLY_API_KEY),
     },
   });
 }
