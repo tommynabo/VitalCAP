@@ -5,11 +5,13 @@ const mocks = vi.hoisted(() => ({
   unauthorizedResponse: vi.fn(() => new Response(null, { status: 401 })),
   runCronRoute: vi.fn(),
   runInstantlyImportTick: vi.fn(),
+  logEvent: vi.fn(),
 }));
 
 vi.mock("@/infrastructure/jobs/runners/instantly-import-runner", () => ({
   runInstantlyImportTick: mocks.runInstantlyImportTick,
 }));
+vi.mock("@/lib/observability/structured-logger", () => ({ logEvent: mocks.logEvent }));
 vi.mock("../_lib/cron-http", () => ({
   isAuthorizedCronRequest: mocks.authorized,
   unauthorizedCronResponse: mocks.unauthorizedResponse,
@@ -38,7 +40,22 @@ describe("Instantly drain cron route", () => {
 
   it("runs only the queue-only Instantly tick when authorized", async () => {
     mocks.authorized.mockReturnValue(true);
-    mocks.runInstantlyImportTick.mockResolvedValue({ leadsAttempted: 3 });
+    mocks.runInstantlyImportTick.mockResolvedValue({
+      candidatesFound: 0,
+      leadsQueued: 0,
+      leadsAttempted: 3,
+      leadsAdded: 1,
+      leadsSkipped: 1,
+      leadsDeferred: 0,
+      leadsFailed: 1,
+      leadsNeedsReconciliation: 0,
+      providerStatus: "ready",
+      instantlyTelemetryReady: true,
+      instantlyLeadImportReady: true,
+      telemetryWarnings: [],
+      quota: null,
+      metrics: {},
+    });
     mocks.runCronRoute.mockImplementation(async (_name, operation) => {
       const result = await operation();
       return Response.json({ status: "completed", ...result });
@@ -49,5 +66,28 @@ describe("Instantly drain cron route", () => {
     expect(response.status).toBe(200);
     expect(mocks.runInstantlyImportTick).toHaveBeenCalledOnce();
     expect(mocks.runInstantlyImportTick).toHaveBeenCalledWith({ processQueueOnly: true });
+    expect(mocks.logEvent).toHaveBeenCalledWith("info", "cron.instantly-drain.completed", expect.objectContaining({
+      provider: "instantly",
+      outcome: "ready",
+      leadsAttempted: 3,
+      leadsAdded: 1,
+      leadsFailed: 1,
+      telemetryReady: true,
+    }));
+    const loggedFields = Object.keys(mocks.logEvent.mock.calls[0]?.[2] ?? {}).sort();
+    expect(loggedFields).toEqual([
+      "candidatesFound",
+      "correlationId",
+      "leadsAdded",
+      "leadsAttempted",
+      "leadsDeferred",
+      "leadsFailed",
+      "leadsNeedsReconciliation",
+      "leadsQueued",
+      "leadsSkipped",
+      "outcome",
+      "provider",
+      "telemetryReady",
+    ]);
   });
 });

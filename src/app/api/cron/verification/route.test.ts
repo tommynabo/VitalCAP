@@ -5,7 +5,6 @@ const mocks = vi.hoisted(() => ({
   runVerificationCronTick: vi.fn(),
   getHistoricalBackfillProgress: vi.fn(),
   repairProviderDisabledVerificationJobs: vi.fn(),
-  logEvent: vi.fn(),
 }));
 
 vi.mock("@/infrastructure/jobs/runners/verification-runner", () => ({
@@ -22,7 +21,6 @@ vi.mock("../_lib/cron-http", () => ({
     return Response.json({ status: "completed", itemsProcessed: result.itemsProcessed, warnings: [], ...result.metadata });
   },
 }));
-vi.mock("@/lib/observability/structured-logger", () => ({ logEvent: mocks.logEvent }));
 
 import { GET } from "./route";
 
@@ -69,13 +67,6 @@ describe("verification cron Instantly scan scope", () => {
       backfillBatchLimit: 500,
       backfillMayContinue: true,
     });
-    expect(mocks.logEvent).toHaveBeenCalledWith("info", "cron.verification.instantly", expect.objectContaining({
-      provider: "instantly",
-      outcome: "ready",
-      candidatesFound: 0,
-      leadsAttempted: 0,
-      leadsAdded: 0,
-    }));
   });
 
   it("uses bounded historical work only for explicit full backfill", async () => {

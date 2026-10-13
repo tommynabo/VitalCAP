@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import type { NextRequest } from "next/server";
 import {
   runVerificationCronTick,
@@ -7,7 +6,6 @@ import {
   repairProviderDisabledVerificationJobs,
 } from "@/infrastructure/jobs/runners/verification-runner";
 import { isAuthorizedCronRequest, unauthorizedCronResponse, runCronRoute } from "../_lib/cron-http";
-import { logEvent } from "@/lib/observability/structured-logger";
 
 export const dynamic = "force-dynamic";
 
@@ -23,22 +21,6 @@ export async function GET(request: NextRequest) {
     const tickOptions = backfillAll ? { backfillAll: true } : recentOnly ? { createdSince } : {};
     const enqueued = await enqueueVerificationJobs(enqueueOptions);
     const result = await runVerificationCronTick(50, tickOptions);
-    if (result.instantly) {
-      logEvent("info", "cron.verification.instantly", {
-        correlationId: randomUUID(),
-        provider: "instantly",
-        outcome: result.instantly.providerStatus,
-        candidatesFound: result.instantly.candidatesFound,
-        leadsQueued: result.instantly.leadsQueued,
-        leadsAttempted: result.instantly.leadsAttempted,
-        leadsAdded: result.instantly.leadsAdded,
-        leadsSkipped: result.instantly.leadsSkipped,
-        leadsDeferred: result.instantly.leadsDeferred,
-        leadsFailed: result.instantly.leadsFailed,
-        leadsNeedsReconciliation: result.instantly.leadsNeedsReconciliation ?? 0,
-        telemetryReady: result.instantly.instantlyTelemetryReady,
-      });
-    }
     const backfillProgress = backfillAll ? await getHistoricalBackfillProgress() : null;
     return {
       itemsProcessed: result.jobsClaimed,
