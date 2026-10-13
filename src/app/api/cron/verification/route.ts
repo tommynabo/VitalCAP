@@ -14,12 +14,13 @@ export async function GET(request: NextRequest) {
   return runCronRoute("verification", async () => {
     const backfillMode = request.nextUrl.searchParams.get("backfill");
     const backfillAll = backfillMode === "all";
+    const recentOnly = backfillMode === "48h";
     const createdSince = new Date(Date.now() - 48 * 60 * 60_000);
     const providerDisabledRepair = await repairProviderDisabledVerificationJobs();
-    const enqueued = await enqueueVerificationJobs(backfillAll ? {} : { createdSince });
-    const result = await runVerificationCronTick(50, {
-      ...(backfillAll ? { backfillAll: true } : { createdSince }),
-    });
+    const enqueueOptions = recentOnly ? { createdSince } : {};
+    const tickOptions = backfillAll ? { backfillAll: true } : recentOnly ? { createdSince } : {};
+    const enqueued = await enqueueVerificationJobs(enqueueOptions);
+    const result = await runVerificationCronTick(50, tickOptions);
     const backfillProgress = backfillAll ? await getHistoricalBackfillProgress() : null;
     return {
       itemsProcessed: result.jobsClaimed,
@@ -50,7 +51,11 @@ export async function GET(request: NextRequest) {
             }
           : backfillMode === "48h"
             ? { backfillMode: "48h", backfillWindowHours: 48 }
-            : { backfillMode: "48h", backfillWindowHours: 48 }),
+            : {
+                backfillMode: "historical_incremental",
+                backfillBatchLimit: 500,
+                backfillMayContinue: enqueued === 500 || result.jobsClaimed === 50,
+              }),
       },
     };
   });

@@ -241,6 +241,7 @@ describe("enqueueVerificationJobs scope", () => {
     expect(query.text).toContain("SELECT DISTINCT cm.account_id, c.workspace_id");
     expect(query.text).toContain("TRUE c.workspace_id");
     expect(query.text).toContain("cp.channel_eligibility NOT IN ('opted_out', 'blocked')");
+    expect(query.text).toContain("cp.verification_status = 'valid' AND cp.channel_eligibility = 'unknown'");
     expect(query.text).not.toContain("channel_eligibility IN (");
     expect(query.values).not.toEqual(expect.arrayContaining([
       "professional_contact",

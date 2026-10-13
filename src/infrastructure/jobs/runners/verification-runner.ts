@@ -386,6 +386,7 @@ export async function enqueueVerificationJobs(options: { createdSince?: Date } =
         AND (
           cp.verification_status = 'unverified'
           OR (cp.verification_status = 'unknown' AND (cp.verification_checked_at IS NULL OR cp.verification_checked_at <= NOW() - INTERVAL '3 days'))
+          OR (cp.verification_status = 'valid' AND cp.channel_eligibility = 'unknown')
         )
         AND NOT EXISTS (
           SELECT 1 FROM suppression_entries se

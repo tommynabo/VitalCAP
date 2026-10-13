@@ -48,16 +48,22 @@ function request(search = ""): Parameters<typeof GET>[0] {
 describe("verification cron Instantly scan scope", () => {
   afterEach(() => vi.clearAllMocks());
 
-  it("keeps scheduled verification and import work within the recent window", async () => {
-    mocks.enqueueVerificationJobs.mockResolvedValue(0);
+  it("scans historical verification work in bounded scheduled batches", async () => {
+    mocks.enqueueVerificationJobs.mockResolvedValue(500);
     mocks.repairProviderDisabledVerificationJobs.mockResolvedValue({ inspected: 0, resolvedFromCurrentResult: 0, reactivated: 0, suppressed: 0 });
-    mocks.runVerificationCronTick.mockResolvedValue(tickResult);
+    mocks.runVerificationCronTick.mockResolvedValue({ ...tickResult, jobsClaimed: 50 });
 
-    await GET(request());
+    const response = await GET(request());
+    const body = await response.json() as Record<string, unknown>;
 
-    expect(mocks.enqueueVerificationJobs).toHaveBeenCalledWith({ createdSince: expect.any(Date) });
+    expect(mocks.enqueueVerificationJobs).toHaveBeenCalledWith({});
     expect(mocks.repairProviderDisabledVerificationJobs).toHaveBeenCalledOnce();
-    expect(mocks.runVerificationCronTick).toHaveBeenCalledWith(50, { createdSince: expect.any(Date) });
+    expect(mocks.runVerificationCronTick).toHaveBeenCalledWith(50, {});
+    expect(body).toMatchObject({
+      backfillMode: "historical_incremental",
+      backfillBatchLimit: 500,
+      backfillMayContinue: true,
+    });
   });
 
   it("uses bounded historical work only for explicit full backfill", async () => {
