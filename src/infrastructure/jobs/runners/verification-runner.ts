@@ -284,7 +284,7 @@ export async function enqueueVerificationJobs(options: { createdSince?: Date } =
     WHERE rc.processed = true
       AND c.status = 'active'
       AND c.autopilot_enabled = true
-      AND a.status IN ('qualified', 'contactable', 'outreach_ready')
+      AND a.status IN ('qualified', 'contactable', 'outreach_ready', 'no_contact_found')
       AND (cm.id IS NULL OR cm.stage = 'discovered')
       ${createdRawFilter}
     ORDER BY a.id
@@ -306,7 +306,7 @@ export async function enqueueVerificationJobs(options: { createdSince?: Date } =
     WHERE c.status = 'active'
       AND c.autopilot_enabled = true
       AND cm.stage IN ('qualified', 'contact_selected', 'ready')
-      AND a.status IN ('qualified', 'contactable', 'outreach_ready')
+      AND a.status IN ('qualified', 'contactable', 'outreach_ready', 'no_contact_found')
       AND EXISTS (
         SELECT 1 FROM raw_candidates rc
         WHERE rc.campaign_id = c.id AND rc.account_id = a.id AND rc.processed = true
@@ -351,7 +351,7 @@ export async function enqueueVerificationJobs(options: { createdSince?: Date } =
       WHERE cm.stage IN ('qualified', 'contact_selected', 'ready')
         AND c.status = 'active'
         AND c.autopilot_enabled = true
-        AND a.status IN ('qualified', 'contactable', 'outreach_ready')
+        AND a.status IN ('qualified', 'contactable', 'outreach_ready', 'no_contact_found')
         AND cm.contacted_at IS NULL
         AND NOT EXISTS (
           SELECT 1 FROM suppression_entries se
@@ -472,10 +472,13 @@ export async function getHistoricalBackfillProgress(): Promise<HistoricalBackfil
         JOIN accounts a ON a.id = cm.account_id AND a.workspace_id = c.workspace_id
         JOIN contact_points cp ON cp.account_id = cm.account_id AND cp.workspace_id = a.workspace_id AND cp.type = 'email'
         WHERE c.status = 'active' AND c.autopilot_enabled = true
-          AND a.status IN ('qualified', 'contactable', 'outreach_ready')
+          AND a.status IN ('qualified', 'contactable', 'outreach_ready', 'no_contact_found')
           AND cm.stage IN ('qualified', 'contact_selected', 'ready')
           AND cp.channel_eligibility NOT IN ('opted_out', 'blocked')
-          AND cp.verification_status IN ('unverified', 'unknown')
+          AND (
+            cp.verification_status IN ('unverified', 'unknown')
+            OR (cp.verification_status = 'valid' AND cp.channel_eligibility = 'unknown')
+          )
           AND (cp.verification_status <> 'unknown' OR cp.verification_checked_at IS NULL OR cp.verification_checked_at <= NOW() - INTERVAL '3 days')
           AND NOT EXISTS (
             SELECT 1 FROM verification_jobs vj
