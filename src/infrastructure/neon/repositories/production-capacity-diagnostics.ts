@@ -55,8 +55,12 @@ function localDateKey(date: Date, timezone: string): string {
   return `${values.year}-${values.month}-${values.day}`;
 }
 
-export async function getProductionCapacityDiagnostics(workspaceId: string, now = new Date()) {
-  const db = getDb();
+export async function getProductionCapacityDiagnostics(
+  workspaceId: string,
+  now = new Date(),
+  database = getDb(),
+) {
+  const db = database;
   const [[settings], activeCampaigns] = await Promise.all([
     db.select({ timezone: autopilotSettings.timezone, maxDailyApifySpendUsd: autopilotSettings.maxDailyApifySpendUsd })
       .from(autopilotSettings)

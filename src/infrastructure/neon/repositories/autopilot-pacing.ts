@@ -68,6 +68,7 @@ export async function getAutopilotPacingMetrics(
       SELECT coalesce(sum(items_requested), 0)::int AS total
       FROM provider_runs
       WHERE workspace_id = ${workspaceId}::uuid
+        AND provider IN ('apify', 'serper')
         AND started_at >= ${start.toISOString()}::timestamptz
         AND started_at < ${end.toISOString()}::timestamptz
     `),

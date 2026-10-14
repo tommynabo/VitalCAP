@@ -241,6 +241,10 @@ describe("enqueueVerificationJobs scope", () => {
     expect(query.text).toContain("SELECT DISTINCT cm.account_id, c.workspace_id");
     expect(query.text).toContain("TRUE c.workspace_id");
     expect(query.text).toContain("cp.channel_eligibility NOT IN ('opted_out', 'blocked')");
+    expect(query.text).toContain("cp.verification_status = 'valid' AND cp.channel_eligibility = 'unknown'");
+    expect(query.text).toContain("a.status IN ('qualified', 'contactable', 'outreach_ready', 'no_contact_found')");
+    expect(query.text).not.toContain("'needs_review'");
+    expect(query.text).not.toContain("'rejected_icp'");
     expect(query.text).not.toContain("channel_eligibility IN (");
     expect(query.values).not.toEqual(expect.arrayContaining([
       "professional_contact",
@@ -383,7 +387,7 @@ describe("enqueueVerificationJobs scope", () => {
     expect(mocks.evaluateComplianceForAccount).toHaveBeenCalledWith("workspace-1", "account-1");
     const preparationQuery = sqlParts(mocks.execute.mock.calls[0]?.[0]);
     expect(preparationQuery.text).toContain("rc.processed = true");
-    expect(preparationQuery.text).toContain("a.status IN ('qualified', 'contactable', 'outreach_ready')");
+    expect(preparationQuery.text).toContain("a.status IN ('qualified', 'contactable', 'outreach_ready', 'no_contact_found')");
   });
 
   it("uses campaigns.workspace_id in historical progress queries", async () => {
@@ -400,7 +404,8 @@ describe("enqueueVerificationJobs scope", () => {
     const query = sqlParts(mocks.execute.mock.calls[0]?.[0]);
     expect(query.text).toContain("se.workspace_id = c.workspace_id");
     expect(query.text).toContain("conv.workspace_id = c.workspace_id");
-    expect(query.text).toContain("a.status IN ('qualified', 'contactable', 'outreach_ready')");
+    expect(query.text).toContain("a.status IN ('qualified', 'contactable', 'outreach_ready', 'no_contact_found')");
+    expect(query.text).toContain("cp.verification_status = 'valid' AND cp.channel_eligibility = 'unknown'");
     expect(query.text).not.toContain("cm.workspace_id");
   });
 });

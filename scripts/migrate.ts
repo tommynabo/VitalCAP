@@ -3,6 +3,7 @@ import { readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { execSync } from "node:child_process";
 import { neon } from "@neondatabase/serverless";
+import { assertNeonDatabaseIdentity } from "./neon-database-identity";
 
 const migrationDirectory = join(process.cwd(), "drizzle");
 const migrationTable = "vitalcap_migrations";
@@ -18,6 +19,12 @@ const databaseUrl = resolveDatabaseUrl("DATABASE_URL_UNPOOLED") ?? resolveDataba
 
 if (!databaseUrl) {
   throw new Error("DATABASE_URL_UNPOOLED (or DATABASE_URL) is required for db:migrate.");
+}
+
+const databaseHost = new URL(databaseUrl).hostname;
+const isLocalDatabase = ["localhost", "127.0.0.1", "[::1]", "::1"].includes(databaseHost);
+if (!isLocalDatabase) {
+  assertNeonDatabaseIdentity(databaseUrl, process.env.Vitalcap_PGHOST ?? process.env.PGHOST);
 }
 
 const db = neon(databaseUrl);
