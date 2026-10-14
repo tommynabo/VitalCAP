@@ -145,6 +145,26 @@ describe("computeAutopilotPacing", () => {
     expect(withBacklog.rawNeededToPlan).toBeLessThan(withoutBacklog.rawNeededToPlan);
   });
 
+  it("keeps a zero-import 250 target behind pace despite a large stale backlog", () => {
+    const result = computeAutopilotPacing({
+      ...base,
+      targetMetric: "instantly_imported",
+      dailyTarget: 250,
+      targetAchievedToday: 0,
+      instantlyImportedToday: 0,
+      eligibleImportBacklog: 10_000,
+      expectedImportsFromBacklog: 10_000,
+      availableDiscoveryCapacity: true,
+      providerHealth: "healthy",
+      now: new Date("2025-06-15T12:00:00Z"),
+    });
+
+    expect(result.expectedImportsFromBacklog).toBeLessThanOrEqual(result.expectedAchievedByNow * 0.1);
+    expect(result.status).toBe("behind_pace");
+    expect(result.targetNeededToPlan).toBeGreaterThan(0);
+    expect(result.rawNeededToPlan).toBeGreaterThan(0);
+  });
+
   it("bounds tiny import yield and never exceeds the daily raw-request cap", () => {
     const result = computeAutopilotPacing({
       ...base,

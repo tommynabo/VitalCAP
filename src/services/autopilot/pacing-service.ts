@@ -178,7 +178,11 @@ export function computeAutopilotPacing(input: PacingComputationInput): Autopilot
   const elapsedOperatingFraction = Math.min(1, Math.max(0, (nowMinutes - startMinutes) / windowLength));
   const expectedAchievedByNow = input.dailyTarget * elapsedOperatingFraction;
   const remainingTarget = Math.max(0, input.dailyTarget - input.targetAchievedToday);
-  const expectedImportsFromBacklog = Math.max(0, input.expectedImportsFromBacklog ?? 0);
+  const backlogCreditCap = Math.floor(Math.min(remainingTarget, expectedAchievedByNow * 0.1));
+  const expectedImportsFromBacklog = Math.min(
+    Math.max(0, input.expectedImportsFromBacklog ?? 0),
+    backlogCreditCap,
+  );
   const expectedProgressFromInFlight = targetMetric === "instantly_imported"
     ? expectedImportsFromBacklog
     : input.expectedQualifiedFromInFlight;
