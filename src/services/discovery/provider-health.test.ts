@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { evaluateApifyRecovery, evaluateProviderHealth, getApifyAllocationHealth, hasUnavailableRequiredDiscoveryProvider, isProviderAvailableForDiscovery, resolveApifyDiscoveryWorkMode } from "./provider-health";
+import { createApifyCredentialFingerprint, evaluateApifyRecovery, evaluateProviderHealth, getApifyAllocationHealth, hasUnavailableRequiredDiscoveryProvider, isProviderAvailableForDiscovery, resolveApifyDiscoveryWorkMode } from "./provider-health";
 
 describe("provider health cold start", () => {
   it("reports zero historical calls as untested", () => {
@@ -64,6 +64,72 @@ describe("Apify recovery health", () => {
     expect(snapshot.nextRecoveryAttemptAt?.getTime()).toBeGreaterThan(now.getTime());
   });
 
+  it("keeps a billing pause local to Apify while healthy Serper remains allocatable", () => {
+    const billingFailure = {
+      ...failedRun,
+      startedAt: "2026-10-11T11:50:00.000Z",
+      finishedAt: "2026-10-11T11:51:00.000Z",
+    };
+    const snapshot = evaluateApifyRecovery([billingFailure], billingFailure, null, false, false, new Date("2026-10-11T11:55:00.000Z"));
+
+    expect(getApifyAllocationHealth(snapshot)).toBe("paused");
+    expect(isProviderAvailableForDiscovery(true, "healthy", 1)).toBe(true);
+  });
+
+  it("allows one bounded immediate probe when the Apify credential fingerprint changes", () => {
+    const oldCredentialFingerprint = createApifyCredentialFingerprint("old-test-token");
+    const newCredentialFingerprint = createApifyCredentialFingerprint("new-test-token");
+    const authenticationFailure = {
+      ...failedRun,
+      startedAt: "2026-10-11T11:58:00.000Z",
+      finishedAt: "2026-10-11T11:59:00.000Z",
+      failureKind: "authentication" as const,
+      credentialFingerprint: oldCredentialFingerprint!,
+    };
+    const now = new Date("2026-10-11T12:00:00.000Z");
+    const snapshot = evaluateApifyRecovery(
+      [authenticationFailure], authenticationFailure, null, false, false, now, newCredentialFingerprint,
+    );
+    const legacyFailure = { ...authenticationFailure, credentialFingerprint: undefined };
+    const legacySnapshot = evaluateApifyRecovery(
+      [legacyFailure], legacyFailure, null, false, false, now, newCredentialFingerprint,
+    );
+
+    expect(newCredentialFingerprint).not.toBe("new-test-token");
+    expect(snapshot.recoveryProbeEligible).toBe(true);
+    expect(legacySnapshot.recoveryProbeEligible).toBe(true);
+    expect(getApifyAllocationHealth(snapshot)).toBe("paused");
+    expect(resolveApifyDiscoveryWorkMode({
+      providerHealth: getApifyAllocationHealth(snapshot),
+      recoveryProbeEligible: snapshot.recoveryProbeEligible,
+      recoveryProbeRequested: true,
+    })).toBe("recovery_probe");
+
+    const inFlight = evaluateApifyRecovery(
+      [authenticationFailure], authenticationFailure, null, true, false, now, newCredentialFingerprint,
+    );
+    expect(inFlight.recoveryProbeEligible).toBe(false);
+  });
+
+  it("re-enters the auth cooldown when the new credential probe fails authentication", () => {
+    const newCredentialFingerprint = createApifyCredentialFingerprint("new-test-token");
+    const failedNewCredentialProbe = {
+      ...failedRun,
+      startedAt: "2026-10-11T12:00:00.000Z",
+      finishedAt: "2026-10-11T12:01:00.000Z",
+      failureKind: "authentication" as const,
+      credentialFingerprint: newCredentialFingerprint!,
+      recoveryProbe: true,
+    };
+    const snapshot = evaluateApifyRecovery(
+      [failedNewCredentialProbe], failedNewCredentialProbe, null, false, false,
+      new Date("2026-10-11T12:02:00.000Z"), newCredentialFingerprint,
+    );
+
+    expect(snapshot.recoveryProbeEligible).toBe(false);
+    expect(snapshot.nextRecoveryAttemptAt?.toISOString()).toBe("2026-10-11T18:01:00.000Z");
+  });
+
   it("restores normal health after a successful recovery probe", () => {
     const probeSucceeded = {
       status: "ingested",
@@ -76,6 +142,8 @@ describe("Apify recovery health", () => {
     const snapshot = evaluateApifyRecovery([failedRun, probeSucceeded], failedRun, probeSucceeded.finishedAt, false, false, now);
     expect(snapshot.recoveryProbeEligible).toBe(false);
     expect(evaluateProviderHealth(snapshot.usage)).toBe("healthy");
+    expect(getApifyAllocationHealth(snapshot)).toBe("healthy");
+    expect(isProviderAvailableForDiscovery(true, getApifyAllocationHealth(snapshot), 1)).toBe(true);
   });
 
   it("re-enters cooldown after a failed probe and honors the safety gate", () => {

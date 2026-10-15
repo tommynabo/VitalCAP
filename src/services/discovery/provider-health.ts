@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { EngineType } from "@/domain/campaigns/types";
 import type { ProviderUsageStats } from "@/domain/providers/types";
 import type { ProviderHealthStatus } from "@/domain/autopilot/types";
@@ -20,6 +21,10 @@ export interface ProviderHealthThresholds {
 
 export const APIFY_RECOVERY_COOLDOWN_MS = 30 * 60 * 1000;
 
+export function createApifyCredentialFingerprint(token: string | null | undefined): string | null {
+  return token ? createHash("sha256").update(token).digest("hex") : null;
+}
+
 export interface ApifyRecoveryRun {
   status: string;
   startedAt: Date | string;
@@ -28,6 +33,7 @@ export interface ApifyRecoveryRun {
   costUsd: number;
   recoveryProbe?: boolean;
   failureKind?: "transient" | "billing" | "authentication" | "configuration" | "safety";
+  credentialFingerprint?: string;
 }
 
 export interface ApifyRecoverySnapshot {
@@ -67,6 +73,7 @@ export function evaluateApifyRecovery(
   recoveryProbeInFlight: boolean,
   blockedBySafetyGate: boolean,
   now = new Date(),
+  currentCredentialFingerprint: string | null = null,
 ): ApifyRecoverySnapshot {
   const emptyUsage: ProviderUsageStats = { calls: 0, items: 0, errors: 0, totalLatencyMs: 0, costUsd: 0, quotaRemaining: null };
   const successAt = runDate(latestSuccessAt);
@@ -96,8 +103,11 @@ export function evaluateApifyRecovery(
     return { usage, recoveryProbeEligible: false, nextRecoveryAttemptAt: null };
   }
 
+  const credentialChanged = latestFailure.failureKind === "authentication"
+    && currentCredentialFingerprint !== null
+    && latestFailure.credentialFingerprint !== currentCredentialFingerprint;
   const cooldownMs = latestFailure.failureKind === "authentication"
-    ? 6 * 60 * 60 * 1000
+    ? credentialChanged ? 0 : 6 * 60 * 60 * 1000
     : latestFailure.failureKind === "safety"
       ? 60 * 60 * 1000
       : APIFY_RECOVERY_COOLDOWN_MS;

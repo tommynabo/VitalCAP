@@ -27,9 +27,10 @@ import { getEffectiveAutopilotState } from "@/domain/autopilot/types";
 import { buildMapsSeedCatalog, buildSerpSeedCatalog, LINKEDIN_OWNER_ROLE_QUERIES, ICP_CATEGORY_TERMS } from "@/services/discovery/spain-search-catalog";
 import { createDiscoveryEngine } from "./engine-factory";
 import type { SearchSeed } from "@/domain/discovery/types";
-import { evaluateProviderHealth, getApifyAllocationHealth, resolveApifyDiscoveryWorkMode } from "@/services/discovery/provider-health";
+import { createApifyCredentialFingerprint, evaluateProviderHealth, getApifyAllocationHealth, resolveApifyDiscoveryWorkMode } from "@/services/discovery/provider-health";
 import { createProviderRequestKey, normalizeProviderQuery } from "@/services/discovery/provider-request-key";
 import { resolvePlanningWindow } from "@/services/autopilot/target-planner";
+import { getMapsEnv } from "@/lib/config/env";
 
 const DISCOVERY_JOB_TYPE = "run_engine_batch";
 const MAX_SEEDS_PER_JOB = 5;
@@ -174,11 +175,14 @@ async function executeDiscoveryJob(job: { id: string; campaignId: string; payloa
       const message = error instanceof Error ? error.message : String(error);
       if (reservationId) {
         const failureKind = error instanceof ProviderFailureError ? error.kind : null;
+        const credentialFingerprint = failureKind === "authentication"
+          ? createApifyCredentialFingerprint(getMapsEnv().APIFY_API_TOKEN)
+          : null;
         await updateProviderRun(reservationId, {
           status: "failed",
           finishedAt: new Date(),
           error: `Provider startup failed: ${message}`,
-          metadata: { engineType: job.payload.engineType, seedId: seed.id, seedRunId, discoveryJobId: job.id, query: seed.query, normalizedQuery, geography: seed.geography, planningWindow, recoveryProbe, ...(failureKind ? { failureKind } : {}) },
+          metadata: { engineType: job.payload.engineType, seedId: seed.id, seedRunId, discoveryJobId: job.id, query: seed.query, normalizedQuery, geography: seed.geography, planningWindow, recoveryProbe, ...(failureKind ? { failureKind } : {}), ...(credentialFingerprint ? { credentialFingerprint } : {}) },
         });
       }
       if (seedRunId) await updateSearchSeedRun(seedRunId, { finishedAt: new Date().toISOString(), error: `Provider startup failed: ${message}` });

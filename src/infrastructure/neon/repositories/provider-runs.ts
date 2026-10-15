@@ -4,7 +4,8 @@ import { getDb } from "../db";
 import { providerRuns } from "../schema/providers";
 import type { ProviderUsageStats } from "@/domain/providers/types";
 import { ProviderBudgetExceededError, ProviderFailureError, ProviderSafetyError } from "@/domain/providers/errors";
-import { evaluateApifyRecovery, type ApifyRecoveryRun } from "@/services/discovery/provider-health";
+import { createApifyCredentialFingerprint, evaluateApifyRecovery, type ApifyRecoveryRun } from "@/services/discovery/provider-health";
+import { getMapsEnv } from "@/lib/config/env";
 
 export interface RecordProviderRunInput {
   workspaceId: string;
@@ -202,6 +203,7 @@ export async function getApifyRecoverySnapshot(workspaceId: string, now = new Da
       itemsReturned: row.itemsReturned,
       costUsd: row.costUsd,
       recoveryProbe: metadata.recoveryProbe === true,
+      ...(typeof metadata.credentialFingerprint === "string" ? { credentialFingerprint: metadata.credentialFingerprint } : {}),
       ...(failureKind === "transient" || failureKind === "billing" || failureKind === "authentication" || failureKind === "configuration" || failureKind === "safety"
         ? { failureKind }
         : {}),
@@ -216,6 +218,7 @@ export async function getApifyRecoverySnapshot(workspaceId: string, now = new Da
     finishedAt: failureRow.finishedAt,
     itemsReturned: 0,
     costUsd: 0,
+    ...(typeof failureMetadata.credentialFingerprint === "string" ? { credentialFingerprint: failureMetadata.credentialFingerprint } : {}),
     ...(failureKind === "transient" || failureKind === "billing" || failureKind === "authentication" || failureKind === "configuration" || failureKind === "safety"
       ? { failureKind }
       : {}),
@@ -232,6 +235,7 @@ export async function getApifyRecoverySnapshot(workspaceId: string, now = new Da
     probeInFlight,
     unreconciled.length > 0,
     now,
+    createApifyCredentialFingerprint(getMapsEnv().APIFY_API_TOKEN),
   );
 }
 
