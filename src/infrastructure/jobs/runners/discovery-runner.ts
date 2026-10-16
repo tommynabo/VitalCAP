@@ -175,7 +175,7 @@ async function executeDiscoveryJob(job: { id: string; campaignId: string; payloa
       const message = error instanceof Error ? error.message : String(error);
       if (reservationId) {
         const failureKind = error instanceof ProviderFailureError ? error.kind : null;
-        const credentialFingerprint = failureKind === "authentication"
+        const credentialFingerprint = failureKind === "authentication" || failureKind === "billing"
           ? createApifyCredentialFingerprint(getMapsEnv().APIFY_API_TOKEN)
           : null;
         await updateProviderRun(reservationId, {

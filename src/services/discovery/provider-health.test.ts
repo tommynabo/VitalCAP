@@ -111,6 +111,53 @@ describe("Apify recovery health", () => {
     expect(inFlight.recoveryProbeEligible).toBe(false);
   });
 
+  it("allows an immediate probe when a billing failure has an old credential fingerprint", () => {
+    const oldCredentialFingerprint = createApifyCredentialFingerprint("old-test-token");
+    const newCredentialFingerprint = createApifyCredentialFingerprint("new-test-token");
+    const billingFailure = {
+      ...failedRun,
+      startedAt: "2026-10-11T11:58:00.000Z",
+      finishedAt: "2026-10-11T11:59:00.000Z",
+      credentialFingerprint: oldCredentialFingerprint!,
+    };
+    const snapshot = evaluateApifyRecovery(
+      [billingFailure], billingFailure, null, false, false, now, newCredentialFingerprint,
+    );
+
+    expect(snapshot.recoveryProbeEligible).toBe(true);
+  });
+
+  it("allows an immediate probe for a legacy billing failure without a fingerprint", () => {
+    const newCredentialFingerprint = createApifyCredentialFingerprint("new-test-token");
+    const legacyBillingFailure = {
+      ...failedRun,
+      startedAt: "2026-10-11T11:58:00.000Z",
+      finishedAt: "2026-10-11T11:59:00.000Z",
+    };
+    const snapshot = evaluateApifyRecovery(
+      [legacyBillingFailure], legacyBillingFailure, null, false, false, now, newCredentialFingerprint,
+    );
+
+    expect(snapshot.recoveryProbeEligible).toBe(true);
+  });
+
+  it("keeps the 30-minute cooldown for a billing failure with the same credential", () => {
+    const credentialFingerprint = createApifyCredentialFingerprint("same-test-token");
+    const billingFailure = {
+      ...failedRun,
+      startedAt: "2026-10-11T11:58:00.000Z",
+      finishedAt: "2026-10-11T11:59:00.000Z",
+      credentialFingerprint: credentialFingerprint!,
+    };
+    const snapshot = evaluateApifyRecovery(
+      [billingFailure], billingFailure, null, false, false,
+      new Date("2026-10-11T12:15:00.000Z"), credentialFingerprint,
+    );
+
+    expect(snapshot.recoveryProbeEligible).toBe(false);
+    expect(snapshot.nextRecoveryAttemptAt?.toISOString()).toBe("2026-10-11T12:29:00.000Z");
+  });
+
   it("re-enters the auth cooldown when the new credential probe fails authentication", () => {
     const newCredentialFingerprint = createApifyCredentialFingerprint("new-test-token");
     const failedNewCredentialProbe = {
@@ -128,6 +175,24 @@ describe("Apify recovery health", () => {
 
     expect(snapshot.recoveryProbeEligible).toBe(false);
     expect(snapshot.nextRecoveryAttemptAt?.toISOString()).toBe("2026-10-11T18:01:00.000Z");
+  });
+
+  it("re-enters the billing cooldown when the new credential probe fails billing", () => {
+    const newCredentialFingerprint = createApifyCredentialFingerprint("new-test-token");
+    const failedNewCredentialProbe = {
+      ...failedRun,
+      startedAt: "2026-10-11T12:00:00.000Z",
+      finishedAt: "2026-10-11T12:01:00.000Z",
+      credentialFingerprint: newCredentialFingerprint!,
+      recoveryProbe: true,
+    };
+    const snapshot = evaluateApifyRecovery(
+      [failedNewCredentialProbe], failedNewCredentialProbe, null, false, false,
+      new Date("2026-10-11T12:02:00.000Z"), newCredentialFingerprint,
+    );
+
+    expect(snapshot.recoveryProbeEligible).toBe(false);
+    expect(snapshot.nextRecoveryAttemptAt?.toISOString()).toBe("2026-10-11T12:31:00.000Z");
   });
 
   it("restores normal health after a successful recovery probe", () => {

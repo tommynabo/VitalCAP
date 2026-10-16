@@ -103,11 +103,15 @@ export function evaluateApifyRecovery(
     return { usage, recoveryProbeEligible: false, nextRecoveryAttemptAt: null };
   }
 
-  const credentialChanged = latestFailure.failureKind === "authentication"
+  const credentialRecoverableFailure = latestFailure.failureKind === "authentication"
+    || latestFailure.failureKind === "billing";
+  const credentialChanged = credentialRecoverableFailure
     && currentCredentialFingerprint !== null
     && latestFailure.credentialFingerprint !== currentCredentialFingerprint;
-  const cooldownMs = latestFailure.failureKind === "authentication"
-    ? credentialChanged ? 0 : 6 * 60 * 60 * 1000
+  const cooldownMs = credentialChanged
+    ? 0
+    : latestFailure.failureKind === "authentication"
+    ? 6 * 60 * 60 * 1000
     : latestFailure.failureKind === "safety"
       ? 60 * 60 * 1000
       : APIFY_RECOVERY_COOLDOWN_MS;
