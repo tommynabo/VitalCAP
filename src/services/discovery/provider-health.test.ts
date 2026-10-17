@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { createApifyCredentialFingerprint, evaluateApifyRecovery, evaluateProviderHealth, getApifyAllocationHealth, hasUnavailableRequiredDiscoveryProvider, isProviderAvailableForDiscovery, resolveApifyDiscoveryWorkMode } from "./provider-health";
+import { createApifyConfigurationFingerprint, createApifyCredentialFingerprint, evaluateApifyRecovery, evaluateProviderHealth, getApifyAllocationHealth, hasUnavailableRequiredDiscoveryProvider, isProviderAvailableForDiscovery, resolveApifyDiscoveryWorkMode } from "./provider-health";
 
 describe("provider health cold start", () => {
   it("reports zero historical calls as untested", () => {
@@ -38,6 +38,12 @@ describe("required discovery provider health", () => {
 
 describe("Apify recovery health", () => {
   const now = new Date("2026-10-11T12:00:00.000Z");
+  const currentConfiguration = {
+    APIFY_BATCH_COST_LIMIT_USD: 0.5,
+    APIFY_MAPS_FAST_ACTOR: "compass/fast",
+    APIFY_MAPS_DEEP_ACTOR: "compass/deep",
+    APIFY_MAPS_FALLBACK_ACTOR: "compass/fallback",
+  };
   const failedRun = {
     status: "failed",
     startedAt: "2026-10-11T10:00:00.000Z",
@@ -127,6 +133,74 @@ describe("Apify recovery health", () => {
     expect(snapshot.recoveryProbeEligible).toBe(true);
   });
 
+  it("creates a deterministic fingerprint from the safe Apify configuration only", () => {
+    const fingerprint = createApifyConfigurationFingerprint(currentConfiguration);
+    expect(fingerprint).toMatch(/^[a-f0-9]{64}$/);
+    expect(createApifyConfigurationFingerprint({ ...currentConfiguration })).toBe(fingerprint);
+    expect(createApifyConfigurationFingerprint({
+      ...currentConfiguration,
+      APIFY_BATCH_COST_LIMIT_USD: 0.75,
+    })).not.toBe(fingerprint);
+  });
+
+  it("keeps an unchanged configuration failure blocked", () => {
+    const configurationFingerprint = createApifyConfigurationFingerprint(currentConfiguration);
+    const configurationFailure = {
+      ...failedRun,
+      failureKind: "configuration" as const,
+      configurationFingerprint,
+    };
+    const snapshot = evaluateApifyRecovery(
+      [configurationFailure], configurationFailure, null, false, false, now, null, configurationFingerprint,
+    );
+
+    expect(snapshot.recoveryProbeEligible).toBe(false);
+    expect(snapshot.nextRecoveryAttemptAt).toBeNull();
+  });
+
+  it("allows one immediate bounded probe after a configuration change", () => {
+    const oldConfigurationFingerprint = createApifyConfigurationFingerprint({
+      ...currentConfiguration,
+      APIFY_BATCH_COST_LIMIT_USD: 0.25,
+    });
+    const currentConfigurationFingerprint = createApifyConfigurationFingerprint(currentConfiguration);
+    const configurationFailure = {
+      ...failedRun,
+      failureKind: "configuration" as const,
+      configurationFingerprint: oldConfigurationFingerprint,
+    };
+    const snapshot = evaluateApifyRecovery(
+      [configurationFailure], configurationFailure, null, false, false, now, null, currentConfigurationFingerprint,
+    );
+    const inFlight = evaluateApifyRecovery(
+      [configurationFailure], configurationFailure, null, true, false, now, null, currentConfigurationFingerprint,
+    );
+    const safetyBlocked = evaluateApifyRecovery(
+      [configurationFailure], configurationFailure, null, false, true, now, null, currentConfigurationFingerprint,
+    );
+
+    expect(snapshot.recoveryProbeEligible).toBe(true);
+    expect(snapshot.nextRecoveryAttemptAt?.toISOString()).toBe(now.toISOString());
+    expect(inFlight.recoveryProbeEligible).toBe(false);
+    expect(safetyBlocked.recoveryProbeEligible).toBe(false);
+  });
+
+  it("allows one immediate opportunity for a legacy configuration failure", () => {
+    const currentConfigurationFingerprint = createApifyConfigurationFingerprint(currentConfiguration);
+    const legacyFailure = { ...failedRun, failureKind: "configuration" as const };
+    const firstSnapshot = evaluateApifyRecovery(
+      [legacyFailure], legacyFailure, null, false, false, now, null, currentConfigurationFingerprint,
+    );
+    const persistedFailure = { ...legacyFailure, configurationFingerprint: currentConfigurationFingerprint };
+    const afterReservation = evaluateApifyRecovery(
+      [persistedFailure], persistedFailure, null, false, false, now, null, currentConfigurationFingerprint,
+    );
+
+    expect(firstSnapshot.recoveryProbeEligible).toBe(true);
+    expect(afterReservation.recoveryProbeEligible).toBe(false);
+    expect(afterReservation.nextRecoveryAttemptAt).toBeNull();
+  });
+
   it("allows an immediate probe for a legacy billing failure without a fingerprint", () => {
     const newCredentialFingerprint = createApifyCredentialFingerprint("new-test-token");
     const legacyBillingFailure = {
@@ -209,6 +283,37 @@ describe("Apify recovery health", () => {
     expect(evaluateProviderHealth(snapshot.usage)).toBe("healthy");
     expect(getApifyAllocationHealth(snapshot)).toBe("healthy");
     expect(isProviderAvailableForDiscovery(true, getApifyAllocationHealth(snapshot), 1)).toBe(true);
+  });
+
+  it("restores normal health after a successful configuration recovery probe", () => {
+    const oldConfigurationFingerprint = createApifyConfigurationFingerprint({
+      ...currentConfiguration,
+      APIFY_BATCH_COST_LIMIT_USD: 0.25,
+    });
+    const currentConfigurationFingerprint = createApifyConfigurationFingerprint(currentConfiguration);
+    const configurationFailure = {
+      ...failedRun,
+      failureKind: "configuration" as const,
+      configurationFingerprint: oldConfigurationFingerprint,
+    };
+    const probeSucceeded = {
+      ...failedRun,
+      status: "ingested",
+      startedAt: "2026-10-11T11:45:00.000Z",
+      finishedAt: "2026-10-11T11:50:00.000Z",
+      itemsReturned: 8,
+      costUsd: 0.1,
+      recoveryProbe: true,
+      configurationFingerprint: currentConfigurationFingerprint,
+    };
+    const snapshot = evaluateApifyRecovery(
+      [configurationFailure, probeSucceeded], configurationFailure, probeSucceeded.finishedAt,
+      false, false, now, null, currentConfigurationFingerprint,
+    );
+
+    expect(snapshot.recoveryProbeEligible).toBe(false);
+    expect(evaluateProviderHealth(snapshot.usage)).toBe("healthy");
+    expect(getApifyAllocationHealth(snapshot)).toBe("healthy");
   });
 
   it("re-enters cooldown after a failed probe and honors the safety gate", () => {

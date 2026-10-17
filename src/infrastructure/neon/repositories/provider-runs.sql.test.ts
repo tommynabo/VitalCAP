@@ -27,6 +27,24 @@ describe("Apify provider run reservation SQL", () => {
     expect(query.params).toContain(15);
   });
 
+  it("marks a legacy configuration failure only when a recovery reservation is inserted", () => {
+    const query = dialect.sqlToQuery(buildReserveApifyProviderRunQuery({
+      workspaceId: "00000000-0000-0000-0000-000000000001",
+      campaignId: "00000000-0000-0000-0000-000000000002",
+      operation: "maps_search",
+      requestKey: "apify:legacy-recovery",
+      seedId: "00000000-0000-0000-0000-000000000003",
+      itemsRequested: 10,
+      recoveryProbe: true,
+      metadata: { configurationFingerprint: "safe-config-fingerprint" },
+    }, 1500, 15, new Date("2026-10-11T00:00:00.000Z"), 0.05));
+
+    expect(query.sql).toContain("legacy_configuration_failure_marked AS");
+    expect(query.sql).toContain("candidate.metadata->>'failureKind' = 'configuration'");
+    expect(query.sql).toContain("EXISTS (SELECT 1 FROM inserted)");
+    expect(query.params).toContain("safe-config-fingerprint");
+  });
+
   it("does not poll an existing provider run before its typed retry cooldown is due", () => {
     const query = dialect.sqlToQuery(buildApifyPollingDuePredicate(new Date("2026-10-11T18:00:00.000Z")));
 

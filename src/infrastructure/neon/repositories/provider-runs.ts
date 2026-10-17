@@ -4,7 +4,7 @@ import { getDb } from "../db";
 import { providerRuns } from "../schema/providers";
 import type { ProviderUsageStats } from "@/domain/providers/types";
 import { ProviderBudgetExceededError, ProviderFailureError, ProviderSafetyError } from "@/domain/providers/errors";
-import { createApifyCredentialFingerprint, evaluateApifyRecovery, type ApifyRecoveryRun } from "@/services/discovery/provider-health";
+import { createApifyConfigurationFingerprint, createApifyCredentialFingerprint, evaluateApifyRecovery, type ApifyRecoveryRun } from "@/services/discovery/provider-health";
 import { getMapsEnv } from "@/lib/config/env";
 
 export interface RecordProviderRunInput {
@@ -126,6 +126,9 @@ export function buildReserveApifyProviderRunQuery(
   dayStart: Date,
   expectedCostUsd: number,
 ) {
+  const configurationFingerprint = typeof input.metadata?.configurationFingerprint === "string"
+    ? input.metadata.configurationFingerprint
+    : null;
   return sql`
     WITH safety AS (
       SELECT
@@ -149,6 +152,25 @@ export function buildReserveApifyProviderRunQuery(
         AND (${input.recoveryProbe ?? false} = false OR safety.recovery_probe_count = 0)
       ON CONFLICT (request_key) DO NOTHING
       RETURNING *
+    ),
+    legacy_configuration_failure_marked AS (
+      UPDATE provider_runs AS failure
+      SET metadata = COALESCE(failure.metadata, '{}'::jsonb) || jsonb_build_object('configurationFingerprint', ${configurationFingerprint})
+      WHERE failure.id = (
+        SELECT candidate.id
+        FROM provider_runs candidate
+        WHERE candidate.workspace_id = ${input.workspaceId}::uuid
+          AND candidate.provider = 'apify'
+          AND candidate.status IN ('failed', 'aborted', 'timed_out')
+          AND candidate.metadata->>'failureKind' = 'configuration'
+          AND NULLIF(candidate.metadata->>'configurationFingerprint', '') IS NULL
+        ORDER BY COALESCE(candidate.finished_at, candidate.started_at) DESC
+        LIMIT 1
+      )
+        AND ${input.recoveryProbe ?? false} = true
+        AND ${configurationFingerprint} IS NOT NULL
+        AND EXISTS (SELECT 1 FROM inserted)
+      RETURNING failure.id
     )
     SELECT
       (SELECT row_to_json(inserted.*) FROM inserted) AS inserted_row,
@@ -160,6 +182,7 @@ export function buildReserveApifyProviderRunQuery(
 export async function getApifyRecoverySnapshot(workspaceId: string, now = new Date()) {
   const db = getDb();
   const since = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+  const mapsEnv = getMapsEnv();
   const [rows, failureRows, successRows] = await Promise.all([
     db.select({
       status: providerRuns.status,
@@ -205,6 +228,7 @@ export async function getApifyRecoverySnapshot(workspaceId: string, now = new Da
       costUsd: row.costUsd,
       recoveryProbe: metadata.recoveryProbe === true,
       ...(typeof metadata.credentialFingerprint === "string" ? { credentialFingerprint: metadata.credentialFingerprint } : {}),
+      ...(typeof metadata.configurationFingerprint === "string" ? { configurationFingerprint: metadata.configurationFingerprint } : {}),
       ...(failureKind === "transient" || failureKind === "billing" || failureKind === "authentication" || failureKind === "configuration" || failureKind === "safety"
         ? { failureKind }
         : {}),
@@ -220,6 +244,7 @@ export async function getApifyRecoverySnapshot(workspaceId: string, now = new Da
     itemsReturned: 0,
     costUsd: 0,
     ...(typeof failureMetadata.credentialFingerprint === "string" ? { credentialFingerprint: failureMetadata.credentialFingerprint } : {}),
+    ...(typeof failureMetadata.configurationFingerprint === "string" ? { configurationFingerprint: failureMetadata.configurationFingerprint } : {}),
     ...(failureKind === "transient" || failureKind === "billing" || failureKind === "authentication" || failureKind === "configuration" || failureKind === "safety"
       ? { failureKind }
       : {}),
@@ -236,7 +261,8 @@ export async function getApifyRecoverySnapshot(workspaceId: string, now = new Da
     probeInFlight,
     unreconciled.length > 0,
     now,
-    createApifyCredentialFingerprint(getMapsEnv().APIFY_API_TOKEN),
+    createApifyCredentialFingerprint(mapsEnv.APIFY_API_TOKEN),
+    createApifyConfigurationFingerprint(mapsEnv),
   );
   return {
     ...recoverySnapshot,

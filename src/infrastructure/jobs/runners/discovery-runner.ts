@@ -27,7 +27,7 @@ import { getEffectiveAutopilotState } from "@/domain/autopilot/types";
 import { buildMapsSeedCatalog, buildSerpSeedCatalog, LINKEDIN_OWNER_ROLE_QUERIES, ICP_CATEGORY_TERMS } from "@/services/discovery/spain-search-catalog";
 import { createDiscoveryEngine } from "./engine-factory";
 import type { SearchSeed } from "@/domain/discovery/types";
-import { createApifyCredentialFingerprint, evaluateProviderHealth, getApifyAllocationHealth, resolveApifyDiscoveryWorkMode } from "@/services/discovery/provider-health";
+import { createApifyConfigurationFingerprint, createApifyCredentialFingerprint, evaluateProviderHealth, getApifyAllocationHealth, resolveApifyDiscoveryWorkMode } from "@/services/discovery/provider-health";
 import { createProviderRequestKey, normalizeProviderQuery } from "@/services/discovery/provider-request-key";
 import { resolvePlanningWindow } from "@/services/autopilot/target-planner";
 import { getMapsEnv } from "@/lib/config/env";
@@ -102,6 +102,9 @@ async function executeDiscoveryJob(
   if (getEffectiveAutopilotState(settings) !== "running") return 0;
 
   const provider = job.payload.engineType === "maps_fast" || job.payload.engineType === "maps_deep" ? "apify" : "serper";
+  const apifyConfigurationFingerprint = provider === "apify"
+    ? createApifyConfigurationFingerprint(getMapsEnv())
+    : null;
   const apifyRecovery = provider === "apify" ? await getApifyRecoverySnapshot(campaign.workspaceId) : null;
   const providerHealth = apifyRecovery
     ? getApifyAllocationHealth(apifyRecovery)
@@ -199,7 +202,17 @@ async function executeDiscoveryJob(
         seedId: seed.id,
         itemsRequested: requestedItems,
         recoveryProbe,
-        metadata: { engineType: job.payload.engineType, seedId: seed.id, discoveryJobId: job.id, query: seed.query, normalizedQuery, geography: seed.geography, planningWindow, recoveryProbe },
+        metadata: {
+          engineType: job.payload.engineType,
+          seedId: seed.id,
+          discoveryJobId: job.id,
+          query: seed.query,
+          normalizedQuery,
+          geography: seed.geography,
+          planningWindow,
+          recoveryProbe,
+          ...(recoveryProbe && apifyConfigurationFingerprint ? { configurationFingerprint: apifyConfigurationFingerprint } : {}),
+        },
       });
       counters.providerReservationsCreated += reservation.created ? 1 : 0;
       counters.providerReservationsSkipped += reservation.created ? 0 : 1;
@@ -257,11 +270,25 @@ async function executeDiscoveryJob(
         const credentialFingerprint = failureKind === "authentication" || failureKind === "billing"
           ? createApifyCredentialFingerprint(getMapsEnv().APIFY_API_TOKEN)
           : null;
+        const configurationFingerprint = failureKind === "configuration" ? apifyConfigurationFingerprint : null;
         await updateProviderRun(reservationId, {
           status: "failed",
           finishedAt: new Date(),
           error: `Provider startup failed: ${message}`,
-          metadata: { engineType: job.payload.engineType, seedId: seed.id, seedRunId, discoveryJobId: job.id, query: seed.query, normalizedQuery, geography: seed.geography, planningWindow, recoveryProbe, ...(failureKind ? { failureKind } : {}), ...(credentialFingerprint ? { credentialFingerprint } : {}) },
+          metadata: {
+            engineType: job.payload.engineType,
+            seedId: seed.id,
+            seedRunId,
+            discoveryJobId: job.id,
+            query: seed.query,
+            normalizedQuery,
+            geography: seed.geography,
+            planningWindow,
+            recoveryProbe,
+            ...(failureKind ? { failureKind } : {}),
+            ...(credentialFingerprint ? { credentialFingerprint } : {}),
+            ...(configurationFingerprint ? { configurationFingerprint } : {}),
+          },
         });
       }
       if (seedRunId) await updateSearchSeedRun(seedRunId, { finishedAt: new Date().toISOString(), error: `Provider startup failed: ${message}` });

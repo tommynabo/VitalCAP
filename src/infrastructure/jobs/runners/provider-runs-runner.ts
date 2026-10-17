@@ -6,7 +6,7 @@ import { ApifyClient, classifyApifyRunFailure } from "@/infrastructure/providers
 import { mapCompassItemToPlaceResult } from "@/infrastructure/providers/maps/apify-actors/compass-adapter";
 import { ingestApifyProviderRun } from "@/infrastructure/neon/repositories/provider-run-ingestion";
 import { ProviderFailureError } from "@/domain/providers/errors";
-import { createApifyCredentialFingerprint } from "@/services/discovery/provider-health";
+import { createApifyConfigurationFingerprint, createApifyCredentialFingerprint } from "@/services/discovery/provider-health";
 
 const MONITORED_PROVIDERS = ["apify", "serper", "email_verification"] as const;
 const MAX_RUNS_PER_TICK = 20;
@@ -76,6 +76,9 @@ export async function runProviderRunsCronTick(maxRuns = MAX_RUNS_PER_TICK): Prom
         const credentialFingerprint = failure.kind === "authentication" || failure.kind === "billing"
           ? createApifyCredentialFingerprint(env.APIFY_API_TOKEN)
           : null;
+        const configurationFingerprint = failure.kind === "configuration"
+          ? createApifyConfigurationFingerprint(env)
+          : null;
         await updateProviderRun(providerRun.id, {
           status: terminalStatus,
           externalDatasetId: run.defaultDatasetId ?? providerRun.externalDatasetId,
@@ -86,6 +89,7 @@ export async function runProviderRunsCronTick(maxRuns = MAX_RUNS_PER_TICK): Prom
             ...((providerRun.metadata ?? {}) as Record<string, unknown>),
             failureKind: failure.kind,
             ...(credentialFingerprint ? { credentialFingerprint } : {}),
+            ...(configurationFingerprint ? { configurationFingerprint } : {}),
           },
         });
         continue;

@@ -25,6 +25,20 @@ export function createApifyCredentialFingerprint(token: string | null | undefine
   return token ? createHash("sha256").update(token).digest("hex") : null;
 }
 
+export function createApifyConfigurationFingerprint(configuration: {
+  APIFY_BATCH_COST_LIMIT_USD: number;
+  APIFY_MAPS_FAST_ACTOR: string;
+  APIFY_MAPS_DEEP_ACTOR: string;
+  APIFY_MAPS_FALLBACK_ACTOR: string;
+}): string {
+  return createHash("sha256").update(JSON.stringify([
+    configuration.APIFY_BATCH_COST_LIMIT_USD,
+    configuration.APIFY_MAPS_FAST_ACTOR,
+    configuration.APIFY_MAPS_DEEP_ACTOR,
+    configuration.APIFY_MAPS_FALLBACK_ACTOR,
+  ])).digest("hex");
+}
+
 export interface ApifyRecoveryRun {
   status: string;
   startedAt: Date | string;
@@ -34,6 +48,7 @@ export interface ApifyRecoveryRun {
   recoveryProbe?: boolean;
   failureKind?: "transient" | "billing" | "authentication" | "configuration" | "safety";
   credentialFingerprint?: string;
+  configurationFingerprint?: string;
 }
 
 export interface ApifyRecoverySnapshot {
@@ -74,6 +89,7 @@ export function evaluateApifyRecovery(
   blockedBySafetyGate: boolean,
   now = new Date(),
   currentCredentialFingerprint: string | null = null,
+  currentConfigurationFingerprint: string | null = null,
 ): ApifyRecoverySnapshot {
   const emptyUsage: ProviderUsageStats = { calls: 0, items: 0, errors: 0, totalLatencyMs: 0, costUsd: 0, quotaRemaining: null };
   const successAt = runDate(latestSuccessAt);
@@ -99,9 +115,20 @@ export function evaluateApifyRecovery(
   }
 
   const providerPaused = evaluateProviderHealth(usage) === "paused" || (latestFailure !== null && !successAfterFailure);
-  if (!latestFailure || successAfterFailure || blockedBySafetyGate || latestFailure.failureKind === "configuration" || !providerPaused) {
+  if (!latestFailure || successAfterFailure || blockedBySafetyGate) {
     return { usage, recoveryProbeEligible: false, nextRecoveryAttemptAt: null };
   }
+
+  if (latestFailure.failureKind === "configuration") {
+    const configurationChanged = currentConfigurationFingerprint !== null
+      && latestFailure.configurationFingerprint !== currentConfigurationFingerprint;
+    if (!configurationChanged || recoveryProbeInFlight) {
+      return { usage, recoveryProbeEligible: false, nextRecoveryAttemptAt: null };
+    }
+    return { usage: emptyUsage, recoveryProbeEligible: true, nextRecoveryAttemptAt: new Date(now) };
+  }
+
+  if (!providerPaused) return { usage, recoveryProbeEligible: false, nextRecoveryAttemptAt: null };
 
   const credentialRecoverableFailure = latestFailure.failureKind === "authentication"
     || latestFailure.failureKind === "billing";
