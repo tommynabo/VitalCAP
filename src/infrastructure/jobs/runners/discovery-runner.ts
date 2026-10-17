@@ -31,6 +31,7 @@ import { createApifyCredentialFingerprint, evaluateProviderHealth, getApifyAlloc
 import { createProviderRequestKey, normalizeProviderQuery } from "@/services/discovery/provider-request-key";
 import { resolvePlanningWindow } from "@/services/autopilot/target-planner";
 import { getMapsEnv } from "@/lib/config/env";
+import { logEvent } from "@/lib/observability/structured-logger";
 
 const DISCOVERY_JOB_TYPE = "run_engine_batch";
 const MAX_SEEDS_PER_JOB = 5;
@@ -71,9 +72,29 @@ interface DiscoveryJobPayload {
   seedGeography?: string;
 }
 
-async function executeDiscoveryJob(job: { id: string; campaignId: string; payload: DiscoveryJobPayload }): Promise<number> {
+interface DiscoveryHandoffCounters {
+  providerReservationsCreated: number;
+  providerReservationsSkipped: number;
+  providerRunsStarted: number;
+  providerStartsFailed: number;
+  providerJobsDeferred: number;
+}
+
+async function executeDiscoveryJob(
+  job: { id: string; campaignId: string; payload: DiscoveryJobPayload },
+  counters: DiscoveryHandoffCounters,
+): Promise<number> {
   const campaign = await getCampaignById(job.campaignId);
   if (!campaign) throw new Error(`Campaign not found: ${job.campaignId}`);
+  logEvent("info", "discovery.job.claimed", {
+    correlationId: job.id,
+    discoveryJobId: job.id,
+    workspaceId: campaign.workspaceId,
+    campaignId: campaign.id,
+    engineType: job.payload.engineType,
+    origin: job.payload.origin ?? null,
+    desiredRawCount: job.payload.desiredRawCount,
+  });
   if (campaign.status !== "active" || !campaign.autopilotEnabled) {
     throw new Error(`Scheduled discovery is disabled for campaign ${job.campaignId}.`);
   }
@@ -93,13 +114,39 @@ async function executeDiscoveryJob(job: { id: string; campaignId: string; payloa
       recoveryProbeRequested: requestedRecoveryProbe,
     })
     : "normal";
-  if (recoveryWorkMode === "skip") return 0;
+  const recoveryProbe = recoveryWorkMode === "recovery_probe";
+  logEvent("info", "discovery.provider.selected", {
+    correlationId: job.id,
+    discoveryJobId: job.id,
+    provider,
+    providerHealth,
+    recoveryWorkMode,
+    recoveryProbe,
+  });
+  if (recoveryWorkMode === "skip") {
+    logEvent("info", "discovery.provider.deferred", {
+      correlationId: job.id,
+      discoveryJobId: job.id,
+      provider,
+      providerHealth,
+      recoveryWorkMode,
+      nextRecoveryAttemptAt: apifyRecovery?.nextRecoveryAttemptAt?.toISOString() ?? null,
+    });
+    return 0;
+  }
   if (recoveryWorkMode === "defer") {
     const retryAt = apifyRecovery?.nextRecoveryAttemptAt;
+    logEvent("info", "discovery.provider.deferred", {
+      correlationId: job.id,
+      discoveryJobId: job.id,
+      provider,
+      providerHealth,
+      recoveryWorkMode,
+      nextRecoveryAttemptAt: retryAt?.toISOString() ?? null,
+    });
     if (!retryAt) throw new ProviderConfigurationError("Apify is paused without an eligible recovery time.");
     throw new ProviderFailureError("Apify provider is in recovery cooldown.", "transient", retryAt);
   }
-  const recoveryProbe = recoveryWorkMode === "recovery_probe";
 
   const engine = createDiscoveryEngine(campaign.workspaceId, job.payload.engineType, campaign.id);
   // Every concrete engine owns a persisted, idempotent seed catalog. Hybrid
@@ -154,7 +201,25 @@ async function executeDiscoveryJob(job: { id: string; campaignId: string; payloa
         recoveryProbe,
         metadata: { engineType: job.payload.engineType, seedId: seed.id, discoveryJobId: job.id, query: seed.query, normalizedQuery, geography: seed.geography, planningWindow, recoveryProbe },
       });
-      if (!reservation.created) continue;
+      counters.providerReservationsCreated += reservation.created ? 1 : 0;
+      counters.providerReservationsSkipped += reservation.created ? 0 : 1;
+      logEvent("info", "discovery.provider.reservation", {
+        correlationId: job.id,
+        discoveryJobId: job.id,
+        ...(reservation.created ? { providerRunId: reservation.providerRun.id } : {}),
+        created: reservation.created,
+        itemsRequested: requestedItems,
+        requestKeyHash: requestKey.slice(requestKey.indexOf(":") + 1),
+        recoveryProbe,
+      });
+      if (!reservation.created) {
+        logEvent("info", "discovery.provider.reservation_skipped", {
+          correlationId: job.id,
+          discoveryJobId: job.id,
+          reason: "duplicate_or_existing_request",
+        });
+        continue;
+      }
       reservationId = reservation.providerRun.id;
       seedRunId = await insertSearchSeedRun({
         seedId: seed.id,
@@ -173,6 +238,20 @@ async function executeDiscoveryJob(job: { id: string; campaignId: string; payloa
       result = await engine.executeDiscovery({ seed, dryRun: false, requestKey, maxResults: requestedItems, planningWindow });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      counters.providerStartsFailed += 1;
+      const retryAt = error instanceof ProviderFailureError || error instanceof ProviderBudgetExceededError
+        ? error.retryAt
+        : null;
+      logEvent("error", "discovery.provider.start_failed", {
+        correlationId: job.id,
+        discoveryJobId: job.id,
+        ...(reservationId ? { providerRunId: reservationId } : {}),
+        failureKind: error instanceof ProviderFailureError
+          ? error.kind
+          : error instanceof ProviderBudgetExceededError ? error.budgetKind : "unknown",
+        errorClass: error instanceof Error ? error.constructor.name : typeof error,
+        retryAt: retryAt?.toISOString() ?? null,
+      });
       if (reservationId) {
         const failureKind = error instanceof ProviderFailureError ? error.kind : null;
         const credentialFingerprint = failureKind === "authentication" || failureKind === "billing"
@@ -199,6 +278,15 @@ async function executeDiscoveryJob(job: { id: string; campaignId: string; payloa
         status: result.providerRun.status,
         costUsd: result.providerRun.costUsd,
         metadata: { ...result.providerRun.metadata, engineType: job.payload.engineType, seedId: seed.id, seedRunId, discoveryJobId: job.id, query: seed.query, geography: seed.geography, recoveryProbe },
+      });
+      counters.providerRunsStarted += 1;
+      logEvent("info", "discovery.provider.started", {
+        correlationId: job.id,
+        discoveryJobId: job.id,
+        providerRunId: reservationId,
+        externalRunIdPresent: Boolean(result.providerRun.externalRunId),
+        externalDatasetIdPresent: Boolean(result.providerRun.externalDatasetId),
+        providerRunStatus: result.providerRun.status,
       });
       continue;
     }
@@ -261,6 +349,11 @@ async function executeDiscoveryJob(job: { id: string; campaignId: string; payloa
 export interface DiscoveryRunnerResult {
   jobsClaimed: number;
   rawCandidatesProduced: number;
+  providerReservationsCreated: number;
+  providerReservationsSkipped: number;
+  providerRunsStarted: number;
+  providerStartsFailed: number;
+  providerJobsDeferred: number;
   pausedWorkspaces: number;
   emergencyStoppedWorkspaces: number;
 }
@@ -275,6 +368,13 @@ export async function runDiscoveryCronTick(maxJobsPerTick: number, now: Date = n
   const workerId = `cron-discovery-${randomUUID()}`;
   let jobsClaimed = 0;
   let rawCandidatesProduced = 0;
+  const handoffCounters: DiscoveryHandoffCounters = {
+    providerReservationsCreated: 0,
+    providerReservationsSkipped: 0,
+    providerRunsStarted: 0,
+    providerStartsFailed: 0,
+    providerJobsDeferred: 0,
+  };
   let pausedWorkspaces = 0;
   let emergencyStoppedWorkspaces = 0;
 
@@ -282,12 +382,14 @@ export async function runDiscoveryCronTick(maxJobsPerTick: number, now: Date = n
   for (const job of jobs) {
     jobsClaimed += 1;
     try {
-      rawCandidatesProduced += await executeDiscoveryJob(job);
+      rawCandidatesProduced += await executeDiscoveryJob(job, handoffCounters);
       await completeDiscoveryJob({ jobId: job.id, workerId, now });
     } catch (error) {
       if (error instanceof ProviderBudgetExceededError) {
+        handoffCounters.providerJobsDeferred += 1;
         await deferDiscoveryJob({ jobId: job.id, workerId, nextAttemptAt: error.retryAt, reason: error.message });
       } else if (error instanceof ProviderFailureError && error.retryAt) {
+        handoffCounters.providerJobsDeferred += 1;
         await deferDiscoveryJob({ jobId: job.id, workerId, nextAttemptAt: getProviderFailureRetryAt(error, now)!, reason: error.message });
       } else if (error instanceof ProviderConfigurationError) {
         await failDiscoveryJob({ workerId, job, error, now, classification: "permanent" });
@@ -302,5 +404,5 @@ export async function runDiscoveryCronTick(maxJobsPerTick: number, now: Date = n
     if (state === "paused") pausedWorkspaces += 1;
     if (state === "emergency_stopped") emergencyStoppedWorkspaces += 1;
   }
-  return { jobsClaimed, rawCandidatesProduced, pausedWorkspaces, emergencyStoppedWorkspaces };
+  return { jobsClaimed, rawCandidatesProduced, ...handoffCounters, pausedWorkspaces, emergencyStoppedWorkspaces };
 }

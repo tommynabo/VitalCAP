@@ -16,6 +16,13 @@ export async function GET(request: NextRequest) {
         state: result.emergencyStoppedWorkspaces > 0 ? "emergency_stopped" : result.pausedWorkspaces > 0 ? "paused" : "running",
         pausedWorkspaces: result.pausedWorkspaces,
         emergencyStoppedWorkspaces: result.emergencyStoppedWorkspaces,
+        jobsClaimed: result.jobsClaimed,
+        rawCandidatesProduced: result.rawCandidatesProduced,
+        providerReservationsCreated: result.providerReservationsCreated,
+        providerReservationsSkipped: result.providerReservationsSkipped,
+        providerRunsStarted: result.providerRunsStarted,
+        providerStartsFailed: result.providerStartsFailed,
+        providerJobsDeferred: result.providerJobsDeferred,
       },
     };
   });
