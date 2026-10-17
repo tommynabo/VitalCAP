@@ -178,6 +178,7 @@ export async function getApifyRecoverySnapshot(workspaceId: string, now = new Da
       status: providerRuns.status,
       startedAt: providerRuns.startedAt,
       finishedAt: providerRuns.finishedAt,
+      error: providerRuns.error,
       metadata: providerRuns.metadata,
     }).from(providerRuns).where(and(
       eq(providerRuns.workspaceId, workspaceId),
@@ -228,7 +229,7 @@ export async function getApifyRecoverySnapshot(workspaceId: string, now = new Da
     eq(providerRuns.workspaceId, workspaceId),
     eq(providerRuns.status, "manual_reconciliation_required"),
   )).limit(1);
-  return evaluateApifyRecovery(
+  const recoverySnapshot = evaluateApifyRecovery(
     runs,
     latestFailure,
     successRows[0]?.finishedAt ?? successRows[0]?.startedAt ?? null,
@@ -237,6 +238,14 @@ export async function getApifyRecoverySnapshot(workspaceId: string, now = new Da
     now,
     createApifyCredentialFingerprint(getMapsEnv().APIFY_API_TOKEN),
   );
+  return {
+    ...recoverySnapshot,
+    recoveryProbeInFlight: probeInFlight,
+    latestFailureKind: latestFailure?.failureKind ?? null,
+    latestFailureAt: latestFailure?.finishedAt ?? latestFailure?.startedAt ?? null,
+    latestFailureMessage: failureRow?.error ?? null,
+    latestSuccessAt: successRows[0]?.finishedAt ?? successRows[0]?.startedAt ?? null,
+  };
 }
 
 export async function reserveApifyProviderRun(input: ReserveApifyProviderRunInput): Promise<{ providerRun: typeof providerRuns.$inferSelect; created: boolean }> {
