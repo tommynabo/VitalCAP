@@ -21,6 +21,15 @@ export interface WatchdogPauseState {
   systemPausedAt: Date | null;
 }
 
+export function getWatchdogPausePredicates(signals: WatchdogQueueSignals): string[] {
+  const matched: string[] = [];
+  if (signals.oldDueDiscovery > 0) matched.push("old_due_discovery");
+  if (signals.oldProcessing > 0) matched.push("old_processing");
+  if (signals.staleDiscoveryLocks > 0) matched.push("stale_discovery_lock");
+  if (signals.staleProcessingLocks > 0) matched.push("stale_processing_lock");
+  return matched;
+}
+
 export function evaluateWatchdogPause(
   current: WatchdogPauseState,
   signals: WatchdogQueueSignals,
@@ -30,10 +39,7 @@ export function evaluateWatchdogPause(
     return current;
   }
 
-  const queueUnhealthy = signals.oldDueDiscovery > 0
-    || signals.oldProcessing > 0
-    || signals.staleDiscoveryLocks > 0
-    || signals.staleProcessingLocks > 0;
+  const queueUnhealthy = getWatchdogPausePredicates(signals).length > 0;
   const reason = signals.manualReconciliations > 0
     ? WATCHDOG_RECONCILIATION_PAUSE_REASON
     : queueUnhealthy

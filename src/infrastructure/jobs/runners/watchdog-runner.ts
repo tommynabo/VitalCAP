@@ -1,7 +1,7 @@
 import { sql } from "drizzle-orm";
-import { PROVIDER_DEFERRED_JOB_ERROR_PREFIX } from "@/domain/discovery/types";
 import { evaluateWatchdogPause } from "@/services/autopilot/watchdog-pause-policy";
 import { getDb } from "../../neon/db";
+import { getWatchdogWorkspaceSignals } from "../../neon/repositories/watchdog-signals";
 import {
   deadLetterExpiredJobs,
   requeueStaleLockedJobs,
@@ -112,51 +112,15 @@ export async function runWatchdogCronTick(): Promise<WatchdogCronResult> {
   const orphanedSeedRuns = orphanedSeeds.rows.length;
 
   // 6. Autopilot System Pause Check (Queue Health) - Workspace Scoped
-  const healthRows = await db.execute(sql`
-    WITH workspace_health AS (
-      SELECT
-        w.id AS workspace_id,
-        (SELECT count(*) FROM discovery_jobs dj JOIN campaigns c ON dj.campaign_id = c.id
-          WHERE c.workspace_id = w.id AND dj.status = 'pending'
-            AND (dj.next_attempt_at IS NULL OR dj.next_attempt_at <= NOW())
-            AND LEFT(COALESCE(dj.last_error, ''), ${PROVIDER_DEFERRED_JOB_ERROR_PREFIX.length}) <> ${PROVIDER_DEFERRED_JOB_ERROR_PREFIX}
-            AND dj.created_at < NOW() - INTERVAL '30 minutes')::int AS old_due_discovery,
-        (SELECT count(*) FROM discovery_jobs dj JOIN campaigns c ON dj.campaign_id = c.id
-          WHERE c.workspace_id = w.id AND dj.status = 'pending'
-            AND (dj.next_attempt_at > NOW() OR LEFT(COALESCE(dj.last_error, ''), ${PROVIDER_DEFERRED_JOB_ERROR_PREFIX.length}) = ${PROVIDER_DEFERRED_JOB_ERROR_PREFIX}))::int AS deferred_discovery,
-        (SELECT count(*) FROM processing_jobs pj JOIN campaigns c ON pj.campaign_id = c.id
-          WHERE c.workspace_id = w.id AND pj.status = 'pending'
-            AND (pj.next_attempt_at IS NULL OR pj.next_attempt_at <= NOW())
-            AND pj.created_at < NOW() - INTERVAL '30 minutes')::int AS old_processing,
-        (SELECT count(*) FROM discovery_jobs dj JOIN campaigns c ON dj.campaign_id = c.id
-          WHERE c.workspace_id = w.id AND dj.status = 'processing'
-            AND dj.locked_at < NOW() - (${STALE_JOB_LOCK_THRESHOLD_MS / 60_000} * INTERVAL '1 minute'))::int AS stuck_discovery,
-        (SELECT count(*) FROM processing_jobs pj JOIN campaigns c ON pj.campaign_id = c.id
-          WHERE c.workspace_id = w.id AND pj.status = 'processing'
-            AND pj.locked_at < NOW() - (${STALE_JOB_LOCK_THRESHOLD_MS / 60_000} * INTERVAL '1 minute'))::int AS stuck_processing,
-        (SELECT count(*) FROM provider_runs pr
-          WHERE pr.workspace_id = w.id AND pr.status = 'manual_reconciliation_required')::int AS provider_reconciliations
-      FROM workspaces w
-    )
-    SELECT wh.*, aps.system_paused, aps.system_pause_reason, aps.system_paused_at
-    FROM workspace_health wh
-    JOIN autopilot_settings aps ON aps.workspace_id = wh.workspace_id AND aps.enabled = true
-  `);
+  const healthRows = await getWatchdogWorkspaceSignals();
 
-  for (const row of healthRows.rows as Array<Record<string, unknown>>) {
+  for (const row of healthRows) {
     const current = {
-      systemPaused: row.system_paused === true,
-      systemPauseReason: typeof row.system_pause_reason === "string" ? row.system_pause_reason : null,
-      systemPausedAt: row.system_paused_at ? new Date(String(row.system_paused_at)) : null,
+      systemPaused: row.systemPaused,
+      systemPauseReason: row.systemPauseReason,
+      systemPausedAt: row.systemPausedAt,
     };
-    const decision = evaluateWatchdogPause(current, {
-      oldDueDiscovery: Number(row.old_due_discovery ?? 0),
-      deferredDiscovery: Number(row.deferred_discovery ?? 0),
-      oldProcessing: Number(row.old_processing ?? 0),
-      staleDiscoveryLocks: Number(row.stuck_discovery ?? 0),
-      staleProcessingLocks: Number(row.stuck_processing ?? 0),
-      manualReconciliations: Number(row.provider_reconciliations ?? 0),
-    }, new Date());
+    const decision = evaluateWatchdogPause(current, row, new Date());
 
     if (decision.systemPaused !== current.systemPaused
       || decision.systemPauseReason !== current.systemPauseReason
@@ -166,7 +130,7 @@ export async function runWatchdogCronTick(): Promise<WatchdogCronResult> {
         SET system_paused = ${decision.systemPaused},
             system_pause_reason = ${decision.systemPauseReason},
             system_paused_at = ${decision.systemPausedAt?.toISOString() ?? null}::timestamptz
-        WHERE workspace_id = ${String(row.workspace_id)}::uuid AND enabled = true
+        WHERE workspace_id = ${row.workspaceId}::uuid AND enabled = true
       `);
     }
   }

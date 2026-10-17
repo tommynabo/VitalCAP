@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { evaluateWatchdogPause, WATCHDOG_QUEUE_PAUSE_REASON, WATCHDOG_RECONCILIATION_PAUSE_REASON } from "./watchdog-pause-policy";
+import { evaluateWatchdogPause, getWatchdogPausePredicates, WATCHDOG_QUEUE_PAUSE_REASON, WATCHDOG_RECONCILIATION_PAUSE_REASON } from "./watchdog-pause-policy";
 
 const now = new Date("2025-01-01T02:00:00Z");
 const clearState = { systemPaused: false, systemPauseReason: null, systemPausedAt: null };
@@ -56,5 +56,23 @@ describe("evaluateWatchdogPause", () => {
     const manualPause = { systemPaused: true, systemPauseReason: "operator_hold", systemPausedAt: now };
 
     expect(evaluateWatchdogPause(manualPause, clearSignals, now)).toEqual(manualPause);
+  });
+});
+
+describe("getWatchdogPausePredicates", () => {
+  it("returns every matched queue predicate in stable order and ignores deferred-only jobs", () => {
+    expect(getWatchdogPausePredicates({ ...clearSignals, deferredDiscovery: 2 })).toEqual([]);
+    expect(getWatchdogPausePredicates({
+      ...clearSignals,
+      oldDueDiscovery: 1,
+      oldProcessing: 2,
+      staleDiscoveryLocks: 3,
+      staleProcessingLocks: 4,
+    })).toEqual([
+      "old_due_discovery",
+      "old_processing",
+      "stale_discovery_lock",
+      "stale_processing_lock",
+    ]);
   });
 });
