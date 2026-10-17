@@ -48,6 +48,7 @@ export async function runCronRoute(route: string, work: () => Promise<CronWorkRe
       outcome: status,
       durationMs: Date.now() - startedAt,
       itemsProcessed: result.itemsProcessed,
+      ...(result.metadata ?? {}),
     });
     return NextResponse.json({ status, itemsProcessed: result.itemsProcessed, warnings: result.warnings ?? [], ...(result.metadata ?? {}) });
   } catch (error) {

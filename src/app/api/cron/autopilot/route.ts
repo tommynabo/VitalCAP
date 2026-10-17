@@ -9,6 +9,7 @@ export async function GET(request: NextRequest) {
   return runCronRoute("autopilot", async () => {
     const result = await runAutopilotCronTick();
     const statuses = result.pacingStates.map((state) => state.status);
+    const pacing = result.pacingStates[0];
     return {
       itemsProcessed: result.campaignsTicked,
       metadata: {
@@ -17,6 +18,19 @@ export async function GET(request: NextRequest) {
         emergencyStoppedWorkspaces: result.emergencyStoppedWorkspaces,
         ordersScheduled: result.ordersScheduled,
         pacingStatuses: statuses,
+        ...(pacing ? {
+          dailyTarget: pacing.dailyTarget,
+          targetAchievedToday: pacing.targetAchievedToday,
+          expectedAchievedByNow: pacing.expectedAchievedByNow,
+          paceDeficit: pacing.paceDeficit,
+          rawNeededToPlan: pacing.rawNeededToPlan,
+          rawRequestsRemaining: pacing.rawRequestsRemaining,
+          providerHealth: pacing.providerHealth,
+          eligibleImportBacklog: pacing.eligibleImportBacklog,
+          verificationInFlight: pacing.verificationInFlight,
+          processingInFlight: pacing.processingInFlight,
+          providerRunsInFlight: pacing.providerRunsInFlight,
+        } : {}),
       },
     };
   });
