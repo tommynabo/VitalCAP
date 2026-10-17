@@ -72,6 +72,57 @@ interface DiscoveryJobPayload {
   seedGeography?: string;
 }
 
+type PreReservationStage = "bootstrap" | "load_seeds" | "plan_batch";
+
+function getErrorClass(error: unknown): string {
+  return error instanceof Error ? error.constructor.name : typeof error;
+}
+
+function getSafeErrorMessage(error: unknown, seeds: readonly SearchSeed[]): string {
+  let message = error instanceof Error ? error.message : "Non-Error exception.";
+  const seedTerms = new Set(seeds.flatMap((seed) => [seed.query, seed.geography]).filter((term) => term.length >= 2));
+  for (const term of seedTerms) {
+    const escapedTerm = term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    message = message.replace(new RegExp(escapedTerm, "gi"), "[seed]");
+  }
+  const payloadStart = [message.indexOf("{"), message.indexOf("[")]
+    .filter((index) => index >= 0)
+    .sort((left, right) => left - right)[0];
+  if (payloadStart !== undefined) message = message.slice(0, payloadStart);
+
+  return message
+    .replace(/\bapify_api_[A-Za-z0-9_-]+\b/gi, "[REDACTED]")
+    .replace(/Bearer\s+\S+/gi, "Bearer [REDACTED]")
+    .replace(/((?:password|api[_-]?key|token|secret|authorization)\s*[:=]\s*)[^\s,;]+/gi, "$1[REDACTED]")
+    .replace(/https?:\/\/\S+/gi, "[URL]")
+    .replace(/[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/gi, "[email]")
+    .replace(/\+?\d[\d\s().-]{7,}\d/g, "[phone]")
+    .replace(/[\r\n\t\u0000-\u001f]+/g, " ")
+    .trim()
+    .slice(0, 300) || "Pre-reservation operation failed.";
+}
+
+async function runPreReservationStage<T>(
+  job: { id: string; payload: DiscoveryJobPayload },
+  stage: PreReservationStage,
+  operation: () => Promise<T>,
+  sensitiveSeeds: readonly SearchSeed[] = [],
+): Promise<T> {
+  try {
+    return await operation();
+  } catch (error) {
+    logEvent("error", "discovery.pre_reservation_failed", {
+      correlationId: job.id,
+      discoveryJobId: job.id,
+      engineType: job.payload.engineType,
+      stage,
+      errorClass: getErrorClass(error),
+      safeErrorMessage: getSafeErrorMessage(error, sensitiveSeeds),
+    });
+    throw error;
+  }
+}
+
 interface DiscoveryHandoffCounters {
   providerReservationsCreated: number;
   providerReservationsSkipped: number;
@@ -155,10 +206,35 @@ async function executeDiscoveryJob(
   // Every concrete engine owns a persisted, idempotent seed catalog. Hybrid
   // Fill is intentionally excluded: it routes work to one of these engines
   // rather than creating a duplicate candidate source of its own.
+  const catalogSeeds = job.payload.engineType === "hybrid_fill"
+    ? []
+    : catalogForEngine(campaign.id, job.payload.engineType);
   if (job.payload.engineType !== "hybrid_fill") {
-    await bootstrapSearchSeeds(campaign.id, job.payload.engineType, catalogForEngine(campaign.id, job.payload.engineType));
+    await runPreReservationStage(
+      job,
+      "bootstrap",
+      () => bootstrapSearchSeeds(campaign.id, job.payload.engineType, catalogSeeds),
+      catalogSeeds,
+    );
+    logEvent("info", "discovery.seeds.bootstrapped", {
+      correlationId: job.id,
+      discoveryJobId: job.id,
+      engineType: job.payload.engineType,
+      catalogSeedCount: catalogSeeds.length,
+    });
   }
-  const persistedSeeds = await listSearchSeedsForCampaignEngine(campaign.id, job.payload.engineType);
+  const persistedSeeds = await runPreReservationStage(
+    job,
+    "load_seeds",
+    () => listSearchSeedsForCampaignEngine(campaign.id, job.payload.engineType),
+    catalogSeeds,
+  );
+  logEvent("info", "discovery.seeds.loaded", {
+    correlationId: job.id,
+    discoveryJobId: job.id,
+    engineType: job.payload.engineType,
+    persistedSeedCount: persistedSeeds.length,
+  });
   if ("seeds" in engine) (engine as { seeds: SearchSeed[] }).seeds = persistedSeeds;
 
   // The first provider run stays deliberately small. Once one terminal
@@ -169,12 +245,50 @@ async function executeDiscoveryJob(
   const desiredRawCount = Math.min(bootstrapCap, Math.max(0, Math.floor(job.payload.desiredRawCount)));
   if (desiredRawCount <= 0) return 0;
   const maxSeeds = Math.min(MAX_SEEDS_PER_JOB, Math.max(1, Math.ceil(desiredRawCount / 10)));
-  const { seeds } = await engine.planDiscoveryBatch({ campaignId: campaign.id, remainingTarget: desiredRawCount });
+  logEvent("info", "discovery.seeds.planning", {
+    correlationId: job.id,
+    discoveryJobId: job.id,
+    engineType: job.payload.engineType,
+    desiredRawCount,
+    maxSeeds,
+    recoveryProbe,
+  });
+  const { seeds } = await runPreReservationStage(
+    job,
+    "plan_batch",
+    () => engine.planDiscoveryBatch({ campaignId: campaign.id, remainingTarget: desiredRawCount }),
+    persistedSeeds,
+  );
+  logEvent("info", "discovery.seeds.planned", {
+    correlationId: job.id,
+    discoveryJobId: job.id,
+    engineType: job.payload.engineType,
+    plannedSeedCount: seeds.length,
+  });
+  const requestedSeedSpecified = Boolean(job.payload.seedQuery && job.payload.seedGeography);
   const requestedSeed = job.payload.seedQuery && job.payload.seedGeography
     ? seeds.find((seed) => seed.query === job.payload.seedQuery && seed.geography === job.payload.seedGeography)
     : undefined;
   const boundedSeeds = requestedSeed ? [requestedSeed] : seeds.slice(0, maxSeeds);
-  if (boundedSeeds.length === 0) return 0;
+  logEvent("info", "discovery.seeds.bounded", {
+    correlationId: job.id,
+    discoveryJobId: job.id,
+    boundedSeedCount: boundedSeeds.length,
+    requestedSeedSpecified,
+    requestedSeedMatchFound: Boolean(requestedSeed),
+  });
+  if (boundedSeeds.length === 0) {
+    logEvent("warn", "discovery.seeds.empty", {
+      correlationId: job.id,
+      discoveryJobId: job.id,
+      engineType: job.payload.engineType,
+      plannedSeedCount: seeds.length,
+      boundedSeedCount: boundedSeeds.length,
+      requestedSeedSpecified,
+      requestedSeedMatchFound: Boolean(requestedSeed),
+    });
+    return 0;
+  }
   let remainingRaw = desiredRawCount;
 
   let totalRawCandidates = 0;
@@ -412,6 +526,21 @@ export async function runDiscoveryCronTick(maxJobsPerTick: number, now: Date = n
       rawCandidatesProduced += await executeDiscoveryJob(job, handoffCounters);
       await completeDiscoveryJob({ jobId: job.id, workerId, now });
     } catch (error) {
+      const failureKind = error instanceof ProviderFailureError
+        ? error.kind
+        : error instanceof ProviderBudgetExceededError ? error.budgetKind : undefined;
+      const retryAt = error instanceof ProviderFailureError || error instanceof ProviderBudgetExceededError
+        ? error.retryAt
+        : null;
+      logEvent("error", "discovery.job.failed", {
+        correlationId: job.id,
+        discoveryJobId: job.id,
+        engineType: job.payload.engineType,
+        origin: job.payload.origin ?? null,
+        errorClass: getErrorClass(error),
+        ...(failureKind ? { failureKind } : {}),
+        ...(retryAt ? { retryAt: retryAt.toISOString() } : {}),
+      });
       if (error instanceof ProviderBudgetExceededError) {
         handoffCounters.providerJobsDeferred += 1;
         await deferDiscoveryJob({ jobId: job.id, workerId, nextAttemptAt: error.retryAt, reason: error.message });
