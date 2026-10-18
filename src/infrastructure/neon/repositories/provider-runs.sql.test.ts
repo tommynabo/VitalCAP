@@ -42,6 +42,9 @@ describe("Apify provider run reservation SQL", () => {
     expect(query.sql).toContain("legacy_configuration_failure_marked AS");
     expect(query.sql).toContain("candidate.metadata->>'failureKind' = 'configuration'");
     expect(query.sql).toContain("EXISTS (SELECT 1 FROM inserted)");
+    expect(query.sql).toMatch(/jsonb_build_object\('configurationFingerprint', \$\d+::text\)/);
+    expect(query.sql).toMatch(/AND \$\d+::text IS NOT NULL/);
+    expect(query.params.filter((parameter) => parameter === "safe-config-fingerprint")).toHaveLength(2);
     expect(query.params).toContain("safe-config-fingerprint");
   });
 

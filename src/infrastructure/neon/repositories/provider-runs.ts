@@ -239,7 +239,7 @@ export function buildReserveApifyProviderRunQuery(
     ),
     legacy_configuration_failure_marked AS (
       UPDATE provider_runs AS failure
-      SET metadata = COALESCE(failure.metadata, '{}'::jsonb) || jsonb_build_object('configurationFingerprint', ${configurationFingerprint})
+      SET metadata = COALESCE(failure.metadata, '{}'::jsonb) || jsonb_build_object('configurationFingerprint', ${configurationFingerprint}::text)
       WHERE failure.id = (
         SELECT candidate.id
         FROM provider_runs candidate
@@ -252,7 +252,7 @@ export function buildReserveApifyProviderRunQuery(
         LIMIT 1
       )
         AND ${input.recoveryProbe ?? false} = true
-        AND ${configurationFingerprint} IS NOT NULL
+        AND ${configurationFingerprint}::text IS NOT NULL
         AND EXISTS (SELECT 1 FROM inserted)
       RETURNING failure.id
     )
