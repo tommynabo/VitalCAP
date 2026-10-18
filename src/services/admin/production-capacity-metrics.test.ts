@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  buildCapacityScenarios,
   calculateCostPerConfirmedImport,
   calculateYield,
   estimateRequestsRequiredForTarget,
@@ -178,14 +179,74 @@ describe("production capacity metrics", () => {
       { requests: 0, confirmedImports: 10 },
       { requests: 10_000, confirmedImports: 0 },
     ], 250)).toEqual({
+      p25: 2_500,
       p50: 5_000, p75: 7_500, p90: 7_500,
+      p25YieldUsed: 0.1,
       p50YieldUsed: 0.05, p75YieldUsed: 1 / 30, p90YieldUsed: 1 / 30, sampleCount: 3,
     });
     expect(estimateRequestsRequiredForTarget([], 250)).toEqual({
+      p25: null,
       p50: null, p75: null, p90: null,
+      p25YieldUsed: null,
       p50YieldUsed: null, p75YieldUsed: null, p90YieldUsed: null, sampleCount: 0,
     });
     expect(estimateRequestsRequiredForTarget([{ requests: 100, confirmedImports: 10 }], 250))
       .toMatchObject({ p50: null, p75: null, p90: null, sampleCount: 1 });
+  });
+
+  it("projects buffered provider requests and costs from the measured rolling mix", () => {
+    const estimates = estimateRequestsRequiredForTarget([
+      { requests: 100, confirmedImports: 10 },
+      { requests: 200, confirmedImports: 10 },
+      { requests: 300, confirmedImports: 10 },
+    ], 250);
+    const scenarios = buildCapacityScenarios({
+      estimates,
+      rolling7d: {
+        finalYield: 0.05,
+        totalRequests: 1_000,
+        apifyRequests: 750,
+        serperRequests: 250,
+        apifySpendUsd: 7,
+        serperSpendUsd: 1.4,
+        verificationSpendUsd: 0.7,
+      },
+    });
+
+    expect(scenarios.CONSERVATIVE).toMatchObject({
+      expectedFinalYield: 1 / 30,
+      rawRequestsFor250: 7_500,
+      rawRequestsWith20PercentBuffer: 9_000,
+      apifyRequests: 6_750,
+      serperRequests: 2_250,
+      apifyDailyCostUsd: 63,
+      serperDailyCostUsd: 12.6,
+      verificationDailyCostUsd: 6.3,
+    });
+    expect(scenarios.BASE.rawRequestsFor250).toBe(5_000);
+    expect(scenarios.OPTIMISTIC.rawRequestsFor250).toBe(2_500);
+  });
+
+  it("uses the measured rolling-seven-day yield for the base request requirement", () => {
+    const estimates = estimateRequestsRequiredForTarget([
+      { requests: 100, confirmedImports: 10 },
+      { requests: 200, confirmedImports: 10 },
+      { requests: 300, confirmedImports: 10 },
+    ], 250);
+    const scenarios = buildCapacityScenarios({
+      estimates,
+      rolling7d: {
+        finalYield: 0.0124,
+        totalRequests: 1_000,
+        apifyRequests: 750,
+        serperRequests: 250,
+        apifySpendUsd: 7,
+        serperSpendUsd: 1.4,
+        verificationSpendUsd: 0.7,
+      },
+    });
+
+    expect(scenarios.BASE.rawRequestsFor250).toBe(20_162);
+    expect(scenarios.BASE.rawRequestsWith20PercentBuffer).toBe(24_195);
   });
 });

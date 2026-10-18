@@ -1,12 +1,13 @@
 import type { EngineType } from "@/domain/campaigns/types";
 import type { BusinessType } from "@/domain/accounts/types";
 import type { RoleType, VerificationStatus } from "@/domain/contacts/types";
+import type { CandidateProcessingMetrics } from "@/domain/discovery/types";
 import type { MapsPlaceResult, SerpResult, WebsiteFetcher, EmailVerificationProvider } from "@/domain/providers/types";
 import { normalizeAddress, normalizeBusinessName, normalizeDomain, normalizePhoneES } from "@/lib/normalization";
 import { evaluateSpainEligibility, type SpainEligibilityVerdict } from "@/lib/geography/spain-eligibility";
 import { evaluateAccountDedup, type AccountIdentitySignals } from "@/services/deduplication/account-dedup";
 import { classifyBusinessType, isAcceptedIcpBusinessType } from "./business-type";
-import { extractCandidateEmails } from "@/services/enrichment/email-extraction";
+import { extractCandidateEmailsWithDiagnostics } from "@/services/enrichment/email-extraction";
 import { computeStrategicPriority } from "@/services/routing/contact-priority";
 import { isContactPointAcceptable, DEFAULT_VERIFICATION_ACCEPTANCE_POLICY, type VerificationAcceptancePolicy } from "@/services/verification/acceptance-policy";
 import { verifyEmailsWithCache, type EmailVerificationCacheStore } from "@/services/verification/email-verification-cache";
@@ -75,6 +76,7 @@ export interface ProcessedCandidateResult {
   businessType: BusinessType;
   icpQualified: boolean;
   contactPoints: ProcessedContactPoint[];
+  processingMetrics: CandidateProcessingMetrics;
   serperEmailRecovery: SerperEmailRecoveryDiagnostics;
   readyForOutreach: boolean;
   rejectionReason: string | null;
@@ -252,6 +254,7 @@ export async function processRawCandidate(
       businessType,
       icpQualified: false,
       contactPoints: [],
+      processingMetrics: { homepageFetchAttempted: 0, homepageFetchSucceeded: 0, homepageFetchFailed: 0, emailRejectedFormat: 0, emailDuplicate: 0 },
       serperEmailRecovery: { candidatesFound: 0, candidatesRelevant: 0, duplicateCandidatesSkipped: 0 },
       readyForOutreach: false,
       rejectionReason: `Rejected: ${spainResult.reason}`,
@@ -271,6 +274,7 @@ export async function processRawCandidate(
       businessType,
       icpQualified: false,
       contactPoints: [],
+      processingMetrics: { homepageFetchAttempted: 0, homepageFetchSucceeded: 0, homepageFetchFailed: 0, emailRejectedFormat: 0, emailDuplicate: 0 },
       serperEmailRecovery: { candidatesFound: 0, candidatesRelevant: 0, duplicateCandidatesSkipped: 0 },
       readyForOutreach: false,
       rejectionReason: `Rejected ICP: ${businessType} is outside the pharmacy, parapharmacy, and herbal-shop scope`,
@@ -280,26 +284,42 @@ export async function processRawCandidate(
   // Step: gather HTML for email extraction. maps_deep already crawled multiple pages during discovery;
   // every other engine does a single best-effort homepage fetch here (§2.3 step 6 / §2.9 "public contact point discovery").
   const pages: Array<{ url: string; body: string }> = [];
+  const processingMetrics: CandidateProcessingMetrics = {
+    homepageFetchAttempted: 0,
+    homepageFetchSucceeded: 0,
+    homepageFetchFailed: 0,
+    emailRejectedFormat: 0,
+    emailDuplicate: 0,
+  };
   if (payload.kind === "maps" && payload.crawledPages) {
     pages.push(...payload.crawledPages);
   } else if (websiteUrl) {
+    processingMetrics.homepageFetchAttempted = 1;
     try {
       const fetched = await context.websiteFetcher.fetchPage(websiteUrl, { signal: context.signal });
       pages.push({ url: fetched.url, body: fetched.body });
+      processingMetrics.homepageFetchSucceeded = 1;
     } catch {
       if (context.signal?.aborted) throw context.signal.reason;
+      processingMetrics.homepageFetchFailed = 1;
       // A single unreachable/blocked website must not fail the whole candidate — it just yields zero contact points.
     }
   }
 
-  const extractedEmails = pages.flatMap((page) => extractCandidateEmails(page.body, page.url));
+  const pageExtractionResults = pages.map((page) => extractCandidateEmailsWithDiagnostics(page.body, page.url));
+  const extractedEmails = pageExtractionResults.flatMap((result) => result.emails);
+  processingMetrics.emailRejectedFormat += pageExtractionResults.reduce((total, result) => total + result.rejectedFormat, 0);
+  processingMetrics.emailDuplicate += pageExtractionResults.reduce((total, result) => total + result.duplicates, 0);
   const serperEmailRecovery: SerperEmailRecoveryDiagnostics = {
     candidatesFound: 0,
     candidatesRelevant: 0,
     duplicateCandidatesSkipped: 0,
   };
   if (payload.kind === "serp") {
-    const candidates = extractCandidateEmails(payload.result.snippet, payload.result.url, "serper_snippet");
+    const extraction = extractCandidateEmailsWithDiagnostics(payload.result.snippet, payload.result.url, "serper_snippet");
+    const candidates = extraction.emails;
+    processingMetrics.emailRejectedFormat += extraction.rejectedFormat;
+    processingMetrics.emailDuplicate += extraction.duplicates;
     serperEmailRecovery.candidatesFound = candidates.length;
     const websiteEmails = new Set(extractedEmails.map((candidate) => candidate.email));
     for (const candidate of candidates) {
@@ -307,12 +327,14 @@ export async function processRawCandidate(
       serperEmailRecovery.candidatesRelevant += 1;
       if (websiteEmails.has(candidate.email)) {
         serperEmailRecovery.duplicateCandidatesSkipped += 1;
+        processingMetrics.emailDuplicate += 1;
         continue;
       }
       extractedEmails.push(candidate);
     }
   }
   const uniqueEmails = Array.from(new Map(extractedEmails.map((e) => [e.email, e])).values());
+  processingMetrics.emailDuplicate += extractedEmails.length - uniqueEmails.length;
 
   // Prompt 6 §6.1 Flow F (provider outage): a verification-provider failure
   // must never crash candidate processing or produce an invalid send — it
@@ -377,6 +399,7 @@ export async function processRawCandidate(
     businessType,
     icpQualified: true,
     contactPoints,
+    processingMetrics,
     serperEmailRecovery,
     readyForOutreach,
     rejectionReason,

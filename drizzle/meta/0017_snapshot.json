@@ -1,6 +1,6 @@
 {
-  "id": "571b2def-26be-4fb5-9401-ed071746970d",
-  "prevId": "d961d57b-3302-4c46-bd36-14f7a1fda300",
+  "id": "02322479-c2aa-45c8-92c9-aab904217e28",
+  "prevId": "571b2def-26be-4fb5-9401-ed071746970d",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -2154,6 +2154,12 @@
           "notNull": true,
           "default": "'{}'::jsonb"
         },
+        "processing_metrics": {
+          "name": "processing_metrics",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": false
+        },
         "search_seed_run_id": {
           "name": "search_seed_run_id",
           "type": "uuid",
@@ -2941,7 +2947,7 @@
             }
           ],
           "isUnique": true,
-          "where": "\"instantly_lead_imports\".\"status\" in ('eligible', 'instantly_queued', 'instantly_added', 'skipped_existing', 'failed', 'deferred', 'deferred_due_to_plan_limit')",
+          "where": "\"instantly_lead_imports\".\"status\" in ('eligible', 'instantly_queued', 'instantly_added', 'skipped_existing', 'failed', 'deferred', 'deferred_due_to_plan_limit', 'reconciliation_required')",
           "concurrently": false,
           "method": "btree",
           "with": {}
@@ -5079,6 +5085,7 @@
             }
           ],
           "isUnique": true,
+          "where": "\"provider_runs\".\"request_key\" is not null",
           "concurrently": false,
           "method": "btree",
           "with": {}

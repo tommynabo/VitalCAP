@@ -15,6 +15,14 @@ export type JobStatus =
   | "failed"
   | "dead_letter";
 
+export interface CandidateProcessingMetrics {
+  homepageFetchAttempted: number;
+  homepageFetchSucceeded: number;
+  homepageFetchFailed: number;
+  emailRejectedFormat: number;
+  emailDuplicate: number;
+}
+
 export const PROVIDER_DEFERRED_JOB_ERROR_PREFIX = "provider_deferred:";
 
 export interface JobRecord<TPayload = Record<string, unknown>> {

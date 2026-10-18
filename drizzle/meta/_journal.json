@@ -120,6 +120,13 @@
       "when": 1791110000000,
       "tag": "0019_autopilot_instantly_target",
       "breakpoints": true
+    },
+    {
+      "idx": 17,
+      "version": "7",
+      "when": 1792334423137,
+      "tag": "0020_pipeline_processing_metrics",
+      "breakpoints": true
     }
   ]
 }

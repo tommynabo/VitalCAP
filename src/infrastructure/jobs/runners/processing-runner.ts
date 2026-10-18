@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { Account, AccountStatus } from "@/domain/accounts/types";
 import { ProviderBudgetExceededError } from "@/domain/providers/errors";
 import type { CampaignMembershipStage } from "@/domain/campaigns/types";
+import type { CandidateProcessingMetrics } from "@/domain/discovery/types";
 import { getCampaignById } from "@/infrastructure/neon/repositories/campaigns";
 import { upsertCampaignMembership } from "@/infrastructure/neon/repositories/campaigns";
 import {
@@ -257,7 +258,13 @@ async function executeProcessingJob(
   const incoming = deriveIncomingIdentitySignals(payload);
   const existingAccounts = await findCandidateAccountMatches(campaign.workspaceId, incoming);
   if (!hasLinkedInEmployerAccount(payload, existingAccounts)) {
-    await markRawCandidateProcessed(raw.id);
+    await markRawCandidateProcessed(raw.id, {
+      homepageFetchAttempted: 0,
+      homepageFetchSucceeded: 0,
+      homepageFetchFailed: 0,
+      emailRejectedFormat: 0,
+      emailDuplicate: 0,
+    });
     return;
   }
 
@@ -334,7 +341,7 @@ async function executeProcessingJob(
   );
 
   if (canonicalResolution.kind === "needsReview") {
-    await markRawCandidateProcessed(raw.id);
+    await markRawCandidateProcessed(raw.id, processed.processingMetrics);
     return;
   }
 
@@ -374,6 +381,7 @@ async function executeProcessingJob(
     contactPointsCreated: 0,
     verificationQueued: 0,
   };
+  const processingMetrics: CandidateProcessingMetrics = { ...processed.processingMetrics };
 
   // --- WEBSITE ENRICHMENT ---
   if (accountFields.websiteUrl && incoming.normalizedDomain && options.enrichContacts !== false) {
@@ -512,6 +520,7 @@ async function executeProcessingJob(
         sourceType: "website_enrichment",
       });
       if (contactPoint.created) websiteRecoveryCounters.contactPointsCreated += 1;
+      else processingMetrics.emailDuplicate += 1;
       if (contactPoint.id && (contactPoint.created || contactPoint.verificationStatus === "unverified")) {
         const verificationQueued = await enqueueVerificationJob({
           workspaceId: campaign.workspaceId,
@@ -556,8 +565,9 @@ async function executeProcessingJob(
       verificationStatus: contactPoint.verificationStatus,
       verificationProvider: contactPoint.verificationProvider,
       sourceUrl: contactPoint.sourceUrl,
-      sourceType: contactPoint.sourceType === "serper_snippet" ? "serper_snippet" : raw.engineType,
+      sourceType: contactPoint.sourceType,
     });
+    if (!insertedContactPoint.created) processingMetrics.emailDuplicate += 1;
     if (contactPoint.sourceType === "serper_snippet") {
       if (insertedContactPoint.created) serperEmailDiagnostics.contactPointsCreated += 1;
       else serperEmailDiagnostics.duplicatesSkipped += 1;
@@ -615,7 +625,7 @@ async function executeProcessingJob(
   }
 
   await updateRawCandidateAccountId(raw.id, accountId);
-  await markRawCandidateProcessed(raw.id);
+  await markRawCandidateProcessed(raw.id, processingMetrics);
   if (raw.engineType === "maps_deep" && payload.kind === "maps" && incoming.normalizedDomain) {
     await enqueueProcessingJob({
       campaignId: campaign.id,

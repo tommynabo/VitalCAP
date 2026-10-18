@@ -3,7 +3,7 @@ import { getDb } from "../db";
 import { searchSeeds, searchSeedRuns, discoveryJobs, rawCandidates } from "../schema/discovery";
 import { campaigns } from "../schema/campaigns";
 import type { EngineType } from "@/domain/campaigns/types";
-import type { RawCandidate, SearchSeed, SearchSeedRun } from "@/domain/discovery/types";
+import type { CandidateProcessingMetrics, RawCandidate, SearchSeed, SearchSeedRun } from "@/domain/discovery/types";
 import { getDayBounds } from "@/lib/time/day-bounds";
 import { recomputeSeedMetrics, recordSeedRun } from "@/services/discovery/geography-planner";
 
@@ -324,9 +324,12 @@ export async function getRawCandidateById(id: string): Promise<RawCandidate | nu
   return row ? toRawCandidate(row) : null;
 }
 
-export async function markRawCandidateProcessed(id: string): Promise<void> {
+export async function markRawCandidateProcessed(id: string, processingMetrics?: CandidateProcessingMetrics): Promise<void> {
   const db = getDb();
-  await db.update(rawCandidates).set({ processed: true }).where(eq(rawCandidates.id, id));
+  await db.update(rawCandidates).set({
+    processed: true,
+    ...(processingMetrics ? { processingMetrics } : {}),
+  }).where(eq(rawCandidates.id, id));
 }
 
 /** Confirms `discoveryJobId` (used by the processing cron to look up the owning campaign/engine without trusting the raw candidate row alone). */

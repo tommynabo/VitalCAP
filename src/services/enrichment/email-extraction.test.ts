@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { extractCandidateEmails } from "./email-extraction";
+import { extractCandidateEmails, extractCandidateEmailsWithDiagnostics } from "./email-extraction";
 
 describe("extractCandidateEmails", () => {
   it("extracts a mailto link", () => {
@@ -52,5 +52,16 @@ describe("extractCandidateEmails", () => {
     const html = '<a href="mailto:info@farmaciadelgado.es">info@farmaciadelgado.es</a>';
     const emails = extractCandidateEmails(html, "https://farmaciadelgado.es/");
     expect(emails).toHaveLength(1);
+  });
+
+  it("reports malformed and duplicate candidates without retaining them in diagnostics", () => {
+    const result = extractCandidateEmailsWithDiagnostics(
+      "info@farmaciadelgado.es info@farmaciadelgado.es bad..name@farmaciadelgado.es",
+      "https://farmaciadelgado.es/",
+    );
+
+    expect(result.emails).toHaveLength(1);
+    expect(result.rejectedFormat).toBe(1);
+    expect(result.duplicates).toBe(1);
   });
 });

@@ -392,6 +392,12 @@ describe("processRawCandidate — serp candidates", () => {
       candidatesRelevant: 1,
       duplicateCandidatesSkipped: 0,
     });
+    expect(result.processingMetrics).toMatchObject({
+      homepageFetchAttempted: 1,
+      homepageFetchSucceeded: 1,
+      homepageFetchFailed: 0,
+      emailRejectedFormat: 1,
+    });
     expect(result.readyForOutreach).toBe(false);
   });
 
@@ -441,6 +447,7 @@ describe("processRawCandidate — serp candidates", () => {
     expect(result.contactPoints).toHaveLength(1);
     expect(result.contactPoints[0]?.sourceType).toBe("website");
     expect(result.serperEmailRecovery.duplicateCandidatesSkipped).toBe(1);
+    expect(result.processingMetrics.emailDuplicate).toBe(1);
   });
 
   it("processes a google_serp result via domain resolution", async () => {

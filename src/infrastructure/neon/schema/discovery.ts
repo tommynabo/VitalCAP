@@ -56,6 +56,7 @@ export const rawCandidates = pgTable(
     sourceFingerprint: text("source_fingerprint").notNull(),
     sourceFingerprintVersion: text("source_fingerprint_version").notNull().default("v1"),
     rawPayload: jsonb("raw_payload").notNull().default({}),
+    processingMetrics: jsonb("processing_metrics"),
     searchSeedRunId: uuid("search_seed_run_id").references(() => searchSeedRuns.id, { onDelete: "set null" }),
     providerRunId: uuid("provider_run_id").references(() => providerRuns.id, { onDelete: "set null" }),
     accountId: uuid("account_id").references(() => accounts.id, { onDelete: "set null" }),

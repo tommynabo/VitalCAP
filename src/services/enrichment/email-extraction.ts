@@ -19,6 +19,12 @@ export interface ExtractedEmail {
   isGeneric: boolean;
 }
 
+export interface EmailExtractionResult {
+  emails: ExtractedEmail[];
+  rejectedFormat: number;
+  duplicates: number;
+}
+
 const MAILTO_RE = /mailto:([^"'?\s>]+)/gi;
 // Matches word@word.ext shapes anywhere in visible text, not just mailto links.
 const VISIBLE_EMAIL_RE = /[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/gi;
@@ -45,11 +51,17 @@ const GENERIC_LOCAL_PARTS = new Set([
   "farmacia",
 ]);
 
-function isFalsePositive(email: string): boolean {
+function hasMalformedFormat(email: string): boolean {
   const [local, domain] = email.split("@");
   if (!local || !domain) return true;
   if (local.startsWith(".") || local.endsWith(".") || local.includes("..")) return true;
-  if (domain.split(".").some((label) => !/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/i.test(label))) return true;
+  return domain.split(".").some((label) => !/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/i.test(label));
+}
+
+function isFalsePositive(email: string): boolean {
+  if (hasMalformedFormat(email)) return true;
+    const [local, domain] = email.split("@");
+  if (!local || !domain) return true;
   const domainExtension = domain.split(".").pop() ?? "";
   if (ASSET_EXTENSIONS.includes(domainExtension.toLowerCase())) return true;
   if (BLOCKED_LOCAL_PARTS.some((blocked) => local.toLowerCase().includes(blocked))) return true;
@@ -63,41 +75,56 @@ function contextAround(html: string, index: number, matchLength: number): string
   return html.slice(start, end).replace(/\s+/g, " ").trim();
 }
 
+export function extractCandidateEmailsWithDiagnostics(
+  html: string,
+  sourceUrl: string,
+  sourceType: ExtractedEmail["sourceType"] = "website",
+): EmailExtractionResult {
+  const found = new Map<string, ExtractedEmail>();
+  let rejectedFormat = 0;
+  let duplicates = 0;
+
+  const addCandidate = (rawEmail: string, index: number, matchLength: number) => {
+    const normalized = normalizeEmail(rawEmail);
+    if (!normalized) {
+      rejectedFormat += 1;
+      return;
+    }
+    if (isFalsePositive(normalized)) {
+      if (hasMalformedFormat(normalized)) rejectedFormat += 1;
+      return;
+    }
+    if (found.has(normalized)) {
+      duplicates += 1;
+      return;
+    }
+    const local = normalized.split("@")[0] ?? "";
+    found.set(normalized, {
+      email: normalized,
+      sourceUrl,
+      sourceType,
+      context: contextAround(html, index, matchLength),
+      label: local,
+      isGeneric: GENERIC_LOCAL_PARTS.has(local),
+    });
+  };
+
+  for (const match of html.matchAll(MAILTO_RE)) {
+    const raw = decodeURIComponent(match[1] ?? "").split("?")[0] ?? "";
+    addCandidate(raw, match.index ?? 0, match[0].length);
+  }
+
+  for (const match of html.matchAll(VISIBLE_EMAIL_RE)) {
+    addCandidate(match[0], match.index ?? 0, match[0].length);
+  }
+
+  return { emails: Array.from(found.values()), rejectedFormat, duplicates };
+}
+
 export function extractCandidateEmails(
   html: string,
   sourceUrl: string,
   sourceType: ExtractedEmail["sourceType"] = "website",
 ): ExtractedEmail[] {
-  const found = new Map<string, ExtractedEmail>();
-
-  for (const match of html.matchAll(MAILTO_RE)) {
-    const raw = decodeURIComponent(match[1] ?? "").split("?")[0] ?? "";
-    const normalized = normalizeEmail(raw);
-    if (!normalized || isFalsePositive(normalized) || found.has(normalized)) continue;
-    const local = normalized.split("@")[0] ?? "";
-    found.set(normalized, {
-      email: normalized,
-      sourceUrl,
-      sourceType,
-      context: contextAround(html, match.index ?? 0, match[0].length),
-      label: local,
-      isGeneric: GENERIC_LOCAL_PARTS.has(local),
-    });
-  }
-
-  for (const match of html.matchAll(VISIBLE_EMAIL_RE)) {
-    const normalized = normalizeEmail(match[0]);
-    if (!normalized || isFalsePositive(normalized) || found.has(normalized)) continue;
-    const local = normalized.split("@")[0] ?? "";
-    found.set(normalized, {
-      email: normalized,
-      sourceUrl,
-      sourceType,
-      context: contextAround(html, match.index ?? 0, match[0].length),
-      label: local,
-      isGeneric: GENERIC_LOCAL_PARTS.has(local),
-    });
-  }
-
-  return Array.from(found.values());
+  return extractCandidateEmailsWithDiagnostics(html, sourceUrl, sourceType).emails;
 }

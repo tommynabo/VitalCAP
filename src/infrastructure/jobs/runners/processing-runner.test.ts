@@ -183,6 +183,7 @@ beforeEach(() => {
     businessType: "pharmacy",
     icpQualified: true,
     contactPoints: [],
+    processingMetrics: { homepageFetchAttempted: 0, homepageFetchSucceeded: 0, homepageFetchFailed: 0, emailRejectedFormat: 0, emailDuplicate: 0 },
     serperEmailRecovery: { candidatesFound: 0, candidatesRelevant: 0, duplicateCandidatesSkipped: 0 },
     readyForOutreach: false,
     rejectionReason: "Awaiting Spain eligibility review",
@@ -730,6 +731,7 @@ describe("runProcessingCronTick", () => {
         sourceType: "serper_snippet",
         verificationProvider: null,
       }],
+      processingMetrics: { homepageFetchAttempted: 0, homepageFetchSucceeded: 0, homepageFetchFailed: 0, emailRejectedFormat: 0, emailDuplicate: 0 },
       serperEmailRecovery: { candidatesFound: 1, candidatesRelevant: 1, duplicateCandidatesSkipped: 0 },
       readyForOutreach: false,
       rejectionReason: "Awaiting Spain evidence",
@@ -765,7 +767,7 @@ describe("runProcessingCronTick", () => {
     }));
   });
 
-  it("persists Serper provenance and queues a new snippet email for MillionVerifier", async () => {
+  it("persists website and Serper provenance and queues a new snippet email for MillionVerifier", async () => {
     const email = "info@farmacia-ejemplo.es";
     mocks.getRawCandidateById.mockResolvedValue({
       id: "raw-candidate-id",
@@ -808,7 +810,19 @@ describe("runProcessingCronTick", () => {
         sourceUrl: "https://farmacia-ejemplo.es/contacto",
         sourceType: "serper_snippet",
         verificationProvider: null,
+      }, {
+        email: "contact@farmacia-ejemplo.es",
+        label: "contact",
+        isGeneric: true,
+        roleType: "generic_role",
+        priorityScore: 0,
+        verificationStatus: "unverified",
+        acceptable: false,
+        sourceUrl: "https://farmacia-ejemplo.es/contacto",
+        sourceType: "website",
+        verificationProvider: null,
       }],
+      processingMetrics: { homepageFetchAttempted: 0, homepageFetchSucceeded: 0, homepageFetchFailed: 0, emailRejectedFormat: 0, emailDuplicate: 0 },
       serperEmailRecovery: { candidatesFound: 1, candidatesRelevant: 1, duplicateCandidatesSkipped: 0 },
       readyForOutreach: false,
       rejectionReason: "unverified",
@@ -825,6 +839,10 @@ describe("runProcessingCronTick", () => {
       sourceUrl: "https://farmacia-ejemplo.es/contacto",
       sourceType: "serper_snippet",
     }));
+    expect(mocks.insertContactPointWithStatus).toHaveBeenCalledWith(expect.objectContaining({
+      value: "contact@farmacia-ejemplo.es",
+      sourceType: "website",
+    }));
     expect(mocks.enqueueVerificationJob).toHaveBeenCalledWith({
       workspaceId: "workspace-id",
       contactPointId: "contact-point-id",
@@ -837,6 +855,11 @@ describe("runProcessingCronTick", () => {
       SERPER_EMAIL_CONTACT_POINTS_CREATED: 1,
       SERPER_EMAIL_DUPLICATES_SKIPPED: 0,
       SERPER_EMAIL_VERIFICATION_QUEUED: 1,
+    }));
+    expect(mocks.markRawCandidateProcessed).toHaveBeenCalledWith("raw-candidate-id", expect.objectContaining({
+      homepageFetchAttempted: 0,
+      emailRejectedFormat: 0,
+      emailDuplicate: 0,
     }));
     expect(JSON.stringify(info.mock.calls)).not.toContain(email);
     expect(mocks.completeProcessingJob).toHaveBeenCalledTimes(1);

@@ -141,9 +141,11 @@ export function estimateRequestsRequiredForTarget(
   dailySamples: readonly { requests: number; confirmedImports: number }[],
   targetImports: number,
 ): {
+  p25: number | null;
   p50: number | null;
   p75: number | null;
   p90: number | null;
+  p25YieldUsed: number | null;
   p50YieldUsed: number | null;
   p75YieldUsed: number | null;
   p90YieldUsed: number | null;
@@ -157,21 +159,104 @@ export function estimateRequestsRequiredForTarget(
     }))
     .sort((left, right) => left.requests - right.requests);
   if (demandSamples.length < 3) {
-    return { p50: null, p75: null, p90: null, p50YieldUsed: null, p75YieldUsed: null, p90YieldUsed: null, sampleCount: demandSamples.length };
+    return { p25: null, p50: null, p75: null, p90: null, p25YieldUsed: null, p50YieldUsed: null, p75YieldUsed: null, p90YieldUsed: null, sampleCount: demandSamples.length };
   }
 
   const percentile = (value: number) => demandSamples[Math.ceil(value * demandSamples.length) - 1]!;
+  const p25 = percentile(0.25);
   const p50 = percentile(0.5);
   const p75 = percentile(0.75);
   const p90 = percentile(0.9);
 
   return {
+    p25: p25.requests,
     p50: p50.requests,
     p75: p75.requests,
     p90: p90.requests,
+    p25YieldUsed: p25.yield,
     p50YieldUsed: p50.yield,
     p75YieldUsed: p75.yield,
     p90YieldUsed: p90.yield,
     sampleCount: demandSamples.length,
   };
+}
+
+export interface CapacityScenario {
+  expectedFinalYield: number | null;
+  rawRequestsFor250: number | null;
+  rawRequestsWith20PercentBuffer: number | null;
+  apifyRequests: number | null;
+  serperRequests: number | null;
+  apifyDailyCostUsd: number | null;
+  serperDailyCostUsd: number | null;
+  verificationDailyCostUsd: number | null;
+}
+
+export function buildCapacityScenarios(input: {
+  estimates: ReturnType<typeof estimateRequestsRequiredForTarget>;
+  rolling7d: {
+    finalYield: number | null;
+    totalRequests: number;
+    apifyRequests: number;
+    serperRequests: number;
+    apifySpendUsd: number;
+    serperSpendUsd: number;
+    verificationSpendUsd: number;
+  };
+}): Record<"CONSERVATIVE" | "BASE" | "OPTIMISTIC", CapacityScenario> {
+  const settings = [
+    { name: "CONSERVATIVE", requests: input.estimates.p90, yield: input.estimates.p90YieldUsed },
+    {
+      name: "BASE",
+      requests: input.rolling7d.finalYield && input.rolling7d.finalYield > 0
+        ? Math.ceil(250 / input.rolling7d.finalYield)
+        : null,
+      yield: input.rolling7d.finalYield,
+    },
+    { name: "OPTIMISTIC", requests: input.estimates.p25, yield: input.estimates.p25YieldUsed },
+  ] as const;
+  const totalProviderRequests = input.rolling7d.apifyRequests + input.rolling7d.serperRequests;
+
+  return Object.fromEntries(settings.map(({ name, requests, yield: expectedFinalYield }) => {
+    if (requests === null || expectedFinalYield === null) {
+      return [name, {
+        expectedFinalYield: null,
+        rawRequestsFor250: null,
+        rawRequestsWith20PercentBuffer: null,
+        apifyRequests: null,
+        serperRequests: null,
+        apifyDailyCostUsd: null,
+        serperDailyCostUsd: null,
+        verificationDailyCostUsd: null,
+      } satisfies CapacityScenario];
+    }
+
+    const bufferedRequests = Math.ceil(requests * 1.2);
+    const providerMixDenominator = totalProviderRequests || input.rolling7d.totalRequests;
+    const apifyShare = providerMixDenominator > 0
+      ? input.rolling7d.apifyRequests / providerMixDenominator
+      : 0;
+    const apifyRequests = Math.round(bufferedRequests * apifyShare);
+    const serperRequests = bufferedRequests - apifyRequests;
+    const apifyDailyCostUsd = input.rolling7d.apifyRequests > 0
+      ? apifyRequests * input.rolling7d.apifySpendUsd / input.rolling7d.apifyRequests
+      : null;
+    const serperDailyCostUsd = input.rolling7d.serperRequests > 0
+      ? serperRequests * input.rolling7d.serperSpendUsd / input.rolling7d.serperRequests
+      : null;
+    const verificationDailyCostUsd = input.rolling7d.totalRequests > 0
+      ? bufferedRequests * input.rolling7d.verificationSpendUsd / input.rolling7d.totalRequests
+      : null;
+
+    return [name, {
+      expectedFinalYield,
+      rawRequestsFor250: requests,
+      rawRequestsWith20PercentBuffer: bufferedRequests,
+      apifyRequests,
+      serperRequests,
+      apifyDailyCostUsd: apifyDailyCostUsd === null ? null : Number(apifyDailyCostUsd.toFixed(6)),
+      serperDailyCostUsd: serperDailyCostUsd === null ? null : Number(serperDailyCostUsd.toFixed(6)),
+      verificationDailyCostUsd: verificationDailyCostUsd === null ? null : Number(verificationDailyCostUsd.toFixed(6)),
+    } satisfies CapacityScenario];
+  })) as Record<"CONSERVATIVE" | "BASE" | "OPTIMISTIC", CapacityScenario>;
 }
