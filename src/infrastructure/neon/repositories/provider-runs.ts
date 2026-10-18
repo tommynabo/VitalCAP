@@ -145,10 +145,27 @@ type TaggedApifyReservationError = Error & {
   retryAt?: Date | null;
 };
 
-function getSafePostgresErrorCode(error: unknown): string | undefined {
-  if (!error || typeof error !== "object" || !("code" in error)) return undefined;
-  const code = error.code;
-  return typeof code === "string" && /^[0-9A-Z]{5}$/.test(code) ? code : undefined;
+export function getSafePostgresErrorCode(error: unknown): string | undefined {
+  const seen = new Set<Error>();
+  let current: unknown = error;
+
+  for (let depth = 0; depth < 3; depth += 1) {
+    if (!(current instanceof Error) || seen.has(current)) return undefined;
+    seen.add(current);
+
+    let code: unknown;
+    let cause: unknown;
+    try {
+      code = (current as Error & { code?: unknown }).code;
+      cause = current.cause;
+    } catch {
+      return undefined;
+    }
+    if (typeof code === "string" && code.length === 5 && /^[0-9A-Z]{5}$/.test(code)) return code;
+    current = cause;
+  }
+
+  return undefined;
 }
 
 function tagApifyReservationFailure<T extends Error>(

@@ -1,6 +1,6 @@
 import { PgDialect } from "drizzle-orm/pg-core";
 import { describe, expect, it } from "vitest";
-import { buildApifyPollingDuePredicate, buildReserveApifyProviderRunQuery, getApifyReservationFailureDetails } from "./provider-runs";
+import { buildApifyPollingDuePredicate, buildReserveApifyProviderRunQuery, getApifyReservationFailureDetails, getSafePostgresErrorCode } from "./provider-runs";
 
 const dialect = new PgDialect();
 
@@ -81,5 +81,47 @@ describe("Apify provider run reservation SQL", () => {
 
     expect(getApifyReservationFailureDetails(validCode)?.safeErrorMessage).toContain("SQLSTATE 42P10");
     expect(getApifyReservationFailureDetails(invalidCode)?.safeErrorMessage).not.toContain("password");
+  });
+
+  it("extracts a PostgreSQL SQLSTATE from the top-level error", () => {
+    expect(getSafePostgresErrorCode(Object.assign(new Error("raw query details"), { code: "42P10" }))).toBe("42P10");
+  });
+
+  it("extracts a PostgreSQL SQLSTATE from one and two cause levels", () => {
+    const oneCause = new Error("wrapper", { cause: Object.assign(new Error("nested raw query"), { code: "42P18" }) });
+    const twoCauses = new Error("outer", {
+      cause: new Error("middle", { cause: Object.assign(new Error("deep raw query"), { code: "22P02" }) }),
+    });
+
+    expect(getSafePostgresErrorCode(oneCause)).toBe("42P18");
+    expect(getSafePostgresErrorCode(twoCauses)).toBe("22P02");
+  });
+
+  it("ignores invalid SQLSTATEs, non-Error objects, and errors deeper than three levels", () => {
+    const invalidCode = Object.assign(new Error("wrapper"), { code: "42p10" });
+    const fourthLevel = Object.assign(new Error("too deep"), { code: "22P02" });
+    const tooDeep = new Error("root", {
+      cause: new Error("second", { cause: new Error("third", { cause: fourthLevel }) }),
+    });
+
+    expect(getSafePostgresErrorCode(invalidCode)).toBeUndefined();
+    expect(getSafePostgresErrorCode({ code: "42P10" })).toBeUndefined();
+    expect(getSafePostgresErrorCode(tooDeep)).toBeUndefined();
+  });
+
+  it("handles cyclic causes without exposing raw error messages", () => {
+    const root = new Error("raw query, parameters, and connection details");
+    const child = new Error("nested raw details", { cause: root });
+    Object.assign(root, { cause: child });
+
+    const code = getSafePostgresErrorCode(root);
+    const details = getApifyReservationFailureDetails(Object.assign(root, {
+      reservationFailureKind: "SQL_OR_UNKNOWN_RESERVATION_FAILURE" as const,
+      reservationErrorCode: code,
+    }));
+
+    expect(code).toBeUndefined();
+    expect(details?.safeErrorMessage).not.toContain("raw");
+    expect(JSON.stringify(details)).not.toContain("connection details");
   });
 });
