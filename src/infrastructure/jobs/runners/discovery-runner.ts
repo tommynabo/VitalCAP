@@ -79,7 +79,13 @@ function getErrorClass(error: unknown): string {
 }
 
 function getSafeErrorMessage(error: unknown, seeds: readonly SearchSeed[]): string {
+  if (error instanceof Error && error.name === "ZodError") return "Environment validation failed.";
   let message = error instanceof Error ? error.message : "Non-Error exception.";
+  for (const [name, value] of Object.entries(process.env)) {
+    if (value && value.length >= 4 && /token|secret|database[_-]?url|api[_-]?key|password/i.test(name)) {
+      message = message.split(value).join("[REDACTED]");
+    }
+  }
   const seedTerms = new Set(seeds.flatMap((seed) => [seed.query, seed.geography]).filter((term) => term.length >= 2));
   for (const term of seedTerms) {
     const escapedTerm = term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -93,7 +99,8 @@ function getSafeErrorMessage(error: unknown, seeds: readonly SearchSeed[]): stri
   return message
     .replace(/\bapify_api_[A-Za-z0-9_-]+\b/gi, "[REDACTED]")
     .replace(/Bearer\s+\S+/gi, "Bearer [REDACTED]")
-    .replace(/((?:password|api[_-]?key|token|secret|authorization)\s*[:=]\s*)[^\s,;]+/gi, "$1[REDACTED]")
+    .replace(/((?:database[_-]?url|password|api[_-]?key|token|secret|authorization)\s*[:=]\s*)[^\s,;]+/gi, "$1[REDACTED]")
+    .replace(/\bpostgres(?:ql)?:\/\/[^\s"'<>]+/gi, "[DATABASE_URL_REDACTED]")
     .replace(/https?:\/\/\S+/gi, "[URL]")
     .replace(/[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/gi, "[email]")
     .replace(/\+?\d[\d\s().-]{7,}\d/g, "[phone]")
@@ -123,6 +130,49 @@ async function runPreReservationStage<T>(
   }
 }
 
+type PreProviderStage =
+  | "campaign_guard"
+  | "load_autopilot_settings"
+  | "resolve_autopilot_state"
+  | "load_maps_env"
+  | "create_configuration_fingerprint"
+  | "load_apify_recovery_snapshot"
+  | "resolve_apify_allocation_health"
+  | "resolve_recovery_work_mode";
+
+async function runPreProviderStage<T>(
+  job: { id: string; payload: DiscoveryJobPayload },
+  stage: PreProviderStage,
+  operation: () => T | Promise<T>,
+): Promise<T> {
+  const fields = {
+    correlationId: job.id,
+    discoveryJobId: job.id,
+    engineType: job.payload.engineType,
+    origin: job.payload.origin ?? "normal",
+    stage,
+  };
+  logEvent("info", "discovery.pre_provider.stage", fields);
+  try {
+    return await operation();
+  } catch (error) {
+    const failureKind = error instanceof ProviderFailureError
+      ? error.kind
+      : error instanceof ProviderBudgetExceededError ? error.budgetKind : undefined;
+    const retryAt = error instanceof ProviderFailureError || error instanceof ProviderBudgetExceededError
+      ? error.retryAt
+      : null;
+    logEvent("error", "discovery.pre_provider.failed", {
+      ...fields,
+      errorClass: getErrorClass(error),
+      safeErrorMessage: getSafeErrorMessage(error, []),
+      ...(failureKind ? { failureKind } : {}),
+      ...(retryAt ? { retryAt: retryAt.toISOString() } : {}),
+    });
+    throw error;
+  }
+}
+
 interface DiscoveryHandoffCounters {
   providerReservationsCreated: number;
   providerReservationsSkipped: number;
@@ -135,8 +185,14 @@ async function executeDiscoveryJob(
   job: { id: string; campaignId: string; payload: DiscoveryJobPayload },
   counters: DiscoveryHandoffCounters,
 ): Promise<number> {
-  const campaign = await getCampaignById(job.campaignId);
-  if (!campaign) throw new Error(`Campaign not found: ${job.campaignId}`);
+  const campaign = await runPreProviderStage(job, "campaign_guard", async () => {
+    const currentCampaign = await getCampaignById(job.campaignId);
+    if (!currentCampaign) throw new Error("Discovery campaign is unavailable.");
+    if (currentCampaign.status !== "active" || !currentCampaign.autopilotEnabled) {
+      throw new Error("Scheduled discovery is disabled for this campaign.");
+    }
+    return currentCampaign;
+  });
   logEvent("info", "discovery.job.claimed", {
     correlationId: job.id,
     discoveryJobId: job.id,
@@ -146,28 +202,31 @@ async function executeDiscoveryJob(
     origin: job.payload.origin ?? null,
     desiredRawCount: job.payload.desiredRawCount,
   });
-  if (campaign.status !== "active" || !campaign.autopilotEnabled) {
-    throw new Error(`Scheduled discovery is disabled for campaign ${job.campaignId}.`);
-  }
-  const settings = await getAutopilotSettings(campaign.workspaceId);
-  if (getEffectiveAutopilotState(settings) !== "running") return 0;
+  const settings = await runPreProviderStage(job, "load_autopilot_settings", () => getAutopilotSettings(campaign.workspaceId));
+  const autopilotState = await runPreProviderStage(job, "resolve_autopilot_state", () => getEffectiveAutopilotState(settings));
+  if (autopilotState !== "running") return 0;
 
   const provider = job.payload.engineType === "maps_fast" || job.payload.engineType === "maps_deep" ? "apify" : "serper";
-  const apifyConfigurationFingerprint = provider === "apify"
-    ? createApifyConfigurationFingerprint(getMapsEnv())
+  const mapsEnv = provider === "apify"
+    ? await runPreProviderStage(job, "load_maps_env", () => getMapsEnv())
     : null;
-  const apifyRecovery = provider === "apify" ? await getApifyRecoverySnapshot(campaign.workspaceId) : null;
+  const apifyConfigurationFingerprint = mapsEnv
+    ? await runPreProviderStage(job, "create_configuration_fingerprint", () => createApifyConfigurationFingerprint(mapsEnv))
+    : null;
+  const apifyRecovery = provider === "apify"
+    ? await runPreProviderStage(job, "load_apify_recovery_snapshot", () => getApifyRecoverySnapshot(campaign.workspaceId))
+    : null;
   const providerHealth = apifyRecovery
-    ? getApifyAllocationHealth(apifyRecovery)
+    ? await runPreProviderStage(job, "resolve_apify_allocation_health", () => getApifyAllocationHealth(apifyRecovery))
     : evaluateProviderHealth(await getRecentProviderUsage(campaign.workspaceId, provider));
   const requestedRecoveryProbe = job.payload.origin === "recovery_probe";
-  const recoveryWorkMode = provider === "apify" && apifyRecovery
+  const recoveryWorkMode = await runPreProviderStage(job, "resolve_recovery_work_mode", () => provider === "apify" && apifyRecovery
     ? resolveApifyDiscoveryWorkMode({
       providerHealth,
       recoveryProbeEligible: apifyRecovery.recoveryProbeEligible,
       recoveryProbeRequested: requestedRecoveryProbe,
     })
-    : "normal";
+    : "normal");
   const recoveryProbe = recoveryWorkMode === "recovery_probe";
   logEvent("info", "discovery.provider.selected", {
     correlationId: job.id,
