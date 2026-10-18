@@ -14,12 +14,13 @@ export interface WatchdogWorkspaceSignals extends WatchdogQueueSignals {
   recoveryProbeDiscoveryCount: number;
 }
 
-function buildWatchdogWorkspaceSignalsQuery(workspaceId?: string) {
+export function buildWatchdogWorkspaceSignalsQuery(workspaceId?: string) {
   const workspaceFilter = workspaceId ? sql`WHERE id = ${workspaceId}::uuid` : sql``;
   const oldDueDiscovery = sql`
     dj.status = 'pending'
     AND (dj.next_attempt_at IS NULL OR dj.next_attempt_at <= NOW())
     AND LEFT(COALESCE(dj.last_error, ''), ${PROVIDER_DEFERRED_JOB_ERROR_PREFIX.length}) <> ${PROVIDER_DEFERRED_JOB_ERROR_PREFIX}
+    AND COALESCE(dj.payload->>'origin', '') <> 'recovery_probe'
     AND dj.created_at < NOW() - INTERVAL '30 minutes'
   `;
   const providerDeferredDiscovery = sql`
