@@ -17,8 +17,12 @@ describe("recovery probe discovery job diagnostics SQL", () => {
     expect(query.sql).toContain("lock_expires_at");
     expect(query.sql).toContain("provider_deferred");
     expect(query.sql).toContain("last_error_present");
+    expect(query.sql).toContain("dj.last_error AS last_error");
+    expect(query.sql).toContain("AS sensitive_terms");
+    expect(query.sql).toContain("ss.query AS term");
+    expect(query.sql).toContain("ss.geography AS term");
     expect(selectClause).not.toContain("dj.payload,");
-    expect(selectClause).not.toMatch(/^\s*dj\.last_error\s*,?$/m);
+    expect(selectClause).not.toContain("dj.payload AS payload");
     expect(query.sql).not.toMatch(/\b(INSERT|UPDATE|DELETE)\b/i);
     expect(query.params).toContain("workspace-1");
   });

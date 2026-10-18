@@ -10,6 +10,7 @@ import { getCurrentWorkspaceId, requireCurrentUser, UnauthorizedError } from "@/
 import { resolveNeonVar } from "@/lib/config/env-utils";
 import { getApifyAllocationHealth } from "@/services/discovery/provider-health";
 import { getWatchdogPausePredicates } from "@/services/autopilot/watchdog-pause-policy";
+import { sanitizeRecoveryJobError } from "./sanitize-recovery-error";
 
 export const dynamic = "force-dynamic";
 
@@ -157,6 +158,7 @@ export async function GET() {
         lockExpiresAt: formatDiagnosticDate(job.lockExpiresAt),
         providerDeferred: job.providerDeferred,
         lastErrorPresent: job.lastErrorPresent,
+        ...(job.origin === "recovery_probe" ? sanitizeRecoveryJobError(job.lastError, job.sensitiveTerms) : {}),
       })),
     }, { headers: { "Cache-Control": "no-store" } });
   } catch (error) {

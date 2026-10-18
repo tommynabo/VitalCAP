@@ -29,6 +29,8 @@ export interface RecoveryProbeDiscoveryJobDiagnostic {
   lockExpiresAt: Date | string | null;
   providerDeferred: boolean;
   lastErrorPresent: boolean;
+  lastError: string | null;
+  sensitiveTerms: string[];
 }
 
 export function buildRecoveryProbeDiscoveryJobsQuery(workspaceId: string) {
@@ -48,7 +50,17 @@ export function buildRecoveryProbeDiscoveryJobsQuery(workspaceId: string) {
         ELSE dj.locked_at + (${JOB_LEASE_MS} * INTERVAL '1 millisecond')
       END AS lock_expires_at,
       LEFT(COALESCE(dj.last_error, ''), ${PROVIDER_DEFERRED_JOB_ERROR_PREFIX.length}) = ${PROVIDER_DEFERRED_JOB_ERROR_PREFIX} AS provider_deferred,
-      dj.last_error IS NOT NULL AS last_error_present
+      dj.last_error IS NOT NULL AS last_error_present,
+      dj.last_error AS last_error,
+      ARRAY(
+        SELECT seed_term.term
+        FROM (
+          SELECT ss.query AS term FROM search_seeds ss WHERE ss.campaign_id = dj.campaign_id
+          UNION
+          SELECT ss.geography AS term FROM search_seeds ss WHERE ss.campaign_id = dj.campaign_id
+        ) AS seed_term
+        WHERE length(seed_term.term) >= 2
+      ) AS sensitive_terms
     FROM discovery_jobs dj
     INNER JOIN campaigns c ON c.id = dj.campaign_id
     WHERE c.workspace_id = ${workspaceId}::uuid
@@ -87,6 +99,10 @@ export async function getRecoveryProbeDiscoveryJobs(workspaceId: string): Promis
     lockExpiresAt: toDiagnosticTimestamp(row.lock_expires_at),
     providerDeferred: row.provider_deferred === true,
     lastErrorPresent: row.last_error_present === true,
+    lastError: typeof row.last_error === "string" ? row.last_error : null,
+    sensitiveTerms: Array.isArray(row.sensitive_terms)
+      ? row.sensitive_terms.filter((term): term is string => typeof term === "string")
+      : [],
   }));
 }
 
