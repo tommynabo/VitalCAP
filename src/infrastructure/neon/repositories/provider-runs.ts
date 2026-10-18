@@ -119,6 +119,61 @@ export interface ReserveApifyProviderRunInput {
   recoveryProbe?: boolean;
 }
 
+export type ApifyReservationFailureKind =
+  | "SETTINGS_MISSING"
+  | "MANUAL_RECONCILIATION"
+  | "RAW_CAP"
+  | "DAILY_COST_CAP"
+  | "RECOVERY_ALREADY_IN_FLIGHT"
+  | "DUPLICATE_REQUEST"
+  | "SQL_OR_UNKNOWN_RESERVATION_FAILURE";
+
+const SAFE_RESERVATION_FAILURE_MESSAGES: Record<ApifyReservationFailureKind, string> = {
+  SETTINGS_MISSING: "Apify reservation settings are unavailable.",
+  MANUAL_RECONCILIATION: "Provider reservation is blocked by unresolved manual reconciliation.",
+  RAW_CAP: "Provider reservation is blocked by the daily raw request cap.",
+  DAILY_COST_CAP: "Provider reservation is blocked by the daily Apify spend cap.",
+  RECOVERY_ALREADY_IN_FLIGHT: "An Apify recovery probe is already in progress.",
+  DUPLICATE_REQUEST: "An idempotent provider-run reservation already exists.",
+  SQL_OR_UNKNOWN_RESERVATION_FAILURE: "Provider-run reservation failed before its outcome could be resolved.",
+};
+
+type TaggedApifyReservationError = Error & {
+  reservationFailureKind: ApifyReservationFailureKind;
+  reservationErrorClass?: string;
+  retryAt?: Date | null;
+};
+
+function tagApifyReservationFailure<T extends Error>(
+  error: T,
+  failureKind: ApifyReservationFailureKind,
+  reservationErrorClass?: string,
+): T & TaggedApifyReservationError {
+  return Object.assign(error, {
+    reservationFailureKind: failureKind,
+    ...(reservationErrorClass ? { reservationErrorClass } : {}),
+  });
+}
+
+export function getApifyReservationFailureDetails(error: unknown): {
+  errorClass: string;
+  safeErrorMessage: string;
+  failureKind: ApifyReservationFailureKind;
+  retryAt?: Date;
+} | null {
+  if (!(error instanceof Error)) return null;
+  const taggedError = error as Partial<TaggedApifyReservationError>;
+  const failureKind = taggedError.reservationFailureKind;
+  if (!failureKind || !Object.hasOwn(SAFE_RESERVATION_FAILURE_MESSAGES, failureKind)) return null;
+  const retryAt = taggedError.retryAt instanceof Date ? taggedError.retryAt : undefined;
+  return {
+    errorClass: taggedError.reservationErrorClass ?? error.constructor.name,
+    safeErrorMessage: SAFE_RESERVATION_FAILURE_MESSAGES[failureKind],
+    failureKind,
+    ...(retryAt ? { retryAt } : {}),
+  };
+}
+
 export function buildReserveApifyProviderRunQuery(
   input: ReserveApifyProviderRunInput,
   maxRequests: number,
@@ -283,7 +338,9 @@ export async function reserveApifyProviderRun(input: ReserveApifyProviderRunInpu
     timezone: autopilotSettings.timezone,
     maxDailySpend: autopilotSettings.maxDailyApifySpendUsd
   }).from(autopilotSettings).where(eq(autopilotSettings.workspaceId, input.workspaceId));
-  if (!settings) throw new Error("Autopilot settings not found for workspace.");
+  if (!settings) {
+    throw tagApifyReservationFailure(new Error("Apify reservation settings are unavailable."), "SETTINGS_MISSING");
+  }
 
   const env = await import("@/lib/config/env");
   const maxRequests = env.getCoreEnv().ACTIVATION_MAX_DAILY_RAW_REQUESTS;
@@ -293,7 +350,16 @@ export async function reserveApifyProviderRun(input: ReserveApifyProviderRunInpu
   const expectedCostUsd = input.itemsRequested * 0.005; // conservative
 
   // 2. Atomic insertion with guard conditions in one Neon HTTP statement.
-  const result = await db.execute(buildReserveApifyProviderRunQuery(input, maxRequests, maxCost, start, expectedCostUsd));
+  let result;
+  try {
+    result = await db.execute(buildReserveApifyProviderRunQuery(input, maxRequests, maxCost, start, expectedCostUsd));
+  } catch (error) {
+    throw tagApifyReservationFailure(
+      new Error("Provider-run reservation query failed."),
+      "SQL_OR_UNKNOWN_RESERVATION_FAILURE",
+      error instanceof Error ? error.constructor.name : typeof error,
+    );
+  }
 
   const row = result.rows[0] as {
     inserted_row: unknown;
@@ -301,32 +367,75 @@ export async function reserveApifyProviderRun(input: ReserveApifyProviderRunInpu
     existing_row: unknown;
   } | undefined;
   if (row?.inserted_row) {
-    const insertedRow = await getProviderRunByRequestKey(input.requestKey);
-    if (!insertedRow) throw new Error("Created provider run reservation could not be loaded.");
+    let insertedRow;
+    try {
+      insertedRow = await getProviderRunByRequestKey(input.requestKey);
+    } catch (error) {
+      throw tagApifyReservationFailure(
+        new Error("Created provider-run reservation could not be loaded."),
+        "SQL_OR_UNKNOWN_RESERVATION_FAILURE",
+        error instanceof Error ? error.constructor.name : typeof error,
+      );
+    }
+    if (!insertedRow) {
+      throw tagApifyReservationFailure(
+        new Error("Created provider-run reservation could not be loaded."),
+        "SQL_OR_UNKNOWN_RESERVATION_FAILURE",
+      );
+    }
     return { providerRun: insertedRow, created: true };
   }
   if (row?.existing_row) {
-    const existing = await getProviderRunByRequestKey(input.requestKey);
-    if (!existing) throw new Error("Existing provider run reservation could not be loaded.");
+    let existing;
+    try {
+      existing = await getProviderRunByRequestKey(input.requestKey);
+    } catch (error) {
+      throw tagApifyReservationFailure(
+        new Error("Existing provider-run reservation could not be loaded."),
+        "SQL_OR_UNKNOWN_RESERVATION_FAILURE",
+        error instanceof Error ? error.constructor.name : typeof error,
+      );
+    }
+    if (!existing) {
+      throw tagApifyReservationFailure(
+        new Error("Existing provider-run reservation could not be loaded."),
+        "SQL_OR_UNKNOWN_RESERVATION_FAILURE",
+      );
+    }
     return { providerRun: existing, created: false };
   }
 
   const safety = row?.safety_row;
   if (safety?.unreconciled_count) {
-    throw new ProviderSafetyError(`Provider run reservation rejected: unresolved manual reconciliation required for workspace ${input.workspaceId}`);
+    throw tagApifyReservationFailure(
+      new ProviderSafetyError("Provider reservation is blocked by unresolved manual reconciliation."),
+      "MANUAL_RECONCILIATION",
+    );
   }
   if (safety && safety.requested_today + input.itemsRequested > maxRequests) {
     const { end: retryAt } = getDayBounds(settings.timezone);
-    throw new ProviderBudgetExceededError(`Provider run reservation rejected: max daily requests exceeded for workspace ${input.workspaceId}`, retryAt, "raw_request_cap");
+    throw tagApifyReservationFailure(
+      new ProviderBudgetExceededError("Provider reservation is blocked by the daily raw request cap.", retryAt, "raw_request_cap"),
+      "RAW_CAP",
+    );
   }
   if (safety && safety.cost_today + expectedCostUsd > maxCost) {
     const { end: retryAt } = getDayBounds(settings.timezone);
-    throw new ProviderBudgetExceededError(`Provider run reservation rejected: daily cost limit exceeded for workspace ${input.workspaceId}`, retryAt);
+    throw tagApifyReservationFailure(
+      new ProviderBudgetExceededError("Provider reservation is blocked by the daily Apify spend cap.", retryAt),
+      "DAILY_COST_CAP",
+    );
   }
   if (input.recoveryProbe && safety?.recovery_probe_count) {
-    throw new ProviderSafetyError(`Apify recovery probe is already in progress for workspace ${input.workspaceId}`);
+    throw tagApifyReservationFailure(
+      new ProviderSafetyError("An Apify recovery probe is already in progress."),
+      "RECOVERY_ALREADY_IN_FLIGHT",
+    );
   }
-  throw new Error(`Unable to resolve provider run reservation for workspace ${input.workspaceId}`);
+  throw tagApifyReservationFailure(
+    new Error("Provider-run reservation outcome could not be resolved."),
+    "SQL_OR_UNKNOWN_RESERVATION_FAILURE",
+  );
 }
 
 export async function createProviderRun(input: CreateProviderRunInput): Promise<string> {

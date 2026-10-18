@@ -1,6 +1,6 @@
 import { PgDialect } from "drizzle-orm/pg-core";
 import { describe, expect, it } from "vitest";
-import { buildApifyPollingDuePredicate, buildReserveApifyProviderRunQuery } from "./provider-runs";
+import { buildApifyPollingDuePredicate, buildReserveApifyProviderRunQuery, getApifyReservationFailureDetails } from "./provider-runs";
 
 const dialect = new PgDialect();
 
@@ -51,5 +51,21 @@ describe("Apify provider run reservation SQL", () => {
     expect(query.sql).toContain("metadata->>'pollRetryAt' IS NULL");
     expect(query.sql).toContain("<=");
     expect(query.params).toContain("2026-10-11T18:00:00.000Z");
+  });
+
+  it("returns only safe reservation failure details instead of the underlying SQL error", () => {
+    const error = Object.assign(new Error("Failed query: SELECT 'sensitive seed geography'"), {
+      reservationFailureKind: "SQL_OR_UNKNOWN_RESERVATION_FAILURE" as const,
+      reservationErrorClass: "NeonDbError",
+    });
+
+    const details = getApifyReservationFailureDetails(error);
+
+    expect(details).toEqual({
+      errorClass: "NeonDbError",
+      safeErrorMessage: "Provider-run reservation failed before its outcome could be resolved.",
+      failureKind: "SQL_OR_UNKNOWN_RESERVATION_FAILURE",
+    });
+    expect(JSON.stringify(details)).not.toContain("sensitive seed geography");
   });
 });

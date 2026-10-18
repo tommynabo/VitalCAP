@@ -21,7 +21,7 @@ import {
   getRemainingDiscoveryTarget,
   updateSearchSeedRun,
 } from "@/infrastructure/neon/repositories/discovery";
-import { getApifyRecoverySnapshot, getRecentProviderUsage, reserveApifyProviderRun, updateProviderRun } from "@/infrastructure/neon/repositories/provider-runs";
+import { getApifyRecoverySnapshot, getApifyReservationFailureDetails, getRecentProviderUsage, reserveApifyProviderRun, updateProviderRun } from "@/infrastructure/neon/repositories/provider-runs";
 import { getAutopilotSettings } from "@/infrastructure/neon/repositories/autopilot";
 import { getEffectiveAutopilotState } from "@/domain/autopilot/types";
 import { buildMapsSeedCatalog, buildSerpSeedCatalog, LINKEDIN_OWNER_ROLE_QUERIES, ICP_CATEGORY_TERMS } from "@/services/discovery/spain-search-catalog";
@@ -295,6 +295,19 @@ async function executeDiscoveryJob(
   for (const [seedIndex, seed] of boundedSeeds.entries()) {
     const requestedItems = Math.min(MAX_RAW_PER_SEED, Math.max(1, Math.ceil(remainingRaw / (boundedSeeds.length - seedIndex))));
     const startedAt = new Date();
+    const reservationFields = {
+      correlationId: job.id,
+      discoveryJobId: job.id,
+      engineType: job.payload.engineType,
+      origin: job.payload.origin ?? "normal",
+      recoveryProbe,
+    };
+    if (engine.usesAsyncProvider) {
+      logEvent("info", "discovery.provider.reserve.prepare", {
+        ...reservationFields,
+        stage: "reserve.prepare",
+      });
+    }
     const planningWindow = resolvePlanningWindow(job.payload.planningWindow, startedAt, campaign.timeZone);
     const normalizedQuery = normalizeProviderQuery(`${seed.query} ${seed.geography}`);
     const requestKey = createProviderRequestKey({
@@ -305,41 +318,67 @@ async function executeDiscoveryJob(
       query: normalizedQuery,
       planningWindow,
     });
+    if (engine.usesAsyncProvider) {
+      logEvent("info", "discovery.provider.reserve.request_key_created", {
+        ...reservationFields,
+        stage: "reserve.request_key_created",
+      });
+    }
     let seedRunId: string | null = null;
     let reservationId: string | null = null;
     if (engine.usesAsyncProvider) {
-      const reservation = await reserveApifyProviderRun({
-        workspaceId: campaign.workspaceId,
-        campaignId: campaign.id,
-        operation: "maps_search",
-        requestKey,
-        seedId: seed.id,
-        itemsRequested: requestedItems,
-        recoveryProbe,
-        metadata: {
-          engineType: job.payload.engineType,
-          seedId: seed.id,
-          discoveryJobId: job.id,
-          query: seed.query,
-          normalizedQuery,
-          geography: seed.geography,
-          planningWindow,
-          recoveryProbe,
-          ...(recoveryProbe && apifyConfigurationFingerprint ? { configurationFingerprint: apifyConfigurationFingerprint } : {}),
-        },
+      logEvent("info", "discovery.provider.reserve.provider_run_attempt", {
+        ...reservationFields,
+        stage: "reserve.provider_run_attempt",
       });
+      let reservation;
+      try {
+        reservation = await reserveApifyProviderRun({
+          workspaceId: campaign.workspaceId,
+          campaignId: campaign.id,
+          operation: "maps_search",
+          requestKey,
+          seedId: seed.id,
+          itemsRequested: requestedItems,
+          recoveryProbe,
+          metadata: {
+            engineType: job.payload.engineType,
+            seedId: seed.id,
+            discoveryJobId: job.id,
+            query: seed.query,
+            normalizedQuery,
+            geography: seed.geography,
+            planningWindow,
+            recoveryProbe,
+            ...(recoveryProbe && apifyConfigurationFingerprint ? { configurationFingerprint: apifyConfigurationFingerprint } : {}),
+          },
+        });
+      } catch (error) {
+        const failure = getApifyReservationFailureDetails(error);
+        logEvent("error", "discovery.provider.reserve.provider_run_failed", {
+          ...reservationFields,
+          stage: "reserve.provider_run_failed",
+          errorClass: failure?.errorClass ?? getErrorClass(error),
+          safeErrorMessage: failure?.safeErrorMessage ?? "Provider reservation failed before its outcome could be resolved.",
+          ...(failure ? { failureKind: failure.failureKind } : {}),
+          ...(failure?.retryAt ? { retryAt: failure.retryAt.toISOString() } : {}),
+        });
+        throw error;
+      }
       counters.providerReservationsCreated += reservation.created ? 1 : 0;
       counters.providerReservationsSkipped += reservation.created ? 0 : 1;
       logEvent("info", "discovery.provider.reservation", {
-        correlationId: job.id,
-        discoveryJobId: job.id,
-        ...(reservation.created ? { providerRunId: reservation.providerRun.id } : {}),
+        ...reservationFields,
         created: reservation.created,
-        itemsRequested: requestedItems,
-        requestKeyHash: requestKey.slice(requestKey.indexOf(":") + 1),
-        recoveryProbe,
       });
       if (!reservation.created) {
+        logEvent("warn", "discovery.provider.reserve.provider_run_failed", {
+          ...reservationFields,
+          stage: "reserve.provider_run_failed",
+          errorClass: "DuplicateReservation",
+          safeErrorMessage: "An idempotent provider-run reservation already exists.",
+          failureKind: "DUPLICATE_REQUEST",
+        });
         logEvent("info", "discovery.provider.reservation_skipped", {
           correlationId: job.id,
           discoveryJobId: job.id,
