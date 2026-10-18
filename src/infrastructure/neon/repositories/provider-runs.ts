@@ -141,17 +141,26 @@ const SAFE_RESERVATION_FAILURE_MESSAGES: Record<ApifyReservationFailureKind, str
 type TaggedApifyReservationError = Error & {
   reservationFailureKind: ApifyReservationFailureKind;
   reservationErrorClass?: string;
+  reservationErrorCode?: string;
   retryAt?: Date | null;
 };
+
+function getSafePostgresErrorCode(error: unknown): string | undefined {
+  if (!error || typeof error !== "object" || !("code" in error)) return undefined;
+  const code = error.code;
+  return typeof code === "string" && /^[0-9A-Z]{5}$/.test(code) ? code : undefined;
+}
 
 function tagApifyReservationFailure<T extends Error>(
   error: T,
   failureKind: ApifyReservationFailureKind,
   reservationErrorClass?: string,
+  reservationErrorCode?: string,
 ): T & TaggedApifyReservationError {
   return Object.assign(error, {
     reservationFailureKind: failureKind,
     ...(reservationErrorClass ? { reservationErrorClass } : {}),
+    ...(reservationErrorCode ? { reservationErrorCode } : {}),
   });
 }
 
@@ -165,10 +174,13 @@ export function getApifyReservationFailureDetails(error: unknown): {
   const taggedError = error as Partial<TaggedApifyReservationError>;
   const failureKind = taggedError.reservationFailureKind;
   if (!failureKind || !Object.hasOwn(SAFE_RESERVATION_FAILURE_MESSAGES, failureKind)) return null;
+  const errorCode = typeof taggedError.reservationErrorCode === "string" && /^[0-9A-Z]{5}$/.test(taggedError.reservationErrorCode)
+    ? taggedError.reservationErrorCode
+    : undefined;
   const retryAt = taggedError.retryAt instanceof Date ? taggedError.retryAt : undefined;
   return {
     errorClass: taggedError.reservationErrorClass ?? error.constructor.name,
-    safeErrorMessage: SAFE_RESERVATION_FAILURE_MESSAGES[failureKind],
+    safeErrorMessage: `${SAFE_RESERVATION_FAILURE_MESSAGES[failureKind]}${errorCode ? ` SQLSTATE ${errorCode}.` : ""}`,
     failureKind,
     ...(retryAt ? { retryAt } : {}),
   };
@@ -354,10 +366,12 @@ export async function reserveApifyProviderRun(input: ReserveApifyProviderRunInpu
   try {
     result = await db.execute(buildReserveApifyProviderRunQuery(input, maxRequests, maxCost, start, expectedCostUsd));
   } catch (error) {
+    const errorCode = getSafePostgresErrorCode(error);
     throw tagApifyReservationFailure(
-      new Error("Provider-run reservation query failed."),
+      new Error(`Provider-run reservation query failed.${errorCode ? ` SQLSTATE ${errorCode}.` : ""}`),
       "SQL_OR_UNKNOWN_RESERVATION_FAILURE",
       error instanceof Error ? error.constructor.name : typeof error,
+      errorCode,
     );
   }
 

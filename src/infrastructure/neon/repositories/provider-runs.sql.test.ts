@@ -68,4 +68,18 @@ describe("Apify provider run reservation SQL", () => {
     });
     expect(JSON.stringify(details)).not.toContain("sensitive seed geography");
   });
+
+  it("includes only a valid PostgreSQL SQLSTATE in safe reservation failure details", () => {
+    const validCode = Object.assign(new Error("Provider-run reservation query failed."), {
+      reservationFailureKind: "SQL_OR_UNKNOWN_RESERVATION_FAILURE" as const,
+      reservationErrorCode: "42P10",
+    });
+    const invalidCode = Object.assign(new Error("Provider-run reservation query failed."), {
+      reservationFailureKind: "SQL_OR_UNKNOWN_RESERVATION_FAILURE" as const,
+      reservationErrorCode: "password=not-safe",
+    });
+
+    expect(getApifyReservationFailureDetails(validCode)?.safeErrorMessage).toContain("SQLSTATE 42P10");
+    expect(getApifyReservationFailureDetails(invalidCode)?.safeErrorMessage).not.toContain("password");
+  });
 });
