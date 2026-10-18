@@ -1,10 +1,73 @@
 import { PgDialect } from "drizzle-orm/pg-core";
 import { describe, expect, it } from "vitest";
-import { buildDeadLetterExpiredJobsQuery, buildDeferJobQuery, buildRequeueStaleLockedJobsQuery } from "./job-queue";
+import { buildClaimJobsQuery, buildDeadLetterExpiredJobsQuery, buildDeferJobQuery, buildRequeueStaleLockedJobsQuery } from "./job-queue";
 
 const dialect = new PgDialect();
+const claimTime = new Date("2026-10-18T09:00:00.000Z");
+
+function buildDiscoveryClaimQuery(batchSize = 1) {
+  return dialect.sqlToQuery(buildClaimJobsQuery("discovery_jobs", {
+    workerId: "worker-1",
+    batchSize,
+    campaignId: "campaign-1",
+    requireAutopilot: true,
+    leaseMs: 5 * 60 * 1000,
+  }, claimTime));
+}
 
 describe("job queue SQL builders", () => {
+  it("orders eligible recovery probes before other discovery jobs deterministically", () => {
+    const query = buildDiscoveryClaimQuery();
+    const orderClause = query.sql.slice(query.sql.indexOf("ORDER BY"), query.sql.indexOf("FOR UPDATE"));
+
+    expect(orderClause.replace(/\s+/g, " ").trim()).toBe(
+      "ORDER BY CASE WHEN j.payload->>'origin' = 'recovery_probe' THEN 0 ELSE 1 END ASC, j.next_attempt_at ASC NULLS FIRST, j.created_at ASC, j.id ASC",
+    );
+  });
+
+  it("keeps future recovery retries ineligible under the shared due-time guard", () => {
+    const query = buildDiscoveryClaimQuery();
+    const whereClause = query.sql.slice(query.sql.indexOf("WHERE"), query.sql.indexOf("ORDER BY"));
+
+    expect(whereClause).toMatch(/j\.next_attempt_at IS NULL OR j\.next_attempt_at <= \$\d+::timestamptz/);
+    expect(whereClause).not.toContain("payload->>'origin'");
+  });
+
+  it("keeps max-attempt recovery jobs ineligible under the shared attempt guard", () => {
+    const query = buildDiscoveryClaimQuery();
+    const whereClause = query.sql.slice(query.sql.indexOf("WHERE"), query.sql.indexOf("ORDER BY"));
+
+    expect(whereClause).toContain("j.attempt_count < j.max_attempts");
+    expect(whereClause).not.toContain("payload->>'origin'");
+  });
+
+  it("leaves normal discovery jobs eligible when no recovery probe is eligible", () => {
+    const query = buildDiscoveryClaimQuery();
+    const whereClause = query.sql.slice(query.sql.indexOf("WHERE"), query.sql.indexOf("ORDER BY"));
+
+    expect(whereClause).not.toContain("payload->>'origin'");
+    expect(query.sql).toContain("CASE WHEN j.payload->>'origin' = 'recovery_probe' THEN 0 ELSE 1 END");
+  });
+
+  it("preserves campaign, Autopilot, status, lease, and SKIP LOCKED guards", () => {
+    const query = buildDiscoveryClaimQuery();
+
+    expect(query.sql).toContain("c.status = 'active'");
+    expect(query.sql).toContain("c.autopilot_enabled = true AND aps.enabled = true AND aps.emergency_stopped = false AND aps.system_paused = false");
+    expect(query.sql).toContain("j.campaign_id =");
+    expect(query.sql).toContain("j.status IN ('pending', 'processing')");
+    expect(query.sql).toContain("j.locked_at + (");
+    expect(query.sql).toContain("FOR UPDATE OF j SKIP LOCKED");
+  });
+
+  it("limits a single-job discovery claim to at most one row", () => {
+    const query = buildDiscoveryClaimQuery(1);
+    const limitParameter = Number(query.sql.match(/LIMIT \$(\d+)/)?.[1]);
+
+    expect(Number.isInteger(limitParameter)).toBe(true);
+    expect(query.params[limitParameter - 1]).toBe(1);
+  });
+
   it("defers a discovery job without retaining a lock or consuming an attempt", () => {
     const query = dialect.sqlToQuery(buildDeferJobQuery("discovery_jobs", {
       jobId: "job-1",

@@ -181,14 +181,28 @@ async function claim<T>(
   requireAutopilot = true,
 ): Promise<JobRecord<T>[]> {
   const db = getDb();
-  const nowIso = now.toISOString();
-  const inputCampaignId = campaignId ?? null;
-  const leaseSeconds = Math.max(1, Math.ceil(leaseMs / 1000));
-  const boundedBatchSize = normalizeBatchSize(batchSize);
+  const result = await db.execute(buildClaimJobsQuery(table, {
+    workerId,
+    batchSize,
+    campaignId,
+    requireAutopilot,
+    now,
+    leaseMs,
+  }, now));
 
-  const result =
-    table === "discovery_jobs"
-      ? await db.execute(sql`
+  return (result.rows as unknown as JobRow[]).map((row) => toJobRecord<T>(row));
+}
+
+export function buildClaimJobsQuery(table: QueueTable, input: ClaimJobsInput, now: Date) {
+  const nowIso = now.toISOString();
+  const inputCampaignId = input.campaignId ?? null;
+  const leaseSeconds = Math.max(1, Math.ceil((input.leaseMs ?? JOB_LEASE_MS) / 1000));
+  const boundedBatchSize = normalizeBatchSize(input.batchSize);
+  const requireAutopilot = input.requireAutopilot ?? true;
+  const workerId = input.workerId;
+
+  return table === "discovery_jobs"
+    ? sql`
           WITH claimable AS (
             SELECT j.id
             FROM discovery_jobs j
@@ -205,7 +219,11 @@ async function claim<T>(
                 OR j.locked_at IS NULL
                 OR j.locked_at + (${leaseSeconds} * interval '1 second') <= ${nowIso}::timestamptz
               )
-            ORDER BY j.next_attempt_at ASC NULLS FIRST
+            ORDER BY
+              CASE WHEN j.payload->>'origin' = 'recovery_probe' THEN 0 ELSE 1 END ASC,
+              j.next_attempt_at ASC NULLS FIRST,
+              j.created_at ASC,
+              j.id ASC
             FOR UPDATE OF j SKIP LOCKED
             LIMIT ${boundedBatchSize}
           )
@@ -218,8 +236,8 @@ async function claim<T>(
           FROM claimable
           WHERE job.id = claimable.id
           RETURNING job.*;
-        `)
-      : await db.execute(sql`
+        `
+    : sql`
           WITH claimable AS (
             SELECT j.id
             FROM processing_jobs j
@@ -249,9 +267,7 @@ async function claim<T>(
           FROM claimable
           WHERE job.id = claimable.id
           RETURNING job.*;
-        `);
-
-  return (result.rows as unknown as JobRow[]).map((row) => toJobRecord<T>(row));
+        `;
 }
 
 export interface ClaimJobsInput {
