@@ -22,7 +22,7 @@ describe("Apify provider run reservation SQL", () => {
     expect(query.sql).toContain("<=");
     expect(query.sql).toContain("safety.cost_today +");
     expect(query.sql).toContain("safety.recovery_probe_count = 0");
-    expect(query.sql).toContain("ON CONFLICT (request_key) DO NOTHING");
+    expect(query.sql).toContain("ON CONFLICT (request_key) WHERE request_key IS NOT NULL DO NOTHING");
     expect(query.params).toContain(1500);
     expect(query.params).toContain(15);
   });

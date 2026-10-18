@@ -205,7 +205,7 @@ export function buildReserveApifyProviderRunQuery(
         AND safety.requested_today + ${input.itemsRequested} <= ${maxRequests}
         AND safety.cost_today + ${expectedCostUsd} <= ${maxCost}
         AND (${input.recoveryProbe ?? false} = false OR safety.recovery_probe_count = 0)
-      ON CONFLICT (request_key) DO NOTHING
+      ON CONFLICT (request_key) WHERE request_key IS NOT NULL DO NOTHING
       RETURNING *
     ),
     legacy_configuration_failure_marked AS (

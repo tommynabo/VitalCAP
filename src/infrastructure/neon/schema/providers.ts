@@ -1,4 +1,5 @@
 import { pgTable, text, timestamp, uuid, numeric, integer, jsonb, index, uniqueIndex } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
 import { workspaces } from "./workspaces";
 import { campaigns } from "./campaigns";
 
@@ -42,7 +43,7 @@ export const providerRuns = pgTable(
     index("idx_provider_runs_workspace").on(table.workspaceId),
     index("idx_provider_runs_campaign").on(table.campaignId),
     index("idx_provider_runs_provider").on(table.provider, table.startedAt),
-    uniqueIndex("uq_provider_runs_request_key").on(table.requestKey),
+    uniqueIndex("uq_provider_runs_request_key").on(table.requestKey).where(sql`${table.requestKey} is not null`),
     index("idx_provider_runs_seed_run").on(table.seedRunId),
   ],
 );
