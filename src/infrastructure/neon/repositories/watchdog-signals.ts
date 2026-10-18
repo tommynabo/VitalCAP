@@ -2,7 +2,7 @@ import { sql } from "drizzle-orm";
 import { PROVIDER_DEFERRED_JOB_ERROR_PREFIX } from "@/domain/discovery/types";
 import type { WatchdogQueueSignals } from "@/services/autopilot/watchdog-pause-policy";
 import { getDb } from "../db";
-import { STALE_JOB_LOCK_THRESHOLD_MS } from "./job-queue";
+import { JOB_LEASE_MS, STALE_JOB_LOCK_THRESHOLD_MS } from "./job-queue";
 
 export interface WatchdogWorkspaceSignals extends WatchdogQueueSignals {
   workspaceId: string;
@@ -12,6 +12,82 @@ export interface WatchdogWorkspaceSignals extends WatchdogQueueSignals {
   oldestDueDiscoveryAgeMinutes: number | null;
   oldestProcessingAgeMinutes: number | null;
   recoveryProbeDiscoveryCount: number;
+}
+
+export interface RecoveryProbeDiscoveryJobDiagnostic {
+  id: string;
+  campaignId: string;
+  engineType: string | null;
+  origin: "recovery_probe";
+  desiredRawCount: number | null;
+  status: string;
+  attemptCount: number;
+  maxAttempts: number;
+  createdAt: Date | string;
+  nextAttemptAt: Date | string | null;
+  lockedAt: Date | string | null;
+  lockExpiresAt: Date | string | null;
+  providerDeferred: boolean;
+  lastErrorPresent: boolean;
+}
+
+export function buildRecoveryProbeDiscoveryJobsQuery(workspaceId: string) {
+  return sql`
+    SELECT dj.id,
+      dj.campaign_id,
+      dj.payload->>'engineType' AS engine_type,
+      dj.payload->>'origin' AS origin,
+      NULLIF(dj.payload->>'desiredRawCount', '')::int AS desired_raw_count,
+      dj.status,
+      dj.attempt_count,
+      dj.max_attempts,
+      dj.created_at,
+      dj.next_attempt_at,
+      dj.locked_at,
+      CASE WHEN dj.locked_at IS NULL THEN NULL
+        ELSE dj.locked_at + (${JOB_LEASE_MS} * INTERVAL '1 millisecond')
+      END AS lock_expires_at,
+      LEFT(COALESCE(dj.last_error, ''), ${PROVIDER_DEFERRED_JOB_ERROR_PREFIX.length}) = ${PROVIDER_DEFERRED_JOB_ERROR_PREFIX} AS provider_deferred,
+      dj.last_error IS NOT NULL AS last_error_present
+    FROM discovery_jobs dj
+    INNER JOIN campaigns c ON c.id = dj.campaign_id
+    WHERE c.workspace_id = ${workspaceId}::uuid
+      AND dj.payload->>'origin' = 'recovery_probe'
+    ORDER BY dj.created_at DESC, dj.id DESC
+    LIMIT 10;
+  `;
+}
+
+function toNullableCount(value: unknown): number | null {
+  if (value === null || value === undefined) return null;
+  const count = Number(value);
+  return Number.isFinite(count) ? count : null;
+}
+
+function toDiagnosticTimestamp(value: unknown): Date | string | null {
+  if (value === null || value === undefined) return null;
+  if (value instanceof Date) return value;
+  return typeof value === "string" ? value : null;
+}
+
+export async function getRecoveryProbeDiscoveryJobs(workspaceId: string): Promise<RecoveryProbeDiscoveryJobDiagnostic[]> {
+  const result = await getDb().execute(buildRecoveryProbeDiscoveryJobsQuery(workspaceId));
+  return (result.rows as Array<Record<string, unknown>>).map((row) => ({
+    id: String(row.id),
+    campaignId: String(row.campaign_id),
+    engineType: typeof row.engine_type === "string" ? row.engine_type : null,
+    origin: "recovery_probe",
+    desiredRawCount: toNullableCount(row.desired_raw_count),
+    status: String(row.status),
+    attemptCount: toNullableCount(row.attempt_count) ?? 0,
+    maxAttempts: toNullableCount(row.max_attempts) ?? 0,
+    createdAt: toDiagnosticTimestamp(row.created_at) ?? "",
+    nextAttemptAt: toDiagnosticTimestamp(row.next_attempt_at),
+    lockedAt: toDiagnosticTimestamp(row.locked_at),
+    lockExpiresAt: toDiagnosticTimestamp(row.lock_expires_at),
+    providerDeferred: row.provider_deferred === true,
+    lastErrorPresent: row.last_error_present === true,
+  }));
 }
 
 export function buildWatchdogWorkspaceSignalsQuery(workspaceId?: string) {

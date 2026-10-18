@@ -5,7 +5,7 @@ import { listCampaigns } from "@/infrastructure/neon/repositories/campaigns";
 import { autopilotSettings } from "@/infrastructure/neon/schema/autopilot";
 import { getWorkspaceRole } from "@/infrastructure/neon/repositories/workspace";
 import { getApifyRecoverySnapshot } from "@/infrastructure/neon/repositories/provider-runs";
-import { getWatchdogWorkspaceSignals } from "@/infrastructure/neon/repositories/watchdog-signals";
+import { getRecoveryProbeDiscoveryJobs, getWatchdogWorkspaceSignals } from "@/infrastructure/neon/repositories/watchdog-signals";
 import { getCurrentWorkspaceId, requireCurrentUser, UnauthorizedError } from "@/lib/auth/workspace";
 import { resolveNeonVar } from "@/lib/config/env-utils";
 import { getApifyAllocationHealth } from "@/services/discovery/provider-health";
@@ -82,7 +82,7 @@ export async function GET() {
     }
 
     const db = getDb();
-    const [campaignRows, [settings], apifyRecovery, watchdogRows] = await Promise.all([
+    const [campaignRows, [settings], apifyRecovery, watchdogRows, discoveryRecoveryJobs] = await Promise.all([
       listCampaigns(workspaceId),
       db.select({
         enabled: autopilotSettings.enabled,
@@ -94,6 +94,7 @@ export async function GET() {
       }).from(autopilotSettings).where(eq(autopilotSettings.workspaceId, workspaceId)).limit(1),
       getApifyRecoverySnapshot(workspaceId),
       getWatchdogWorkspaceSignals(workspaceId),
+      getRecoveryProbeDiscoveryJobs(workspaceId),
     ]);
     const watchdogSignals = watchdogRows[0] ?? null;
 
@@ -141,6 +142,22 @@ export async function GET() {
         providerDeferredDiscoveryCount: watchdogSignals.deferredDiscovery,
         recoveryProbeDiscoveryCount: watchdogSignals.recoveryProbeDiscoveryCount,
       } : null,
+      discoveryRecoveryJobs: discoveryRecoveryJobs.map((job) => ({
+        id: job.id,
+        campaignId: job.campaignId,
+        engineType: job.engineType,
+        origin: job.origin,
+        desiredRawCount: job.desiredRawCount,
+        status: job.status,
+        attemptCount: job.attemptCount,
+        maxAttempts: job.maxAttempts,
+        createdAt: formatDiagnosticDate(job.createdAt),
+        nextAttemptAt: formatDiagnosticDate(job.nextAttemptAt),
+        lockedAt: formatDiagnosticDate(job.lockedAt),
+        lockExpiresAt: formatDiagnosticDate(job.lockExpiresAt),
+        providerDeferred: job.providerDeferred,
+        lastErrorPresent: job.lastErrorPresent,
+      })),
     }, { headers: { "Cache-Control": "no-store" } });
   } catch (error) {
     if (error instanceof UnauthorizedError) {
