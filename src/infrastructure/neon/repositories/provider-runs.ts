@@ -1,11 +1,12 @@
 import { and, asc, desc, eq, gte, inArray, sql } from "drizzle-orm";
 import { getDayBounds } from "@/lib/time/day-bounds";
 import { getDb } from "../db";
+import { buildDailyRawRequestCommitmentCtes, executeUnderGlobalDailyRawCapLock } from "./daily-raw-request-cap";
 import { providerRuns } from "../schema/providers";
 import type { ProviderUsageStats } from "@/domain/providers/types";
 import { ProviderBudgetExceededError, ProviderFailureError, ProviderSafetyError } from "@/domain/providers/errors";
 import { createApifyConfigurationFingerprint, createApifyCredentialFingerprint, evaluateApifyRecovery, type ApifyRecoveryRun } from "@/services/discovery/provider-health";
-import { getMapsEnv } from "@/lib/config/env";
+import { getCoreEnv, getMapsEnv } from "@/lib/config/env";
 
 export interface RecordProviderRunInput {
   workspaceId: string;
@@ -36,28 +37,74 @@ export interface ReserveSerperProviderRunInput {
   itemsRequested: number;
   costUsd: number;
   metadata: Record<string, unknown>;
+  timeZone?: string;
 }
 
 export async function reserveSerperProviderRun(input: ReserveSerperProviderRunInput): Promise<{ providerRun: typeof providerRuns.$inferSelect; created: boolean }> {
   const db = getDb();
-  const [inserted] = await db.insert(providerRuns).values({
-    workspaceId: input.workspaceId,
-    campaignId: input.campaignId,
-    provider: "serper",
-    operation: "search",
-    requestKey: input.requestKey,
-    seedId: input.seedId ?? null,
-    status: "starting",
-    itemsRequested: input.itemsRequested,
-    itemsReturned: 0,
-    costUsd: input.costUsd,
-    metadata: input.metadata,
-  }).onConflictDoNothing({ target: providerRuns.requestKey }).returning();
-  if (inserted) return { providerRun: inserted, created: true };
+  const maxRequests = getCoreEnv().ACTIVATION_MAX_DAILY_RAW_REQUESTS;
+  const now = new Date();
+  const [row] = await executeUnderGlobalDailyRawCapLock(buildReserveSerperProviderRunQuery(input, maxRequests, now)) as Array<{
+    inserted_row: unknown;
+    safety_row: { committed_raw_requests: number; additional_raw_requests: number } | null;
+    existing_row: unknown;
+  }>;
+  if (row?.inserted_row || row?.existing_row) {
+    const existing = await getProviderRunByRequestKey(input.requestKey);
+    if (!existing) throw new Error(`Unable to resolve Serper provider run ${input.requestKey}.`);
+    return { providerRun: existing, created: Boolean(row.inserted_row) };
+  }
 
-  const [existing] = await db.select().from(providerRuns).where(eq(providerRuns.requestKey, input.requestKey)).limit(1);
-  if (!existing) throw new Error(`Unable to resolve Serper provider run ${input.requestKey}.`);
-  return { providerRun: existing, created: false };
+  if (row?.safety_row && row.safety_row.committed_raw_requests + row.safety_row.additional_raw_requests > maxRequests) {
+    const retryAt = getDayBounds(input.timeZone ?? "Europe/Madrid", now).end;
+    throw new ProviderBudgetExceededError("Provider reservation is blocked by the daily raw request cap.", retryAt, "raw_request_cap");
+  }
+  throw new Error(`Unable to reserve Serper provider run ${input.requestKey}.`);
+}
+
+export function buildReserveSerperProviderRunQuery(input: ReserveSerperProviderRunInput, maxRequests: number, now: Date) {
+  const discoveryJobId = typeof input.metadata.discoveryJobId === "string" ? input.metadata.discoveryJobId : "";
+  return sql`
+    WITH ${buildDailyRawRequestCommitmentCtes(now)},
+    raw_safety AS (
+      SELECT daily_raw_commitment.committed_raw_requests,
+        COALESCE((
+          SELECT GREATEST(
+            CASE WHEN job.payload->>'desiredRawCount' ~ '^[0-9]+$'
+              THEN (job.payload->>'desiredRawCount')::int ELSE 0 END
+              - COALESCE((SELECT run.provider_reserved_raw_requests FROM provider_requests_by_discovery_job run
+                WHERE run.discovery_job_id = job.id::text), 0),
+            0
+          )
+          FROM discovery_jobs job
+          WHERE job.id::text = ${discoveryJobId}
+            AND job.status IN ('pending', 'processing')
+        ), 0)::int AS job_unrepresented_raw_requests
+      FROM daily_raw_commitment
+    ),
+    safety AS (
+      SELECT committed_raw_requests,
+        GREATEST(${input.itemsRequested} - job_unrepresented_raw_requests, 0)::int AS additional_raw_requests
+      FROM raw_safety
+    ),
+    inserted AS (
+      INSERT INTO provider_runs (
+        workspace_id, campaign_id, provider, operation, request_key, seed_id, status,
+        items_requested, items_returned, cost_usd, metadata
+      )
+      SELECT ${input.workspaceId}::uuid, ${input.campaignId}::uuid, 'serper', 'search',
+        ${input.requestKey}, ${input.seedId ?? null}::uuid, 'starting', ${input.itemsRequested},
+        0, ${input.costUsd}, ${JSON.stringify(input.metadata)}::jsonb
+      FROM safety
+      WHERE safety.committed_raw_requests + safety.additional_raw_requests <= ${maxRequests}
+      ON CONFLICT (request_key) WHERE request_key IS NOT NULL DO NOTHING
+      RETURNING *
+    )
+    SELECT
+      (SELECT row_to_json(inserted.*) FROM inserted) AS inserted_row,
+      (SELECT row_to_json(safety.*) FROM safety) AS safety_row,
+      (SELECT row_to_json(existing.*) FROM provider_runs existing WHERE existing.request_key = ${input.requestKey}) AS existing_row
+  `;
 }
 
 /**
@@ -209,17 +256,40 @@ export function buildReserveApifyProviderRunQuery(
   maxCost: number,
   dayStart: Date,
   expectedCostUsd: number,
+  now = new Date(),
 ) {
   const configurationFingerprint = typeof input.metadata?.configurationFingerprint === "string"
     ? input.metadata.configurationFingerprint
     : null;
   return sql`
-    WITH safety AS (
+    WITH ${buildDailyRawRequestCommitmentCtes(now)},
+    raw_safety AS (
+      SELECT daily_raw_commitment.committed_raw_requests,
+        COALESCE((
+          SELECT GREATEST(
+            CASE WHEN job.payload->>'desiredRawCount' ~ '^[0-9]+$'
+              THEN (job.payload->>'desiredRawCount')::int ELSE 0 END
+              - COALESCE((SELECT run.provider_reserved_raw_requests FROM provider_requests_by_discovery_job run
+                WHERE run.discovery_job_id = job.id::text), 0),
+            0
+          )
+          FROM discovery_jobs job
+          WHERE job.id::text = ${typeof input.metadata?.discoveryJobId === "string" ? input.metadata.discoveryJobId : ""}
+            AND job.status IN ('pending', 'processing')
+        ), 0)::int AS job_unrepresented_raw_requests,
+        (SELECT COUNT(*) FROM provider_runs WHERE workspace_id = ${input.workspaceId}::uuid AND status = 'manual_reconciliation_required')::int AS unreconciled_count,
+        (SELECT COALESCE(SUM(cost_usd), 0) FROM provider_runs WHERE workspace_id = ${input.workspaceId}::uuid AND provider = 'apify' AND started_at >= ${dayStart.toISOString()}::timestamptz)::numeric AS cost_today,
+        (SELECT COUNT(*) FROM provider_runs WHERE workspace_id = ${input.workspaceId}::uuid AND provider = 'apify' AND status IN ('starting', 'queued', 'running', 'succeeded', 'ingesting') AND COALESCE((metadata->>'recoveryProbe')::boolean, false) = true)::int AS recovery_probe_count
+      FROM daily_raw_commitment
+    ),
+    safety AS (
       SELECT
-        (SELECT COUNT(*) FROM provider_runs WHERE workspace_id = ${input.workspaceId}::uuid AND status = 'manual_reconciliation_required')::int as unreconciled_count,
-        (SELECT COALESCE(SUM(items_requested), 0) FROM provider_runs WHERE workspace_id = ${input.workspaceId}::uuid AND provider = 'apify' AND started_at >= ${dayStart.toISOString()}::timestamptz)::int as requested_today,
-        (SELECT COALESCE(SUM(cost_usd), 0) FROM provider_runs WHERE workspace_id = ${input.workspaceId}::uuid AND provider = 'apify' AND started_at >= ${dayStart.toISOString()}::timestamptz)::numeric as cost_today,
-        (SELECT COUNT(*) FROM provider_runs WHERE workspace_id = ${input.workspaceId}::uuid AND provider = 'apify' AND status IN ('starting', 'queued', 'running', 'succeeded', 'ingesting') AND COALESCE((metadata->>'recoveryProbe')::boolean, false) = true)::int as recovery_probe_count
+        raw_safety.unreconciled_count,
+        raw_safety.committed_raw_requests AS requested_today,
+        GREATEST(${input.itemsRequested} - raw_safety.job_unrepresented_raw_requests, 0)::int AS additional_raw_requests,
+        raw_safety.cost_today,
+        raw_safety.recovery_probe_count
+      FROM raw_safety
     ),
     inserted AS (
       INSERT INTO provider_runs (
@@ -231,7 +301,7 @@ export function buildReserveApifyProviderRunQuery(
         ${JSON.stringify({ ...(input.metadata ?? {}), recoveryProbe: input.recoveryProbe ?? false })}::jsonb, NOW()
       FROM safety
       WHERE safety.unreconciled_count = 0
-        AND safety.requested_today + ${input.itemsRequested} <= ${maxRequests}
+        AND safety.requested_today + safety.additional_raw_requests <= ${maxRequests}
         AND safety.cost_today + ${expectedCostUsd} <= ${maxCost}
         AND (${input.recoveryProbe ?? false} = false OR safety.recovery_probe_count = 0)
       ON CONFLICT (request_key) WHERE request_key IS NOT NULL DO NOTHING
@@ -376,13 +446,14 @@ export async function reserveApifyProviderRun(input: ReserveApifyProviderRunInpu
   const maxRequests = env.getCoreEnv().ACTIVATION_MAX_DAILY_RAW_REQUESTS;
   const maxCost = Math.min(env.getMapsEnv().APIFY_DAILY_COST_LIMIT_USD, settings.maxDailySpend ?? Number.POSITIVE_INFINITY);
 
-  const { start } = getDayBounds(settings.timezone);
+  const now = new Date();
+  const { start } = getDayBounds(settings.timezone, now);
   const expectedCostUsd = input.itemsRequested * 0.005; // conservative
 
   // 2. Atomic insertion with guard conditions in one Neon HTTP statement.
   let result;
   try {
-    result = await db.execute(buildReserveApifyProviderRunQuery(input, maxRequests, maxCost, start, expectedCostUsd));
+    result = { rows: await executeUnderGlobalDailyRawCapLock(buildReserveApifyProviderRunQuery(input, maxRequests, maxCost, start, expectedCostUsd, now)) };
   } catch (error) {
     const errorCode = getSafePostgresErrorCode(error);
     throw tagApifyReservationFailure(
@@ -395,7 +466,7 @@ export async function reserveApifyProviderRun(input: ReserveApifyProviderRunInpu
 
   const row = result.rows[0] as {
     inserted_row: unknown;
-    safety_row: { unreconciled_count: number; requested_today: number; cost_today: number; recovery_probe_count: number } | null;
+    safety_row: { unreconciled_count: number; requested_today: number; additional_raw_requests: number; cost_today: number; recovery_probe_count: number } | null;
     existing_row: unknown;
   } | undefined;
   if (row?.inserted_row) {
@@ -444,7 +515,7 @@ export async function reserveApifyProviderRun(input: ReserveApifyProviderRunInpu
       "MANUAL_RECONCILIATION",
     );
   }
-  if (safety && safety.requested_today + input.itemsRequested > maxRequests) {
+  if (safety && safety.requested_today + safety.additional_raw_requests > maxRequests) {
     const { end: retryAt } = getDayBounds(settings.timezone);
     throw tagApifyReservationFailure(
       new ProviderBudgetExceededError("Provider reservation is blocked by the daily raw request cap.", retryAt, "raw_request_cap"),

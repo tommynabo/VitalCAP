@@ -261,7 +261,7 @@ async function executeDiscoveryJob(
     throw new ProviderFailureError("Apify provider is in recovery cooldown.", "transient", retryAt);
   }
 
-  const engine = createDiscoveryEngine(campaign.workspaceId, job.payload.engineType, campaign.id);
+  const engine = createDiscoveryEngine(campaign.workspaceId, job.payload.engineType, campaign.id, job.id);
   // Every concrete engine owns a persisted, idempotent seed catalog. Hybrid
   // Fill is intentionally excluded: it routes work to one of these engines
   // rather than creating a duplicate candidate source of its own.

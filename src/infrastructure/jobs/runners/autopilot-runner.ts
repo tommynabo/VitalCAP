@@ -4,7 +4,8 @@ import { getEffectiveAutopilotState } from "@/domain/autopilot/types";
 import { listAutopilotEnabledCampaigns } from "@/infrastructure/neon/repositories/campaigns";
 import { listWorkspaceIds } from "@/infrastructure/neon/repositories/workspace";
 import { getAutopilotSettings, getAutopilotPacingState, insertRebalanceDecision } from "@/infrastructure/neon/repositories/autopilot";
-import { enqueueDiscoveryJob, getCampaignQueueDepth } from "@/infrastructure/neon/repositories/job-queue";
+import { getCampaignQueueDepth } from "@/infrastructure/neon/repositories/job-queue";
+import { enqueueDiscoveryOrdersWithinDailyRawCap } from "@/infrastructure/neon/repositories/daily-raw-request-cap";
 import { bootstrapSearchSeeds, listSearchSeedsForCampaignEngine } from "@/infrastructure/neon/repositories/discovery";
 import { getApifyRecoverySnapshot, getRecentProviderUsage, getTodaySpendUsd } from "@/infrastructure/neon/repositories/provider-runs";
 import { allocateEngineWork, MAX_RAW_PER_PLANNING_WINDOW, planApifyRecoveryProbe, rerouteEngineOrders, type EnginePlanningPerformance } from "@/services/autopilot/target-planner";
@@ -185,22 +186,34 @@ export async function runAutopilotCronTick(now: Date = new Date()): Promise<Auto
     }
     orders = [...orders, ...recoveryProbeOrders];
 
-    for (const order of orders) {
-      await enqueueDiscoveryJob({
-        campaignId: order.campaignId,
-        type: "run_engine_batch",
-        payload: { engineType: order.engineType, desiredRawCount: order.desiredRawCount, planningWindow: order.planningWindow, reason: order.reason, origin: order.origin },
-        idempotencyKey: order.idempotencyKey,
-      });
-      ordersScheduled += order.desiredRawCount;
-    }
+    const reservation = await enqueueDiscoveryOrdersWithinDailyRawCap(orders.map((order) => ({
+      campaignId: order.campaignId,
+      type: "run_engine_batch",
+      payload: { engineType: order.engineType, desiredRawCount: order.desiredRawCount, planningWindow: order.planningWindow, reason: order.reason, origin: order.origin },
+      idempotencyKey: order.idempotencyKey,
+      desiredRawCount: order.desiredRawCount,
+    })), now);
+    const reservedByKey = new Map(reservation.orders.map((order) => [order.idempotencyKey, order]));
+    const reservedOrders = orders.flatMap((order) => {
+      const reserved = reservedByKey.get(order.idempotencyKey);
+      return reserved
+        ? [{ ...order, desiredRawCount: reserved.desiredRawCount, rebalanceAmount: Math.min(order.rebalanceAmount ?? 0, reserved.desiredRawCount) }]
+        : [];
+    });
+    ordersScheduled += reservedOrders.reduce((total, order) => total + order.desiredRawCount, 0);
+
+    const remainingRebalanceByKey = new Map(reservedOrders.map((order) => [order.idempotencyKey, order.rebalanceAmount ?? 0]));
     for (const rebalance of hybridRebalances) {
       const { decision, order, amount } = rebalance;
+      const remainingRebalance = remainingRebalanceByKey.get(order.idempotencyKey) ?? 0;
+      const reservedAmount = Math.min(amount, remainingRebalance);
+      if (reservedAmount <= 0) continue;
+      remainingRebalanceByKey.set(order.idempotencyKey, remainingRebalance - reservedAmount);
       const baseKey = `hybrid:${workspaceId}:${order.engineType}:${order.campaignId}:${order.planningWindow}`;
       await insertRebalanceDecision(workspaceId, {
         fromEngine: decision.sourceEngine,
         toEngine: order.engineType,
-        amount,
+        amount: reservedAmount,
         reason: decision.reason,
         fromCampaignId: decision.sourceCampaignId,
         toCampaignId: order.campaignId,

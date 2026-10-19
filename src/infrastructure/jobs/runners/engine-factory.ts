@@ -26,20 +26,20 @@ export const realWebsiteFetcher: WebsiteFetcher = {
  * delegates to freshly-built `maps_fast`/`google_serp` engines, matching
  * `HybridFillEngine`'s own delegate contract.
  */
-export function createDiscoveryEngine(workspaceId: string, engineType: EngineType, campaignId: string): DiscoveryEngine {
+export function createDiscoveryEngine(workspaceId: string, engineType: EngineType, campaignId: string, discoveryJobId?: string): DiscoveryEngine {
   switch (engineType) {
     case "maps_fast":
       return new MapsFastEngine(createMapsDiscoveryProvider(workspaceId, "maps_fast"));
     case "maps_deep":
-      return new MapsDeepEngine(createMapsDiscoveryProvider(workspaceId, "maps_deep"), realWebsiteFetcher, createSerpDiscoveryProvider(workspaceId, engineType, campaignId));
+      return new MapsDeepEngine(createMapsDiscoveryProvider(workspaceId, "maps_deep"), realWebsiteFetcher, createSerpDiscoveryProvider(workspaceId, engineType, campaignId, discoveryJobId));
     case "google_serp":
-      return new GoogleSerpEngine(createSerpDiscoveryProvider(workspaceId, engineType, campaignId));
+      return new GoogleSerpEngine(createSerpDiscoveryProvider(workspaceId, engineType, campaignId, discoveryJobId));
     case "linkedin_owner":
-      return new LinkedInOwnerEngine(createSerpDiscoveryProvider(workspaceId, engineType, campaignId));
+      return new LinkedInOwnerEngine(createSerpDiscoveryProvider(workspaceId, engineType, campaignId, discoveryJobId));
     case "hybrid_fill":
       return new HybridFillEngine({
         maps_fast: new MapsFastEngine(createMapsDiscoveryProvider(workspaceId, "maps_fast")),
-        google_serp: new GoogleSerpEngine(createSerpDiscoveryProvider(workspaceId, engineType, campaignId)),
+        google_serp: new GoogleSerpEngine(createSerpDiscoveryProvider(workspaceId, engineType, campaignId, discoveryJobId)),
       });
     default: {
       const exhaustive: never = engineType;

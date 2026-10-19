@@ -7,6 +7,7 @@ import { getDayBounds } from "@/lib/time/day-bounds";
 import { emailChannelEligibilitySql } from "@/services/compliance/email-channel-policy";
 import { actualPriorColdOutreachSql } from "./actual-outreach";
 import { buildDeadLetterAggregateQuery } from "./production-capacity-diagnostics-sql";
+import { getDailyRawRequestCapSnapshot } from "./daily-raw-request-cap";
 import { getDb } from "../db";
 import { autopilotSettings } from "../schema/autopilot";
 import { campaigns } from "../schema/campaigns";
@@ -60,7 +61,7 @@ function localDateKey(date: Date, timezone: string): string {
 
 export async function getProductionCapacityDiagnostics(workspaceId: string, now = new Date()) {
   const db = getDb();
-  const [[settings], activeCampaigns] = await Promise.all([
+  const [[settings], activeCampaigns, dailyRawRequestCap] = await Promise.all([
     db.select({ timezone: autopilotSettings.timezone, maxDailyApifySpendUsd: autopilotSettings.maxDailyApifySpendUsd })
       .from(autopilotSettings)
       .where(eq(autopilotSettings.workspaceId, workspaceId))
@@ -68,6 +69,7 @@ export async function getProductionCapacityDiagnostics(workspaceId: string, now 
     db.selectDistinct({ engineType: campaigns.engineType })
       .from(campaigns)
       .where(and(eq(campaigns.workspaceId, workspaceId), eq(campaigns.status, "active"))),
+    getDailyRawRequestCapSnapshot(now),
   ]);
 
   const timezone = settings?.timezone ?? "Europe/Madrid";
@@ -661,6 +663,7 @@ export async function getProductionCapacityDiagnostics(workspaceId: string, now 
     timezone,
     globalRawRequestCap: coreEnv.ACTIVATION_MAX_DAILY_RAW_REQUESTS,
     safeRawCapNow: currentRawRequestCap,
+    dailyRawRequestCap,
     engines: engineMetrics,
     pipelineFunnel: {
       attribution: "Stage populations are account-level by raw-candidate engine and discovery window; email rejection and duplicate totals are processing events. Source, website, and Serper email counts can overlap when an account has multiple email origins. Legacy engine-labeled contact points are not counted as provider-source emails because their origin is ambiguous.",

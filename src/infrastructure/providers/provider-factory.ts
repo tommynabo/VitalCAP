@@ -78,7 +78,7 @@ export function createMapsDiscoveryProvider(workspaceId: string, role: MapsEngin
   });
 }
 
-export function createSerpDiscoveryProvider(workspaceId: string, engineType: EngineType, campaignId: string): SerpDiscoveryProvider {
+export function createSerpDiscoveryProvider(workspaceId: string, engineType: EngineType, campaignId: string, discoveryJobId?: string): SerpDiscoveryProvider {
   const env = getSerperEnv();
   if (env.SERP_PROVIDER === "disabled") throw new ProviderDisabledError("SERP_PROVIDER");
   if (env.SERP_PROVIDER === "mock") return new MockSerpDiscoveryProvider();
@@ -117,7 +117,8 @@ export function createSerpDiscoveryProvider(workspaceId: string, engineType: Eng
       seedId: input.seedId,
       itemsRequested: input.maxResults,
       costUsd: SERPER_ESTIMATED_COST_PER_QUERY_USD,
-      metadata: { engineType, query: input.query, normalizedQuery, planningWindow },
+      metadata: { engineType, query: input.query, normalizedQuery, planningWindow, ...(discoveryJobId ? { discoveryJobId } : {}) },
+      timeZone: settings.timezone,
     });
     if (!reservation.created) {
       if (reservation.providerRun.status === "budget_blocked") {
@@ -138,7 +139,7 @@ export function createSerpDiscoveryProvider(workspaceId: string, engineType: Eng
         costUsd: 0,
         finishedAt: new Date(),
         error: message,
-        metadata: { engineType, query: input.query, normalizedQuery, planningWindow, retryAt: retryAt.toISOString(), budgetBlocked: true },
+        metadata: { engineType, query: input.query, normalizedQuery, planningWindow, retryAt: retryAt.toISOString(), budgetBlocked: true, ...(discoveryJobId ? { discoveryJobId } : {}) },
       });
       throw new ProviderBudgetExceededError(message, retryAt);
     }
@@ -153,7 +154,7 @@ export function createSerpDiscoveryProvider(workspaceId: string, engineType: Eng
         costUsd: 0,
         finishedAt: new Date(),
         error: error instanceof Error ? error.message : String(error),
-        metadata: { engineType, query: input.query, normalizedQuery, planningWindow },
+        metadata: { engineType, query: input.query, normalizedQuery, planningWindow, ...(discoveryJobId ? { discoveryJobId } : {}) },
       });
       throw error;
     }
@@ -163,7 +164,7 @@ export function createSerpDiscoveryProvider(workspaceId: string, engineType: Eng
       itemsReturned: output.results.length,
       costUsd: output.usage.costUsd,
       finishedAt: new Date(),
-      metadata: { engineType, query: input.query, normalizedQuery, planningWindow },
+      metadata: { engineType, query: input.query, normalizedQuery, planningWindow, ...(discoveryJobId ? { discoveryJobId } : {}) },
     });
     return { ...output, providerRunId: reservation.providerRun.id };
   };

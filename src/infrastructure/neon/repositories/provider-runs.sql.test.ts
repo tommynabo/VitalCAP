@@ -1,6 +1,6 @@
 import { PgDialect } from "drizzle-orm/pg-core";
 import { describe, expect, it } from "vitest";
-import { buildApifyPollingDuePredicate, buildReserveApifyProviderRunQuery, getApifyReservationFailureDetails, getSafePostgresErrorCode } from "./provider-runs";
+import { buildApifyPollingDuePredicate, buildReserveApifyProviderRunQuery, buildReserveSerperProviderRunQuery, getApifyReservationFailureDetails, getSafePostgresErrorCode } from "./provider-runs";
 
 const dialect = new PgDialect();
 
@@ -19,12 +19,33 @@ describe("Apify provider run reservation SQL", () => {
     expect(query.sql).toContain("status = 'manual_reconciliation_required'");
     expect(query.sql).toContain("safety.unreconciled_count = 0");
     expect(query.sql).toContain("safety.requested_today +");
+    expect(query.sql).toContain("safety.additional_raw_requests <=");
+    expect(query.sql).toContain("run.provider IN ('apify', 'serper')");
     expect(query.sql).toContain("<=");
     expect(query.sql).toContain("safety.cost_today +");
     expect(query.sql).toContain("safety.recovery_probe_count = 0");
     expect(query.sql).toContain("ON CONFLICT (request_key) WHERE request_key IS NOT NULL DO NOTHING");
     expect(query.params).toContain(1500);
     expect(query.params).toContain(15);
+  });
+
+  it("applies the same global cap to Serper and replaces its discovery-job reservation", () => {
+    const query = dialect.sqlToQuery(buildReserveSerperProviderRunQuery({
+      workspaceId: "00000000-0000-0000-0000-000000000001",
+      campaignId: "00000000-0000-0000-0000-000000000002",
+      requestKey: "serper:stable-key",
+      seedId: "00000000-0000-0000-0000-000000000003",
+      itemsRequested: 10,
+      costUsd: 0.01,
+      metadata: { engineType: "google_serp", discoveryJobId: "00000000-0000-0000-0000-000000000004" },
+    }, 1523, new Date("2026-10-19T12:00:00.000Z")));
+
+    expect(query.sql).toContain("safety.committed_raw_requests + safety.additional_raw_requests <=");
+    expect(query.sql).toContain("provider_requests_by_discovery_job run");
+    expect(query.sql).toContain("WHERE run.discovery_job_id = job.id::text");
+    expect(query.sql).toContain("ON CONFLICT (request_key) WHERE request_key IS NOT NULL DO NOTHING");
+    expect(query.params).toContain(1523);
+    expect(query.params).toContain("00000000-0000-0000-0000-000000000004");
   });
 
   it("marks a legacy configuration failure only when a recovery reservation is inserted", () => {
