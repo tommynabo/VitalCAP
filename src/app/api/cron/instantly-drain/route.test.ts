@@ -36,7 +36,7 @@ describe("Instantly drain cron route", () => {
     expect(mocks.runInstantlyImportTick).not.toHaveBeenCalled();
   });
 
-  it("runs only the queue-only Instantly tick when authorized", async () => {
+  it("runs the bounded eligibility reconciliation and queue-only Instantly tick when authorized", async () => {
     mocks.authorized.mockReturnValue(true);
     mocks.runInstantlyImportTick.mockResolvedValue({ leadsAttempted: 3 });
     mocks.runCronRoute.mockImplementation(async (_name, operation) => {
@@ -48,6 +48,6 @@ describe("Instantly drain cron route", () => {
 
     expect(response.status).toBe(200);
     expect(mocks.runInstantlyImportTick).toHaveBeenCalledOnce();
-    expect(mocks.runInstantlyImportTick).toHaveBeenCalledWith({ processQueueOnly: true });
+    expect(mocks.runInstantlyImportTick).toHaveBeenCalledWith({ processQueueOnly: true, reconcileEligible: true });
   });
 });

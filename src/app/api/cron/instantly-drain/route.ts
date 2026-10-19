@@ -8,7 +8,7 @@ export async function GET(request: NextRequest) {
   if (!isAuthorizedCronRequest(request)) return unauthorizedCronResponse();
 
   return runCronRoute("instantly-drain", async () => {
-    const result = await runInstantlyImportTick({ processQueueOnly: true });
+    const result = await runInstantlyImportTick({ processQueueOnly: true, reconcileEligible: true });
     return {
       itemsProcessed: result.leadsAttempted,
       metadata: { instantly: result },

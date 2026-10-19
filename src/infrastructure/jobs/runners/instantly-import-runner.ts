@@ -418,6 +418,7 @@ export async function runInstantlyImportTick(options: {
   contactPointIds?: readonly string[];
   backfillAll?: boolean;
   processQueueOnly?: boolean;
+  reconcileEligible?: boolean;
   maxJobs?: number;
   now?: Date;
 } = {}): Promise<InstantlyImportTickResult> {
@@ -472,12 +473,13 @@ export async function runInstantlyImportTick(options: {
     return result;
   }
 
-  if (!options.processQueueOnly) {
+  const reconcileEligible = options.processQueueOnly && options.reconcileEligible === true;
+  if (!options.processQueueOnly || reconcileEligible) {
     const candidates = await listEligibleCandidates({
       providerCampaignId: env.INSTANTLY_CAMPAIGN_ID,
-      createdSince: options.createdSince,
-      contactPointIds: options.contactPointIds,
-      backfillAll: options.backfillAll,
+      createdSince: reconcileEligible ? undefined : options.createdSince,
+      contactPointIds: reconcileEligible ? undefined : options.contactPointIds,
+      backfillAll: reconcileEligible || options.backfillAll,
       forEnqueue: true,
     });
     result.candidatesFound = candidates.length;

@@ -1,5 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { SQL } from "drizzle-orm";
+import { PgDialect } from "drizzle-orm/pg-core";
 import { resetServerEnvCacheForTests } from "@/lib/config/env";
+import { evaluateInstantlyDeliveryCapacity } from "@/services/admin/production-capacity-metrics";
 
 const mocks = vi.hoisted(() => ({
   execute: vi.fn(),
@@ -205,6 +208,63 @@ describe("runInstantlyImportTick", () => {
       status: "instantly_added",
       providerLeadId: "provider-lead-1",
     }));
+  });
+
+  it("reconciles an older valid ready contact and drains it without sending", async () => {
+    setupWithOneClaimedJob([candidate()]);
+
+    const result = await runInstantlyImportTick({ processQueueOnly: true, reconcileEligible: true });
+    const candidateQuery = new PgDialect().sqlToQuery(mocks.execute.mock.calls[2]?.[0] as SQL).sql;
+
+    expect(result.candidatesFound).toBe(1);
+    expect(result.leadsQueued).toBe(1);
+    expect(result.leadsAdded).toBe(1);
+    expect(candidateQuery).toContain("LIMIT 500");
+    expect(candidateQuery).not.toContain("cp.created_at >=");
+    expect(mocks.enqueueImport).toHaveBeenCalledWith(expect.objectContaining({
+      workspaceId: "workspace-1",
+      accountId: "account-1",
+      contactPointId: "contact-point-1",
+      providerCampaignId: campaignId,
+    }));
+    expect(mocks.claimImports).toHaveBeenCalledOnce();
+    expect(mocks.addLeadToCampaign).toHaveBeenCalledWith(expect.objectContaining({
+      allowCampaignImportInDryRun: true,
+    }));
+    expect(mocks.addLeads).not.toHaveBeenCalled();
+  });
+
+  it("keeps repeated eligible reconciliation idempotent", async () => {
+    const candidateRows = [candidate()];
+    configureDbResults([
+      readySchemaRows, metricReads(), candidateRows, metricReads(), metricReads(),
+      readySchemaRows, metricReads(), candidateRows, metricReads(), metricReads(),
+    ]);
+    mocks.claimImports.mockResolvedValue([]);
+    mocks.enqueueImport.mockResolvedValueOnce(true).mockResolvedValueOnce(false);
+
+    const first = await runInstantlyImportTick({ processQueueOnly: true, reconcileEligible: true });
+    const second = await runInstantlyImportTick({ processQueueOnly: true, reconcileEligible: true });
+
+    expect(first.leadsQueued).toBe(1);
+    expect(second.leadsQueued).toBe(0);
+    expect(mocks.enqueueImport).toHaveBeenCalledTimes(2);
+    expect(mocks.addLeadToCampaign).not.toHaveBeenCalled();
+    expect(mocks.addLeads).not.toHaveBeenCalled();
+  });
+
+  it("does not let reconciliation widen a non-queue-only caller's candidate scope", async () => {
+    setupWithoutClaimedJobs([candidate()]);
+
+    await runInstantlyImportTick({
+      createdSince: new Date("2026-10-01T00:00:00.000Z"),
+      contactPointIds: ["contact-point-1"],
+      reconcileEligible: true,
+    });
+    const candidateQuery = new PgDialect().sqlToQuery(mocks.execute.mock.calls[2]?.[0] as SQL).sql;
+
+    expect(candidateQuery).toContain("cp.created_at >=");
+    expect(candidateQuery).toContain("cp.id IN");
   });
 
   it("uses direct single-lead writes with exact flags and readback for every claimed job", async () => {
@@ -454,11 +514,25 @@ describe("runInstantlyImportTick", () => {
     setupWithoutClaimedJobs([candidate()]);
     mocks.hasActualPriorColdOutreach.mockResolvedValue(true);
 
-    const result = await runInstantlyImportTick({ contactPointIds: ["contact-point-1"] });
+    const result = await runInstantlyImportTick({ processQueueOnly: true, reconcileEligible: true });
 
     expect(result.leadsQueued).toBe(0);
     expect(mocks.enqueueImport).not.toHaveBeenCalled();
     expect(mocks.addLeads).not.toHaveBeenCalled();
+    expect(mocks.addLeadToCampaign).not.toHaveBeenCalled();
+  });
+
+  it("keeps suppressed, invalid, and compliance-unapproved contacts out of reconciliation", async () => {
+    setupWithoutClaimedJobs([]);
+
+    const result = await runInstantlyImportTick({ processQueueOnly: true, reconcileEligible: true });
+    const candidateQuery = new PgDialect().sqlToQuery(mocks.execute.mock.calls[2]?.[0] as SQL).sql;
+
+    expect(result.leadsQueued).toBe(0);
+    expect(candidateQuery).toContain("suppression_entries");
+    expect(candidateQuery).toContain("verification_status = 'valid'");
+    expect(candidateQuery).toContain("compliance_decisions");
+    expect(mocks.enqueueImport).not.toHaveBeenCalled();
     expect(mocks.addLeadToCampaign).not.toHaveBeenCalled();
   });
 
@@ -595,7 +669,7 @@ describe("runInstantlyImportTick", () => {
     mocks.getMonthlyEmailUsage.mockResolvedValue({ emailsSent: 5000 });
     mocks.deferByPlanLimit.mockResolvedValue(1);
 
-    const result = await runInstantlyImportTick({ createdSince: new Date("2026-10-02T00:00:00.000Z") });
+    const result = await runInstantlyImportTick({ processQueueOnly: true, reconcileEligible: true });
 
     expect(result.quota).toMatchObject({
       uploadedContacts: 1000,
@@ -616,6 +690,30 @@ describe("runInstantlyImportTick", () => {
     await runInstantlyImportTick({ contactPointIds: ["contact-point-1"] });
 
     expect(mocks.claimImports).toHaveBeenCalledWith(1, expect.any(Date), ["contact-point-1"]);
+  });
+
+  it("allows an ordinary import with positive headroom even when ramp-to-250 capacity is blocked", async () => {
+    setupWithOneClaimedJob([candidate()]);
+    mocks.getPlanUsage.mockResolvedValue({ currentLeadCount: 999, totalLeadLimit: 5000 });
+    mocks.getMonthlyEmailUsage.mockResolvedValue({ emailsSent: 4999 });
+    const rampCapacity = evaluateInstantlyDeliveryCapacity({
+      targetLeadsPerDay: 250,
+      planningDays: 30,
+      uploadedContacts: 999,
+      providerContactLimit: 5000,
+      configuredContactHardLimit: 1000,
+      monthlyEmailsSent: 4999,
+      monthlyEmailLimit: 5000,
+      followupEmailsPerLead: 0,
+    });
+
+    const result = await runInstantlyImportTick({ contactPointIds: ["contact-point-1"] });
+
+    expect(rampCapacity.supportsTarget).toBe(false);
+    expect(result.leadsAdded).toBe(1);
+    expect(result.quota).toMatchObject({ uploadedContacts: 1000, monthlyEmailsSent: 4999 });
+    expect(mocks.addLeadToCampaign).toHaveBeenCalledOnce();
+    expect(mocks.addLeads).not.toHaveBeenCalled();
   });
 
   it("can rerun the same 48-hour backfill without creating a second import", async () => {
