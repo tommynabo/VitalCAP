@@ -72,6 +72,34 @@ describe("InstantlyEmailDeliveryProvider", () => {
     }));
   });
 
+  it("lists exact workspace email matches without a campaign filter or writes", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(jsonResponse({ items: [
+      { id: "workspace-lead-1", email: "person@example.com", campaign: "other-campaign" },
+      { id: "unrelated", email: "someone-else@example.com", campaign: null },
+    ] }));
+    const provider = new InstantlyEmailDeliveryProvider({ apiKey: "secret-test-key", fetchImpl });
+
+    await expect(provider.findLeadsByEmail(" Person@Example.com ")).resolves.toEqual([
+      { id: "workspace-lead-1", campaignId: "other-campaign" },
+    ]);
+    expect(fetchImpl).toHaveBeenCalledOnce();
+    expect(fetchImpl).toHaveBeenCalledWith("https://api.instantly.ai/api/v2/leads/list", expect.objectContaining({
+      method: "POST",
+      body: JSON.stringify({ contacts: ["person@example.com"], limit: 100 }),
+    }));
+  });
+
+  it("rejects a paginated workspace lookup rather than treating it as complete", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(jsonResponse({
+      items: [{ id: "workspace-lead-1", email: "person@example.com", campaign: null }],
+      next_starting_after: "next-page",
+    }));
+    const provider = new InstantlyEmailDeliveryProvider({ apiKey: "secret-test-key", fetchImpl });
+
+    await expect(provider.findLeadsByEmail("person@example.com")).rejects.toThrow("lookup was incomplete");
+    expect(fetchImpl).toHaveBeenCalledOnce();
+  });
+
   it.each([401, 403])("returns a structured sanitized failure for HTTP %s", async (status) => {
     const fetchImpl = vi.fn().mockResolvedValue(new Response(JSON.stringify({
       message: "Denied for Person@example.com using secret-test-key",

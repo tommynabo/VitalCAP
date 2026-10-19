@@ -28,6 +28,23 @@ export async function enqueueInstantlyLeadImport(candidate: InstantLeadImportCan
   return Boolean(inserted);
 }
 
+export async function findInstantlyLeadImportByEmail(
+  workspaceId: string,
+  providerCampaignId: string,
+  normalizedEmail: string,
+): Promise<Record<string, unknown> | null> {
+  const db = getDb();
+  const result = await db.execute(sql`
+    SELECT id, status, provider_lead_id, account_id, contact_point_id
+    FROM instantly_lead_imports
+    WHERE workspace_id = ${workspaceId}
+      AND provider_campaign_id = ${providerCampaignId}
+      AND normalized_email = ${normalizedEmail.trim().toLowerCase()}
+    LIMIT 1
+  `);
+  return (result.rows[0] as Record<string, unknown> | undefined) ?? null;
+}
+
 export async function claimInstantlyLeadImports(
   limit: number,
   now: Date,
@@ -40,14 +57,14 @@ export async function claimInstantlyLeadImports(
     : sql``;
   const claimed = await db.execute(sql`
     WITH available AS (
-      SELECT id
+      SELECT id, status AS claimed_from_status
       FROM instantly_lead_imports
-      WHERE status IN ('eligible', 'failed', 'deferred', 'deferred_due_to_plan_limit', 'instantly_queued')
+      WHERE status IN ('reconciliation_required', 'eligible', 'failed', 'deferred', 'deferred_due_to_plan_limit', 'instantly_queued')
         AND (locked_at IS NULL OR locked_at < ${lockExpiry.toISOString()})
         AND (next_attempt_at IS NULL OR next_attempt_at <= ${now.toISOString()})
         AND attempt_count < max_attempts
         ${contactPointFilter}
-      ORDER BY created_at ASC
+      ORDER BY CASE WHEN status = 'reconciliation_required' THEN 0 ELSE 1 END, created_at ASC
       LIMIT ${limit}
       FOR UPDATE SKIP LOCKED
     )
@@ -58,7 +75,7 @@ export async function claimInstantlyLeadImports(
         updated_at = ${now.toISOString()}
     FROM available
     WHERE imports.id = available.id
-    RETURNING imports.*
+    RETURNING imports.*, available.claimed_from_status
   `);
   return claimed.rows as Record<string, unknown>[];
 }

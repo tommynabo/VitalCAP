@@ -9,6 +9,7 @@ import {
   claimInstantlyLeadImports,
   deferInstantlyLeadImportsForPlanLimit,
   enqueueInstantlyLeadImport,
+  findInstantlyLeadImportByEmail,
   getInstantlyLeadImportCounts,
   isInstantlyImportCircuitOpen,
   releaseInstantlyImportLock,
@@ -57,6 +58,11 @@ export interface InstantlyImportTickResult {
   leadsExistingTarget?: number;
   leadsNeedsCampaignMove?: number;
   leadsNeedsReconciliation?: number;
+  reconciliationChecked: number;
+  reconciliationConfirmedTarget: number;
+  reconciliationNeedsCampaignMove: number;
+  reconciliationRetryable: number;
+  emailAlreadyRepresented: number;
   leadsDeferred: number;
   leadsFailed: number;
   providerStatus: "ready" | "missing_configuration" | "unhealthy" | "busy" | "schema_not_ready";
@@ -176,8 +182,9 @@ async function listEligibleCandidates(options: {
 async function enqueueCandidates(
   rows: readonly CandidateRow[],
   providerCampaignId: string,
-): Promise<number> {
+): Promise<{ queued: number; emailAlreadyRepresented: number }> {
   let enqueued = 0;
+  let emailAlreadyRepresented = 0;
   for (const row of rows) {
     if (!isEmailChannelEligible(row.channel_eligibility)) continue;
     const hasPriorOutreach = await hasActualPriorColdOutreach({
@@ -198,6 +205,16 @@ async function enqueueCandidates(
     });
     if (!eligibility.eligible) continue;
 
+    const existing = await findInstantlyLeadImportByEmail(
+      row.workspace_id,
+      providerCampaignId,
+      row.normalized_email,
+    );
+    if (existing) {
+      emailAlreadyRepresented++;
+      continue;
+    }
+
     const created = await enqueueInstantlyLeadImport({
       workspaceId: row.workspace_id,
       accountId: row.account_id,
@@ -207,9 +224,36 @@ async function enqueueCandidates(
       providerCampaignId,
       normalizedEmail: row.normalized_email,
     });
-    if (created) enqueued++;
+    if (created) {
+      enqueued++;
+    } else if (await findInstantlyLeadImportByEmail(row.workspace_id, providerCampaignId, row.normalized_email)) {
+      emailAlreadyRepresented++;
+    }
   }
-  return enqueued;
+  return { queued: enqueued, emailAlreadyRepresented };
+}
+
+async function findLeadInCampaignForReconciliation(
+  provider: InstantlyEmailDeliveryProvider,
+  providerCampaignId: string,
+  email: string,
+): Promise<{ providerLeadId: string | null; authFailure: boolean; lookupFailed: boolean; requestId: string | null }> {
+  try {
+    return {
+      providerLeadId: await provider.findLeadInCampaign(providerCampaignId, email),
+      authFailure: false,
+      lookupFailed: false,
+      requestId: null,
+    };
+  } catch (error) {
+    const details = instantlyHttpErrorDetails(error);
+    return {
+      providerLeadId: null,
+      authFailure: details?.httpStatus === 401 || details?.httpStatus === 403,
+      lookupFailed: true,
+      requestId: details?.requestId ?? null,
+    };
+  }
 }
 
 function buildLeadVariables(row: CandidateRow): Record<string, string> {
@@ -440,6 +484,11 @@ export async function runInstantlyImportTick(options: {
       leadsSkipped: 0,
       leadsDeferred: 0,
       leadsFailed: 0,
+      reconciliationChecked: 0,
+      reconciliationConfirmedTarget: 0,
+      reconciliationNeedsCampaignMove: 0,
+      reconciliationRetryable: 0,
+      emailAlreadyRepresented: 0,
       providerStatus: "schema_not_ready",
       instantlyLeadImportReady: false,
       instantlyTelemetryReady: false,
@@ -458,6 +507,11 @@ export async function runInstantlyImportTick(options: {
     leadsExistingTarget: 0,
     leadsNeedsCampaignMove: 0,
     leadsNeedsReconciliation: 0,
+    reconciliationChecked: 0,
+    reconciliationConfirmedTarget: 0,
+    reconciliationNeedsCampaignMove: 0,
+    reconciliationRetryable: 0,
+    emailAlreadyRepresented: 0,
     leadsDeferred: 0,
     leadsFailed: 0,
     providerStatus: "missing_configuration",
@@ -483,7 +537,9 @@ export async function runInstantlyImportTick(options: {
       forEnqueue: true,
     });
     result.candidatesFound = candidates.length;
-    result.leadsQueued = await enqueueCandidates(candidates, env.INSTANTLY_CAMPAIGN_ID);
+    const enqueueResult = await enqueueCandidates(candidates, env.INSTANTLY_CAMPAIGN_ID);
+    result.leadsQueued = enqueueResult.queued;
+    result.emailAlreadyRepresented = enqueueResult.emailAlreadyRepresented;
   }
   result.metrics = await readPipelineMetrics();
   if (env.EMAIL_DELIVERY_PROVIDER !== "instantly" || !env.INSTANTLY_API_KEY) return result;
@@ -573,7 +629,7 @@ export async function runInstantlyImportTick(options: {
         contactPointIds: jobs.map((job) => String(job.contact_point_id)),
       }) : [];
     const candidateByContactPoint = new Map(currentCandidates.map((candidate) => [candidate.contact_point_id, candidate]));
-    const importableJobs: Array<{ job: Record<string, unknown>; candidate: CandidateRow }> = [];
+    const eligibleJobs: Array<{ job: Record<string, unknown>; candidate: CandidateRow }> = [];
     for (const job of jobs) {
       const jobId = String(job.id);
       const candidate = candidateByContactPoint.get(String(job.contact_point_id));
@@ -587,10 +643,143 @@ export async function runInstantlyImportTick(options: {
         result.leadsDeferred++;
         continue;
       }
-      importableJobs.push({ job, candidate });
+      eligibleJobs.push({ job, candidate });
     }
 
-    if (importableJobs.length > 0) {
+    const reconciliationJobs = eligibleJobs.filter(({ job }) => job.claimed_from_status === "reconciliation_required");
+    const importableJobs = eligibleJobs.filter(({ job }) => job.claimed_from_status !== "reconciliation_required");
+    let reconciliationAuthFailure = false;
+    for (const { job, candidate } of reconciliationJobs) {
+      const jobId = String(job.id);
+      if (reconciliationAuthFailure) {
+        await updateInstantlyLeadImport(jobId, {
+          status: "reconciliation_required",
+          now,
+          nextAttemptAt: retryAt(Number(job.attempt_count ?? 1), now),
+          lastError: "Instantly reconciliation paused after an authorization failure.",
+          providerLeadId: typeof job.provider_lead_id === "string" ? job.provider_lead_id : null,
+          decrementAttemptCount: true,
+        });
+        result.reconciliationRetryable++;
+        continue;
+      }
+      result.reconciliationChecked++;
+      const target = await findLeadInCampaignForReconciliation(provider, env.INSTANTLY_CAMPAIGN_ID, candidate.normalized_email);
+      if (target.authFailure) {
+        reconciliationAuthFailure = true;
+        result.providerStatus = "unhealthy";
+        preserveLock = true;
+        await tripInstantlyImportCircuitBreaker(env.INSTANTLY_CAMPAIGN_ID, lockToken, target.requestId ?? randomUUID());
+        await updateInstantlyLeadImport(jobId, {
+          status: "reconciliation_required",
+          now,
+          nextAttemptAt: retryAt(Number(job.attempt_count ?? 1), now),
+          lastError: "Instantly authorization failed during reconciliation.",
+          providerLeadId: typeof job.provider_lead_id === "string" ? job.provider_lead_id : null,
+          decrementAttemptCount: true,
+        });
+        result.reconciliationRetryable++;
+        continue;
+      }
+      if (target.lookupFailed) {
+        await updateInstantlyLeadImport(jobId, {
+          status: "reconciliation_required",
+          now,
+          nextAttemptAt: retryAt(Number(job.attempt_count ?? 1), now),
+          lastError: "Instantly target lookup was ambiguous; no provider write was attempted.",
+          providerLeadId: typeof job.provider_lead_id === "string" ? job.provider_lead_id : null,
+          decrementAttemptCount: true,
+        });
+        result.reconciliationRetryable++;
+        continue;
+      }
+      if (target.providerLeadId) {
+        const wasAcceptedWrite = typeof job.provider_lead_id === "string" && job.provider_lead_id.length > 0;
+        await updateInstantlyLeadImport(jobId, {
+          status: wasAcceptedWrite ? "instantly_added" : "skipped_existing",
+          now,
+          providerLeadId: target.providerLeadId,
+        });
+        result.reconciliationConfirmedTarget++;
+        result.instantlyLeadImportReady = true;
+        continue;
+      }
+
+      if (!reconciliationAuthFailure) {
+        try {
+          const workspaceLeads = await provider.findLeadsByEmail(candidate.normalized_email);
+          const outsideTarget = workspaceLeads.find((lead) => lead.campaignId !== env.INSTANTLY_CAMPAIGN_ID);
+          if (outsideTarget) {
+            await updateInstantlyLeadImport(jobId, {
+              status: "needs_campaign_move",
+              now,
+              providerLeadId: outsideTarget.id,
+              lastError: "Instantly lead exists in the workspace but not in the target campaign.",
+              decrementAttemptCount: true,
+            });
+            result.reconciliationNeedsCampaignMove++;
+            result.leadsNeedsCampaignMove = (result.leadsNeedsCampaignMove ?? 0) + 1;
+          } else if (workspaceLeads.length === 0) {
+            await updateInstantlyLeadImport(jobId, {
+              status: "failed",
+              now,
+              nextAttemptAt: retryAt(Number(job.attempt_count ?? 1), now),
+              lastError: "Instantly confirmed the lead is not present; retry is safe after backoff.",
+              providerLeadId: null,
+              decrementAttemptCount: true,
+            });
+            result.reconciliationRetryable++;
+          } else {
+            await updateInstantlyLeadImport(jobId, {
+              status: "reconciliation_required",
+              now,
+              nextAttemptAt: retryAt(Number(job.attempt_count ?? 1), now),
+              lastError: "Instantly workspace lookup did not establish target membership.",
+              providerLeadId: null,
+              decrementAttemptCount: true,
+            });
+            result.reconciliationRetryable++;
+          }
+        } catch (error) {
+          const details = instantlyHttpErrorDetails(error);
+          const authFailure = details?.httpStatus === 401 || details?.httpStatus === 403;
+          if (authFailure) {
+            reconciliationAuthFailure = true;
+            result.providerStatus = "unhealthy";
+            preserveLock = true;
+            await tripInstantlyImportCircuitBreaker(env.INSTANTLY_CAMPAIGN_ID, lockToken, details?.requestId ?? randomUUID());
+          }
+          await updateInstantlyLeadImport(jobId, {
+            status: "reconciliation_required",
+            now,
+            nextAttemptAt: retryAt(Number(job.attempt_count ?? 1), now),
+            lastError: authFailure
+              ? "Instantly authorization failed during workspace reconciliation."
+              : "Instantly workspace lookup was ambiguous; no provider write was attempted.",
+            providerLeadId: null,
+            decrementAttemptCount: true,
+          });
+          result.reconciliationRetryable++;
+        }
+      }
+    }
+
+    if (reconciliationAuthFailure) {
+      for (const { job } of importableJobs) {
+        await updateInstantlyLeadImport(String(job.id), {
+          status: "deferred",
+          now,
+          nextAttemptAt: now,
+          lastError: "Instantly import paused after reconciliation authorization failure.",
+          providerLeadId: null,
+          decrementAttemptCount: true,
+        });
+        result.leadsDeferred++;
+      }
+      result.instantlyLeadImportReady = false;
+    }
+
+    if (importableJobs.length > 0 && !reconciliationAuthFailure) {
       try {
         const direct = await importLeadsDirect(
           provider,

@@ -36,6 +36,12 @@ interface InstantlyLeadResponse {
 
 interface InstantlyListLeadsResponse {
   items?: InstantlyLeadResponse[];
+  next_starting_after?: string;
+}
+
+export interface InstantlyWorkspaceLead {
+  id: string;
+  campaignId: string | null;
 }
 
 export type InstantlySingleLeadStatus = "added" | "already_in_target" | "failed";
@@ -281,12 +287,35 @@ export class InstantlyEmailDeliveryProvider implements EmailDeliveryProvider {
       body: JSON.stringify({ campaign: providerCampaignId, contacts: [email.trim().toLowerCase()], limit: 1 }),
       signal: AbortSignal.timeout(15_000),
     });
-    const lead = data.items?.find((item) =>
+    if (!Array.isArray(data.items)) throw new Error("Instantly lead lookup returned an invalid response.");
+    const lead = data.items.find((item) =>
       item.email?.trim().toLowerCase() === email.trim().toLowerCase()
       && item.campaign === providerCampaignId
       && typeof item.id === "string",
     );
     return lead?.id ?? null;
+  }
+
+  async findLeadsByEmail(email: string): Promise<InstantlyWorkspaceLead[]> {
+    this.ensureConfigured();
+    const normalizedEmail = email.trim().toLowerCase();
+    const { data } = await this.requestJson<InstantlyListLeadsResponse>("leads/list", `${INSTANTLY_API_BASE_URL}/leads/list`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${this.apiKey}`,
+      },
+      body: JSON.stringify({ contacts: [normalizedEmail], limit: 100 }),
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (!Array.isArray(data.items) || data.next_starting_after) {
+      throw new Error("Instantly workspace lead lookup was incomplete.");
+    }
+    return data.items.flatMap((item) =>
+      item.email?.trim().toLowerCase() === normalizedEmail && typeof item.id === "string"
+        ? [{ id: item.id, campaignId: item.campaign ?? null }]
+        : [],
+    );
   }
 
   async addLeadToCampaign(input: EmailLeadInput): Promise<InstantlySingleLeadResult> {

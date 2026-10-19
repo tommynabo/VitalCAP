@@ -11,6 +11,7 @@ const mocks = vi.hoisted(() => ({
   claimImports: vi.fn(),
   deferByPlanLimit: vi.fn(),
   enqueueImport: vi.fn(),
+  findImportByEmail: vi.fn(),
   getImportCounts: vi.fn(),
   isCircuitOpen: vi.fn(),
   releaseLock: vi.fn(),
@@ -21,6 +22,7 @@ const mocks = vi.hoisted(() => ({
   addLeads: vi.fn(),
   addLeadToCampaign: vi.fn(),
   findLeadInCampaign: vi.fn(),
+  findLeadsByEmail: vi.fn(),
 }));
 
 vi.mock("@/infrastructure/neon/db", () => ({ getDb: () => ({ execute: mocks.execute }) }));
@@ -33,6 +35,7 @@ vi.mock("@/infrastructure/neon/repositories/instantly-lead-imports", () => ({
   claimInstantlyLeadImports: mocks.claimImports,
   deferInstantlyLeadImportsForPlanLimit: mocks.deferByPlanLimit,
   enqueueInstantlyLeadImport: mocks.enqueueImport,
+  findInstantlyLeadImportByEmail: mocks.findImportByEmail,
   getInstantlyLeadImportCounts: mocks.getImportCounts,
   isInstantlyImportCircuitOpen: mocks.isCircuitOpen,
   releaseInstantlyImportLock: mocks.releaseLock,
@@ -46,6 +49,7 @@ vi.mock("@/infrastructure/providers/instantly/provider", () => ({
     addLeads = mocks.addLeads;
     addLeadToCampaign = mocks.addLeadToCampaign;
     findLeadInCampaign = mocks.findLeadInCampaign;
+    findLeadsByEmail = mocks.findLeadsByEmail;
   },
 }));
 
@@ -129,6 +133,7 @@ beforeEach(() => {
   mocks.hasActualPriorColdOutreach.mockResolvedValue(false);
   mocks.acquireLock.mockResolvedValue(true);
   mocks.enqueueImport.mockResolvedValue(true);
+  mocks.findImportByEmail.mockResolvedValue(null);
   mocks.getImportCounts.mockResolvedValue({});
   mocks.releaseLock.mockResolvedValue(undefined);
   mocks.isCircuitOpen.mockResolvedValue(false);
@@ -148,6 +153,7 @@ beforeEach(() => {
     sanitizedProviderMessage: null,
   });
   mocks.findLeadInCampaign.mockResolvedValue("provider-lead-1");
+  mocks.findLeadsByEmail.mockResolvedValue([]);
 });
 
 afterEach(() => {
@@ -569,6 +575,187 @@ describe("runInstantlyImportTick", () => {
       providerCampaignId: campaignId,
     }));
     expect(mocks.addLeadToCampaign).toHaveBeenCalledOnce();
+  });
+
+  it("reuses the canonical target-campaign email row across multiple accounts", async () => {
+    const first = candidate();
+    const second = candidate({ account_id: "account-2", contact_id: "contact-2", contact_point_id: "contact-point-2" });
+    setupWithClaimedJobs([first, second], [{
+      id: "canonical-import",
+      account_id: "account-1",
+      contact_point_id: "contact-point-1",
+      attempt_count: 1,
+      max_attempts: 8,
+    }]);
+    mocks.findImportByEmail
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce({ id: "canonical-import", status: "instantly_added" });
+
+    const result = await runInstantlyImportTick({ createdSince: new Date("2026-10-02T00:00:00.000Z") });
+
+    expect(result.leadsQueued).toBe(1);
+    expect(result.emailAlreadyRepresented).toBe(1);
+    expect(mocks.enqueueImport).toHaveBeenCalledOnce();
+    expect(mocks.addLeadToCampaign).toHaveBeenCalledOnce();
+  });
+
+  it("reconciles an existing canonical row already present in the target campaign", async () => {
+    const reconJob = {
+      id: "recon-import",
+      account_id: "account-1",
+      contact_point_id: "contact-point-1",
+      provider_lead_id: null,
+      claimed_from_status: "reconciliation_required",
+      attempt_count: 1,
+      max_attempts: 8,
+    };
+    setupWithClaimedJobs([candidate()], [reconJob]);
+    mocks.findImportByEmail.mockResolvedValue({ id: "recon-import", status: "reconciliation_required" });
+
+    const result = await runInstantlyImportTick({ processQueueOnly: true, reconcileEligible: true });
+
+    expect(result.reconciliationChecked).toBe(1);
+    expect(result.reconciliationConfirmedTarget).toBe(1);
+    expect(result.leadsQueued).toBe(0);
+    expect(mocks.enqueueImport).not.toHaveBeenCalled();
+    expect(mocks.updateImport).toHaveBeenCalledWith("recon-import", expect.objectContaining({
+      status: "skipped_existing",
+      providerLeadId: "provider-lead-1",
+    }));
+    expect(mocks.addLeadToCampaign).not.toHaveBeenCalled();
+  });
+
+  it("marks a workspace lead outside the target campaign for campaign-move handling", async () => {
+    setupWithClaimedJobs([candidate()], [{
+      id: "recon-import",
+      account_id: "account-1",
+      contact_point_id: "contact-point-1",
+      provider_lead_id: null,
+      claimed_from_status: "reconciliation_required",
+      attempt_count: 1,
+      max_attempts: 8,
+    }]);
+    mocks.findImportByEmail.mockResolvedValue({ id: "recon-import", status: "reconciliation_required" });
+    mocks.findLeadInCampaign.mockResolvedValue(null);
+    mocks.findLeadsByEmail.mockResolvedValue([{ id: "workspace-lead", campaignId: "another-campaign" }]);
+
+    const result = await runInstantlyImportTick({ processQueueOnly: true, reconcileEligible: true });
+
+    expect(result.reconciliationNeedsCampaignMove).toBe(1);
+    expect(result.leadsNeedsCampaignMove).toBe(1);
+    expect(mocks.updateImport).toHaveBeenCalledWith("recon-import", expect.objectContaining({
+      status: "needs_campaign_move",
+      providerLeadId: "workspace-lead",
+    }));
+    expect(mocks.addLeadToCampaign).not.toHaveBeenCalled();
+  });
+
+  it("retries a reconciliation only after a confirmed provider absence", async () => {
+    setupWithClaimedJobs([candidate()], [{
+      id: "recon-import",
+      account_id: "account-1",
+      contact_point_id: "contact-point-1",
+      provider_lead_id: null,
+      claimed_from_status: "reconciliation_required",
+      attempt_count: 1,
+      max_attempts: 8,
+    }]);
+    mocks.findImportByEmail.mockResolvedValue({ id: "recon-import", status: "reconciliation_required" });
+    mocks.findLeadInCampaign.mockResolvedValue(null);
+    mocks.findLeadsByEmail.mockResolvedValue([]);
+
+    const result = await runInstantlyImportTick({ processQueueOnly: true, reconcileEligible: true });
+
+    expect(result.reconciliationRetryable).toBe(1);
+    expect(mocks.updateImport).toHaveBeenCalledWith("recon-import", expect.objectContaining({
+      status: "failed",
+      nextAttemptAt: expect.any(Date),
+      lastError: expect.stringContaining("confirmed the lead is not present"),
+    }));
+    expect(mocks.addLeadToCampaign).not.toHaveBeenCalled();
+  });
+
+  it("keeps an ambiguous target lookup retryable without attempting another provider add", async () => {
+    setupWithClaimedJobs([candidate()], [{
+      id: "recon-import",
+      account_id: "account-1",
+      contact_point_id: "contact-point-1",
+      provider_lead_id: "accepted-lead",
+      claimed_from_status: "reconciliation_required",
+      attempt_count: 1,
+      max_attempts: 8,
+    }]);
+    mocks.findImportByEmail.mockResolvedValue({ id: "recon-import", status: "reconciliation_required" });
+    const lookupError = new Error("Temporary provider failure");
+    lookupError.name = "InstantlyApiError";
+    Object.assign(lookupError, { details: { httpStatus: 503, requestId: "lookup-503" } });
+    mocks.findLeadInCampaign.mockRejectedValue(lookupError);
+
+    const result = await runInstantlyImportTick({ processQueueOnly: true, reconcileEligible: true });
+
+    expect(result.reconciliationRetryable).toBe(1);
+    expect(mocks.findLeadsByEmail).not.toHaveBeenCalled();
+    expect(mocks.updateImport).toHaveBeenCalledWith("recon-import", expect.objectContaining({
+      status: "reconciliation_required",
+      providerLeadId: "accepted-lead",
+      nextAttemptAt: expect.any(Date),
+    }));
+    expect(mocks.addLeadToCampaign).not.toHaveBeenCalled();
+  });
+
+  it.each([401, 403])("opens the existing auth circuit when reconciliation lookup returns %i", async (httpStatus) => {
+    setupWithClaimedJobs([candidate()], [{
+      id: "recon-import",
+      account_id: "account-1",
+      contact_point_id: "contact-point-1",
+      provider_lead_id: null,
+      claimed_from_status: "reconciliation_required",
+      attempt_count: 1,
+      max_attempts: 8,
+    }]);
+    mocks.findImportByEmail.mockResolvedValue({ id: "recon-import", status: "reconciliation_required" });
+    const authError = new Error("Unauthorized");
+    authError.name = "InstantlyApiError";
+    Object.assign(authError, { details: { httpStatus, requestId: "lookup-auth" } });
+    mocks.findLeadInCampaign.mockRejectedValue(authError);
+
+    const result = await runInstantlyImportTick({ processQueueOnly: true, reconcileEligible: true });
+
+    expect(result.providerStatus).toBe("unhealthy");
+    expect(mocks.tripCircuitBreaker).toHaveBeenCalledWith(campaignId, expect.any(String), "lookup-auth");
+    expect(mocks.findLeadsByEmail).not.toHaveBeenCalled();
+    expect(mocks.addLeadToCampaign).not.toHaveBeenCalled();
+    expect(mocks.releaseLock).not.toHaveBeenCalled();
+  });
+
+  it("does not repeat provider writes when a reconciled canonical row is seen on later ticks", async () => {
+    const candidateRows = [candidate()];
+    const reconJob = {
+      id: "recon-import",
+      account_id: "account-1",
+      contact_point_id: "contact-point-1",
+      provider_lead_id: null,
+      claimed_from_status: "reconciliation_required",
+      attempt_count: 1,
+      max_attempts: 8,
+    };
+    configureDbResults([
+      readySchemaRows, metricReads(), candidateRows, metricReads(), candidateRows, metricReads(),
+      readySchemaRows, metricReads(), candidateRows, metricReads(), candidateRows, metricReads(),
+    ]);
+    mocks.claimImports.mockResolvedValueOnce([reconJob]).mockResolvedValueOnce([]);
+    mocks.findImportByEmail
+      .mockResolvedValueOnce({ id: "recon-import", status: "reconciliation_required" })
+      .mockResolvedValueOnce({ id: "recon-import", status: "skipped_existing" });
+
+    const first = await runInstantlyImportTick({ processQueueOnly: true, reconcileEligible: true });
+    const second = await runInstantlyImportTick({ processQueueOnly: true, reconcileEligible: true });
+
+    expect(first.reconciliationConfirmedTarget).toBe(1);
+    expect(second.reconciliationChecked).toBe(0);
+    expect(mocks.findLeadInCampaign).toHaveBeenCalledOnce();
+    expect(mocks.addLeadToCampaign).not.toHaveBeenCalled();
+    expect(mocks.addLeads).not.toHaveBeenCalled();
   });
 
   it("persists provider failures as retryable imports", async () => {
