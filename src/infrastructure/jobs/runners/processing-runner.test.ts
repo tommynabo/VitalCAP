@@ -749,6 +749,9 @@ describe("runProcessingCronTick", () => {
       pagesFetched: 2,
       internalPagesFetched: 1,
       emailCandidatesFound: 1,
+      emailExtractionLiteralFound: 0,
+      emailExtractionDeobfuscatedFound: 1,
+      targetContactPagesFetched: 1,
       contentHash: "content-hash",
       evidence: [{
         evidenceType: "email",
@@ -785,8 +788,16 @@ describe("runProcessingCronTick", () => {
       WEBSITE_RECOVERY_FETCH_FAILED: 0,
       WEBSITE_RECOVERY_INTERNAL_PAGES_FETCHED: 1,
       WEBSITE_EMAIL_CANDIDATES_FOUND: 1,
+      EMAIL_EXTRACTION_LITERAL_FOUND: 0,
+      EMAIL_EXTRACTION_DEOBFUSCATED_FOUND: 1,
+      TARGET_CONTACT_PAGE_FETCHED: 1,
       WEBSITE_EMAIL_CONTACT_POINTS_CREATED: 1,
       WEBSITE_EMAIL_VERIFICATION_QUEUED: 1,
+    }));
+    expect(mocks.markRawCandidateProcessed).toHaveBeenCalledWith("raw-candidate-id", expect.objectContaining({
+      websiteEmailExtractionLiteralFound: 0,
+      websiteEmailExtractionDeobfuscatedFound: 1,
+      websiteTargetContactPagesFetched: 1,
     }));
   });
 

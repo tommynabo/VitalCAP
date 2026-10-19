@@ -473,6 +473,9 @@ async function executeProcessingJob(
     fetchFailed: 0,
     internalPagesFetched: 0,
     emailCandidatesFound: 0,
+    emailExtractionLiteralFound: 0,
+    emailExtractionDeobfuscatedFound: 0,
+    targetContactPagesFetched: 0,
     contactPointsCreated: 0,
     verificationQueued: 0,
   };
@@ -503,6 +506,15 @@ async function executeProcessingJob(
       }
       websiteRecoveryCounters.internalPagesFetched += result.internalPagesFetched ?? 0;
       websiteRecoveryCounters.emailCandidatesFound += result.emailCandidatesFound ?? 0;
+      websiteRecoveryCounters.emailExtractionLiteralFound += result.emailExtractionLiteralFound ?? 0;
+      websiteRecoveryCounters.emailExtractionDeobfuscatedFound += result.emailExtractionDeobfuscatedFound ?? 0;
+      websiteRecoveryCounters.targetContactPagesFetched += result.targetContactPagesFetched ?? 0;
+      processingMetrics.websiteEmailExtractionLiteralFound =
+        (processingMetrics.websiteEmailExtractionLiteralFound ?? 0) + websiteRecoveryCounters.emailExtractionLiteralFound;
+      processingMetrics.websiteEmailExtractionDeobfuscatedFound =
+        (processingMetrics.websiteEmailExtractionDeobfuscatedFound ?? 0) + websiteRecoveryCounters.emailExtractionDeobfuscatedFound;
+      processingMetrics.websiteTargetContactPagesFetched =
+        (processingMetrics.websiteTargetContactPagesFetched ?? 0) + websiteRecoveryCounters.targetContactPagesFetched;
 
       const nextRefreshAt = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000); // 30 days
       const failureBackoffMs = result.status === "timeout" || result.status === "transient_error"
@@ -633,6 +645,9 @@ async function executeProcessingJob(
         WEBSITE_RECOVERY_FETCH_FAILED: websiteRecoveryCounters.fetchFailed,
         WEBSITE_RECOVERY_INTERNAL_PAGES_FETCHED: websiteRecoveryCounters.internalPagesFetched,
         WEBSITE_EMAIL_CANDIDATES_FOUND: websiteRecoveryCounters.emailCandidatesFound,
+        EMAIL_EXTRACTION_LITERAL_FOUND: processingMetrics.websiteEmailExtractionLiteralFound ?? 0,
+        EMAIL_EXTRACTION_DEOBFUSCATED_FOUND: processingMetrics.websiteEmailExtractionDeobfuscatedFound ?? 0,
+        TARGET_CONTACT_PAGE_FETCHED: processingMetrics.websiteTargetContactPagesFetched ?? 0,
         WEBSITE_EMAIL_CONTACT_POINTS_CREATED: websiteRecoveryCounters.contactPointsCreated,
         WEBSITE_EMAIL_VERIFICATION_QUEUED: websiteRecoveryCounters.verificationQueued,
       });

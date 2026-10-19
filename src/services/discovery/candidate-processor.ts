@@ -402,10 +402,14 @@ export async function processRawCandidate(
     }
   }
 
-  const pageExtractionResults = pages.map((page) => extractCandidateEmailsWithDiagnostics(page.body, page.url));
+  const pageExtractionResults = pages.map((page) =>
+    extractCandidateEmailsWithDiagnostics(page.body, page.url, "website", { allowEncodedAndObfuscated: true }),
+  );
   const extractedEmails = pageExtractionResults.flatMap((result) => result.emails);
   processingMetrics.emailRejectedFormat += pageExtractionResults.reduce((total, result) => total + result.rejectedFormat, 0);
   processingMetrics.emailDuplicate += pageExtractionResults.reduce((total, result) => total + result.duplicates, 0);
+  processingMetrics.websiteEmailExtractionLiteralFound = pageExtractionResults.reduce((total, result) => total + result.literalFound, 0);
+  processingMetrics.websiteEmailExtractionDeobfuscatedFound = pageExtractionResults.reduce((total, result) => total + result.deobfuscatedFound, 0);
   const serperEmailRecovery: SerperEmailRecoveryDiagnostics = {
     candidatesFound: 0,
     candidatesRelevant: 0,

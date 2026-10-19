@@ -104,6 +104,44 @@ describe("WebsiteEnrichmentService", () => {
     expect(fetcher.fetchPage).not.toHaveBeenCalledWith("https://thirdparty.es/contacto");
   });
 
+  it("extracts email addresses from safe contact attributes on a newly targeted Spanish page", async () => {
+    const contactUrl = "https://farmacia.es/atencion-al-cliente";
+    const fetcher: WebsiteFetcher = {
+      fetchPage: vi.fn(async (url: string) => url === contactUrl
+        ? {
+            url,
+            status: 200,
+            contentType: "text/html",
+            body: '<div data-email="info&#64;farmacia.es">Email</div><span title="ventas@farmacia.es">Ventas</span><meta itemprop="email" content="hola@farmacia.es"><a href="mailto:pedidos%40farmacia.es">Pedidos</a>',
+          }
+        : {
+            url: "https://farmacia.es/",
+            status: 200,
+            contentType: "text/html",
+            body: '<a href="/atencion-al-cliente">Atención al cliente</a><a href="https://thirdparty.es/contacto">External contact</a>',
+          }),
+    };
+
+    const result = await new WebsiteEnrichmentService(fetcher).enrich({
+      workspaceId: "ws_1",
+      accountId: "acc_1",
+      websiteUrl: "https://farmacia.es/",
+    });
+    const emails = result.evidence.filter((fact) => fact.evidenceType === "email");
+
+    expect(emails.map((fact) => fact.value).sort()).toEqual([
+      "hola@farmacia.es",
+      "info@farmacia.es",
+      "pedidos@farmacia.es",
+      "ventas@farmacia.es",
+    ]);
+    expect(emails.every((fact) => fact.sourceUrl === contactUrl)).toBe(true);
+    expect(result.emailExtractionLiteralFound).toBe(2);
+    expect(result.emailExtractionDeobfuscatedFound).toBe(2);
+    expect(result.targetContactPagesFetched).toBe(1);
+    expect(fetcher.fetchPage).not.toHaveBeenCalledWith("https://thirdparty.es/contacto");
+  });
+
   it("extracts authoritative JSON-LD location facts from same-domain pages with provenance", async () => {
     const contactUrl = "https://farmacia.es/contacto";
     const fetcher: WebsiteFetcher = {

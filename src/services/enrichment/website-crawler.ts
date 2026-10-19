@@ -25,9 +25,12 @@ const TARGET_PATH_KEYWORDS = [
   "quienes-somos",
 ];
 
+const CONTACT_TARGET_KEYWORDS = ["contact", "contacto", "contactanos", "atencion-al-cliente"];
+
 export interface CrawledPage {
   url: string;
   body: string;
+  contactTarget?: boolean;
 }
 
 export interface WebsiteCrawlOptions {
@@ -51,9 +54,13 @@ const RETRYABLE_NETWORK_CODES = new Set([
 const PATH_PRIORITIES: ReadonlyArray<readonly [string, number]> = [
   ["contact", 100],
   ["contacto", 100],
+  ["contactanos", 100],
+  ["atencion-al-cliente", 100],
   ["about", 90],
   ["nosotros", 90],
   ["quienes-somos", 90],
+  ["empresa", 90],
+  ["conocenos", 90],
   ["team", 80],
   ["equipo", 80],
   ["aviso-legal", 70],
@@ -66,9 +73,13 @@ const PATH_PRIORITIES: ReadonlyArray<readonly [string, number]> = [
 const LINK_LABEL_PRIORITIES: ReadonlyArray<readonly [string, number]> = [
   ["contact", 100],
   ["contacto", 100],
+  ["contactanos", 100],
+  ["atencion al cliente", 100],
   ["contact us", 100],
   ["about", 90],
   ["nosotros", 90],
+  ["empresa", 90],
+  ["conocenos", 90],
   ["quienes somos", 90],
   ["who we are", 90],
   ["team", 80],
@@ -106,8 +117,14 @@ function targetPriority(url: string, label: string): number {
   return Math.max(pathPriority, labelPriority);
 }
 
-function extractLinks(html: string, baseUrl: string, allowedDomain: string): Array<{ url: string; priority: number }> {
-  const links: Array<{ url: string; priority: number }> = [];
+function isContactTarget(url: string, label: string): boolean {
+  const path = new URL(url).pathname.toLowerCase();
+  const normalizedLabel = normalizeLinkLabel(label);
+  return CONTACT_TARGET_KEYWORDS.some((keyword) => path.includes(keyword) || normalizedLabel.includes(keyword.replaceAll("-", " ")));
+}
+
+function extractLinks(html: string, baseUrl: string, allowedDomain: string): Array<{ url: string; priority: number; contactTarget: boolean }> {
+  const links: Array<{ url: string; priority: number; contactTarget: boolean }> = [];
   const anchorRe = /<a\b[^>]*?(?:\s)href\s*=\s*(["'])(.*?)\1[^>]*>([\s\S]*?)<\/a\s*>/gi;
   for (const match of html.matchAll(anchorRe)) {
     const href = match[2];
@@ -118,7 +135,9 @@ function extractLinks(html: string, baseUrl: string, allowedDomain: string): Arr
       const normalizedResolved = normalizeDomain(resolved.hostname);
       if (allowedDomain && normalizedResolved === allowedDomain) {
         const priority = targetPriority(resolved.toString(), match[3] ?? "");
-        if (priority > 0) links.push({ url: resolved.toString(), priority });
+        if (priority > 0) {
+          links.push({ url: resolved.toString(), priority, contactTarget: isContactTarget(resolved.toString(), match[3] ?? "") });
+        }
       }
     } catch {
       // ignore malformed hrefs (mailto:, tel:, javascript:, etc.)
@@ -186,6 +205,7 @@ async function fetchPageWithRetry(fetcher: WebsiteFetcher, url: string, signal?:
  */
 export async function crawlWebsite(fetcher: WebsiteFetcher, rootUrl: string, options: Partial<WebsiteCrawlOptions> = {}): Promise<CrawledPage[]> {
   const opts = { ...DEFAULT_OPTIONS, ...options };
+  const maxPages = Math.max(1, Math.min(Math.floor(opts.maxPages), 6));
   const visited = new Set<string>();
   const pages: CrawledPage[] = [];
 
@@ -197,7 +217,7 @@ export async function crawlWebsite(fetcher: WebsiteFetcher, rootUrl: string, opt
   }
   
   visited.add(home.url);
-  pages.push({ url: home.url, body: home.body });
+  pages.push({ url: home.url, body: home.body, contactTarget: isContactTarget(home.url, "") });
 
   const allowedDomain = normalizeDomain(new URL(rootUrl).hostname);
   const candidateLinks = extractLinks(home.body, home.url, allowedDomain!).filter(({ url }) => !visited.has(url));
@@ -210,7 +230,7 @@ export async function crawlWebsite(fetcher: WebsiteFetcher, rootUrl: string, opt
   let attemptedPages = pages.length;
   
   const worker = async () => {
-    while (index < uniqueCandidates.length && attemptedPages < opts.maxPages) {
+    while (index < uniqueCandidates.length && attemptedPages < maxPages) {
       opts.signal?.throwIfAborted();
       const candidate = uniqueCandidates[index++];
       if (!candidate) break;
@@ -219,8 +239,8 @@ export async function crawlWebsite(fetcher: WebsiteFetcher, rootUrl: string, opt
       attemptedPages++;
       try {
         const page = await fetchPageWithRetry(fetcher, candidate.url, opts.signal);
-        if (pages.length < opts.maxPages) {
-          pages.push(page);
+        if (pages.length < maxPages) {
+          pages.push({ ...page, contactTarget: candidate.contactTarget });
         }
       } catch (error) {
         if (opts.signal?.aborted) throw opts.signal.reason ?? error;

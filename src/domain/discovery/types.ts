@@ -29,6 +29,9 @@ export interface CandidateProcessingMetrics {
   websiteRecoveryDomain?: string | null;
   websiteRecoveryUrl?: string | null;
   websiteRecoveryEvidence?: SerpResult | null;
+  websiteEmailExtractionLiteralFound?: number;
+  websiteEmailExtractionDeobfuscatedFound?: number;
+  websiteTargetContactPagesFetched?: number;
 }
 
 export const PROVIDER_DEFERRED_JOB_ERROR_PREFIX = "provider_deferred:";

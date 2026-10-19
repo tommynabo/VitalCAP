@@ -127,7 +127,7 @@ describe("processRawCandidate — maps candidates", () => {
       url,
       status: 200,
       contentType: "text/html",
-      body: "Contacta con info@farmacia-ejemplo.es",
+      body: "Contacta con info [at] farmacia-ejemplo [dot] es",
     }));
     const website = {
       domain: "farmacia-ejemplo.es",
@@ -160,6 +160,7 @@ describe("processRawCandidate — maps candidates", () => {
       websiteRecoverySucceeded: 1,
       websiteRecoveryFailed: 0,
       websiteRecoveryProvider: "serper",
+      websiteEmailExtractionDeobfuscatedFound: 1,
     });
     expect(result.contactPoints).toContainEqual(expect.objectContaining({
       email: "info@farmacia-ejemplo.es",
@@ -525,6 +526,22 @@ describe("processRawCandidate — serp candidates", () => {
       emailRejectedFormat: 1,
     });
     expect(result.readyForOutreach).toBe(false);
+  });
+
+  it("does not deobfuscate email-like text from Serper snippets", async () => {
+    const result = await processRawCandidate({
+      kind: "serp",
+      result: {
+        title: "Farmacia Ejemplo",
+        url: "https://farmacia-ejemplo.es/contacto",
+        snippet: "Contacta con info [at] farmacia-ejemplo [dot] es",
+        domain: "farmacia-ejemplo.es",
+      },
+      geography: "Madrid",
+    }, "google_serp", baseContext({ websiteFetcher: fetcherReturning(""), deferVerification: true }));
+
+    expect(result.contactPoints).toHaveLength(0);
+    expect(result.serperEmailRecovery.candidatesFound).toBe(0);
   });
 
   it("rejects an unrelated third-party email when the snippet is not tied to the business", async () => {

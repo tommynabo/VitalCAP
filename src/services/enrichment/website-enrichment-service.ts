@@ -3,7 +3,7 @@ import { normalizeDomain, normalizePhoneES } from "@/lib/normalization";
 import { provinceForPostalCode } from "@/lib/geography/spain-provinces";
 import type { WebsiteFetcher } from "@/domain/providers/types";
 import { crawlWebsite, type CrawledPage } from "./website-crawler";
-import { extractCandidateEmails } from "./email-extraction";
+import { extractCandidateEmailsWithDiagnostics } from "./email-extraction";
 import { SafeFetchError } from "@/lib/security/safe-fetch";
 import { createDeadlineSignal, DeadlineExceededError, raceWithAbort } from "@/lib/async/deadline";
 
@@ -35,6 +35,9 @@ export interface WebsiteEnrichmentResult {
   pagesFetched: number;
   internalPagesFetched: number;
   emailCandidatesFound: number;
+  emailExtractionLiteralFound?: number;
+  emailExtractionDeobfuscatedFound?: number;
+  targetContactPagesFetched?: number;
   contentHash: string | null;
   evidence: WebsiteEvidenceFact[];
 }
@@ -114,6 +117,14 @@ function visibleEmailContent(html: string): string {
     .replace(/<([a-z][\w:-]*)\b[^>]*\shidden(?:\s|=|>)[^>]*>[\s\S]*?<\/\1\s*>/gi, " ")
     .replace(/<([a-z][\w:-]*)\b(?=[^>]*\baria-hidden\s*=\s*(["'])true\2)[^>]*>[\s\S]*?<\/\1\s*>/gi, " ")
     .replace(/<([a-z][\w:-]*)\b(?=[^>]*\bstyle\s*=\s*(["'])[^"']*(?:display\s*:\s*none|visibility\s*:\s*hidden)[^"']*\2)[^>]*>[\s\S]*?<\/\1\s*>/gi, " ")
+    .replace(/<([a-z][\w:-]*)\b([^>]*)>/gi, (tag, _name: string, attributes: string) => {
+      const values = Array.from(attributes.matchAll(/\b(?:data-email|aria-label|title)\s*=\s*(["'])(.*?)\1/gi), (match) => match[2]);
+      if (/\bitemprop\s*=\s*["']email["']/i.test(attributes)) {
+        const content = attributes.match(/\bcontent\s*=\s*(["'])(.*?)\1/i)?.[2];
+        if (content) values.push(content);
+      }
+      return values.length > 0 ? `${tag} ${values.join(" ")} ` : tag;
+    })
     .replace(/<a\b[^>]*\bhref\s*=\s*(["'])mailto:([^"']+)\1[^>]*>([\s\S]*?)<\/a\s*>/gi, (_match, _quote: string, target: string, text: string) => `mailto:${target} ${text}`)
     .replace(/<[^>]+>/g, " ");
 }
@@ -552,6 +563,8 @@ export class WebsiteEnrichmentService {
     
     const evidence: WebsiteEvidenceFact[] = [];
     const seenEvidence = new Set<string>();
+    let emailExtractionLiteralFound = 0;
+    let emailExtractionDeobfuscatedFound = 0;
 
     const addFact = (fact: WebsiteEvidenceFact) => {
       const provenanceKey = fact.evidenceType.startsWith("location_") ? `:${fact.sourceUrl}` : "";
@@ -563,8 +576,15 @@ export class WebsiteEnrichmentService {
     };
 
     for (const page of pages) {
-      const emails = extractCandidateEmails(visibleEmailContent(page.body), page.url);
-      for (const email of emails) {
+      const extraction = extractCandidateEmailsWithDiagnostics(
+        visibleEmailContent(page.body),
+        page.url,
+        "website",
+        { allowEncodedAndObfuscated: true },
+      );
+      emailExtractionLiteralFound += extraction.literalFound;
+      emailExtractionDeobfuscatedFound += extraction.deobfuscatedFound;
+      for (const email of extraction.emails) {
         addFact({
           evidenceType: "email",
           value: email.email,
@@ -601,6 +621,9 @@ export class WebsiteEnrichmentService {
       pagesFetched: pages.length,
       internalPagesFetched: Math.max(0, pages.length - 1),
       emailCandidatesFound: evidence.filter((fact) => fact.evidenceType === "email").length,
+      emailExtractionLiteralFound,
+      emailExtractionDeobfuscatedFound,
+      targetContactPagesFetched: pages.filter((page) => page.contactTarget).length,
       contentHash,
       evidence,
     };

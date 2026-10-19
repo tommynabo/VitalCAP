@@ -45,6 +45,34 @@ describe("crawlWebsite", () => {
     expect(fetcher.fetchPage).toHaveBeenCalledTimes(2);
   });
 
+  it("targets common Spanish customer-care paths and marks the fetched contact page", async () => {
+    const fetcher = makeFetcher({
+      "https://farmaciadelgado.es/": '<a href="/atencion-al-cliente">Atención al cliente</a><a href="/empresa">Conócenos</a>',
+      "https://farmaciadelgado.es/atencion-al-cliente": "customer care",
+      "https://farmaciadelgado.es/empresa": "company page",
+    });
+
+    const pages = await crawlWebsite(fetcher, "https://farmaciadelgado.es/", { maxPages: 3 });
+
+    expect(pages.map((page) => page.url)).toContain("https://farmaciadelgado.es/atencion-al-cliente");
+    expect(pages.map((page) => page.url)).toContain("https://farmaciadelgado.es/empresa");
+    expect(pages.find((page) => page.url.endsWith("/atencion-al-cliente"))?.contactTarget).toBe(true);
+  });
+
+  it("hard-caps the total crawl at six pages even when a caller requests more", async () => {
+    const links = Array.from({ length: 8 }, (_, index) => `/contactanos/${index}`);
+    const bodies = Object.fromEntries([
+      ["https://farmaciadelgado.es/", links.map((path) => `<a href="${path}">Contacto</a>`).join("")],
+      ...links.map((path) => [`https://farmaciadelgado.es${path}`, "contact page"]),
+    ]);
+    const fetcher = makeFetcher(bodies);
+
+    const pages = await crawlWebsite(fetcher, "https://farmaciadelgado.es/", { maxPages: 20 });
+
+    expect(pages).toHaveLength(6);
+    expect(fetcher.fetchPage).toHaveBeenCalledTimes(6);
+  });
+
   it("does not fail the whole crawl if one internal page is unreachable", async () => {
     const fetcher: WebsiteFetcher = {
       fetchPage: vi.fn(async (url: string) => {

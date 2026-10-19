@@ -1,20 +1,15 @@
 import { normalizeEmail } from "@/lib/normalization";
 
 /**
- * Email extraction from a fetched page (Prompt 2 §2.6). Extracts *every*
- * candidate email — not just the first — with source/context metadata so
- * downstream priority scoring and verification can each make their own
- * call. Deliberately does not auto-discard `info@`: it is valuable for
- * pharmacies (§2.6).
+ * Email extraction from a fetched page. Candidates retain source/context
+ * metadata and pass through the same normalization and rejection guards.
  */
 
 export interface ExtractedEmail {
   email: string;
   sourceUrl: string;
   sourceType: "website" | "serper_snippet";
-  /** Short surrounding text snippet, for a human reviewing why this email was picked up. */
   context: string;
-  /** Local-part-derived label, e.g. "info", "compras", "maria.garcia". */
   label: string;
   isGeneric: boolean;
 }
@@ -23,11 +18,18 @@ export interface EmailExtractionResult {
   emails: ExtractedEmail[];
   rejectedFormat: number;
   duplicates: number;
+  literalFound: number;
+  deobfuscatedFound: number;
+}
+
+export interface EmailExtractionOptions {
+  allowEncodedAndObfuscated?: boolean;
 }
 
 const MAILTO_RE = /mailto:([^"'?\s>]+)/gi;
-// Matches word@word.ext shapes anywhere in visible text, not just mailto links.
 const VISIBLE_EMAIL_RE = /[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/gi;
+const EMAIL_SOURCE_RE = /[a-z0-9._%+-]+(?:@|&commat;|&#(?:0*64|x0*40);)[a-z0-9-]+(?:(?:\.|&period;|&#(?:0*46|x0*2e);)[a-z0-9-]+)*(?:\.|&period;|&#(?:0*46|x0*2e);)[a-z]{2,}/gi;
+const OBFUSCATED_EMAIL_RE = /[a-z0-9._%+-]+(?:\s*@\s*|\s*\[\s*at\s*\]\s*|\s*\(\s*at\s*\)\s*|\s*\{\s*at\s*\}\s*)[a-z0-9-]+(?:\s*(?:\[\s*dot\s*\]|\(\s*dot\s*\)|\{\s*dot\s*\}|\.)\s*[a-z0-9-]+)*\s*(?:\[\s*dot\s*\]|\(\s*dot\s*\)|\{\s*dot\s*\}|\.)\s*[a-z]{2,}/gi;
 
 const ASSET_EXTENSIONS = ["png", "jpg", "jpeg", "gif", "svg", "webp", "ico", "css", "js", "woff", "woff2"];
 const BLOCKED_LOCAL_PARTS = ["noreply", "no-reply", "donotreply", "test", "example"];
@@ -60,7 +62,7 @@ function hasMalformedFormat(email: string): boolean {
 
 function isFalsePositive(email: string): boolean {
   if (hasMalformedFormat(email)) return true;
-    const [local, domain] = email.split("@");
+  const [local, domain] = email.split("@");
   if (!local || !domain) return true;
   const domainExtension = domain.split(".").pop() ?? "";
   if (ASSET_EXTENSIONS.includes(domainExtension.toLowerCase())) return true;
@@ -75,16 +77,51 @@ function contextAround(html: string, index: number, matchLength: number): string
   return html.slice(start, end).replace(/\s+/g, " ").trim();
 }
 
+function decodeEmailEntities(value: string): string {
+  return value.replace(/&(?:commat|period);|&#(?:x[0-9a-f]+|\d+);/gi, (entity) => {
+    const lower = entity.toLowerCase();
+    if (lower === "&commat;") return "@";
+    if (lower === "&period;") return ".";
+    const encoded = entity.slice(2, -1).toLowerCase();
+    const codePoint = encoded.startsWith("x")
+      ? Number.parseInt(encoded.slice(1), 16)
+      : Number.parseInt(encoded, 10);
+    return codePoint === 64 ? "@" : codePoint === 46 ? "." : entity;
+  });
+}
+
+function decodeMailtoTarget(value: string, allowEncodedAndObfuscated: boolean): { email: string; deobfuscated: boolean } {
+  let decoded = value.split("?")[0] ?? "";
+  try {
+    decoded = decodeURIComponent(decoded);
+  } catch {
+    // Keep the original target; normalization and format guards reject malformed values.
+  }
+  const withEntitiesDecoded = allowEncodedAndObfuscated ? decodeEmailEntities(decoded) : decoded;
+  return { email: withEntitiesDecoded, deobfuscated: withEntitiesDecoded !== value };
+}
+
+function normalizeObfuscatedEmail(value: string): string {
+  return value
+    .replace(/\[\s*at\s*\]|\(\s*at\s*\)|\{\s*at\s*\}/gi, "@")
+    .replace(/\[\s*dot\s*\]|\(\s*dot\s*\)|\{\s*dot\s*\}/gi, ".")
+    .replace(/\s*@\s*/g, "@")
+    .replace(/\s*\.\s*/g, ".");
+}
+
 export function extractCandidateEmailsWithDiagnostics(
   html: string,
   sourceUrl: string,
   sourceType: ExtractedEmail["sourceType"] = "website",
+  options: EmailExtractionOptions = {},
 ): EmailExtractionResult {
   const found = new Map<string, ExtractedEmail>();
+  const literalEmails = new Set<string>();
+  const deobfuscatedEmails = new Set<string>();
   let rejectedFormat = 0;
   let duplicates = 0;
 
-  const addCandidate = (rawEmail: string, index: number, matchLength: number) => {
+  const addCandidate = (rawEmail: string, index: number, matchLength: number, deobfuscated: boolean) => {
     const normalized = normalizeEmail(rawEmail);
     if (!normalized) {
       rejectedFormat += 1;
@@ -94,6 +131,7 @@ export function extractCandidateEmailsWithDiagnostics(
       if (hasMalformedFormat(normalized)) rejectedFormat += 1;
       return;
     }
+    (deobfuscated ? deobfuscatedEmails : literalEmails).add(normalized);
     if (found.has(normalized)) {
       duplicates += 1;
       return;
@@ -110,15 +148,32 @@ export function extractCandidateEmailsWithDiagnostics(
   };
 
   for (const match of html.matchAll(MAILTO_RE)) {
-    const raw = decodeURIComponent(match[1] ?? "").split("?")[0] ?? "";
-    addCandidate(raw, match.index ?? 0, match[0].length);
+    const decoded = decodeMailtoTarget(match[1] ?? "", options.allowEncodedAndObfuscated === true);
+    addCandidate(decoded.email, match.index ?? 0, match[0].length, decoded.deobfuscated);
   }
 
-  for (const match of html.matchAll(VISIBLE_EMAIL_RE)) {
-    addCandidate(match[0], match.index ?? 0, match[0].length);
+  const visibleEmailPattern = options.allowEncodedAndObfuscated ? EMAIL_SOURCE_RE : VISIBLE_EMAIL_RE;
+  for (const match of html.matchAll(visibleEmailPattern)) {
+    const decoded = options.allowEncodedAndObfuscated ? decodeEmailEntities(match[0]) : match[0];
+    addCandidate(decoded, match.index ?? 0, match[0].length, decoded !== match[0]);
   }
 
-  return { emails: Array.from(found.values()), rejectedFormat, duplicates };
+  if (options.allowEncodedAndObfuscated) {
+    for (const match of html.matchAll(OBFUSCATED_EMAIL_RE)) {
+      const normalizedRaw = normalizeEmail(match[0]);
+      const normalizedObfuscated = normalizeEmail(normalizeObfuscatedEmail(match[0]));
+      if (!normalizedObfuscated || normalizedObfuscated === normalizedRaw) continue;
+      addCandidate(normalizedObfuscated, match.index ?? 0, match[0].length, true);
+    }
+  }
+
+  return {
+    emails: Array.from(found.values()),
+    rejectedFormat,
+    duplicates,
+    literalFound: literalEmails.size,
+    deobfuscatedFound: deobfuscatedEmails.size,
+  };
 }
 
 export function extractCandidateEmails(

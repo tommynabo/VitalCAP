@@ -64,4 +64,69 @@ describe("extractCandidateEmails", () => {
     expect(result.rejectedFormat).toBe(1);
     expect(result.duplicates).toBe(1);
   });
+
+  it("dedupes a literal and a deobfuscated form of the same email", () => {
+    const result = extractCandidateEmailsWithDiagnostics(
+      "info@farmaciadelgado.es and info [at] farmaciadelgado [dot] es",
+      "https://farmaciadelgado.es/contacto",
+      "website",
+      { allowEncodedAndObfuscated: true },
+    );
+
+    expect(result.emails).toHaveLength(1);
+    expect(result.literalFound).toBe(1);
+    expect(result.deobfuscatedFound).toBe(1);
+  });
+
+  it("extracts HTML-entity encoded email characters", () => {
+    const result = extractCandidateEmailsWithDiagnostics(
+      "<p>info&#64;farmaciadelgado&#46;es</p> <a href=\"mailto:ventas&commat;farmaciadelgado&period;es\">Email</a>",
+      "https://farmaciadelgado.es/contacto",
+      "website",
+      { allowEncodedAndObfuscated: true },
+    );
+
+    expect(result.emails.map((email) => email.email).sort()).toEqual([
+      "info@farmaciadelgado.es",
+      "ventas@farmaciadelgado.es",
+    ]);
+    expect(result.deobfuscatedFound).toBe(2);
+  });
+
+  it.each([
+    "info @ farmaciadelgado.es",
+    "info [at] farmaciadelgado [dot] es",
+    "info (at) farmaciadelgado (dot) es",
+  ])("extracts a high-confidence obfuscated email: %s", (text) => {
+    const result = extractCandidateEmailsWithDiagnostics(
+      text,
+      "https://farmaciadelgado.es/contacto",
+      "website",
+      { allowEncodedAndObfuscated: true },
+    );
+
+    expect(result.emails.map((email) => email.email)).toEqual(["info@farmaciadelgado.es"]);
+    expect(result.deobfuscatedFound).toBe(1);
+  });
+
+  it("rejects malformed obfuscation and asset-like values", () => {
+    const result = extractCandidateEmailsWithDiagnostics(
+      "info [at] farmaciadelgado [dot] ; logo [at] 2x [dot] png",
+      "https://farmaciadelgado.es/contacto",
+      "website",
+      { allowEncodedAndObfuscated: true },
+    );
+
+    expect(result.emails).toHaveLength(0);
+  });
+
+  it("keeps non-website callers on literal extraction unless safe variants are enabled", () => {
+    const emails = extractCandidateEmails(
+      "info [at] farmaciadelgado [dot] es",
+      "https://farmaciadelgado.es/contacto",
+      "serper_snippet",
+    );
+
+    expect(emails).toHaveLength(0);
+  });
 });
