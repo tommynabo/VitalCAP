@@ -3,6 +3,8 @@ import {
   buildCapacityScenarios,
   calculateCostPerConfirmedImport,
   calculateYield,
+  evaluateInstantlyDeliveryCapacity,
+  evaluateRampReadiness,
   estimateRequestsRequiredForTarget,
   getCapacityWindowBounds,
   rollupConfirmedImports,
@@ -30,7 +32,159 @@ const imported = (accountId: string, uploadedAt: string, overrides: Partial<Conf
   ...overrides,
 });
 
+const deliveryCapacityInput = (overrides: Partial<Parameters<typeof evaluateInstantlyDeliveryCapacity>[0]> = {}) => ({
+  targetLeadsPerDay: 250,
+  planningDays: 30,
+  uploadedContacts: 427,
+  providerContactLimit: 25_000,
+  configuredContactHardLimit: 25_000,
+  monthlyEmailsSent: 0,
+  monthlyEmailLimit: 10_000,
+  followupEmailsPerLead: 0,
+  ...overrides,
+});
+
 describe("production capacity metrics", () => {
+  it("supports the initial-email target when contact and monthly capacity cover the 30-day cohort", () => {
+    expect(evaluateInstantlyDeliveryCapacity(deliveryCapacityInput())).toMatchObject({
+      projectedNewContacts: 7_500,
+      remainingContactSlots: 24_573,
+      contactCapacityStatus: "supported",
+      projectedInitialMonthlyEmails: 7_500,
+      projectedTotalMonthlyEmails: 7_500,
+      totalMonthlyEmailShortfall: 0,
+      supportsTarget: true,
+    });
+  });
+
+  it("blocks a target that exceeds monthly email headroom even when contacts fit", () => {
+    expect(evaluateInstantlyDeliveryCapacity(deliveryCapacityInput({
+      monthlyEmailsSent: 400,
+      monthlyEmailLimit: 5_000,
+    }))).toMatchObject({
+      contactCapacityStatus: "supported",
+      monthlyEmailHeadroom: 4_600,
+      monthlyEmailShortfall: 2_900,
+      totalEmailCapacityStatus: "blocked",
+      supportsTarget: false,
+    });
+  });
+
+  it("blocks a target that exceeds the effective provider contact quota", () => {
+    expect(evaluateInstantlyDeliveryCapacity(deliveryCapacityInput({
+      uploadedContacts: 900,
+      providerContactLimit: 1_000,
+      configuredContactHardLimit: 1_000,
+    }))).toMatchObject({
+      remainingContactSlots: 100,
+      contactShortfall: 7_400,
+      contactCapacityStatus: "blocked",
+      supportsTarget: false,
+    });
+  });
+
+  it("reports both email and contact constraints when both are binding", () => {
+    expect(evaluateInstantlyDeliveryCapacity(deliveryCapacityInput({
+      uploadedContacts: 900,
+      providerContactLimit: 1_000,
+      configuredContactHardLimit: 1_000,
+      monthlyEmailsSent: 400,
+      monthlyEmailLimit: 5_000,
+    }))).toMatchObject({
+      contactCapacityStatus: "blocked",
+      totalEmailCapacityStatus: "blocked",
+      supportsTarget: false,
+    });
+  });
+
+  it("returns unknown when required provider usage telemetry is unavailable", () => {
+    expect(evaluateInstantlyDeliveryCapacity(deliveryCapacityInput({
+      uploadedContacts: null,
+      providerContactLimit: null,
+      monthlyEmailsSent: null,
+    }))).toMatchObject({
+      contactCapacityStatus: "unknown",
+      monthlyEmailHeadroom: null,
+      totalEmailCapacityStatus: "unknown",
+      supportsTarget: null,
+    });
+    expect(evaluateInstantlyDeliveryCapacity(deliveryCapacityInput({
+      monthlyEmailsSent: null,
+    }))).toMatchObject({
+      contactCapacityStatus: "supported",
+      initialEmailCapacityStatus: "unknown",
+      supportsTarget: null,
+    });
+    expect(evaluateInstantlyDeliveryCapacity(deliveryCapacityInput({
+      uploadedContacts: null,
+      providerContactLimit: null,
+    }))).toMatchObject({
+      contactCapacityStatus: "unknown",
+      totalEmailCapacityStatus: "supported",
+      supportsTarget: null,
+    });
+  });
+
+  it("keeps follow-up volume unknown instead of treating it as zero", () => {
+    expect(evaluateInstantlyDeliveryCapacity(deliveryCapacityInput({
+      followupEmailsPerLead: null,
+    }))).toMatchObject({
+      projectedInitialMonthlyEmails: 7_500,
+      projectedTotalMonthlyEmails: null,
+      followupEmailsPerLead: null,
+      totalEmailCapacityStatus: "unknown",
+      supportsTarget: null,
+    });
+  });
+
+  it("includes a known follow-up multiplier in total monthly send requirements", () => {
+    expect(evaluateInstantlyDeliveryCapacity(deliveryCapacityInput({
+      monthlyEmailLimit: 20_000,
+      followupEmailsPerLead: 2,
+    }))).toMatchObject({
+      projectedInitialMonthlyEmails: 7_500,
+      projectedTotalMonthlyEmails: 22_500,
+      totalMonthlyEmailShortfall: 2_500,
+      totalEmailCapacityStatus: "blocked",
+      supportsTarget: false,
+    });
+  });
+
+  it("calculates prospective capacity while auto-send is disabled", () => {
+    expect(evaluateInstantlyDeliveryCapacity(deliveryCapacityInput({ autoSendEnabled: false })))
+      .toMatchObject({ projectedInitialMonthlyEmails: 7_500, supportsTarget: true });
+  });
+
+  it("requires delivery, provider, pause, dead-letter, raw-cap, and yield gates to be ready", () => {
+    expect(evaluateRampReadiness({
+      deliveryCapacity: "blocked",
+      providersHealthy: false,
+      paused: false,
+      systemicDeadLetterCount: 0,
+      rawCapHealthy: false,
+      yieldSampleCount: 6,
+    })).toEqual({
+      decision: "BLOCKED",
+      blockers: ["instantly_delivery_capacity", "provider_health", "raw_request_cap"],
+      unknowns: [],
+    });
+  });
+
+  it("does not mark incomplete ramp evidence as safe", () => {
+    expect(evaluateRampReadiness({
+      deliveryCapacity: "supported",
+      providersHealthy: null,
+      paused: null,
+      systemicDeadLetterCount: null,
+      rawCapHealthy: null,
+      yieldSampleCount: 2,
+    })).toMatchObject({
+      decision: "BLOCKED",
+      blockers: ["yield_sample_sufficiency"],
+      unknowns: ["provider_health", "autopilot_pause_state", "systemic_dead_letters", "raw_request_cap"],
+    });
+  });
+
   it("counts imports from a source in the same cohort and separates multi-source accounts", () => {
     const result = rollupConfirmedImports({
       workspaceId: "workspace-1",

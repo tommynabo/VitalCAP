@@ -8,6 +8,7 @@ import { emailChannelEligibilitySql } from "@/services/compliance/email-channel-
 import { actualPriorColdOutreachSql } from "./actual-outreach";
 import { buildDeadLetterAggregateQuery } from "./production-capacity-diagnostics-sql";
 import { getDailyRawRequestCapSnapshot } from "./daily-raw-request-cap";
+import { getSystemHealthDiagnostics } from "./health-diagnostics";
 import { getDb } from "../db";
 import { autopilotSettings } from "../schema/autopilot";
 import { campaigns } from "../schema/campaigns";
@@ -15,6 +16,8 @@ import {
   calculateCostPerConfirmedImport,
   calculateYield,
   buildCapacityScenarios,
+  evaluateInstantlyDeliveryCapacity,
+  evaluateRampReadiness,
   DISCOVERY_ENGINE_TYPES,
   estimateRequestsRequiredForTarget,
   getCapacityWindowBounds,
@@ -25,6 +28,7 @@ import {
   type ConfirmedImportFact,
 } from "@/services/admin/production-capacity-metrics";
 import { calculateProductionPipelineRates, classifyProductionPrimaryLossStage } from "@/services/admin/production-pipeline-metrics";
+import { evaluateProviderHealth } from "@/services/discovery/provider-health";
 
 type RawRow = Record<string, unknown>;
 
@@ -575,9 +579,15 @@ export async function getProductionCapacityDiagnostics(workspaceId: string, now 
     .sort((left, right) => right.yield - left.yield);
   const recordedSevenDayCosts = apifySpend.sevenDays + serperSpend.sevenDays + verificationSpend.sevenDays;
   const planProvider = new InstantlyEmailDeliveryProvider();
-  const [planUsage, monthlyUsage] = await Promise.all([
+  const [planUsage, monthlyUsage, systemHealth] = await Promise.all([
     planProvider.getPlanUsage().catch(() => null),
     planProvider.getMonthlyEmailUsage(now).catch(() => null),
+    getSystemHealthDiagnostics({
+      workspaceId,
+      now,
+      mapsDailyBudgetUsd: apifyBudget,
+      serperDailyBudgetUsd: serperEnv.SERPER_DAILY_COST_LIMIT_USD,
+    }),
   ]);
   const apifyRolling7dRequests = getProviderRequests("rolling7d", "apify");
   const serperRolling7dRequests = getProviderRequests("rolling7d", "serper");
@@ -593,12 +603,23 @@ export async function getProductionCapacityDiagnostics(workspaceId: string, now 
       verificationSpendUsd: verificationSpend.sevenDays,
     },
   });
-  const currentMonthlySendHeadroom = monthlyUsage
-    ? Math.max(0, deliveryEnv.INSTANTLY_MAX_MONTHLY_EMAILS - monthlyUsage.emailsSent)
-    : null;
-  const initialEmailsPerDay = 250;
-  const expectedFollowupsPerDay = 0;
-  const requiredMonthlySendCapacity = (initialEmailsPerDay + expectedFollowupsPerDay) * 30;
+  const targetLeadsPerDay = 250;
+  const planningDays = 30;
+  const initialEmailsPerDay = targetLeadsPerDay;
+  const expectedFollowupsPerDay = null;
+  const deliveryCapacity = evaluateInstantlyDeliveryCapacity({
+    targetLeadsPerDay,
+    planningDays,
+    uploadedContacts: planUsage?.currentLeadCount ?? null,
+    providerContactLimit: planUsage?.totalLeadLimit ?? null,
+    configuredContactHardLimit: deliveryEnv.INSTANTLY_MAX_UPLOADED_CONTACTS,
+    monthlyEmailsSent: monthlyUsage?.emailsSent ?? null,
+    monthlyEmailLimit: deliveryEnv.INSTANTLY_MAX_MONTHLY_EMAILS,
+    followupEmailsPerLead: null,
+    autoSendEnabled: false,
+  });
+  const currentMonthlySendHeadroom = deliveryCapacity.monthlyEmailHeadroom;
+  const requiredMonthlySendCapacity = deliveryCapacity.projectedInitialMonthlyEmails;
   const currentRawRequestCap = coreEnv.ACTIVATION_MAX_DAILY_RAW_REQUESTS;
   const baseScenario = capacityScenarios.BASE;
   const baseRawRequestsWithBuffer = baseScenario.rawRequestsWith20PercentBuffer;
@@ -651,11 +672,68 @@ export async function getProductionCapacityDiagnostics(workspaceId: string, now 
       confidence: period.emailRejectedFormat === null || period.emailDuplicate === null ? "partial" : "complete",
     }];
   }));
-  const instantlySupports250NewLeadsPerDay = currentMonthlySendHeadroom !== null
-    && currentMonthlySendHeadroom >= requiredMonthlySendCapacity;
-  const canSupport250FinalLeadsPerDayNow = instantlySupports250NewLeadsPerDay
+  const instantlySupports250NewLeadsPerDay = deliveryCapacity.supportsTarget;
+  const canSupport250FinalLeadsPerDayNow = instantlySupports250NewLeadsPerDay === true
     && baseRawRequestsWithBuffer !== null
-    && currentRawRequestCap >= baseRawRequestsWithBuffer;
+    && currentRawRequestCap >= baseRawRequestsWithBuffer
+    && !dailyRawRequestCap.blocked;
+  const apifyReliabilityHealth = evaluateProviderHealth({
+    calls: systemHealth.providers.apify.recentTerminalCalls,
+    items: 0,
+    errors: systemHealth.providers.apify.recentErrors,
+    totalLatencyMs: 0,
+    costUsd: 0,
+    quotaRemaining: null,
+  });
+  const serperReliabilityHealth = evaluateProviderHealth({
+    calls: systemHealth.providers.serper.recentTerminalCalls,
+    items: 0,
+    errors: systemHealth.providers.serper.recentErrors,
+    totalLatencyMs: 0,
+    costUsd: 0,
+    quotaRemaining: null,
+  });
+  const activeNeedsApify = activeEngineTypes.has("maps_fast")
+    || activeEngineTypes.has("maps_deep")
+    || activeEngineTypes.has("hybrid_fill");
+  const activeNeedsSerper = activeEngineTypes.has("google_serp");
+  const requiredProviderChecks = [
+    ...(activeNeedsApify ? [{
+      configured: mapsEnv.MAPS_PROVIDER === "apify" && Boolean(mapsEnv.APIFY_API_TOKEN),
+      healthy: apifyReliabilityHealth === "healthy" || apifyReliabilityHealth === "untested",
+      known: apifyReliabilityHealth !== "untested",
+      budgetAllowed: systemHealth.providers.apify.budgetAllowed,
+    }] : []),
+    ...(activeNeedsSerper ? [{
+      configured: serperEnv.SERP_PROVIDER === "serper" && Boolean(serperEnv.SERPER_API_KEY),
+      healthy: serperReliabilityHealth === "healthy" || serperReliabilityHealth === "untested",
+      known: serperReliabilityHealth !== "untested",
+      budgetAllowed: systemHealth.providers.serper.budgetAllowed,
+    }] : []),
+  ];
+  const providersHealthy = requiredProviderChecks.length === 0
+    ? null
+    : requiredProviderChecks.some((provider) => !provider.configured || !provider.budgetAllowed || !provider.healthy)
+      ? false
+      : requiredProviderChecks.every((provider) => provider.known) ? true : null;
+  const paused = systemHealth.autopilotEffectiveState === "running" && !systemHealth.systemPaused
+    ? false
+    : systemHealth.autopilotEffectiveState === "unknown" || systemHealth.autopilotEffectiveState === "mixed"
+      ? null
+      : true;
+  const rawCapHealthy = baseRawRequestsWithBuffer !== null
+    && currentRawRequestCap >= baseRawRequestsWithBuffer
+    && !dailyRawRequestCap.blocked;
+  const rampReadiness = evaluateRampReadiness({
+    deliveryCapacity: deliveryCapacity.supportsTarget === null
+      ? "unknown"
+      : deliveryCapacity.supportsTarget ? "supported" : "blocked",
+    providersHealthy,
+    paused,
+    systemicDeadLetterCount: activeSystemicDeadLetterCount,
+    rawCapHealthy,
+    yieldSampleCount: successfulDaySamples,
+  });
 
   return {
     generatedAt: now.toISOString(),
@@ -774,9 +852,20 @@ export async function getProductionCapacityDiagnostics(workspaceId: string, now 
       },
     },
     instantly: {
+      providerConfigured: deliveryEnv.EMAIL_DELIVERY_PROVIDER === "instantly" && Boolean(deliveryEnv.INSTANTLY_API_KEY),
+      targetCampaignConfigured: deliveryEnv.EMAIL_DELIVERY_PROVIDER === "instantly"
+        && Boolean(deliveryEnv.INSTANTLY_API_KEY && deliveryEnv.INSTANTLY_CAMPAIGN_ID),
+      providerPlanTelemetryAvailable: planUsage !== null,
+      monthlyEmailTelemetryAvailable: monthlyUsage !== null,
+      monthlyEmailTelemetryScope: "all_campaigns",
       totalLeadCapacity: planUsage?.totalLeadLimit ?? null,
       currentLeads: planUsage?.currentLeadCount ?? null,
-      remainingLeads: planUsage ? Math.max(0, planUsage.totalLeadLimit - planUsage.currentLeadCount) : null,
+      configuredContactHardLimit: deliveryEnv.INSTANTLY_MAX_UPLOADED_CONTACTS,
+      effectiveContactHardLimit: deliveryCapacity.effectiveContactHardLimit,
+      remainingLeads: deliveryCapacity.remainingContactSlots,
+      contactShortfallFor30Days: deliveryCapacity.contactShortfall,
+      contactRunwayDaysAt250PerDay: deliveryCapacity.contactRunwayDays,
+      contactCapacityStatus: deliveryCapacity.contactCapacityStatus,
       dailyWriteLimit: null,
       batchLimitPerTick: 50,
       writeConcurrency: 2,
@@ -784,15 +873,53 @@ export async function getProductionCapacityDiagnostics(workspaceId: string, now 
       monthlyEmailsSent: monthlyUsage?.emailsSent ?? null,
       autoSendEnabled: false,
       currentMonthlySendHeadroom,
-      newLeadsPerDay: 250,
+      newLeadsPerDay: targetLeadsPerDay,
       initialEmailsPerDay,
       expectedFollowupsPerDay,
-      followupProjectionBasis: "0 today: AUTO_SEND is disabled and no active cold-sequence dispatch is wired.",
-      requiredMonthlySendCapacity,
+      followupEmailsPerLead: deliveryCapacity.followupEmailsPerLead,
+      followupProjectionBasis: "UNKNOWN: no live sequence configuration is available; the sequence-service test fixture is not production evidence.",
+      planningDays,
+      projectedNewContacts: deliveryCapacity.projectedNewContacts,
+      projectedInitialMonthlyEmails: deliveryCapacity.projectedInitialMonthlyEmails,
+      projectedTotalMonthlyEmails: deliveryCapacity.projectedTotalMonthlyEmails,
+      initialEmailCapacityStatus: deliveryCapacity.initialEmailCapacityStatus,
+      totalEmailCapacityStatus: deliveryCapacity.totalEmailCapacityStatus,
+      monthlyEmailShortfall: deliveryCapacity.monthlyEmailShortfall,
+      totalMonthlyEmailShortfall: deliveryCapacity.totalMonthlyEmailShortfall,
+      requiredInitialMonthlySendCapacity: requiredMonthlySendCapacity,
+      minimumRequiredMonthlySendCapacity: requiredMonthlySendCapacity,
+      requiredMonthlySendCapacity: deliveryCapacity.projectedTotalMonthlyEmails,
       supports250NewLeadsPerDay: instantlySupports250NewLeadsPerDay,
+      requiredAdditionalInitialMonthlySendCapacity: monthlySendCapacityIncrease,
       requiredAdditionalMonthlySendCapacity: monthlySendCapacityIncrease,
       configuredMonthlySendLimitIncrease,
     },
+    providerHealth: {
+      apify: {
+        requiredByActiveCampaign: activeNeedsApify,
+        configured: mapsEnv.MAPS_PROVIDER === "apify" && Boolean(mapsEnv.APIFY_API_TOKEN),
+        reliability: apifyReliabilityHealth,
+        recentTerminalCalls: systemHealth.providers.apify.recentTerminalCalls,
+        recentErrors: systemHealth.providers.apify.recentErrors,
+        budgetAllowed: systemHealth.providers.apify.budgetAllowed,
+      },
+      serper: {
+        requiredByActiveCampaign: activeNeedsSerper,
+        configured: serperEnv.SERP_PROVIDER === "serper" && Boolean(serperEnv.SERPER_API_KEY),
+        reliability: serperReliabilityHealth,
+        recentTerminalCalls: systemHealth.providers.serper.recentTerminalCalls,
+        recentErrors: systemHealth.providers.serper.recentErrors,
+        budgetAllowed: systemHealth.providers.serper.budgetAllowed,
+      },
+    },
+    autopilotState: {
+      effectiveState: systemHealth.autopilotEffectiveState,
+      systemPaused: systemHealth.systemPaused,
+      pauseReason: systemHealth.systemPauseReason,
+    },
+    SAFE_TO_RAMP_TO_250: rampReadiness.decision === "READY",
+    safeToRampTo250Status: rampReadiness.decision,
+    safeToRampTo250: rampReadiness,
     rolling: {
       rolling3dRequests,
       rolling3dSameCohortConfirmedImports: rolling3dSameCohortImports,

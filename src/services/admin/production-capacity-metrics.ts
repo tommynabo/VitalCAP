@@ -1,6 +1,9 @@
 import type { EngineType } from "@/domain/campaigns/types";
+import { evaluateInstantlyContactQuota } from "@/domain/providers/instantly-plan-guard";
 
 export type CapacityWindow = "today" | "rolling3d" | "rolling7d";
+export type CapacityStatus = "supported" | "blocked" | "unknown";
+export type RampReadiness = "READY" | "BLOCKED" | "UNKNOWN";
 
 export const DISCOVERY_ENGINE_TYPES: readonly EngineType[] = [
   "maps_fast",
@@ -9,6 +12,132 @@ export const DISCOVERY_ENGINE_TYPES: readonly EngineType[] = [
   "linkedin_owner",
   "hybrid_fill",
 ];
+
+export function evaluateInstantlyDeliveryCapacity(input: {
+  targetLeadsPerDay: number;
+  planningDays: number;
+  uploadedContacts: number | null;
+  providerContactLimit: number | null;
+  configuredContactHardLimit: number;
+  monthlyEmailsSent: number | null;
+  monthlyEmailLimit: number;
+  followupEmailsPerLead: number | null;
+  autoSendEnabled?: boolean;
+}): {
+  projectedNewContacts: number;
+  effectiveContactHardLimit: number | null;
+  remainingContactSlots: number | null;
+  contactShortfall: number | null;
+  contactRunwayDays: number | null;
+  contactCapacityStatus: CapacityStatus;
+  initialEmailsPerLead: 1;
+  projectedInitialMonthlyEmails: number;
+  projectedTotalMonthlyEmails: number | null;
+  followupEmailsPerLead: number | null;
+  monthlyEmailHeadroom: number | null;
+  monthlyEmailShortfall: number | null;
+  totalMonthlyEmailShortfall: number | null;
+  initialEmailCapacityStatus: CapacityStatus;
+  totalEmailCapacityStatus: CapacityStatus;
+  supportsTarget: boolean | null;
+} {
+  const projectedNewContacts = input.targetLeadsPerDay * input.planningDays;
+  const initialEmailsPerLead = 1 as const;
+  const projectedInitialMonthlyEmails = projectedNewContacts * initialEmailsPerLead;
+  const monthlyEmailHeadroom = input.monthlyEmailsSent === null
+    ? null
+    : Math.max(0, input.monthlyEmailLimit - input.monthlyEmailsSent);
+  const contactQuota = input.uploadedContacts === null || input.providerContactLimit === null
+    ? null
+    : evaluateInstantlyContactQuota({
+        uploadedContacts: input.uploadedContacts,
+        providerLimit: input.providerContactLimit,
+        configuredHardLimit: input.configuredContactHardLimit,
+        warningThreshold: input.configuredContactHardLimit,
+      });
+  const remainingContactSlots = contactQuota?.remaining ?? null;
+  const contactShortfall = remainingContactSlots === null
+    ? null
+    : Math.max(0, projectedNewContacts - remainingContactSlots);
+  const contactCapacityStatus: CapacityStatus = remainingContactSlots === null
+    ? "unknown"
+    : contactShortfall! > 0 ? "blocked" : "supported";
+  const initialEmailCapacityStatus: CapacityStatus = monthlyEmailHeadroom === null
+    ? "unknown"
+    : monthlyEmailHeadroom < projectedInitialMonthlyEmails ? "blocked" : "supported";
+  const projectedTotalMonthlyEmails = input.followupEmailsPerLead === null
+    ? null
+    : Math.ceil(projectedNewContacts * (initialEmailsPerLead + input.followupEmailsPerLead));
+  const totalEmailCapacityStatus: CapacityStatus = input.followupEmailsPerLead === null
+    ? initialEmailCapacityStatus === "blocked" ? "blocked" : "unknown"
+    : monthlyEmailHeadroom === null
+      ? "unknown"
+      : monthlyEmailHeadroom < projectedTotalMonthlyEmails! ? "blocked" : "supported";
+  const contactRunwayDays = remainingContactSlots === null || input.targetLeadsPerDay <= 0
+    ? null
+    : remainingContactSlots / input.targetLeadsPerDay;
+  const supportsTarget = contactCapacityStatus === "blocked" || totalEmailCapacityStatus === "blocked"
+    ? false
+    : contactCapacityStatus === "unknown" || totalEmailCapacityStatus === "unknown"
+      ? null
+      : true;
+
+  return {
+    projectedNewContacts,
+    effectiveContactHardLimit: contactQuota?.hardLimit ?? null,
+    remainingContactSlots,
+    contactShortfall,
+    contactRunwayDays,
+    contactCapacityStatus,
+    initialEmailsPerLead,
+    projectedInitialMonthlyEmails,
+    projectedTotalMonthlyEmails,
+    followupEmailsPerLead: input.followupEmailsPerLead,
+    monthlyEmailHeadroom,
+    monthlyEmailShortfall: monthlyEmailHeadroom === null
+      ? null
+      : Math.max(0, projectedInitialMonthlyEmails - monthlyEmailHeadroom),
+    totalMonthlyEmailShortfall: monthlyEmailHeadroom === null || projectedTotalMonthlyEmails === null
+      ? null
+      : Math.max(0, projectedTotalMonthlyEmails - monthlyEmailHeadroom),
+    initialEmailCapacityStatus,
+    totalEmailCapacityStatus,
+    supportsTarget,
+  };
+}
+
+export function evaluateRampReadiness(input: {
+  deliveryCapacity: CapacityStatus;
+  providersHealthy: boolean | null;
+  paused: boolean | null;
+  systemicDeadLetterCount: number | null;
+  rawCapHealthy: boolean | null;
+  yieldSampleCount: number | null;
+  minimumYieldSamples?: number;
+}): { decision: RampReadiness; blockers: string[]; unknowns: string[] } {
+  const blockers: string[] = [];
+  const unknowns: string[] = [];
+  const check = (value: boolean | null, blocker: string) => {
+    if (value === false) blockers.push(blocker);
+    else if (value === null) unknowns.push(blocker);
+  };
+
+  check(input.deliveryCapacity === "blocked" ? false : input.deliveryCapacity === "unknown" ? null : true, "instantly_delivery_capacity");
+  check(input.providersHealthy, "provider_health");
+  check(input.paused === null ? null : !input.paused, "autopilot_pause_state");
+  check(input.systemicDeadLetterCount === null ? null : input.systemicDeadLetterCount === 0, "systemic_dead_letters");
+  check(input.rawCapHealthy, "raw_request_cap");
+  check(
+    input.yieldSampleCount === null ? null : input.yieldSampleCount >= (input.minimumYieldSamples ?? 3),
+    "yield_sample_sufficiency",
+  );
+
+  return {
+    decision: blockers.length > 0 ? "BLOCKED" : unknowns.length > 0 ? "UNKNOWN" : "READY",
+    blockers,
+    unknowns,
+  };
+}
 
 export interface CapacityWindowBounds {
   start: Date;
