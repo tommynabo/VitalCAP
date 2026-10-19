@@ -350,6 +350,7 @@ export async function getApifyRecoverySnapshot(workspaceId: string, now = new Da
   );
   return {
     ...recoverySnapshot,
+    safetyBlocked: unreconciled.length > 0,
     recoveryProbeInFlight: probeInFlight,
     latestFailureKind: latestFailure?.failureKind ?? null,
     latestFailureAt: latestFailure?.finishedAt ?? latestFailure?.startedAt ?? null,

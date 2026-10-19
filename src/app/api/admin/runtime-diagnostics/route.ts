@@ -5,10 +5,12 @@ import { listCampaigns } from "@/infrastructure/neon/repositories/campaigns";
 import { autopilotSettings } from "@/infrastructure/neon/schema/autopilot";
 import { getWorkspaceRole } from "@/infrastructure/neon/repositories/workspace";
 import { getApifyRecoverySnapshot } from "@/infrastructure/neon/repositories/provider-runs";
+import { getSystemHealthDiagnostics } from "@/infrastructure/neon/repositories/health-diagnostics";
 import { getRecoveryProbeDiscoveryJobs, getWatchdogWorkspaceSignals } from "@/infrastructure/neon/repositories/watchdog-signals";
 import { getCurrentWorkspaceId, requireCurrentUser, UnauthorizedError } from "@/lib/auth/workspace";
+import { getMapsEnv, getSerperEnv } from "@/lib/config/env";
 import { resolveNeonVar } from "@/lib/config/env-utils";
-import { getApifyAllocationHealth } from "@/services/discovery/provider-health";
+import { buildProviderHealthSnapshot } from "@/services/discovery/provider-health";
 import { getWatchdogPausePredicates } from "@/services/autopilot/watchdog-pause-policy";
 import { sanitizeRecoveryJobError } from "./sanitize-recovery-error";
 
@@ -83,7 +85,10 @@ export async function GET() {
     }
 
     const db = getDb();
-    const [campaignRows, [settings], apifyRecovery, watchdogRows, discoveryRecoveryJobs] = await Promise.all([
+    const mapsEnv = getMapsEnv();
+    const serperEnv = getSerperEnv();
+    const diagnosticsNow = new Date();
+    const [campaignRows, [settings], apifyRecovery, watchdogRows, discoveryRecoveryJobs, systemDiagnostics] = await Promise.all([
       listCampaigns(workspaceId),
       db.select({
         enabled: autopilotSettings.enabled,
@@ -96,8 +101,41 @@ export async function GET() {
       getApifyRecoverySnapshot(workspaceId),
       getWatchdogWorkspaceSignals(workspaceId),
       getRecoveryProbeDiscoveryJobs(workspaceId),
+      getSystemHealthDiagnostics({
+        workspaceId,
+        now: diagnosticsNow,
+        mapsDailyBudgetUsd: mapsEnv.APIFY_DAILY_COST_LIMIT_USD,
+        serperDailyBudgetUsd: serperEnv.SERPER_DAILY_COST_LIMIT_USD,
+      }),
     ]);
     const watchdogSignals = watchdogRows[0] ?? null;
+    const apifyHealth = buildProviderHealthSnapshot({
+      provider: "apify",
+      configured: mapsEnv.MAPS_PROVIDER === "apify" && Boolean(mapsEnv.APIFY_API_TOKEN),
+      budgetAllowed: systemDiagnostics.providers.apify.budgetAllowed,
+      usage: {
+        calls: systemDiagnostics.providers.apify.recentTerminalCalls,
+        errors: systemDiagnostics.providers.apify.recentErrors,
+        items: 0,
+        totalLatencyMs: 0,
+        costUsd: 0,
+        quotaRemaining: null,
+      },
+      recovery: apifyRecovery,
+    });
+    const serperHealth = buildProviderHealthSnapshot({
+      provider: "serper",
+      configured: serperEnv.SERP_PROVIDER === "serper" && Boolean(serperEnv.SERPER_API_KEY),
+      budgetAllowed: systemDiagnostics.providers.serper.budgetAllowed,
+      usage: {
+        calls: systemDiagnostics.providers.serper.recentTerminalCalls,
+        errors: systemDiagnostics.providers.serper.recentErrors,
+        items: 0,
+        totalLatencyMs: 0,
+        costUsd: 0,
+        quotaRemaining: null,
+      },
+    });
 
     return NextResponse.json({
       currentUserId: user.userId,
@@ -115,7 +153,17 @@ export async function GET() {
         dailySoftTarget: campaign.dailySoftTarget,
       })),
       apify: {
-        allocationHealth: getApifyAllocationHealth(apifyRecovery),
+        reliabilityHealth: apifyHealth.reliabilityHealth,
+        allocationHealth: apifyHealth.allocationHealth,
+        providerAvailable: apifyHealth.providerAvailable,
+        recentTerminalCalls: apifyHealth.recentTerminalCalls,
+        recentErrors: apifyHealth.recentErrors,
+        recentErrorRate: apifyHealth.recentErrorRate,
+        budgetAllowed: apifyHealth.budgetAllowed,
+        recoveredAfterLatestFailure: apifyHealth.recoveredAfterLatestFailure,
+        lastSuccessAt: systemDiagnostics.providers.apify.lastSuccessAt,
+        lastFailureAt: systemDiagnostics.providers.apify.lastFailureAt,
+        lastFailureClass: systemDiagnostics.providers.apify.lastFailureClass,
         recoveryProbeEligible: apifyRecovery.recoveryProbeEligible,
         recoveryProbeInFlight: apifyRecovery.recoveryProbeInFlight,
         nextRecoveryAttemptAt: formatDiagnosticDate(apifyRecovery.nextRecoveryAttemptAt),
@@ -123,6 +171,18 @@ export async function GET() {
         latestFailureAt: formatDiagnosticDate(apifyRecovery.latestFailureAt),
         latestFailureMessage: sanitizeApifyFailureMessage(apifyRecovery.latestFailureMessage),
         latestSuccessAt: formatDiagnosticDate(apifyRecovery.latestSuccessAt),
+      },
+      serper: {
+        reliabilityHealth: serperHealth.reliabilityHealth,
+        allocationHealth: serperHealth.allocationHealth,
+        providerAvailable: serperHealth.providerAvailable,
+        recentTerminalCalls: serperHealth.recentTerminalCalls,
+        recentErrors: serperHealth.recentErrors,
+        recentErrorRate: serperHealth.recentErrorRate,
+        budgetAllowed: serperHealth.budgetAllowed,
+        lastSuccessAt: systemDiagnostics.providers.serper.lastSuccessAt,
+        lastFailureAt: systemDiagnostics.providers.serper.lastFailureAt,
+        lastFailureClass: systemDiagnostics.providers.serper.lastFailureClass,
       },
       autopilot: settings ? {
         enabled: settings.enabled,

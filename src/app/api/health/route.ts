@@ -9,41 +9,21 @@ import {
   getDeliveryEnv,
 } from "@/lib/config/env";
 import { getAuthEnv } from "@/lib/config/auth-env";
-import { getRecentProviderUsage } from "@/infrastructure/neon/repositories/provider-runs";
+import { getApifyRecoverySnapshot } from "@/infrastructure/neon/repositories/provider-runs";
 import { getActiveAutopilotDiscoveryEngineTypes, getHealthWorkspaceIds } from "@/infrastructure/neon/repositories/diagnostics";
 import { getSystemHealthDiagnostics, type SystemHealthDiagnostics } from "@/infrastructure/neon/repositories/health-diagnostics";
-import type { ProviderHealthStatus } from "@/domain/autopilot/types";
 import type { EngineType } from "@/domain/campaigns/types";
-import type { ProviderUsageStats } from "@/domain/providers/types";
-import { emptyProviderUsageStats } from "@/domain/providers/types";
-import { accumulateUsage, evaluateProviderHealth, hasUnavailableRequiredDiscoveryProvider } from "@/services/discovery/provider-health";
+import type { ProviderHealthSnapshot } from "@/services/discovery/provider-health";
+import { aggregateProviderHealthSnapshots, buildProviderHealthSnapshot, hasUnavailableRequiredDiscoveryProvider } from "@/services/discovery/provider-health";
 
 export const dynamic = "force-dynamic";
-
-type HealthProviderStatus = ProviderHealthStatus | "missing_configuration";
 
 type WorkspaceHealthSnapshot = {
   engineTypes: EngineType[];
   diagnostics: SystemHealthDiagnostics;
-  mapsUsage: ProviderUsageStats;
-  serpUsage: ProviderUsageStats;
+  maps: ProviderHealthSnapshot;
+  serper: ProviderHealthSnapshot;
 };
-
-const providerHealthSeverity: Record<HealthProviderStatus, number> = {
-  missing_configuration: 6,
-  paused: 5,
-  degraded: 4,
-  unknown: 3,
-  untested: 2,
-  healthy: 1,
-};
-
-function aggregateProviderHealth(statuses: HealthProviderStatus[]): HealthProviderStatus {
-  if (statuses.length === 0) return "unknown";
-  return statuses.reduce((worst, current) =>
-    providerHealthSeverity[current] > providerHealthSeverity[worst] ? current : worst,
-  );
-}
 
 function latestTimestamp(values: Array<string | null>): string | null {
   return values.filter((value): value is string => value !== null).sort().at(-1) ?? null;
@@ -130,8 +110,19 @@ export async function GET() {
   const mapsConfigured = mapsProvider === "mock"
     || (mapsProvider === "apify" && Boolean(mapsEnv?.APIFY_API_TOKEN));
   const serpConfigured = serpEnv?.SERP_PROVIDER === "serper" && Boolean(serpEnv?.SERPER_API_KEY);
-  let mapsHealth = mapsConfigured ? "untested" : "missing_configuration";
-  let serpHealth = serpConfigured ? "untested" : "missing_configuration";
+  let mapsReliabilityHealth = mapsConfigured ? "untested" : "missing_configuration";
+  let mapsAllocationHealth = mapsReliabilityHealth;
+  let mapsProviderAvailable = mapsConfigured;
+  let mapsRecentTerminalCalls = 0;
+  let mapsRecentErrors = 0;
+  let mapsRecentErrorRate = 0;
+  let mapsRecoveredAfterLatestFailure = false;
+  let serpReliabilityHealth = serpConfigured ? "untested" : "missing_configuration";
+  let serpAllocationHealth = serpReliabilityHealth;
+  let serpProviderAvailable = serpConfigured;
+  let serpRecentTerminalCalls = 0;
+  let serpRecentErrors = 0;
+  let serpRecentErrorRate = 0;
   let diagnostics: Awaited<ReturnType<typeof getSystemHealthDiagnostics>> | null = null;
   let healthWorkspaceCount = 0;
   let operationalWorkspaceCount = 0;
@@ -148,50 +139,92 @@ export async function GET() {
       operationalWorkspaceCount = operationalWorkspaces.length;
       if (operationalWorkspaces.length === 0) {
         status = "degraded";
-        if (mapsConfigured) mapsHealth = "unknown";
-        if (serpConfigured) serpHealth = "unknown";
+        if (mapsConfigured) mapsReliabilityHealth = mapsAllocationHealth = "unknown";
+        if (serpConfigured) serpReliabilityHealth = serpAllocationHealth = "unknown";
+        mapsProviderAvailable = false;
+        serpProviderAvailable = false;
       } else {
         const snapshots: WorkspaceHealthSnapshot[] = await Promise.all(operationalWorkspaces.map(async ({ engineTypes, workspaceId }) => {
-          const [systemDiagnostics, mapsUsage, serpUsage] = await Promise.all([
+          const [systemDiagnostics, apifyRecovery] = await Promise.all([
             getSystemHealthDiagnostics({
               workspaceId,
               now: new Date(),
               mapsDailyBudgetUsd: mapsEnv?.APIFY_DAILY_COST_LIMIT_USD ?? 0,
               serperDailyBudgetUsd: serpEnv?.SERPER_DAILY_COST_LIMIT_USD ?? 0,
             }),
-            getRecentProviderUsage(workspaceId, "apify"),
-            getRecentProviderUsage(workspaceId, "serper"),
+            mapsProvider === "apify" ? getApifyRecoverySnapshot(workspaceId) : Promise.resolve(null),
           ]);
-          return { engineTypes, diagnostics: systemDiagnostics, mapsUsage, serpUsage };
+          const mapsUsage = {
+            calls: systemDiagnostics.providers.apify.recentTerminalCalls,
+            errors: systemDiagnostics.providers.apify.recentErrors,
+            items: 0,
+            totalLatencyMs: 0,
+            costUsd: 0,
+            quotaRemaining: null,
+          };
+          const serperUsage = {
+            calls: systemDiagnostics.providers.serper.recentTerminalCalls,
+            errors: systemDiagnostics.providers.serper.recentErrors,
+            items: 0,
+            totalLatencyMs: 0,
+            costUsd: 0,
+            quotaRemaining: null,
+          };
+          return {
+            engineTypes,
+            diagnostics: systemDiagnostics,
+            maps: buildProviderHealthSnapshot({
+              provider: mapsProvider === "apify" ? "apify" : "serper",
+              configured: mapsConfigured,
+              budgetAllowed: mapsProvider !== "apify" || systemDiagnostics.providers.apify.budgetAllowed,
+              usage: mapsUsage,
+              ...(apifyRecovery ? { recovery: apifyRecovery } : {}),
+            }),
+            serper: buildProviderHealthSnapshot({
+              provider: "serper",
+              configured: serpConfigured,
+              budgetAllowed: systemDiagnostics.providers.serper.budgetAllowed,
+              usage: serperUsage,
+            }),
+          };
         }));
         const workspaceDiagnostics = snapshots.map((snapshot) => snapshot.diagnostics);
         diagnostics = aggregateSystemDiagnostics(workspaceDiagnostics);
+        const mapsSnapshot = aggregateProviderHealthSnapshots(snapshots.map((snapshot) => snapshot.maps));
+        const serperSnapshot = aggregateProviderHealthSnapshots(snapshots.map((snapshot) => snapshot.serper));
+        mapsReliabilityHealth = mapsSnapshot.reliabilityHealth;
+        mapsAllocationHealth = mapsSnapshot.allocationHealth;
+        mapsProviderAvailable = mapsSnapshot.providerAvailable;
+        mapsRecentTerminalCalls = mapsSnapshot.recentTerminalCalls;
+        mapsRecentErrors = mapsSnapshot.recentErrors;
+        mapsRecentErrorRate = mapsSnapshot.recentErrorRate;
+        mapsRecoveredAfterLatestFailure = mapsSnapshot.recoveredAfterLatestFailure;
+        serpReliabilityHealth = serperSnapshot.reliabilityHealth;
+        serpAllocationHealth = serperSnapshot.allocationHealth;
+        serpProviderAvailable = serperSnapshot.providerAvailable;
+        serpRecentTerminalCalls = serperSnapshot.recentTerminalCalls;
+        serpRecentErrors = serperSnapshot.recentErrors;
+        serpRecentErrorRate = serperSnapshot.recentErrorRate;
         pausedOperationalWorkspaceCount = workspaceDiagnostics.filter((item) =>
           item.systemPaused || item.autopilotEffectiveState === "system_paused" || item.autopilotEffectiveState === "paused",
         ).length;
-        if (snapshots.some(({ engineTypes }) => hasUnavailableRequiredDiscoveryProvider(engineTypes, mapsConfigured, serpConfigured))) {
+        if (snapshots.some(({ engineTypes, maps, serper }) =>
+          hasUnavailableRequiredDiscoveryProvider(engineTypes, maps.providerAvailable, serper.providerAvailable),
+        )) {
           status = "degraded";
-        }
-        if (mapsConfigured) {
-          mapsHealth = aggregateProviderHealth(snapshots.map(({ mapsUsage }) => evaluateProviderHealth(mapsUsage)));
-        }
-        if (serpConfigured) {
-          serpHealth = aggregateProviderHealth(snapshots.map(({ serpUsage }) => evaluateProviderHealth(serpUsage)));
         }
       }
     } catch {
       status = "degraded";
-      if (mapsConfigured) mapsHealth = "unknown";
-      if (serpConfigured) serpHealth = "unknown";
+      if (mapsConfigured) mapsReliabilityHealth = mapsAllocationHealth = "unknown";
+      if (serpConfigured) serpReliabilityHealth = serpAllocationHealth = "unknown";
+      mapsProviderAvailable = false;
+      serpProviderAvailable = false;
     }
   }
 
   const mapsBudgetAllowed = diagnostics?.providers.apify.budgetAllowed ?? true;
   const serpBudgetAllowed = diagnostics?.providers.serper.budgetAllowed ?? true;
-  const mapsProviderAvailable = mapsConfigured && mapsBudgetAllowed && (mapsHealth === "healthy" || mapsHealth === "untested");
-  const serpProviderAvailable = serpConfigured && serpBudgetAllowed && (serpHealth === "healthy" || serpHealth === "untested");
-  if (mapsConfigured && (!mapsBudgetAllowed || !["healthy", "untested"].includes(mapsHealth))) status = "degraded";
-  if (serpConfigured && (!serpBudgetAllowed || !["healthy", "untested"].includes(serpHealth))) status = "degraded";
   if (diagnostics && (
     diagnostics.systemPaused
     || diagnostics.autopilotEffectiveState !== "running"
@@ -217,22 +250,29 @@ export async function GET() {
     maps: {
       provider: mapsProvider,
       configured: mapsConfigured,
-      health: mapsHealth,
-      recentTerminalCalls: diagnostics?.providers.apify.recentTerminalCalls ?? 0,
-      recentErrors: diagnostics?.providers.apify.recentErrors ?? 0,
+      health: mapsReliabilityHealth,
+      reliabilityHealth: mapsReliabilityHealth,
+      allocationHealth: mapsAllocationHealth,
+      recentTerminalCalls: mapsRecentTerminalCalls,
+      recentErrors: mapsRecentErrors,
+      recentErrorRate: mapsRecentErrorRate,
       lastSuccessAt: diagnostics?.providers.apify.lastSuccessAt ?? null,
       lastFailureAt: diagnostics?.providers.apify.lastFailureAt ?? null,
       lastFailureClass: diagnostics?.providers.apify.lastFailureClass ?? null,
       budgetAllowed: mapsBudgetAllowed,
       providerAvailable: mapsProviderAvailable,
+      recoveredAfterLatestFailure: mapsRecoveredAfterLatestFailure,
     },
     serp: {
       provider: serpEnv?.SERP_PROVIDER || process.env.SERP_PROVIDER || "disabled",
       configured: serpConfigured,
-      health: serpHealth,
-      status: serpHealth,
-      recentTerminalCalls: diagnostics?.providers.serper.recentTerminalCalls ?? 0,
-      recentErrors: diagnostics?.providers.serper.recentErrors ?? 0,
+      health: serpReliabilityHealth,
+      status: serpReliabilityHealth,
+      reliabilityHealth: serpReliabilityHealth,
+      allocationHealth: serpAllocationHealth,
+      recentTerminalCalls: serpRecentTerminalCalls,
+      recentErrors: serpRecentErrors,
+      recentErrorRate: serpRecentErrorRate,
       lastSuccessAt: diagnostics?.providers.serper.lastSuccessAt ?? null,
       lastFailureAt: diagnostics?.providers.serper.lastFailureAt ?? null,
       lastFailureClass: diagnostics?.providers.serper.lastFailureClass ?? null,

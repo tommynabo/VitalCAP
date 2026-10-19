@@ -1,13 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-const { mockGetHealthWorkspaceIds, mockGetRecentProviderUsage, mockGetActiveAutopilotDiscoveryEngineTypes, mockGetSystemHealthDiagnostics } = vi.hoisted(() => ({
+const { mockGetHealthWorkspaceIds, mockGetApifyRecoverySnapshot, mockGetActiveAutopilotDiscoveryEngineTypes, mockGetSystemHealthDiagnostics } = vi.hoisted(() => ({
   mockGetHealthWorkspaceIds: vi.fn(),
-  mockGetRecentProviderUsage: vi.fn(),
+  mockGetApifyRecoverySnapshot: vi.fn(),
   mockGetActiveAutopilotDiscoveryEngineTypes: vi.fn(),
   mockGetSystemHealthDiagnostics: vi.fn(),
 }));
 
-vi.mock("@/infrastructure/neon/repositories/provider-runs", () => ({ getRecentProviderUsage: mockGetRecentProviderUsage }));
+vi.mock("@/infrastructure/neon/repositories/provider-runs", () => ({ getApifyRecoverySnapshot: mockGetApifyRecoverySnapshot }));
 vi.mock("@/infrastructure/neon/repositories/diagnostics", () => ({ getHealthWorkspaceIds: mockGetHealthWorkspaceIds, getActiveAutopilotDiscoveryEngineTypes: mockGetActiveAutopilotDiscoveryEngineTypes }));
 vi.mock("@/infrastructure/neon/repositories/health-diagnostics", () => ({ getSystemHealthDiagnostics: mockGetSystemHealthDiagnostics }));
 
@@ -19,6 +19,23 @@ const environmentNames = ["APP_ENV", "VERCEL_ENV", "DEV_SEED_MODE", "DATABASE_UR
 
 const emptyUsage = { calls: 0, items: 0, errors: 0, totalLatencyMs: 0, costUsd: 0, quotaRemaining: null };
 const healthyUsage = { ...emptyUsage, calls: 4, items: 8 };
+type RecoveryFixture = {
+  usage: typeof emptyUsage;
+  recoveryProbeEligible: boolean;
+  nextRecoveryAttemptAt: Date | null;
+  safetyBlocked: boolean;
+  latestFailureAt: Date | string | null;
+  latestSuccessAt: Date | string | null;
+};
+
+const healthyRecovery: RecoveryFixture = {
+  usage: healthyUsage,
+  recoveryProbeEligible: false,
+  nextRecoveryAttemptAt: null,
+  safetyBlocked: false,
+  latestFailureAt: null,
+  latestSuccessAt: null,
+};
 const emptyQueue = {
   duePendingDiscovery: 0,
   deferredDiscovery: 0,
@@ -33,8 +50,8 @@ const emptyQueue = {
 function diagnostics(overrides: Record<string, unknown> = {}) {
   const defaults = {
     providers: {
-      apify: { recentTerminalCalls: 0, recentErrors: 0, lastSuccessAt: null, lastFailureAt: null, lastFailureClass: null, budgetAllowed: true },
-      serper: { recentTerminalCalls: 0, recentErrors: 0, lastSuccessAt: null, lastFailureAt: null, lastFailureClass: null, budgetAllowed: true },
+      apify: { recentTerminalCalls: 4, recentErrors: 0, lastSuccessAt: null, lastFailureAt: null, lastFailureClass: null, budgetAllowed: true },
+      serper: { recentTerminalCalls: 4, recentErrors: 0, lastSuccessAt: null, lastFailureAt: null, lastFailureClass: null, budgetAllowed: true },
     },
     autopilotEffectiveState: "running",
     systemPaused: false,
@@ -66,23 +83,41 @@ function configureWorkspaces(fixtures: Record<string, {
   diagnostics?: ReturnType<typeof diagnostics>;
   apifyUsage?: typeof emptyUsage;
   serperUsage?: typeof emptyUsage;
+  apifyRecovery?: RecoveryFixture;
 }>) {
   mockGetHealthWorkspaceIds.mockResolvedValue(Object.keys(fixtures));
   mockGetActiveAutopilotDiscoveryEngineTypes.mockImplementation(async (workspaceId: string) => fixtures[workspaceId]?.engineTypes ?? []);
-  mockGetSystemHealthDiagnostics.mockImplementation(async ({ workspaceId }: { workspaceId: string }) => fixtures[workspaceId]?.diagnostics ?? diagnostics());
-  mockGetRecentProviderUsage.mockImplementation(async (workspaceId: string, provider: string) =>
-    provider === "apify" ? fixtures[workspaceId]?.apifyUsage ?? healthyUsage : fixtures[workspaceId]?.serperUsage ?? healthyUsage,
-  );
+  mockGetSystemHealthDiagnostics.mockImplementation(async ({ workspaceId }: { workspaceId: string }) => {
+    const current = fixtures[workspaceId];
+    const base = current?.diagnostics ?? diagnostics();
+    return {
+      ...base,
+      providers: {
+        ...base.providers,
+        apify: {
+          ...base.providers.apify,
+          recentTerminalCalls: current?.apifyUsage?.calls ?? base.providers.apify.recentTerminalCalls,
+          recentErrors: current?.apifyUsage?.errors ?? base.providers.apify.recentErrors,
+        },
+        serper: {
+          ...base.providers.serper,
+          recentTerminalCalls: current?.serperUsage?.calls ?? base.providers.serper.recentTerminalCalls,
+          recentErrors: current?.serperUsage?.errors ?? base.providers.serper.recentErrors,
+        },
+      },
+    };
+  });
+  mockGetApifyRecoverySnapshot.mockImplementation(async (workspaceId: string) => fixtures[workspaceId]?.apifyRecovery ?? healthyRecovery);
 }
 
 describe("GET /api/health", () => {
   beforeEach(() => {
     mockGetHealthWorkspaceIds.mockReset();
-    mockGetRecentProviderUsage.mockReset();
+    mockGetApifyRecoverySnapshot.mockReset();
     mockGetActiveAutopilotDiscoveryEngineTypes.mockReset();
     mockGetSystemHealthDiagnostics.mockReset();
     mockGetHealthWorkspaceIds.mockResolvedValue([]);
-    mockGetRecentProviderUsage.mockResolvedValue(emptyUsage);
+    mockGetApifyRecoverySnapshot.mockResolvedValue(healthyRecovery);
     mockGetActiveAutopilotDiscoveryEngineTypes.mockResolvedValue([]);
     mockGetSystemHealthDiagnostics.mockResolvedValue(diagnostics());
   });
@@ -197,8 +232,7 @@ describe("GET /api/health", () => {
     expect(mockGetHealthWorkspaceIds).toHaveBeenCalledWith("055534c5-c3e3-414f-b140-f4770b293c00");
     expect(mockGetActiveAutopilotDiscoveryEngineTypes).toHaveBeenCalledWith("workspace-1");
     expect(mockGetSystemHealthDiagnostics).toHaveBeenCalledWith(expect.objectContaining({ workspaceId: "workspace-1" }));
-    expect(mockGetRecentProviderUsage).toHaveBeenCalledWith("workspace-1", "apify");
-    expect(mockGetRecentProviderUsage).toHaveBeenCalledWith("workspace-1", "serper");
+    expect(mockGetApifyRecoverySnapshot).toHaveBeenCalledWith("workspace-1");
 
     expect(body.maps).toMatchObject({
       provider: "apify",
@@ -298,7 +332,11 @@ describe("GET /api/health", () => {
     configureHealthEnvironment();
     configureWorkspaces({
       "workspace-a": { engineTypes: ["maps_fast"] },
-      "workspace-b": { engineTypes: ["maps_fast"], apifyUsage: { ...healthyUsage, calls: 4, errors: 3 } },
+      "workspace-b": {
+        engineTypes: ["maps_fast"],
+        apifyUsage: { ...healthyUsage, calls: 4, errors: 3 },
+        apifyRecovery: { ...healthyRecovery, recoveryProbeEligible: true },
+      },
     });
 
     const body = await (await GET()).json();
@@ -306,6 +344,74 @@ describe("GET /api/health", () => {
     expect(body.status).toBe("degraded");
     expect(body.maps.health).toBe("paused");
     expect(body.maps.providerAvailable).toBe(false);
+  });
+
+  it("keeps production ready when recent Apify reliability is degraded but recovery allows allocation", async () => {
+    configureHealthEnvironment();
+    configureWorkspaces({
+      active: {
+        engineTypes: ["maps_fast"],
+        apifyUsage: { ...healthyUsage, calls: 33, errors: 10 },
+        apifyRecovery: {
+          ...healthyRecovery,
+          latestFailureAt: "2026-10-19T12:00:00.000Z",
+          latestSuccessAt: "2026-10-19T13:30:00.000Z",
+        },
+      },
+    });
+
+    const body = await (await GET()).json();
+
+    expect(body.status).toBe("ok");
+    expect(body.maps).toMatchObject({
+      health: "degraded",
+      reliabilityHealth: "degraded",
+      allocationHealth: "healthy",
+      providerAvailable: true,
+      recentTerminalCalls: 33,
+      recentErrors: 10,
+      recentErrorRate: 10 / 33,
+      recoveredAfterLatestFailure: true,
+    });
+  });
+
+  it("degrades production for an unresolved latest Apify billing failure", async () => {
+    configureHealthEnvironment();
+    configureWorkspaces({
+      active: {
+        engineTypes: ["maps_fast"],
+        diagnostics: diagnostics({
+          providers: { apify: { lastFailureClass: "billing", budgetAllowed: true } },
+        }),
+        apifyRecovery: {
+          ...healthyRecovery,
+          recoveryProbeEligible: false,
+          nextRecoveryAttemptAt: new Date("2026-10-19T14:00:00.000Z"),
+          latestFailureAt: "2026-10-19T13:00:00.000Z",
+          latestSuccessAt: "2026-10-19T12:00:00.000Z",
+        },
+      },
+    });
+
+    const body = await (await GET()).json();
+
+    expect(body.status).toBe("degraded");
+    expect(body.maps).toMatchObject({ allocationHealth: "paused", providerAvailable: false, lastFailureClass: "billing" });
+  });
+
+  it("degrades production when the required Apify budget is exhausted", async () => {
+    configureHealthEnvironment();
+    configureWorkspaces({
+      active: {
+        engineTypes: ["maps_fast"],
+        diagnostics: diagnostics({ providers: { apify: { budgetAllowed: false } } }),
+      },
+    });
+
+    const body = await (await GET()).json();
+
+    expect(body.status).toBe("degraded");
+    expect(body.maps).toMatchObject({ allocationHealth: "paused", budgetAllowed: false, providerAvailable: false });
   });
 
   it("aggregates healthy Serper and Apify provider states across operational workspaces", async () => {

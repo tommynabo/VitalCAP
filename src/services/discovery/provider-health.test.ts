@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { createApifyConfigurationFingerprint, createApifyCredentialFingerprint, evaluateApifyRecovery, evaluateProviderHealth, getApifyAllocationHealth, hasUnavailableRequiredDiscoveryProvider, isProviderAvailableForDiscovery, resolveApifyDiscoveryWorkMode } from "./provider-health";
+import { aggregateProviderHealthSnapshots, buildProviderHealthSnapshot, createApifyConfigurationFingerprint, createApifyCredentialFingerprint, evaluateApifyRecovery, evaluateProviderHealth, getApifyAllocationHealth, hasUnavailableRequiredDiscoveryProvider, isProviderAvailableForDiscovery, resolveApifyDiscoveryWorkMode } from "./provider-health";
 
 describe("provider health cold start", () => {
   it("reports zero historical calls as untested", () => {
@@ -349,5 +349,130 @@ describe("Apify recovery health", () => {
     const afterSuccess = evaluateApifyRecovery([], oldFailure, "2026-10-08T10:32:00.000Z", false, false, new Date("2026-10-08T10:33:00.000Z"));
     expect(afterSuccess.recoveryProbeEligible).toBe(false);
     expect(getApifyAllocationHealth(afterSuccess)).toBe("untested");
+  });
+});
+
+describe("shared provider health snapshots", () => {
+  const usage = (calls: number, errors: number) => ({
+    calls,
+    errors,
+    items: 0,
+    totalLatencyMs: 0,
+    costUsd: 0,
+    quotaRemaining: null,
+  });
+
+  it("reports a healthy Apify provider as reliable, allocatable, and available", () => {
+    const snapshot = buildProviderHealthSnapshot({
+      provider: "apify",
+      configured: true,
+      budgetAllowed: true,
+      usage: usage(5, 0),
+      recovery: { usage: usage(5, 0), recoveryProbeEligible: false, nextRecoveryAttemptAt: null },
+    });
+
+    expect(snapshot).toMatchObject({
+      reliabilityHealth: "healthy",
+      allocationHealth: "healthy",
+      providerAvailable: true,
+      recentTerminalCalls: 5,
+      recentErrors: 0,
+      recentErrorRate: 0,
+    });
+  });
+
+  it("keeps recent reliability degraded while allowing allocation after recovery", () => {
+    const recoveredRun = {
+      status: "succeeded",
+      startedAt: "2026-10-11T10:59:00Z",
+      finishedAt: "2026-10-11T11:00:00Z",
+      itemsReturned: 5,
+      costUsd: 0.1,
+    };
+    const recovery = evaluateApifyRecovery(
+      [recoveredRun],
+      { status: "failed", startedAt: "2026-10-11T10:00:00Z", finishedAt: "2026-10-11T10:01:00Z", itemsReturned: 0, costUsd: 0 },
+      "2026-10-11T11:00:00Z",
+      false,
+      false,
+      new Date("2026-10-11T11:05:00Z"),
+    );
+    const snapshot = buildProviderHealthSnapshot({
+      provider: "apify",
+      configured: true,
+      budgetAllowed: true,
+      usage: usage(10, 3),
+      recovery: { ...recovery, latestFailureAt: "2026-10-11T10:01:00Z", latestSuccessAt: "2026-10-11T11:00:00Z" },
+    });
+
+    expect(snapshot).toMatchObject({
+      reliabilityHealth: "degraded",
+      allocationHealth: "healthy",
+      providerAvailable: true,
+      recentErrorRate: 0.3,
+      recoveredAfterLatestFailure: true,
+    });
+  });
+
+  it.each([
+    ["billing failure cooldown", false, new Date("2026-10-11T12:30:00Z")],
+    ["eligible recovery probe", true, null],
+  ])("pauses allocation for an active %s", (_label, recoveryProbeEligible, nextRecoveryAttemptAt) => {
+    const snapshot = buildProviderHealthSnapshot({
+      provider: "apify",
+      configured: true,
+      budgetAllowed: true,
+      usage: usage(4, 0),
+      recovery: {
+        usage: usage(0, 0),
+        recoveryProbeEligible: Boolean(recoveryProbeEligible),
+        nextRecoveryAttemptAt,
+      },
+    });
+
+    expect(snapshot.allocationHealth).toBe("paused");
+    expect(snapshot.providerAvailable).toBe(false);
+  });
+
+  it("blocks allocation when budget or safety is blocked", () => {
+    const recovery = { usage: usage(5, 0), recoveryProbeEligible: false, nextRecoveryAttemptAt: null };
+    const budgetBlocked = buildProviderHealthSnapshot({
+      provider: "apify", configured: true, budgetAllowed: false, usage: usage(5, 0), recovery,
+    });
+    const safetyBlocked = buildProviderHealthSnapshot({
+      provider: "apify", configured: true, budgetAllowed: true, usage: usage(5, 0), recovery: { ...recovery, safetyBlocked: true },
+    });
+
+    expect(budgetBlocked).toMatchObject({ allocationHealth: "paused", providerAvailable: false, budgetAllowed: false });
+    expect(safetyBlocked).toMatchObject({ allocationHealth: "paused", providerAvailable: false });
+  });
+
+  it("keeps Serper reliability and allocation health coherent", () => {
+    const snapshot = buildProviderHealthSnapshot({
+      provider: "serper", configured: true, budgetAllowed: true, usage: usage(20, 0),
+    });
+
+    expect(snapshot).toMatchObject({ reliabilityHealth: "healthy", allocationHealth: "healthy", providerAvailable: true });
+  });
+
+  it("aggregates usage totals and never hides a workspace with unavailable allocation", () => {
+    const healthy = buildProviderHealthSnapshot({
+      provider: "apify", configured: true, budgetAllowed: true, usage: usage(20, 0),
+      recovery: { usage: usage(20, 0), recoveryProbeEligible: false, nextRecoveryAttemptAt: null },
+    });
+    const blocked = buildProviderHealthSnapshot({
+      provider: "apify", configured: true, budgetAllowed: true, usage: usage(13, 3),
+      recovery: { usage: usage(0, 0), recoveryProbeEligible: true, nextRecoveryAttemptAt: null },
+    });
+    const aggregate = aggregateProviderHealthSnapshots([healthy, blocked]);
+
+    expect(aggregate).toMatchObject({
+      reliabilityHealth: "degraded",
+      allocationHealth: "paused",
+      providerAvailable: false,
+      recentTerminalCalls: 33,
+      recentErrors: 3,
+      recentErrorRate: 3 / 33,
+    });
   });
 });

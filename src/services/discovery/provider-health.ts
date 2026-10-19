@@ -55,14 +55,118 @@ export interface ApifyRecoverySnapshot {
   usage: ProviderUsageStats;
   recoveryProbeEligible: boolean;
   nextRecoveryAttemptAt: Date | null;
+  safetyBlocked?: boolean;
+  latestFailureAt?: Date | string | null;
+  latestSuccessAt?: Date | string | null;
 }
 
 export type ApifyDiscoveryWorkMode = "normal" | "recovery_probe" | "defer" | "skip";
 
 export function getApifyAllocationHealth(snapshot: ApifyRecoverySnapshot): ProviderHealthStatus {
-  return snapshot.recoveryProbeEligible || snapshot.nextRecoveryAttemptAt !== null
+  return snapshot.safetyBlocked || snapshot.recoveryProbeEligible || snapshot.nextRecoveryAttemptAt !== null
     ? "paused"
     : evaluateProviderHealth(snapshot.usage);
+}
+
+export type ProviderHealthLabel = ProviderHealthStatus | "missing_configuration";
+
+export interface ProviderHealthSnapshot {
+  reliabilityHealth: ProviderHealthLabel;
+  allocationHealth: ProviderHealthLabel;
+  providerAvailable: boolean;
+  recentTerminalCalls: number;
+  recentErrors: number;
+  recentErrorRate: number;
+  budgetAllowed: boolean;
+  recoveredAfterLatestFailure: boolean;
+  lastSuccessAt: string | null;
+  lastFailureAt: string | null;
+}
+
+export function buildProviderHealthSnapshot(input: {
+  provider: "apify" | "serper";
+  configured: boolean;
+  budgetAllowed: boolean;
+  usage: ProviderUsageStats;
+  recovery?: ApifyRecoverySnapshot;
+}): ProviderHealthSnapshot {
+  const reliabilityHealth: ProviderHealthLabel = input.configured
+    ? evaluateProviderHealth(input.usage)
+    : "missing_configuration";
+  const allocationHealth: ProviderHealthLabel = !input.configured
+    ? "missing_configuration"
+    : !input.budgetAllowed
+      ? "paused"
+      : input.provider === "apify"
+        ? input.recovery ? getApifyAllocationHealth(input.recovery) : "unknown"
+        : reliabilityHealth;
+  const latestFailureAt = input.provider === "apify" ? input.recovery?.latestFailureAt ?? null : null;
+  const latestSuccessAt = input.provider === "apify" ? input.recovery?.latestSuccessAt ?? null : null;
+  const failureTime = latestFailureAt === null ? Number.NaN : new Date(latestFailureAt).getTime();
+  const successTime = latestSuccessAt === null ? Number.NaN : new Date(latestSuccessAt).getTime();
+  const providerAvailable = input.configured
+    && input.budgetAllowed
+    && (allocationHealth === "healthy" || allocationHealth === "untested");
+
+  return {
+    reliabilityHealth,
+    allocationHealth,
+    providerAvailable,
+    recentTerminalCalls: input.usage.calls,
+    recentErrors: input.usage.errors,
+    recentErrorRate: input.usage.calls > 0 ? input.usage.errors / input.usage.calls : 0,
+    budgetAllowed: input.budgetAllowed,
+    recoveredAfterLatestFailure: Number.isFinite(failureTime) && Number.isFinite(successTime) && successTime > failureTime,
+    lastSuccessAt: Number.isFinite(successTime) ? new Date(successTime).toISOString() : null,
+    lastFailureAt: Number.isFinite(failureTime) ? new Date(failureTime).toISOString() : null,
+  };
+}
+
+const providerHealthSeverity: Record<ProviderHealthLabel, number> = {
+  missing_configuration: 6,
+  paused: 5,
+  degraded: 4,
+  unknown: 3,
+  untested: 2,
+  healthy: 1,
+};
+
+export function aggregateProviderHealthSnapshots(snapshots: readonly ProviderHealthSnapshot[]): ProviderHealthSnapshot {
+  if (snapshots.length === 0) {
+    return {
+      reliabilityHealth: "unknown",
+      allocationHealth: "unknown",
+      providerAvailable: false,
+      recentTerminalCalls: 0,
+      recentErrors: 0,
+      recentErrorRate: 0,
+      budgetAllowed: false,
+      recoveredAfterLatestFailure: false,
+      lastSuccessAt: null,
+      lastFailureAt: null,
+    };
+  }
+
+  const worst = (field: "reliabilityHealth" | "allocationHealth"): ProviderHealthLabel => snapshots.reduce((current, snapshot) =>
+    providerHealthSeverity[snapshot[field]] > providerHealthSeverity[current] ? snapshot[field] : current,
+  snapshots[0]![field]);
+  const recentTerminalCalls = snapshots.reduce((total, snapshot) => total + snapshot.recentTerminalCalls, 0);
+  const recentErrors = snapshots.reduce((total, snapshot) => total + snapshot.recentErrors, 0);
+  const snapshotsWithFailures = snapshots.filter((snapshot) => snapshot.lastFailureAt !== null);
+
+  return {
+    reliabilityHealth: worst("reliabilityHealth"),
+    allocationHealth: worst("allocationHealth"),
+    providerAvailable: snapshots.every((snapshot) => snapshot.providerAvailable),
+    recentTerminalCalls,
+    recentErrors,
+    recentErrorRate: recentTerminalCalls > 0 ? recentErrors / recentTerminalCalls : 0,
+    budgetAllowed: snapshots.every((snapshot) => snapshot.budgetAllowed),
+    recoveredAfterLatestFailure: snapshotsWithFailures.length > 0
+      && snapshotsWithFailures.every((snapshot) => snapshot.recoveredAfterLatestFailure),
+    lastSuccessAt: snapshots.map((snapshot) => snapshot.lastSuccessAt).filter((value): value is string => value !== null).sort().at(-1) ?? null,
+    lastFailureAt: snapshots.map((snapshot) => snapshot.lastFailureAt).filter((value): value is string => value !== null).sort().at(-1) ?? null,
+  };
 }
 
 export function resolveApifyDiscoveryWorkMode(input: {
