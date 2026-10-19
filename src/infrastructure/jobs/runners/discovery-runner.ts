@@ -32,6 +32,7 @@ import { createProviderRequestKey, normalizeProviderQuery } from "@/services/dis
 import { resolvePlanningWindow } from "@/services/autopilot/target-planner";
 import { getMapsEnv } from "@/lib/config/env";
 import { logEvent } from "@/lib/observability/structured-logger";
+import { getApifyFailureClass, getApifyFailureKind } from "@/infrastructure/providers/maps/apify-client";
 
 const DISCOVERY_JOB_TYPE = "run_engine_batch";
 const MAX_SEEDS_PER_JOB = 5;
@@ -464,6 +465,10 @@ async function executeDiscoveryJob(
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       counters.providerStartsFailed += 1;
+      const normalizedFailureKind = error instanceof ProviderFailureError
+        ? getApifyFailureKind(error) ?? error.kind
+        : error instanceof ProviderBudgetExceededError ? error.budgetKind : null;
+      const failureClass = getApifyFailureClass(error);
       const retryAt = error instanceof ProviderFailureError || error instanceof ProviderBudgetExceededError
         ? error.retryAt
         : null;
@@ -471,14 +476,12 @@ async function executeDiscoveryJob(
         correlationId: job.id,
         discoveryJobId: job.id,
         ...(reservationId ? { providerRunId: reservationId } : {}),
-        failureKind: error instanceof ProviderFailureError
-          ? error.kind
-          : error instanceof ProviderBudgetExceededError ? error.budgetKind : "unknown",
+        failureKind: normalizedFailureKind ?? "unknown",
         errorClass: error instanceof Error ? error.constructor.name : typeof error,
         retryAt: retryAt?.toISOString() ?? null,
       });
       if (reservationId) {
-        const failureKind = error instanceof ProviderFailureError ? error.kind : null;
+        const failureKind = normalizedFailureKind;
         const credentialFingerprint = failureKind === "authentication" || failureKind === "billing"
           ? createApifyCredentialFingerprint(getMapsEnv().APIFY_API_TOKEN)
           : null;
@@ -498,6 +501,7 @@ async function executeDiscoveryJob(
             planningWindow,
             recoveryProbe,
             ...(failureKind ? { failureKind } : {}),
+            ...(failureClass ? { failureClass } : {}),
             ...(credentialFingerprint ? { credentialFingerprint } : {}),
             ...(configurationFingerprint ? { configurationFingerprint } : {}),
           },
@@ -625,7 +629,7 @@ export async function runDiscoveryCronTick(maxJobsPerTick: number, now: Date = n
       await completeDiscoveryJob({ jobId: job.id, workerId, now });
     } catch (error) {
       const failureKind = error instanceof ProviderFailureError
-        ? error.kind
+        ? getApifyFailureKind(error) ?? error.kind
         : error instanceof ProviderBudgetExceededError ? error.budgetKind : undefined;
       const retryAt = error instanceof ProviderFailureError || error instanceof ProviderBudgetExceededError
         ? error.retryAt

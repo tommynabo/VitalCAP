@@ -171,6 +171,7 @@ export type ApifyReservationFailureKind =
   | "MANUAL_RECONCILIATION"
   | "RAW_CAP"
   | "DAILY_COST_CAP"
+  | "CONCURRENCY_LIMIT"
   | "RECOVERY_ALREADY_IN_FLIGHT"
   | "DUPLICATE_REQUEST"
   | "SQL_OR_UNKNOWN_RESERVATION_FAILURE";
@@ -180,6 +181,7 @@ const SAFE_RESERVATION_FAILURE_MESSAGES: Record<ApifyReservationFailureKind, str
   MANUAL_RECONCILIATION: "Provider reservation is blocked by unresolved manual reconciliation.",
   RAW_CAP: "Provider reservation is blocked by the daily raw request cap.",
   DAILY_COST_CAP: "Provider reservation is blocked by the daily Apify spend cap.",
+  CONCURRENCY_LIMIT: "Apify reservation is deferred by the workspace concurrency limit.",
   RECOVERY_ALREADY_IN_FLIGHT: "An Apify recovery probe is already in progress.",
   DUPLICATE_REQUEST: "An idempotent provider-run reservation already exists.",
   SQL_OR_UNKNOWN_RESERVATION_FAILURE: "Provider-run reservation failed before its outcome could be resolved.",
@@ -191,6 +193,8 @@ type TaggedApifyReservationError = Error & {
   reservationErrorCode?: string;
   retryAt?: Date | null;
 };
+
+export const MAX_CONCURRENT_APIFY_RUNS_PER_WORKSPACE = 4;
 
 export function getSafePostgresErrorCode(error: unknown): string | undefined {
   const seen = new Set<Error>();
@@ -257,6 +261,7 @@ export function buildReserveApifyProviderRunQuery(
   dayStart: Date,
   expectedCostUsd: number,
   now = new Date(),
+  maxConcurrentRuns = MAX_CONCURRENT_APIFY_RUNS_PER_WORKSPACE,
 ) {
   const configurationFingerprint = typeof input.metadata?.configurationFingerprint === "string"
     ? input.metadata.configurationFingerprint
@@ -278,6 +283,7 @@ export function buildReserveApifyProviderRunQuery(
             AND job.status IN ('pending', 'processing')
         ), 0)::int AS job_unrepresented_raw_requests,
         (SELECT COUNT(*) FROM provider_runs WHERE workspace_id = ${input.workspaceId}::uuid AND status = 'manual_reconciliation_required')::int AS unreconciled_count,
+        (SELECT COUNT(*) FROM provider_runs WHERE workspace_id = ${input.workspaceId}::uuid AND provider = 'apify' AND status IN ('starting', 'queued', 'running'))::int AS concurrent_apify_run_count,
         (SELECT COALESCE(SUM(cost_usd), 0) FROM provider_runs WHERE workspace_id = ${input.workspaceId}::uuid AND provider = 'apify' AND started_at >= ${dayStart.toISOString()}::timestamptz)::numeric AS cost_today,
         (SELECT COUNT(*) FROM provider_runs WHERE workspace_id = ${input.workspaceId}::uuid AND provider = 'apify' AND status IN ('starting', 'queued', 'running', 'succeeded', 'ingesting') AND COALESCE((metadata->>'recoveryProbe')::boolean, false) = true)::int AS recovery_probe_count
       FROM daily_raw_commitment
@@ -285,6 +291,7 @@ export function buildReserveApifyProviderRunQuery(
     safety AS (
       SELECT
         raw_safety.unreconciled_count,
+        raw_safety.concurrent_apify_run_count,
         raw_safety.committed_raw_requests AS requested_today,
         GREATEST(${input.itemsRequested} - raw_safety.job_unrepresented_raw_requests, 0)::int AS additional_raw_requests,
         raw_safety.cost_today,
@@ -301,6 +308,7 @@ export function buildReserveApifyProviderRunQuery(
         ${JSON.stringify({ ...(input.metadata ?? {}), recoveryProbe: input.recoveryProbe ?? false })}::jsonb, NOW()
       FROM safety
       WHERE safety.unreconciled_count = 0
+        AND safety.concurrent_apify_run_count < ${maxConcurrentRuns}
         AND safety.requested_today + safety.additional_raw_requests <= ${maxRequests}
         AND safety.cost_today + ${expectedCostUsd} <= ${maxCost}
         AND (${input.recoveryProbe ?? false} = false OR safety.recovery_probe_count = 0)
@@ -383,7 +391,7 @@ export async function getApifyRecoverySnapshot(workspaceId: string, now = new Da
       recoveryProbe: metadata.recoveryProbe === true,
       ...(typeof metadata.credentialFingerprint === "string" ? { credentialFingerprint: metadata.credentialFingerprint } : {}),
       ...(typeof metadata.configurationFingerprint === "string" ? { configurationFingerprint: metadata.configurationFingerprint } : {}),
-      ...(failureKind === "transient" || failureKind === "billing" || failureKind === "authentication" || failureKind === "configuration" || failureKind === "safety"
+      ...(failureKind === "transient" || failureKind === "billing" || failureKind === "authentication" || failureKind === "configuration" || failureKind === "safety" || failureKind === "actor_resource_limit"
         ? { failureKind }
         : {}),
     };
@@ -399,7 +407,7 @@ export async function getApifyRecoverySnapshot(workspaceId: string, now = new Da
     costUsd: 0,
     ...(typeof failureMetadata.credentialFingerprint === "string" ? { credentialFingerprint: failureMetadata.credentialFingerprint } : {}),
     ...(typeof failureMetadata.configurationFingerprint === "string" ? { configurationFingerprint: failureMetadata.configurationFingerprint } : {}),
-    ...(failureKind === "transient" || failureKind === "billing" || failureKind === "authentication" || failureKind === "configuration" || failureKind === "safety"
+    ...(failureKind === "transient" || failureKind === "billing" || failureKind === "authentication" || failureKind === "configuration" || failureKind === "safety" || failureKind === "actor_resource_limit"
       ? { failureKind }
       : {}),
   } : null;
@@ -453,7 +461,15 @@ export async function reserveApifyProviderRun(input: ReserveApifyProviderRunInpu
   // 2. Atomic insertion with guard conditions in one Neon HTTP statement.
   let result;
   try {
-    result = { rows: await executeUnderGlobalDailyRawCapLock(buildReserveApifyProviderRunQuery(input, maxRequests, maxCost, start, expectedCostUsd, now)) };
+    result = { rows: await executeUnderGlobalDailyRawCapLock(buildReserveApifyProviderRunQuery(
+      input,
+      maxRequests,
+      maxCost,
+      start,
+      expectedCostUsd,
+      now,
+      MAX_CONCURRENT_APIFY_RUNS_PER_WORKSPACE,
+    )) };
   } catch (error) {
     const errorCode = getSafePostgresErrorCode(error);
     throw tagApifyReservationFailure(
@@ -466,7 +482,7 @@ export async function reserveApifyProviderRun(input: ReserveApifyProviderRunInpu
 
   const row = result.rows[0] as {
     inserted_row: unknown;
-    safety_row: { unreconciled_count: number; requested_today: number; additional_raw_requests: number; cost_today: number; recovery_probe_count: number } | null;
+    safety_row: { unreconciled_count: number; concurrent_apify_run_count: number; requested_today: number; additional_raw_requests: number; cost_today: number; recovery_probe_count: number } | null;
     existing_row: unknown;
   } | undefined;
   if (row?.inserted_row) {
@@ -527,6 +543,13 @@ export async function reserveApifyProviderRun(input: ReserveApifyProviderRunInpu
     throw tagApifyReservationFailure(
       new ProviderBudgetExceededError("Provider reservation is blocked by the daily Apify spend cap.", retryAt),
       "DAILY_COST_CAP",
+    );
+  }
+  if (safety && safety.concurrent_apify_run_count >= MAX_CONCURRENT_APIFY_RUNS_PER_WORKSPACE) {
+    const retryAt = new Date(now.getTime() + 60 * 1000);
+    throw tagApifyReservationFailure(
+      new ProviderFailureError("Apify workspace concurrency limit is reached; defer this reservation.", "transient", retryAt),
+      "CONCURRENCY_LIMIT",
     );
   }
   if (input.recoveryProbe && safety?.recovery_probe_count) {

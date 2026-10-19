@@ -82,6 +82,53 @@ describe("Apify recovery health", () => {
     expect(isProviderAvailableForDiscovery(true, "healthy", 1)).toBe(true);
   });
 
+  it("keeps actor resource limits out of credential recovery and leaves Serper allocatable", () => {
+    const oldCredentialFingerprint = createApifyCredentialFingerprint("old-test-token");
+    const newCredentialFingerprint = createApifyCredentialFingerprint("new-test-token");
+    const memoryFailure = {
+      ...failedRun,
+      failureKind: "actor_resource_limit" as const,
+      credentialFingerprint: oldCredentialFingerprint!,
+    };
+    const snapshot = evaluateApifyRecovery(
+      [memoryFailure], memoryFailure, null, false, false,
+      new Date("2026-10-11T10:15:00.000Z"), newCredentialFingerprint,
+    );
+
+    expect(snapshot.recoveryProbeEligible).toBe(false);
+    expect(snapshot.nextRecoveryAttemptAt?.toISOString()).toBe("2026-10-11T10:31:00.000Z");
+    expect(getApifyAllocationHealth(snapshot)).toBe("paused");
+    expect(isProviderAvailableForDiscovery(true, "healthy", 1)).toBe(true);
+
+    const afterCooldown = evaluateApifyRecovery(
+      [memoryFailure], memoryFailure, null, false, false,
+      new Date("2026-10-11T10:31:00.000Z"), newCredentialFingerprint,
+    );
+    expect(afterCooldown.recoveryProbeEligible).toBe(true);
+  });
+
+  it("restores healthy allocation after an Apify success following an actor resource limit", () => {
+    const memoryFailure = {
+      ...failedRun,
+      failureKind: "actor_resource_limit" as const,
+    };
+    const success = {
+      status: "ingested",
+      startedAt: "2026-10-11T10:05:00.000Z",
+      finishedAt: "2026-10-11T10:10:00.000Z",
+      itemsReturned: 8,
+      costUsd: 0.1,
+    };
+    const snapshot = evaluateApifyRecovery(
+      [memoryFailure, success], memoryFailure, success.finishedAt, false, false,
+      new Date("2026-10-11T10:15:00.000Z"),
+    );
+
+    expect(evaluateProviderHealth(snapshot.usage)).toBe("healthy");
+    expect(getApifyAllocationHealth(snapshot)).toBe("healthy");
+    expect(isProviderAvailableForDiscovery(true, getApifyAllocationHealth(snapshot), 1)).toBe(true);
+  });
+
   it("allows one bounded immediate probe when the Apify credential fingerprint changes", () => {
     const oldCredentialFingerprint = createApifyCredentialFingerprint("old-test-token");
     const newCredentialFingerprint = createApifyCredentialFingerprint("new-test-token");

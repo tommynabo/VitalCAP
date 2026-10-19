@@ -46,7 +46,7 @@ export interface ApifyRecoveryRun {
   itemsReturned: number;
   costUsd: number;
   recoveryProbe?: boolean;
-  failureKind?: "transient" | "billing" | "authentication" | "configuration" | "safety";
+  failureKind?: "transient" | "billing" | "authentication" | "configuration" | "safety" | "actor_resource_limit";
   credentialFingerprint?: string;
   configurationFingerprint?: string;
 }

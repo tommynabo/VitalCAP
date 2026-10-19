@@ -39,29 +39,66 @@ export interface ApifyRun {
   statusMessage?: string | null;
 }
 
-export function classifyApifyRunFailure(run: Pick<ApifyRun, "id" | "status" | "statusMessage">): ProviderFailureError {
+export type ApifyFailureKind = "transient" | "billing" | "authentication" | "configuration" | "actor_resource_limit";
+
+function isActorMemoryLimit(detail: string): boolean {
+  return /actor[-_ ]memory[-_ ]limit|memory[-_ ]limit|memory.{0,30}(limit|exceed)|out of memory|\boom\b/i.test(detail);
+}
+
+export function getApifyFailureKind(error: unknown): ApifyFailureKind | null {
+  if (error instanceof ApifyRequestError) return error.failureKind;
+  if (!(error instanceof ProviderFailureError)) return null;
+  const failureKind = (error as ProviderFailureError & { failureKind?: unknown }).failureKind;
+  return failureKind === "transient" || failureKind === "billing" || failureKind === "authentication"
+    || failureKind === "configuration" || failureKind === "actor_resource_limit"
+    ? failureKind
+    : null;
+}
+
+export function getApifyFailureClass(error: unknown): "actor_memory_limit" | null {
+  if (!(error instanceof ProviderFailureError)) return null;
+  return (error as ProviderFailureError & { failureClass?: unknown }).failureClass === "actor_memory_limit"
+    ? "actor_memory_limit"
+    : null;
+}
+
+export function classifyApifyRunFailure(run: Pick<ApifyRun, "id" | "status" | "statusMessage">): ProviderFailureError & { failureKind: ApifyFailureKind } {
   const detail = run.statusMessage?.trim() ?? "";
-  const message = `Apify Actor run ${run.id} ended with status ${run.status}${detail ? `: ${detail}` : ""}`;
-  if (/credit|billing|payment|402/i.test(detail)) return new ProviderBillingError(message);
-  if (/unauthori[sz]ed|forbidden|invalid token|authentication|401|403/i.test(detail)) return new ProviderAuthenticationError(message);
-  if (/invalid input|input schema|validation|configuration|bad request/i.test(detail)) return new ProviderConfigurationError(message);
-  return new ProviderTransientError(message);
+  if (isActorMemoryLimit(detail)) {
+    return Object.assign(new ProviderTransientError(`Apify Actor run ${run.id} ended with an actor memory limit.`), {
+      failureKind: "actor_resource_limit" as const,
+      failureClass: "actor_memory_limit" as const,
+    });
+  }
+  const message = `Apify Actor run ${run.id} ended with status ${run.status}.`;
+  if (/credit|billing|payment|402/i.test(detail)) return Object.assign(new ProviderBillingError(message), { failureKind: "billing" as const });
+  if (/unauthori[sz]ed|forbidden|invalid token|authentication|401|403/i.test(detail)) return Object.assign(new ProviderAuthenticationError(message), { failureKind: "authentication" as const });
+  if (/invalid input|input schema|validation|configuration|bad request/i.test(detail)) return Object.assign(new ProviderConfigurationError(message), { failureKind: "configuration" as const });
+  return Object.assign(new ProviderTransientError(message), { failureKind: "transient" as const });
 }
 
 export class ApifyRequestError extends ProviderFailureError {
+  readonly failureKind: ApifyFailureKind;
+  readonly failureClass: "actor_memory_limit" | null;
+
   constructor(
     message: string,
     readonly status: number,
+    failureKind?: "actor_resource_limit",
   ) {
     const now = Date.now();
-    const retryDelay = status === 402
+    const retryDelay = failureKind === "actor_resource_limit"
+      ? 30 * 60 * 1000
+      : status === 402
       ? 30 * 60 * 1000
       : status === 401 || status === 403
         ? 6 * 60 * 60 * 1000
         : status === 408 || status === 425 || status === 429 || status >= 500
           ? 2 * 60 * 1000
           : null;
-    const kind = status === 402
+    const kind = failureKind === "actor_resource_limit"
+      ? "transient"
+      : status === 402
       ? "billing"
       : status === 401 || status === 403
         ? "authentication"
@@ -70,6 +107,8 @@ export class ApifyRequestError extends ProviderFailureError {
           : "transient";
     super(message, kind, retryDelay === null ? null : new Date(now + retryDelay));
     this.name = "ApifyRequestError";
+    this.failureKind = failureKind ?? kind;
+    this.failureClass = failureKind === "actor_resource_limit" ? "actor_memory_limit" : null;
   }
 }
 
@@ -107,7 +146,11 @@ export class ApifyClient {
   private async parseOrThrow(response: Response, action: string): Promise<unknown> {
     if (!response.ok) {
       const body = await response.text().catch(() => "");
-      throw new ApifyRequestError(`Apify ${action} failed: HTTP ${response.status} ${body}`.trim(), response.status);
+      const actorMemoryLimit = isActorMemoryLimit(body);
+      const message = actorMemoryLimit
+        ? "Apify actor resource limit rejected the run."
+        : `Apify ${action} failed: HTTP ${response.status}.`;
+      throw new ApifyRequestError(message, response.status, actorMemoryLimit ? "actor_resource_limit" : undefined);
     }
     try {
       return await response.json();
@@ -165,7 +208,11 @@ export class ApifyClient {
     });
     if (!response.ok) {
       const body = await response.text().catch(() => "");
-      throw new ApifyRequestError(`Apify get dataset items failed: HTTP ${response.status} ${body}`.trim(), response.status);
+      const actorMemoryLimit = isActorMemoryLimit(body);
+      const message = actorMemoryLimit
+        ? "Apify actor resource limit rejected the dataset request."
+        : `Apify get dataset items failed: HTTP ${response.status}.`;
+      throw new ApifyRequestError(message, response.status, actorMemoryLimit ? "actor_resource_limit" : undefined);
     }
     try {
       return (await response.json()) as unknown[];

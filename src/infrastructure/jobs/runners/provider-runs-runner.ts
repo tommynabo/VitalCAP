@@ -2,7 +2,7 @@ import { listWorkspaceIds } from "@/infrastructure/neon/repositories/workspace";
 import { getTodaySpendUsd, listApifyRunsForPolling, updateProviderRun, claimProviderRunForIngestion } from "@/infrastructure/neon/repositories/provider-runs";
 import { getMapsEnv } from "@/lib/config/env";
 import { getAutopilotSettings } from "@/infrastructure/neon/repositories/autopilot";
-import { ApifyClient, classifyApifyRunFailure } from "@/infrastructure/providers/maps/apify-client";
+import { ApifyClient, classifyApifyRunFailure, getApifyFailureClass, getApifyFailureKind } from "@/infrastructure/providers/maps/apify-client";
 import { mapCompassItemToPlaceResult } from "@/infrastructure/providers/maps/apify-actors/compass-adapter";
 import { ingestApifyProviderRun } from "@/infrastructure/neon/repositories/provider-run-ingestion";
 import { ProviderFailureError } from "@/domain/providers/errors";
@@ -73,10 +73,11 @@ export async function runProviderRunsCronTick(maxRuns = MAX_RUNS_PER_TICK): Prom
       if (run.status !== "SUCCEEDED") {
         const terminalStatus = run.status === "ABORTED" ? "aborted" : run.status === "TIMED-OUT" ? "timed_out" : "failed";
         const failure = classifyApifyRunFailure(run);
-        const credentialFingerprint = failure.kind === "authentication" || failure.kind === "billing"
+        const failureKind = getApifyFailureKind(failure) ?? failure.kind;
+        const credentialFingerprint = failureKind === "authentication" || failureKind === "billing"
           ? createApifyCredentialFingerprint(env.APIFY_API_TOKEN)
           : null;
-        const configurationFingerprint = failure.kind === "configuration"
+        const configurationFingerprint = failureKind === "configuration"
           ? createApifyConfigurationFingerprint(env)
           : null;
         await updateProviderRun(providerRun.id, {
@@ -87,7 +88,8 @@ export async function runProviderRunsCronTick(maxRuns = MAX_RUNS_PER_TICK): Prom
           error: failure.message,
           metadata: {
             ...((providerRun.metadata ?? {}) as Record<string, unknown>),
-            failureKind: failure.kind,
+            failureKind,
+            ...(getApifyFailureClass(failure) ? { failureClass: getApifyFailureClass(failure) } : {}),
             ...(credentialFingerprint ? { credentialFingerprint } : {}),
             ...(configurationFingerprint ? { configurationFingerprint } : {}),
           },

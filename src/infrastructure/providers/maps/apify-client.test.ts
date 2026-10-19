@@ -47,6 +47,21 @@ describe("ApifyClient", () => {
     await expect(client.getRun("run1")).rejects.toMatchObject({ kind: "billing", retryAt: expect.any(Date) });
   });
 
+  it("classifies actor memory-limit 402 responses as a safe resource failure", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(new Response("actor-memory-limit secret=do-not-store query=private", { status: 402 }));
+    const client = new ApifyClient({ apiToken: "t", fetchImpl });
+    let failure: unknown;
+    try {
+      await client.startActorRun("owner/actor", {});
+    } catch (error) {
+      failure = error;
+    }
+
+    expect(failure).toMatchObject({ kind: "transient", failureKind: "actor_resource_limit", failureClass: "actor_memory_limit", status: 402 });
+    expect((failure as Error).message).not.toContain("secret=do-not-store");
+    expect((failure as Error).message).not.toContain("query=private");
+  });
+
   it("classifies HTTP 500 as a short transient provider cooldown", async () => {
     const fetchImpl = vi.fn().mockResolvedValue(new Response("provider unavailable", { status: 500 }));
     const client = new ApifyClient({ apiToken: "t", fetchImpl });
@@ -70,6 +85,9 @@ describe("ApifyClient", () => {
     expect(classifyApifyRunFailure({ id: "run2", status: "FAILED", statusMessage: "Insufficient credits" }).kind).toBe("billing");
     expect(classifyApifyRunFailure({ id: "run3", status: "FAILED", statusMessage: "Invalid token" }).kind).toBe("authentication");
     expect(classifyApifyRunFailure({ id: "run4", status: "FAILED", statusMessage: "Temporary server issue" }).kind).toBe("transient");
+    const memoryFailure = classifyApifyRunFailure({ id: "run5", status: "FAILED", statusMessage: "actor-memory-limit, HTTP 402" });
+    expect(memoryFailure).toMatchObject({ kind: "transient", failureKind: "actor_resource_limit", failureClass: "actor_memory_limit" });
+    expect(memoryFailure.message).not.toContain("HTTP 402");
   });
 
   it("runAndWait polls until a terminal status", async () => {
