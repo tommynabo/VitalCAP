@@ -11,6 +11,7 @@ import { extractCandidateEmailsWithDiagnostics } from "@/services/enrichment/ema
 import { computeStrategicPriority } from "@/services/routing/contact-priority";
 import { isContactPointAcceptable, DEFAULT_VERIFICATION_ACCEPTANCE_POLICY, type VerificationAcceptancePolicy } from "@/services/verification/acceptance-policy";
 import { verifyEmailsWithCache, type EmailVerificationCacheStore } from "@/services/verification/email-verification-cache";
+import type { MapsFastWebsiteRecoveryOutcome, RecoveredBusinessWebsite } from "./maps-fast-website-recovery";
 
 /**
  * Shared candidate-processing pipeline (Prompt 2 §2.3 steps 1–11, reused by
@@ -80,6 +81,7 @@ export interface ProcessedCandidateResult {
   serperEmailRecovery: SerperEmailRecoveryDiagnostics;
   readyForOutreach: boolean;
   rejectionReason: string | null;
+  recoveredWebsite?: RecoveredBusinessWebsite | null;
 }
 
 export interface ProcessingContext {
@@ -90,6 +92,8 @@ export interface ProcessingContext {
   verificationProvider: EmailVerificationProvider;
   verificationCacheStore: EmailVerificationCacheStore;
   now: Date;
+  existingProcessingMetrics?: CandidateProcessingMetrics | null;
+  recoverMapsFastWebsite?: (place: MapsPlaceResult) => Promise<MapsFastWebsiteRecoveryOutcome>;
   verificationPolicy?: VerificationAcceptancePolicy;
   deferVerification?: boolean;
   /** Default off (§2.9) — LinkedIn never guesses a personal email pattern unless a campaign explicitly opts in, and even then this pipeline still only reports it, never invents a source. */
@@ -254,7 +258,17 @@ export async function processRawCandidate(
       businessType,
       icpQualified: false,
       contactPoints: [],
-      processingMetrics: { homepageFetchAttempted: 0, homepageFetchSucceeded: 0, homepageFetchFailed: 0, emailRejectedFormat: 0, emailDuplicate: 0 },
+      processingMetrics: {
+        homepageFetchAttempted: 0,
+        homepageFetchSucceeded: 0,
+        homepageFetchFailed: 0,
+        emailRejectedFormat: 0,
+        emailDuplicate: 0,
+        websiteRecoveryAttempted: 0,
+        websiteRecoverySucceeded: 0,
+        websiteRecoveryFailed: 0,
+        websiteRecoveryProvider: null,
+      },
       serperEmailRecovery: { candidatesFound: 0, candidatesRelevant: 0, duplicateCandidatesSkipped: 0 },
       readyForOutreach: false,
       rejectionReason: `Rejected: ${spainResult.reason}`,
@@ -274,7 +288,17 @@ export async function processRawCandidate(
       businessType,
       icpQualified: false,
       contactPoints: [],
-      processingMetrics: { homepageFetchAttempted: 0, homepageFetchSucceeded: 0, homepageFetchFailed: 0, emailRejectedFormat: 0, emailDuplicate: 0 },
+      processingMetrics: {
+        homepageFetchAttempted: 0,
+        homepageFetchSucceeded: 0,
+        homepageFetchFailed: 0,
+        emailRejectedFormat: 0,
+        emailDuplicate: 0,
+        websiteRecoveryAttempted: 0,
+        websiteRecoverySucceeded: 0,
+        websiteRecoveryFailed: 0,
+        websiteRecoveryProvider: null,
+      },
       serperEmailRecovery: { candidatesFound: 0, candidatesRelevant: 0, duplicateCandidatesSkipped: 0 },
       readyForOutreach: false,
       rejectionReason: `Rejected ICP: ${businessType} is outside the pharmacy, parapharmacy, and herbal-shop scope`,
@@ -284,19 +308,91 @@ export async function processRawCandidate(
   // Step: gather HTML for email extraction. maps_deep already crawled multiple pages during discovery;
   // every other engine does a single best-effort homepage fetch here (§2.3 step 6 / §2.9 "public contact point discovery").
   const pages: Array<{ url: string; body: string }> = [];
+  let effectiveWebsiteUrl = websiteUrl;
+  let recoveredWebsite: RecoveredBusinessWebsite | null = null;
   const processingMetrics: CandidateProcessingMetrics = {
     homepageFetchAttempted: 0,
     homepageFetchSucceeded: 0,
     homepageFetchFailed: 0,
     emailRejectedFormat: 0,
     emailDuplicate: 0,
+    websiteRecoveryAttempted: context.existingProcessingMetrics?.websiteRecoveryAttempted ?? 0,
+    websiteRecoverySucceeded: context.existingProcessingMetrics?.websiteRecoverySucceeded ?? 0,
+    websiteRecoveryFailed: context.existingProcessingMetrics?.websiteRecoveryFailed ?? 0,
+    websiteRecoveryProvider: context.existingProcessingMetrics?.websiteRecoveryProvider ?? null,
+    websiteRecoveryStatus: context.existingProcessingMetrics?.websiteRecoveryStatus,
+    websiteRecoveryDomain: context.existingProcessingMetrics?.websiteRecoveryDomain ?? null,
+    websiteRecoveryUrl: context.existingProcessingMetrics?.websiteRecoveryUrl ?? null,
+    websiteRecoveryEvidence: context.existingProcessingMetrics?.websiteRecoveryEvidence ?? null,
   };
+  if (
+    processingMetrics.websiteRecoveryStatus === "succeeded"
+    && processingMetrics.websiteRecoveryDomain
+    && processingMetrics.websiteRecoveryUrl
+    && processingMetrics.websiteRecoveryEvidence
+  ) {
+    recoveredWebsite = {
+      domain: processingMetrics.websiteRecoveryDomain,
+      websiteUrl: processingMetrics.websiteRecoveryUrl,
+      evidence: processingMetrics.websiteRecoveryEvidence,
+    };
+    effectiveWebsiteUrl = recoveredWebsite.websiteUrl;
+  }
+  const matchedAccount = matchedAccountKey
+    ? context.existingAccounts.find((account) => account.accountId === matchedAccountKey)
+    : undefined;
+  const recoveryAlreadyFinalized = processingMetrics.websiteRecoveryStatus === "started"
+    || processingMetrics.websiteRecoveryStatus === "succeeded"
+    || processingMetrics.websiteRecoveryStatus === "failed";
+  if (
+    engineType === "maps_fast"
+    && payload.kind === "maps"
+    && !normalizeDomain(websiteUrl)
+    && !normalizeDomain(matchedAccount?.normalizedDomain)
+    && !recoveryAlreadyFinalized
+    && context.recoverMapsFastWebsite
+  ) {
+    try {
+      const recovery = await context.recoverMapsFastWebsite(payload.place);
+      if (recovery.status === "recovered") {
+        recoveredWebsite = recovery.website;
+        effectiveWebsiteUrl = recovery.website.websiteUrl;
+        processingMetrics.websiteRecoveryAttempted = 1;
+        processingMetrics.websiteRecoverySucceeded = 1;
+        processingMetrics.websiteRecoveryFailed = 0;
+        processingMetrics.websiteRecoveryProvider = "serper";
+        processingMetrics.websiteRecoveryStatus = "succeeded";
+        processingMetrics.websiteRecoveryDomain = recovery.website.domain;
+        processingMetrics.websiteRecoveryUrl = recovery.website.websiteUrl;
+        processingMetrics.websiteRecoveryEvidence = recovery.website.evidence;
+      } else if (recovery.status === "failed" || recovery.status === "no_match") {
+        processingMetrics.websiteRecoveryAttempted = 1;
+        processingMetrics.websiteRecoverySucceeded = 0;
+        processingMetrics.websiteRecoveryFailed = 1;
+        processingMetrics.websiteRecoveryProvider = "serper";
+        processingMetrics.websiteRecoveryStatus = "failed";
+      } else {
+        processingMetrics.websiteRecoveryAttempted = 0;
+        processingMetrics.websiteRecoverySucceeded = 0;
+        processingMetrics.websiteRecoveryFailed = 0;
+        processingMetrics.websiteRecoveryProvider = null;
+        processingMetrics.websiteRecoveryStatus = "blocked";
+      }
+    } catch {
+      if (context.signal?.aborted) throw context.signal.reason;
+      processingMetrics.websiteRecoveryAttempted = 1;
+      processingMetrics.websiteRecoverySucceeded = 0;
+      processingMetrics.websiteRecoveryFailed = 1;
+      processingMetrics.websiteRecoveryProvider = "serper";
+      processingMetrics.websiteRecoveryStatus = "failed";
+    }
+  }
   if (payload.kind === "maps" && payload.crawledPages) {
     pages.push(...payload.crawledPages);
-  } else if (websiteUrl) {
+  } else if (effectiveWebsiteUrl) {
     processingMetrics.homepageFetchAttempted = 1;
     try {
-      const fetched = await context.websiteFetcher.fetchPage(websiteUrl, { signal: context.signal });
+      const fetched = await context.websiteFetcher.fetchPage(effectiveWebsiteUrl, { signal: context.signal });
       pages.push({ url: fetched.url, body: fetched.body });
       processingMetrics.homepageFetchSucceeded = 1;
     } catch {
@@ -403,5 +499,6 @@ export async function processRawCandidate(
     serperEmailRecovery,
     readyForOutreach,
     rejectionReason,
+    recoveredWebsite,
   };
 }

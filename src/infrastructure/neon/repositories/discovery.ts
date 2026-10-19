@@ -32,6 +32,7 @@ function toRawCandidate(row: typeof rawCandidates.$inferSelect): RawCandidate {
     sourceExternalId: row.sourceExternalId,
     sourceUrl: row.sourceUrl,
     rawPayload: row.rawPayload as Record<string, unknown>,
+    processingMetrics: row.processingMetrics as CandidateProcessingMetrics | null,
     searchSeedRunId: row.searchSeedRunId,
     providerRunId: row.providerRunId,
     accountId: row.accountId,
@@ -322,6 +323,28 @@ export async function getRawCandidateById(id: string): Promise<RawCandidate | nu
   const db = getDb();
   const [row] = await db.select().from(rawCandidates).where(eq(rawCandidates.id, id));
   return row ? toRawCandidate(row) : null;
+}
+
+export async function claimMapsFastWebsiteRecovery(rawCandidateId: string): Promise<boolean> {
+  const db = getDb();
+  const claimed = await db.update(rawCandidates).set({
+    processingMetrics: sql`COALESCE(${rawCandidates.processingMetrics}, '{}'::jsonb) || '{"websiteRecoveryStatus":"started","websiteRecoveryProvider":"serper"}'::jsonb`,
+  }).where(and(
+    eq(rawCandidates.id, rawCandidateId),
+    eq(rawCandidates.engineType, "maps_fast"),
+    sql`COALESCE(${rawCandidates.processingMetrics}->>'websiteRecoveryStatus', '') NOT IN ('started', 'succeeded', 'failed')`,
+  )).returning({ id: rawCandidates.id });
+  return claimed.length > 0;
+}
+
+export async function updateRawCandidateProcessingMetrics(
+  rawCandidateId: string,
+  metrics: Partial<CandidateProcessingMetrics>,
+): Promise<void> {
+  const db = getDb();
+  await db.update(rawCandidates).set({
+    processingMetrics: sql`COALESCE(${rawCandidates.processingMetrics}, '{}'::jsonb) || ${JSON.stringify(metrics)}::jsonb`,
+  }).where(eq(rawCandidates.id, rawCandidateId));
 }
 
 export async function markRawCandidateProcessed(id: string, processingMetrics?: CandidateProcessingMetrics): Promise<void> {

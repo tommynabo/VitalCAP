@@ -1,5 +1,5 @@
-import { describe, expect, it } from "vitest";
-import type { EmailVerificationProvider, WebsiteFetcher } from "@/domain/providers/types";
+import { describe, expect, it, vi } from "vitest";
+import type { EmailVerificationProvider, MapsPlaceResult, WebsiteFetcher } from "@/domain/providers/types";
 import { createInMemoryVerificationCacheStore } from "@/services/verification/email-verification-cache";
 import { hasLinkedInEmployerAccount, processRawCandidate, type CandidateRawPayload } from "./candidate-processor";
 
@@ -15,6 +15,30 @@ function alwaysValidVerifier(): EmailVerificationProvider {
 
 function fetcherReturning(body: string): WebsiteFetcher {
   return { fetchPage: async (url) => ({ url, status: 200, contentType: "text/html", body }) };
+}
+
+function mapsPayload(overrides: Partial<MapsPlaceResult> = {}): CandidateRawPayload {
+  return {
+    kind: "maps",
+    place: {
+      externalPlaceId: "maps-recovery-test",
+      name: "Farmacia Ejemplo",
+      category: "farmacia",
+      address: "Calle Mayor 1",
+      postalCode: "28001",
+      province: "Madrid",
+      city: "Madrid",
+      countryCode: "ES",
+      websiteUrl: null,
+      phone: "+34 911 111 111",
+      latitude: null,
+      longitude: null,
+      rating: null,
+      reviewCount: null,
+      sourceUrl: null,
+      ...overrides,
+    },
+  };
 }
 
 function baseContext(overrides: Partial<Parameters<typeof processRawCandidate>[2]> = {}) {
@@ -50,9 +74,11 @@ describe("processRawCandidate — maps candidates", () => {
         sourceUrl: null,
       },
     };
-    const result = await processRawCandidate(payload, "maps_fast", baseContext());
+    const recoverMapsFastWebsite = vi.fn();
+    const result = await processRawCandidate(payload, "maps_fast", baseContext({ recoverMapsFastWebsite }));
     expect(result.spainVerdict).toBe("rejected");
     expect(result.readyForOutreach).toBe(false);
+    expect(recoverMapsFastWebsite).not.toHaveBeenCalled();
   });
 
   it("produces a ready-for-outreach account for a verified Spain candidate with a valid email", async () => {
@@ -82,6 +108,106 @@ describe("processRawCandidate — maps candidates", () => {
     expect(result.icpQualified).toBe(true);
     expect(result.contactPoints.length).toBeGreaterThan(0);
     expect(result.readyForOutreach).toBe(true);
+  });
+
+  it("does not call Serper when a Maps Fast source website already exists", async () => {
+    const recoverMapsFastWebsite = vi.fn();
+    const result = await processRawCandidate(
+      mapsPayload({ websiteUrl: "https://farmacia-ejemplo.es" }),
+      "maps_fast",
+      baseContext({ recoverMapsFastWebsite }),
+    );
+
+    expect(recoverMapsFastWebsite).not.toHaveBeenCalled();
+    expect(result.processingMetrics.websiteRecoveryAttempted).toBe(0);
+  });
+
+  it("fetches a recovered Maps Fast site through normal website extraction with website provenance", async () => {
+    const fetchPage = vi.fn(async (url: string) => ({
+      url,
+      status: 200,
+      contentType: "text/html",
+      body: "Contacta con info@farmacia-ejemplo.es",
+    }));
+    const website = {
+      domain: "farmacia-ejemplo.es",
+      websiteUrl: "https://farmacia-ejemplo.es/",
+      evidence: {
+        title: "Farmacia Ejemplo Madrid",
+        url: "https://farmacia-ejemplo.es/contacto",
+        snippet: "Farmacia Ejemplo en Madrid",
+        domain: "farmacia-ejemplo.es",
+      },
+    };
+    const recoverMapsFastWebsite = vi.fn().mockResolvedValue({ status: "recovered", website });
+    const result = await processRawCandidate(
+      mapsPayload(),
+      "maps_fast",
+      baseContext({
+        recoverMapsFastWebsite,
+        websiteFetcher: { fetchPage },
+        deferVerification: true,
+      }),
+    );
+
+    expect(recoverMapsFastWebsite).toHaveBeenCalledOnce();
+    expect(fetchPage).toHaveBeenCalledWith("https://farmacia-ejemplo.es/", expect.anything());
+    expect(result.recoveredWebsite).toEqual(website);
+    expect(result.processingMetrics).toMatchObject({
+      homepageFetchAttempted: 1,
+      homepageFetchSucceeded: 1,
+      websiteRecoveryAttempted: 1,
+      websiteRecoverySucceeded: 1,
+      websiteRecoveryFailed: 0,
+      websiteRecoveryProvider: "serper",
+    });
+    expect(result.contactPoints).toContainEqual(expect.objectContaining({
+      email: "info@farmacia-ejemplo.es",
+      sourceType: "website",
+      sourceUrl: "https://farmacia-ejemplo.es/",
+    }));
+  });
+
+  it("keeps a no-result recovery on the ordinary no-email path", async () => {
+    const recoverMapsFastWebsite = vi.fn().mockResolvedValue({ status: "no_match" });
+    const fetchPage = vi.fn();
+    const result = await processRawCandidate(
+      mapsPayload({ phone: null }),
+      "maps_fast",
+      baseContext({ recoverMapsFastWebsite, websiteFetcher: { fetchPage } }),
+    );
+
+    expect(fetchPage).not.toHaveBeenCalled();
+    expect(result.rejectionReason).toBe("no_email");
+    expect(result.processingMetrics).toMatchObject({ websiteRecoveryAttempted: 1, websiteRecoverySucceeded: 0, websiteRecoveryFailed: 1 });
+  });
+
+  it("does not recover a duplicate whose matched account already has a domain", async () => {
+    const recoverMapsFastWebsite = vi.fn();
+    const result = await processRawCandidate(
+      mapsPayload({ externalPlaceId: "existing-place", phone: null }),
+      "maps_fast",
+      baseContext({
+        recoverMapsFastWebsite,
+        existingAccounts: [{
+          accountId: "existing-account",
+          normalizedName: "farmacia ejemplo",
+          googlePlaceId: "existing-place",
+          normalizedDomain: "farmacia-ejemplo.es",
+        }],
+      }),
+    );
+
+    expect(result.isDuplicate).toBe(true);
+    expect(recoverMapsFastWebsite).not.toHaveBeenCalled();
+  });
+
+  it("does not call the recovery hook for other engines", async () => {
+    const recoverMapsFastWebsite = vi.fn();
+    const result = await processRawCandidate(mapsPayload(), "maps_deep", baseContext({ recoverMapsFastWebsite }));
+
+    expect(recoverMapsFastWebsite).not.toHaveBeenCalled();
+    expect(result.processingMetrics.websiteRecoveryAttempted).toBe(0);
   });
 
   it("defers email verification without blocking processing or marking the candidate ready", async () => {

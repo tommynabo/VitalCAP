@@ -6,7 +6,7 @@
  */
 
 import type { EngineType } from "@/domain/campaigns/types";
-import type { AsyncMapsRun } from "@/domain/providers/types";
+import type { AsyncMapsRun, SerpResult } from "@/domain/providers/types";
 
 export type JobStatus =
   | "pending"
@@ -21,6 +21,14 @@ export interface CandidateProcessingMetrics {
   homepageFetchFailed: number;
   emailRejectedFormat: number;
   emailDuplicate: number;
+  websiteRecoveryAttempted?: number;
+  websiteRecoverySucceeded?: number;
+  websiteRecoveryFailed?: number;
+  websiteRecoveryProvider?: "serper" | null;
+  websiteRecoveryStatus?: "started" | "succeeded" | "failed" | "budget_blocked" | "blocked";
+  websiteRecoveryDomain?: string | null;
+  websiteRecoveryUrl?: string | null;
+  websiteRecoveryEvidence?: SerpResult | null;
 }
 
 export const PROVIDER_DEFERRED_JOB_ERROR_PREFIX = "provider_deferred:";
@@ -56,6 +64,7 @@ export interface RawCandidate {
   sourceExternalId: string | null;
   sourceUrl: string | null;
   rawPayload: Record<string, unknown>;
+  processingMetrics?: CandidateProcessingMetrics | null;
   searchSeedRunId?: string | null;
   providerRunId?: string | null;
   accountId?: string | null;

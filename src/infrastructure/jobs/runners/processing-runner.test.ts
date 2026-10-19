@@ -1,6 +1,8 @@
 import { readFileSync } from "node:fs";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ProviderBudgetExceededError } from "@/domain/providers/errors";
+import type { MapsPlaceResult } from "@/domain/providers/types";
+import type { ProcessedCandidateResult, ProcessingContext } from "@/services/discovery/candidate-processor";
 
 const mocks = vi.hoisted(() => ({
   claimProcessingJobs: vi.fn(),
@@ -9,6 +11,8 @@ const mocks = vi.hoisted(() => ({
   failProcessingJob: vi.fn(),
   enqueueProcessingJob: vi.fn(),
   getRawCandidateById: vi.fn(),
+  claimMapsFastWebsiteRecovery: vi.fn(),
+  updateRawCandidateProcessingMetrics: vi.fn(),
   refreshSearchSeedQualification: vi.fn(),
   getCampaignById: vi.fn(),
   markRawCandidateProcessed: vi.fn(),
@@ -31,6 +35,8 @@ const mocks = vi.hoisted(() => ({
   hasLinkedInEmployerAccount: vi.fn(),
   processRawCandidate: vi.fn(),
   enrichWebsite: vi.fn(),
+  createSerpDiscoveryProvider: vi.fn(),
+  getAutopilotSettings: vi.fn(),
 }));
 
 vi.mock("@/infrastructure/neon/repositories/job-queue", () => ({
@@ -43,6 +49,8 @@ vi.mock("@/infrastructure/neon/repositories/job-queue", () => ({
 
 vi.mock("@/infrastructure/neon/repositories/discovery", () => ({
   getRawCandidateById: mocks.getRawCandidateById,
+  claimMapsFastWebsiteRecovery: mocks.claimMapsFastWebsiteRecovery,
+  updateRawCandidateProcessingMetrics: mocks.updateRawCandidateProcessingMetrics,
   markRawCandidateProcessed: mocks.markRawCandidateProcessed,
   refreshSearchSeedQualification: mocks.refreshSearchSeedQualification,
   updateRawCandidateAccountId: mocks.updateRawCandidateAccountId,
@@ -72,6 +80,15 @@ vi.mock("@/infrastructure/neon/repositories/enrichment", () => ({
 
 vi.mock("@/infrastructure/neon/repositories/verification-queue", () => ({
   enqueueVerificationJob: mocks.enqueueVerificationJob,
+}));
+
+vi.mock("@/infrastructure/neon/repositories/autopilot", () => ({
+  getAutopilotSettings: mocks.getAutopilotSettings,
+}));
+
+vi.mock("@/infrastructure/providers/provider-factory", () => ({
+  createSerpDiscoveryProvider: mocks.createSerpDiscoveryProvider,
+  ProviderDisabledError: class ProviderDisabledError extends Error {},
 }));
 
 vi.mock("@/services/discovery/candidate-processor", () => ({
@@ -145,8 +162,74 @@ function makeJob(id: string) {
   };
 }
 
+const mapsFastRecoveryPlace: MapsPlaceResult = {
+  externalPlaceId: "maps-fast-recovery-place",
+  name: "Farmacia Ejemplo",
+  category: "farmacia",
+  address: "Calle Mayor 1",
+  postalCode: "28001",
+  province: "Madrid",
+  city: "Madrid",
+  countryCode: "ES",
+  websiteUrl: null,
+  phone: "+34 911 111 111",
+  latitude: null,
+  longitude: null,
+  rating: null,
+  reviewCount: null,
+  sourceUrl: "https://maps.example/place/maps-fast-recovery-place",
+};
+
+function prepareMapsFastRecoveryJob(processedOverride: Partial<ProcessedCandidateResult> = {}): void {
+  mocks.getRawCandidateById.mockResolvedValue({
+    id: "raw-candidate-id",
+    campaignId: "campaign-id",
+    engineType: "maps_fast",
+    sourceExternalId: mapsFastRecoveryPlace.externalPlaceId,
+    sourceUrl: mapsFastRecoveryPlace.sourceUrl,
+    rawPayload: { kind: "maps", place: mapsFastRecoveryPlace },
+    processingMetrics: null,
+    accountId: null,
+    searchSeedRunId: null,
+  });
+  mocks.getCampaignById.mockResolvedValue({ id: "campaign-id", workspaceId: "workspace-id" });
+  mocks.deriveIncomingIdentitySignals.mockReturnValue({ normalizedName: "farmacia ejemplo", normalizedDomain: null });
+  mocks.claimProcessingJobs.mockResolvedValueOnce([{ ...makeJob("maps-fast-recovery"), type: "process_raw_candidate" }]).mockResolvedValueOnce([]);
+  mocks.processRawCandidate.mockImplementationOnce(async (_payload: unknown, engineType: string, context: ProcessingContext) => {
+    const recovery = await context.recoverMapsFastWebsite?.(mapsFastRecoveryPlace) ?? { status: "blocked" as const };
+    return {
+      engineType: engineType as ProcessedCandidateResult["engineType"],
+      accountKey: "place:maps-fast-recovery-place",
+      businessNameGuess: "Farmacia Ejemplo",
+      isDuplicate: false,
+      matchedAccountKey: null,
+      spainVerdict: "needs_review",
+      businessType: "pharmacy",
+      icpQualified: true,
+      contactPoints: [],
+      processingMetrics: { homepageFetchAttempted: 0, homepageFetchSucceeded: 0, homepageFetchFailed: 0, emailRejectedFormat: 0, emailDuplicate: 0 },
+      serperEmailRecovery: { candidatesFound: 0, candidatesRelevant: 0, duplicateCandidatesSkipped: 0 },
+      readyForOutreach: false,
+      rejectionReason: "Awaiting Spain eligibility review",
+      recoveredWebsite: recovery.status === "recovered" ? recovery.website : null,
+      ...processedOverride,
+    };
+  });
+}
+
+const recoveredWebsite = {
+  domain: "farmacia-ejemplo.es",
+  websiteUrl: "https://farmacia-ejemplo.es/",
+  evidence: {
+    title: "Farmacia Ejemplo Madrid",
+    url: "https://farmacia-ejemplo.es/contacto",
+    snippet: "Farmacia Ejemplo Madrid 911111111",
+    domain: "farmacia-ejemplo.es",
+  },
+};
+
 beforeEach(() => {
-  vi.clearAllMocks();
+  vi.resetAllMocks();
   vi.spyOn(performance, "now").mockReturnValue(0);
   mocks.completeProcessingJob.mockResolvedValue(undefined);
   mocks.deferProcessingJob.mockResolvedValue(undefined);
@@ -202,10 +285,17 @@ beforeEach(() => {
     }],
   });
   mocks.getRawCandidateById.mockResolvedValue({
+    id: "raw-candidate-id",
+    engineType: "maps_fast",
     accountId: "account-id",
     rawPayload: { kind: "maps", place: { websiteUrl: null } },
+    processingMetrics: null,
     searchSeedRunId: null,
   });
+  mocks.claimMapsFastWebsiteRecovery.mockResolvedValue(true);
+  mocks.updateRawCandidateProcessingMetrics.mockResolvedValue(undefined);
+  mocks.getAutopilotSettings.mockResolvedValue({ enabled: true, systemPaused: false, emergencyStopped: false, timezone: "Europe/Madrid" });
+  mocks.createSerpDiscoveryProvider.mockReturnValue({ providerName: "mock", search: vi.fn() });
 });
 
 afterEach(() => {
@@ -213,6 +303,82 @@ afterEach(() => {
 });
 
 describe("runProcessingCronTick", () => {
+  it("does not construct a Serper provider while Autopilot is paused", async () => {
+    prepareMapsFastRecoveryJob();
+    mocks.getAutopilotSettings.mockResolvedValue({ enabled: true, systemPaused: true, emergencyStopped: false, timezone: "Europe/Madrid" });
+
+    await runProcessingCronTick(1);
+
+    expect(mocks.createSerpDiscoveryProvider).not.toHaveBeenCalled();
+    expect(mocks.claimMapsFastWebsiteRecovery).not.toHaveBeenCalled();
+    expect(mocks.failProcessingJob).not.toHaveBeenCalled();
+  });
+
+  it("does not claim or search when Serper is unavailable", async () => {
+    prepareMapsFastRecoveryJob();
+    mocks.createSerpDiscoveryProvider.mockReturnValue({ providerName: "mock", search: vi.fn() });
+
+    await runProcessingCronTick(1);
+
+    expect(mocks.processRawCandidate).toHaveBeenCalledOnce();
+    expect(mocks.createSerpDiscoveryProvider).toHaveBeenCalledWith("workspace-id", "maps_fast", "campaign-id");
+    expect(mocks.claimMapsFastWebsiteRecovery).not.toHaveBeenCalled();
+    expect(mocks.failProcessingJob).not.toHaveBeenCalled();
+  });
+
+  it("treats a Serper budget block as a safe no-website outcome", async () => {
+    prepareMapsFastRecoveryJob();
+    const search = vi.fn().mockRejectedValue(new ProviderBudgetExceededError("Serper daily budget exhausted", new Date("2026-10-20T00:00:00Z")));
+    mocks.createSerpDiscoveryProvider.mockReturnValue({ providerName: "serper", search });
+
+    await runProcessingCronTick(1);
+
+    expect(search).toHaveBeenCalledOnce();
+    expect(mocks.updateRawCandidateProcessingMetrics).toHaveBeenCalledWith("raw-candidate-id", expect.objectContaining({
+      websiteRecoveryAttempted: 0,
+      websiteRecoveryStatus: "budget_blocked",
+    }));
+    expect(mocks.failProcessingJob).not.toHaveBeenCalled();
+    expect(mocks.completeProcessingJob).toHaveBeenCalledOnce();
+  });
+
+  it("does not repeat a paid lookup when the persisted atomic claim is already held", async () => {
+    prepareMapsFastRecoveryJob();
+    const search = vi.fn();
+    mocks.createSerpDiscoveryProvider.mockReturnValue({ providerName: "serper", search });
+    mocks.claimMapsFastWebsiteRecovery.mockResolvedValue(false);
+
+    await runProcessingCronTick(1);
+
+    expect(mocks.claimMapsFastWebsiteRecovery).toHaveBeenCalledWith("raw-candidate-id");
+    expect(search).not.toHaveBeenCalled();
+    expect(mocks.failProcessingJob).not.toHaveBeenCalled();
+  });
+
+  it("persists a recovered domain as Serper evidence and uses it for canonical account enrichment", async () => {
+    prepareMapsFastRecoveryJob();
+    const search = vi.fn().mockResolvedValue({
+      results: [recoveredWebsite.evidence],
+      usage: { calls: 1, items: 1, errors: 0, totalLatencyMs: 10, costUsd: 0.001, quotaRemaining: null },
+    });
+    mocks.createSerpDiscoveryProvider.mockReturnValue({ providerName: "serper", search });
+
+    await runProcessingCronTick(1);
+
+    expect(search).toHaveBeenCalledWith(expect.objectContaining({ query: '"Farmacia Ejemplo" Madrid', maxResults: 5 }));
+    expect(mocks.resolveCanonicalAccount).toHaveBeenCalledWith("workspace-id", expect.objectContaining({ normalizedDomain: "farmacia-ejemplo.es" }), expect.objectContaining({
+      websiteUrl: "https://farmacia-ejemplo.es/",
+      normalizedDomain: "farmacia-ejemplo.es",
+    }), expect.anything());
+    expect(mocks.insertAccountSource).toHaveBeenCalledWith(expect.objectContaining({
+      sourceType: "maps_fast",
+      sourceProvider: "serper",
+      sourceUrl: recoveredWebsite.evidence.url,
+      rawSnapshot: expect.objectContaining({ kind: "maps_fast_website_recovery", provider: "serper" }),
+    }));
+    expect(mocks.getWebsiteEnrichmentStatus).toHaveBeenCalledWith("account-id", "farmacia-ejemplo.es");
+  });
+
   it("stops claiming before the time budget and leaves later work retryable", async () => {
     let elapsed = 0;
     vi.spyOn(performance, "now").mockImplementation(() => elapsed);

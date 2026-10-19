@@ -112,6 +112,10 @@ export async function getProductionCapacityDiagnostics(workspaceId: string, now 
           WHERE account_record.id IS NOT NULL AND NULLIF(TRIM(account_record.website_url), '') IS NULL
         )::int AS website_missing,
         COUNT(*) FILTER (WHERE raw.processing_metrics IS NOT NULL)::int AS processing_metrics_rows,
+        COUNT(*) FILTER (WHERE raw.processing_metrics ? 'websiteRecoveryAttempted')::int AS website_recovery_metrics_rows,
+        COALESCE(SUM(NULLIF(raw.processing_metrics->>'websiteRecoveryAttempted', '')::int), 0)::int AS website_recovery_attempted,
+        COALESCE(SUM(NULLIF(raw.processing_metrics->>'websiteRecoverySucceeded', '')::int), 0)::int AS website_recovery_succeeded,
+        COALESCE(SUM(NULLIF(raw.processing_metrics->>'websiteRecoveryFailed', '')::int), 0)::int AS website_recovery_failed,
         COALESCE(SUM(NULLIF(raw.processing_metrics->>'emailRejectedFormat', '')::int), 0)::int AS email_rejected_format,
         COALESCE(SUM(NULLIF(raw.processing_metrics->>'emailDuplicate', '')::int), 0)::int AS email_duplicate,
         COUNT(DISTINCT raw.account_id) FILTER (
@@ -416,6 +420,11 @@ export async function getProductionCapacityDiagnostics(workspaceId: string, now 
       sourceRows: number;
       processedSourceRows: number;
       processingMetricsRows: number;
+      websiteRecoveryMetricsRows: number;
+      websiteRecoveryMetricsComplete: boolean;
+      websiteRecoveryAttempted: number | null;
+      websiteRecoverySucceeded: number | null;
+      websiteRecoveryFailed: number | null;
       uniqueAccounts: number;
       accountsCreated: number;
       websitePresent: number;
@@ -464,6 +473,8 @@ export async function getProductionCapacityDiagnostics(workspaceId: string, now 
       const sourceRows = asNumber(source?.source_rows);
       const processingMetricsRows = asNumber(source?.processing_metrics_rows);
       const processingMetricsComplete = sourceRows === 0 || processingMetricsRows === sourceRows;
+      const websiteRecoveryMetricsRows = asNumber(source?.website_recovery_metrics_rows);
+      const websiteRecoveryMetricsComplete = sourceRows === 0 || websiteRecoveryMetricsRows === sourceRows;
       const providerSpendUsd = asNumber(apifyRequest?.provider_spend_usd)
         + asNumber(serperRequest?.provider_spend_usd);
       periods[window] = {
@@ -473,6 +484,11 @@ export async function getProductionCapacityDiagnostics(workspaceId: string, now 
         sourceRows,
         processedSourceRows: asNumber(source?.processed_source_rows),
         processingMetricsRows,
+        websiteRecoveryMetricsRows,
+        websiteRecoveryMetricsComplete,
+        websiteRecoveryAttempted: websiteRecoveryMetricsComplete ? asNumber(source?.website_recovery_attempted) : null,
+        websiteRecoverySucceeded: websiteRecoveryMetricsComplete ? asNumber(source?.website_recovery_succeeded) : null,
+        websiteRecoveryFailed: websiteRecoveryMetricsComplete ? asNumber(source?.website_recovery_failed) : null,
         uniqueAccounts,
         accountsCreated: asNumber(source?.accounts_created),
         websitePresent: asNumber(source?.website_present),
@@ -650,8 +666,9 @@ export async function getProductionCapacityDiagnostics(workspaceId: string, now 
       attribution: "Stage populations are account-level by raw-candidate engine and discovery window; email rejection and duplicate totals are processing events. Source, website, and Serper email counts can overlap when an account has multiple email origins. Legacy engine-labeled contact points are not counted as provider-source emails because their origin is ambiguous.",
       websiteFetchCoverage: "Account-level fetch outcomes include the candidate processor's persisted homepage attempt and website_enrichments recovery records. Historical homepage outcomes before the processing_metrics migration are not reconstructable.",
       emailTelemetryCoverage: "Format-rejection and duplicate counts are null unless every raw candidate in that engine/window has persisted processing metrics.",
+      websiteRecoveryProvider: serperEnv.SERP_PROVIDER === "serper" ? "serper" : null,
       serperFallbackExecution: {
-        mapsFast: serperEnv.SERP_PROVIDER === "serper" ? "NOT_INVOKED_BY_MAPS_FAST_PROCESSOR" : "SERPER_DISABLED",
+        mapsFast: serperEnv.SERP_PROVIDER === "serper" ? "BOUNDED_IDENTITY_BOUND_WEBSITE_RECOVERY_QUERY" : "SERPER_DISABLED",
         googleSerp: "EXTRACTS_RELEVANT_EMAILS_FROM_EXISTING_RESULT_SNIPPETS; DOES_NOT_ISSUE_A_SEPARATE_FALLBACK_QUERY",
         providerSourceEmailSupport: "NO_CURRENT_DISCOVERY_PROVIDER_CONTRACT_RETURNS_EMAIL_FIELDS",
       },
@@ -663,6 +680,11 @@ export async function getProductionCapacityDiagnostics(workspaceId: string, now 
           processedRawCandidates: period.processedSourceRows,
           processingMetricsRows: period.processingMetricsRows,
           processingMetricsComplete: period.sourceRows === 0 || period.processingMetricsRows === period.sourceRows,
+          websiteRecoveryMetricsRows: period.websiteRecoveryMetricsRows,
+          websiteRecoveryMetricsComplete: period.websiteRecoveryMetricsComplete,
+          websiteRecoveryAttempted: period.websiteRecoveryAttempted,
+          websiteRecoverySucceeded: period.websiteRecoverySucceeded,
+          websiteRecoveryFailed: period.websiteRecoveryFailed,
           accountsCreated: period.accountsCreated,
           accountsLinked: period.uniqueAccounts,
           websitePresent: period.websitePresent,

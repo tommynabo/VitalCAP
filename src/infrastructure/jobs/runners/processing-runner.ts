@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { Account, AccountStatus } from "@/domain/accounts/types";
 import { ProviderBudgetExceededError } from "@/domain/providers/errors";
+import { getEffectiveAutopilotState } from "@/domain/autopilot/types";
 import type { CampaignMembershipStage } from "@/domain/campaigns/types";
 import type { CandidateProcessingMetrics } from "@/domain/discovery/types";
 import { getCampaignById } from "@/infrastructure/neon/repositories/campaigns";
@@ -12,7 +13,7 @@ import {
   failProcessingJob,
   enqueueProcessingJob,
 } from "@/infrastructure/neon/repositories/job-queue";
-import { getRawCandidateById, markRawCandidateProcessed, refreshSearchSeedQualification, updateRawCandidateAccountId } from "@/infrastructure/neon/repositories/discovery";
+import { claimMapsFastWebsiteRecovery, getRawCandidateById, markRawCandidateProcessed, refreshSearchSeedQualification, updateRawCandidateAccountId, updateRawCandidateProcessingMetrics } from "@/infrastructure/neon/repositories/discovery";
 import {
   findCandidateAccountMatches,
   getAccountById,
@@ -23,7 +24,7 @@ import {
   updateAccountFields,
   type InsertAccountInput,
 } from "@/infrastructure/neon/repositories/accounts";
-import { createSerpDiscoveryProvider } from "@/infrastructure/providers/provider-factory";
+import { createSerpDiscoveryProvider, ProviderDisabledError } from "@/infrastructure/providers/provider-factory";
 import { createInMemoryVerificationCacheStore } from "@/services/verification/email-verification-cache";
 import type { EmailVerificationProvider, WebsiteFetcher } from "@/domain/providers/types";
 import { enqueueVerificationJob } from "@/infrastructure/neon/repositories/verification-queue";
@@ -36,6 +37,8 @@ import { evaluateSpainEligibility } from "@/lib/geography/spain-eligibility";
 import { getWebsiteEnrichmentStatus, upsertWebsiteEnrichmentStatus, insertWebsiteEvidence, listUnlinkedWebsiteEmailEvidence } from "@/infrastructure/neon/repositories/enrichment";
 import { DomainFetchCache } from "@/lib/security/safe-fetch";
 import { normalizeDomain } from "@/lib/normalization";
+import { getAutopilotSettings } from "@/infrastructure/neon/repositories/autopilot";
+import { buildMapsFastWebsiteRecoveryQuery, selectMapsFastRecoveredWebsite } from "@/services/discovery/maps-fast-website-recovery";
 import { createDeadlineSignal, DeadlineExceededError, raceWithAbort, runWithDeadlineSignal } from "@/lib/async/deadline";
 
 interface ProcessingJobPayload {
@@ -264,6 +267,10 @@ async function executeProcessingJob(
       homepageFetchFailed: 0,
       emailRejectedFormat: 0,
       emailDuplicate: 0,
+      websiteRecoveryAttempted: 0,
+      websiteRecoverySucceeded: 0,
+      websiteRecoveryFailed: 0,
+      websiteRecoveryProvider: null,
     });
     return;
   }
@@ -287,14 +294,85 @@ async function executeProcessingJob(
     verificationCacheStore: createInMemoryVerificationCacheStore(),
     now: new Date(),
     deferVerification: true,
+    existingProcessingMetrics: raw.processingMetrics,
+    ...(raw.engineType === "maps_fast" && payload.kind === "maps" ? {
+      recoverMapsFastWebsite: async (place) => {
+        const query = buildMapsFastWebsiteRecoveryQuery(place);
+        if (!query) return { status: "blocked" as const };
+
+        let attemptClaimed = false;
+        try {
+          const settings = await getAutopilotSettings(campaign.workspaceId);
+          if (getEffectiveAutopilotState(settings) !== "running") return { status: "blocked" as const };
+
+          const provider = createSerpDiscoveryProvider(campaign.workspaceId, "maps_fast", campaign.id);
+          if (provider.providerName !== "serper") return { status: "blocked" as const };
+
+          attemptClaimed = await claimMapsFastWebsiteRecovery(raw.id);
+          if (!attemptClaimed) return { status: "blocked" as const };
+
+          const output = await provider.search({ query, maxResults: 5, signal: options.signal });
+          const website = selectMapsFastRecoveredWebsite(place, output.results);
+          if (!website) {
+            await updateRawCandidateProcessingMetrics(raw.id, {
+              websiteRecoveryAttempted: 1,
+              websiteRecoverySucceeded: 0,
+              websiteRecoveryFailed: 1,
+              websiteRecoveryProvider: "serper",
+              websiteRecoveryStatus: "failed",
+            });
+            return { status: "no_match" as const };
+          }
+
+          await updateRawCandidateProcessingMetrics(raw.id, {
+            websiteRecoveryAttempted: 1,
+            websiteRecoverySucceeded: 1,
+            websiteRecoveryFailed: 0,
+            websiteRecoveryProvider: "serper",
+            websiteRecoveryStatus: "succeeded",
+            websiteRecoveryDomain: website.domain,
+            websiteRecoveryUrl: website.websiteUrl,
+            websiteRecoveryEvidence: website.evidence,
+          });
+          return { status: "recovered" as const, website };
+        } catch (error) {
+          if (options.signal?.aborted) throw options.signal.reason ?? error;
+          if (error instanceof ProviderBudgetExceededError) {
+            if (attemptClaimed) {
+              await updateRawCandidateProcessingMetrics(raw.id, {
+                websiteRecoveryAttempted: 0,
+                websiteRecoverySucceeded: 0,
+                websiteRecoveryFailed: 0,
+                websiteRecoveryProvider: null,
+                websiteRecoveryStatus: "budget_blocked",
+              });
+            }
+            return { status: "blocked" as const };
+          }
+          if (!attemptClaimed || error instanceof ProviderDisabledError) return { status: "blocked" as const };
+          await updateRawCandidateProcessingMetrics(raw.id, {
+            websiteRecoveryAttempted: 1,
+            websiteRecoverySucceeded: 0,
+            websiteRecoveryFailed: 1,
+            websiteRecoveryProvider: "serper",
+            websiteRecoveryStatus: "failed",
+          });
+          return { status: "failed" as const };
+        }
+      },
+    } : {}),
   });
 
   const accountFields = extractAccountFields(payload);
+  const accountIdentity = processed.recoveredWebsite
+    ? { ...incoming, normalizedDomain: processed.recoveredWebsite.domain }
+    : incoming;
+  if (processed.recoveredWebsite) accountFields.websiteUrl = processed.recoveredWebsite.websiteUrl;
   const incomingAccountFields: IncomingAccountFields = {
     phone: accountFields.phone,
     normalizedPhone: incoming.normalizedPhone ?? null,
     websiteUrl: accountFields.websiteUrl,
-    normalizedDomain: incoming.normalizedDomain ?? null,
+    normalizedDomain: accountIdentity.normalizedDomain ?? null,
     googlePlaceId: accountFields.googlePlaceId,
     mapsUrl: accountFields.mapsUrl,
     addressLine: accountFields.addressLine,
@@ -312,7 +390,7 @@ async function executeProcessingJob(
 
   const canonicalResolution = await resolveCanonicalAccount(
     campaign.workspaceId,
-    incoming,
+    accountIdentity,
     {
       workspaceId: campaign.workspaceId,
       canonicalName: accountFields.canonicalName,
@@ -330,7 +408,7 @@ async function executeProcessingJob(
       phone: accountFields.phone,
       normalizedPhone: incoming.normalizedPhone ?? null,
       websiteUrl: accountFields.websiteUrl,
-      normalizedDomain: incoming.normalizedDomain ?? null,
+      normalizedDomain: accountIdentity.normalizedDomain ?? null,
       googlePlaceId: accountFields.googlePlaceId,
       mapsUrl: accountFields.mapsUrl,
       rating: accountFields.rating,
@@ -373,6 +451,23 @@ async function executeProcessingJob(
     });
   }
 
+  if (processed.recoveredWebsite && payload.kind === "maps") {
+    await insertAccountSource({
+      accountId,
+      sourceType: raw.engineType,
+      sourceProvider: "serper",
+      sourceExternalId: processed.recoveredWebsite.evidence.url,
+      sourceUrl: processed.recoveredWebsite.evidence.url,
+      rawSnapshot: {
+        kind: "maps_fast_website_recovery",
+        provider: "serper",
+        websiteDomain: processed.recoveredWebsite.domain,
+        result: processed.recoveredWebsite.evidence,
+        googlePlaceId: payload.place.externalPlaceId,
+      },
+    });
+  }
+
   const websiteRecoveryCounters = {
     accountsAttempted: 0,
     fetchFailed: 0,
@@ -384,8 +479,8 @@ async function executeProcessingJob(
   const processingMetrics: CandidateProcessingMetrics = { ...processed.processingMetrics };
 
   // --- WEBSITE ENRICHMENT ---
-  if (accountFields.websiteUrl && incoming.normalizedDomain && options.enrichContacts !== false) {
-    const cache = await getWebsiteEnrichmentStatus(accountId, incoming.normalizedDomain);
+  if (accountFields.websiteUrl && accountIdentity.normalizedDomain && options.enrichContacts !== false) {
+    const cache = await getWebsiteEnrichmentStatus(accountId, accountIdentity.normalizedDomain);
     const now = new Date();
     const transientCacheFailure = cache?.status === "timeout" || cache?.status === "transient_error";
     const transientRetryAt = transientCacheFailure && cache
@@ -429,7 +524,7 @@ async function executeProcessingJob(
       await upsertWebsiteEnrichmentStatus({
         workspaceId: campaign.workspaceId,
         accountId,
-        normalizedDomain: incoming.normalizedDomain,
+        normalizedDomain: accountIdentity.normalizedDomain,
         status: result.status,
         startedAt: now,
         completedAt: new Date(),
@@ -484,7 +579,7 @@ async function executeProcessingJob(
       ) {
         const account = await getAccountById(accountId);
         if (account?.status === "needs_review") {
-          const reevaluation = evaluateStructuredWebsiteLocation(account, locationFacts, incoming.normalizedDomain ?? null);
+          const reevaluation = evaluateStructuredWebsiteLocation(account, locationFacts, accountIdentity.normalizedDomain ?? null);
           const accountUpdates = reevaluation.accountUpdates;
           if (reevaluation.verdict.verdict !== "needs_review") {
             accountUpdates.status = resolveAccountStatus({ ...processed, spainVerdict: reevaluation.verdict.verdict });
@@ -500,7 +595,7 @@ async function executeProcessingJob(
       }
     }
 
-    const unlinkedEmailEvidence = await listUnlinkedWebsiteEmailEvidence(accountId, incoming.normalizedDomain);
+    const unlinkedEmailEvidence = await listUnlinkedWebsiteEmailEvidence(accountId, accountIdentity.normalizedDomain);
     for (const fact of unlinkedEmailEvidence) {
       const email = fact.normalizedValue.trim().toLowerCase();
       if (!email) continue;
