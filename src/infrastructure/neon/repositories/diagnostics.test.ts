@@ -12,7 +12,7 @@ vi.mock("../db", () => ({
   getDb: () => ({ select: query.select, selectDistinct: query.selectDistinct }),
 }));
 
-import { getEmailVerificationUsage, getHealthWorkspaceId } from "./diagnostics";
+import { getEmailVerificationUsage, getHealthWorkspaceIds } from "./diagnostics";
 
 describe("getEmailVerificationUsage", () => {
   beforeEach(() => {
@@ -66,28 +66,35 @@ describe("getEmailVerificationUsage", () => {
     });
   });
 
-  it("resolves the workspace from a configured Instantly provider mapping first", async () => {
-    query.where.mockResolvedValueOnce([{ workspaceId: "mapped-workspace" }]);
+  it("returns all distinct workspaces linked by mappings and target import history", async () => {
+    query.where
+      .mockResolvedValueOnce([{ workspaceId: "mapped-workspace" }, { workspaceId: "shared-workspace" }])
+      .mockResolvedValueOnce([{ workspaceId: "import-workspace" }, { workspaceId: "shared-workspace" }]);
 
-    await expect(getHealthWorkspaceId("provider-campaign-id")).resolves.toBe("mapped-workspace");
-    expect(query.selectDistinct).toHaveBeenCalledTimes(1);
+    await expect(getHealthWorkspaceIds("provider-campaign-id")).resolves.toEqual([
+      "import-workspace",
+      "mapped-workspace",
+      "shared-workspace",
+    ]);
+    expect(query.selectDistinct).toHaveBeenCalledTimes(2);
   });
 
-  it("falls back to the unique workspace in target import history", async () => {
+  it("uses target import history when no provider mapping exists", async () => {
     query.where
       .mockResolvedValueOnce([])
       .mockResolvedValueOnce([{ workspaceId: "import-workspace" }]);
 
-    await expect(getHealthWorkspaceId("provider-campaign-id")).resolves.toBe("import-workspace");
+    await expect(getHealthWorkspaceIds("provider-campaign-id")).resolves.toEqual(["import-workspace"]);
     expect(query.selectDistinct).toHaveBeenCalledTimes(2);
   });
 
-  it("fails closed when target imports span multiple workspaces", async () => {
+  it("falls back to all active Autopilot workspaces when the target has no history", async () => {
     query.where
       .mockResolvedValueOnce([])
-      .mockResolvedValueOnce([{ workspaceId: "workspace-a" }, { workspaceId: "workspace-b" }]);
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([{ workspaceId: "workspace-b" }, { workspaceId: "workspace-a" }]);
 
-    await expect(getHealthWorkspaceId("provider-campaign-id")).resolves.toBeNull();
-    expect(query.selectDistinct).toHaveBeenCalledTimes(2);
+    await expect(getHealthWorkspaceIds("provider-campaign-id")).resolves.toEqual(["workspace-a", "workspace-b"]);
+    expect(query.selectDistinct).toHaveBeenCalledTimes(3);
   });
 });

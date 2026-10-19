@@ -123,7 +123,7 @@ export async function getInstantlyPipelineDiagnostics(
   };
 }
 
-export async function getHealthWorkspaceId(providerCampaignId: string): Promise<string | null> {
+export async function getHealthWorkspaceIds(providerCampaignId: string): Promise<string[]> {
   const db = getDb();
   const mappedWorkspaces = await db.selectDistinct({ workspaceId: campaignProviderMappings.workspaceId })
     .from(campaignProviderMappings)
@@ -131,9 +131,6 @@ export async function getHealthWorkspaceId(providerCampaignId: string): Promise<
       eq(campaignProviderMappings.provider, "instantly"),
       eq(campaignProviderMappings.providerCampaignId, providerCampaignId),
     ));
-  if (mappedWorkspaces.length > 1) return null;
-  if (mappedWorkspaces[0]) return mappedWorkspaces[0].workspaceId;
-
   const importedWorkspaces = await db.selectDistinct({ workspaceId: instantlyLeadImports.workspaceId })
     .from(instantlyLeadImports)
     .innerJoin(campaigns, eq(instantlyLeadImports.sourceCampaignId, campaigns.id))
@@ -141,13 +138,22 @@ export async function getHealthWorkspaceId(providerCampaignId: string): Promise<
       eq(instantlyLeadImports.providerCampaignId, providerCampaignId),
       eq(instantlyLeadImports.workspaceId, campaigns.workspaceId),
     ));
-  if (importedWorkspaces.length > 1) return null;
-  if (importedWorkspaces[0]) return importedWorkspaces[0].workspaceId;
+  const linkedWorkspaceIds = [...new Set([
+    ...mappedWorkspaces.map((row) => row.workspaceId),
+    ...importedWorkspaces.map((row) => row.workspaceId),
+  ])].sort();
+  if (linkedWorkspaceIds.length > 0) return linkedWorkspaceIds;
 
   const activeCampaignWorkspaces = await db.selectDistinct({ workspaceId: campaigns.workspaceId })
     .from(campaigns)
-    .where(and(eq(campaigns.status, "active"), eq(campaigns.autopilotEnabled, true)));
-  return activeCampaignWorkspaces.length === 1 ? activeCampaignWorkspaces[0]!.workspaceId : null;
+    .innerJoin(autopilotSettings, eq(autopilotSettings.workspaceId, campaigns.workspaceId))
+    .where(and(
+      eq(campaigns.status, "active"),
+      eq(campaigns.autopilotEnabled, true),
+      eq(autopilotSettings.enabled, true),
+      eq(autopilotSettings.emergencyStopped, false),
+    ));
+  return activeCampaignWorkspaces.map((row) => row.workspaceId).sort();
 }
 
 export async function getActiveAutopilotDiscoveryEngineTypes(workspaceId: string): Promise<EngineType[]> {
@@ -162,7 +168,6 @@ export async function getActiveAutopilotDiscoveryEngineTypes(workspaceId: string
       eq(campaigns.autopilotEnabled, true),
       eq(autopilotSettings.enabled, true),
       eq(autopilotSettings.emergencyStopped, false),
-      eq(autopilotSettings.systemPaused, false),
     ));
   return rows.map((row) => row.engineType as EngineType);
 }
