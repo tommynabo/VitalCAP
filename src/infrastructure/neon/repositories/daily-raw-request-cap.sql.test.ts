@@ -9,12 +9,26 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock("../db", () => ({ getDb: mocks.getDb, getNeonSql: mocks.getNeonSql }));
 
-import { buildDailyRawRequestCapSnapshotQuery, buildEnqueueDiscoveryOrdersWithinDailyRawCapQuery, executeUnderGlobalDailyRawCapLock } from "./daily-raw-request-cap";
+import { buildDailyRawRequestCapSnapshot, buildDailyRawRequestCapSnapshotQuery, buildEnqueueDiscoveryOrdersWithinDailyRawCapQuery, executeUnderGlobalDailyRawCapLock } from "./daily-raw-request-cap";
 
 const dialect = new PgDialect();
 const now = new Date("2026-10-19T12:00:00.000Z");
 
 describe("global daily raw request cap SQL", () => {
+  it("reports unclamped utilization and overshoot while blocking new work", () => {
+    expect(buildDailyRawRequestCapSnapshot(1523, 2878, 2857, 21)).toEqual({
+      cap: 1523,
+      committedRawRequests: 2878,
+      providerReservedRawRequests: 2857,
+      queuedRawRequests: 21,
+      remainingRawRequests: 0,
+      utilization: 2878 / 1523,
+      blocked: true,
+      overshootRawRequests: 1355,
+      blockedReason: "daily_raw_request_cap_reached",
+    });
+  });
+
   it("counts provider reservations in each workspace's local day and carries active runs", () => {
     const query = dialect.sqlToQuery(buildDailyRawRequestCapSnapshotQuery(now));
 

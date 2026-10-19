@@ -11,6 +11,8 @@ export interface DailyRawRequestCapSnapshot {
   providerReservedRawRequests: number;
   queuedRawRequests: number;
   remainingRawRequests: number;
+  utilization: number;
+  blocked: boolean;
   overshootRawRequests: number;
   blockedReason: "daily_raw_request_cap_reached" | null;
 }
@@ -186,7 +188,7 @@ export async function executeUnderGlobalDailyRawCapLock(query: SQL): Promise<Arr
   return results[1] as Array<Record<string, unknown>>;
 }
 
-function toSnapshot(
+export function buildDailyRawRequestCapSnapshot(
   cap: number,
   committedRawRequests: number,
   providerReservedRawRequests: number,
@@ -199,6 +201,8 @@ function toSnapshot(
     providerReservedRawRequests,
     queuedRawRequests,
     remainingRawRequests,
+    utilization: cap > 0 ? committedRawRequests / cap : 0,
+    blocked: remainingRawRequests === 0,
     overshootRawRequests: Math.max(0, committedRawRequests - cap),
     blockedReason: remainingRawRequests === 0 ? "daily_raw_request_cap_reached" : null,
   };
@@ -214,7 +218,7 @@ export async function getDailyRawRequestCapSnapshot(now = new Date()): Promise<D
   } | undefined;
   const providerReservedRawRequests = Number(row?.provider_reserved_raw_requests ?? 0);
   const queuedRawRequests = Number(row?.queued_raw_requests ?? 0);
-  return toSnapshot(cap, Number(row?.committed_raw_requests ?? 0), providerReservedRawRequests, queuedRawRequests);
+  return buildDailyRawRequestCapSnapshot(cap, Number(row?.committed_raw_requests ?? 0), providerReservedRawRequests, queuedRawRequests);
 }
 
 export async function enqueueDiscoveryOrdersWithinDailyRawCap(
@@ -232,7 +236,7 @@ export async function enqueueDiscoveryOrdersWithinDailyRawCap(
   } | undefined;
   const newlyReserved = Number(row?.newly_reserved_raw_requests ?? 0);
   const committedRawRequests = Number(row?.committed_raw_requests ?? 0) + newlyReserved;
-  const snapshot = toSnapshot(
+  const snapshot = buildDailyRawRequestCapSnapshot(
     cap,
     committedRawRequests,
     Number(row?.provider_reserved_raw_requests ?? 0),
