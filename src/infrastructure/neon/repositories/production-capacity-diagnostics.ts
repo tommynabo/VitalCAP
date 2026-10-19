@@ -724,11 +724,22 @@ export async function getProductionCapacityDiagnostics(workspaceId: string, now 
   const rawCapHealthy = baseRawRequestsWithBuffer !== null
     && currentRawRequestCap >= baseRawRequestsWithBuffer
     && !dailyRawRequestCap.blocked;
+  const providerSpendBudgetChecks = [
+    baseScenario.apifyDailyCostUsd === null ? null : baseScenario.apifyDailyCostUsd <= apifyBudget,
+    baseScenario.serperDailyCostUsd === null ? null : baseScenario.serperDailyCostUsd <= serperEnv.SERPER_DAILY_COST_LIMIT_USD,
+    baseScenario.verificationDailyCostUsd === null
+      ? null
+      : baseScenario.verificationDailyCostUsd <= verificationEnv.EMAIL_VERIFICATION_DAILY_COST_LIMIT_USD,
+  ];
+  const spendBudgetsHealthy = providerSpendBudgetChecks.some((check) => check === false)
+    ? false
+    : providerSpendBudgetChecks.some((check) => check === null) ? null : true;
   const rampReadiness = evaluateRampReadiness({
     deliveryCapacity: deliveryCapacity.supportsTarget === null
       ? "unknown"
       : deliveryCapacity.supportsTarget ? "supported" : "blocked",
     providersHealthy,
+    spendBudgetsHealthy,
     paused,
     systemicDeadLetterCount: activeSystemicDeadLetterCount,
     rawCapHealthy,
@@ -911,6 +922,15 @@ export async function getProductionCapacityDiagnostics(workspaceId: string, now 
         recentErrors: systemHealth.providers.serper.recentErrors,
         budgetAllowed: systemHealth.providers.serper.budgetAllowed,
       },
+    },
+    providerSpendBudgetFit: {
+      apify: baseScenario.apifyDailyCostUsd === null ? null : baseScenario.apifyDailyCostUsd <= apifyBudget,
+      serper: baseScenario.serperDailyCostUsd === null
+        ? null
+        : baseScenario.serperDailyCostUsd <= serperEnv.SERPER_DAILY_COST_LIMIT_USD,
+      emailVerification: baseScenario.verificationDailyCostUsd === null
+        ? null
+        : baseScenario.verificationDailyCostUsd <= verificationEnv.EMAIL_VERIFICATION_DAILY_COST_LIMIT_USD,
     },
     autopilotState: {
       effectiveState: systemHealth.autopilotEffectiveState,

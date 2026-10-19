@@ -159,13 +159,14 @@ describe("production capacity metrics", () => {
     expect(evaluateRampReadiness({
       deliveryCapacity: "blocked",
       providersHealthy: false,
+      spendBudgetsHealthy: false,
       paused: false,
       systemicDeadLetterCount: 0,
       rawCapHealthy: false,
       yieldSampleCount: 6,
     })).toEqual({
       decision: "BLOCKED",
-      blockers: ["instantly_delivery_capacity", "provider_health", "raw_request_cap"],
+      blockers: ["instantly_delivery_capacity", "provider_health", "provider_spend_budgets", "raw_request_cap"],
       unknowns: [],
     });
   });
@@ -174,6 +175,7 @@ describe("production capacity metrics", () => {
     expect(evaluateRampReadiness({
       deliveryCapacity: "supported",
       providersHealthy: null,
+      spendBudgetsHealthy: null,
       paused: null,
       systemicDeadLetterCount: null,
       rawCapHealthy: null,
@@ -181,7 +183,7 @@ describe("production capacity metrics", () => {
     })).toMatchObject({
       decision: "BLOCKED",
       blockers: ["yield_sample_sufficiency"],
-      unknowns: ["provider_health", "autopilot_pause_state", "systemic_dead_letters", "raw_request_cap"],
+      unknowns: ["provider_health", "provider_spend_budgets", "autopilot_pause_state", "systemic_dead_letters", "raw_request_cap"],
     });
   });
 

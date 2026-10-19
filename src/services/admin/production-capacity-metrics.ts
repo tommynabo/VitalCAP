@@ -109,6 +109,7 @@ export function evaluateInstantlyDeliveryCapacity(input: {
 export function evaluateRampReadiness(input: {
   deliveryCapacity: CapacityStatus;
   providersHealthy: boolean | null;
+  spendBudgetsHealthy: boolean | null;
   paused: boolean | null;
   systemicDeadLetterCount: number | null;
   rawCapHealthy: boolean | null;
@@ -124,6 +125,7 @@ export function evaluateRampReadiness(input: {
 
   check(input.deliveryCapacity === "blocked" ? false : input.deliveryCapacity === "unknown" ? null : true, "instantly_delivery_capacity");
   check(input.providersHealthy, "provider_health");
+  check(input.spendBudgetsHealthy, "provider_spend_budgets");
   check(input.paused === null ? null : !input.paused, "autopilot_pause_state");
   check(input.systemicDeadLetterCount === null ? null : input.systemicDeadLetterCount === 0, "systemic_dead_letters");
   check(input.rawCapHealthy, "raw_request_cap");
