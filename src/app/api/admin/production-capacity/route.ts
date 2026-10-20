@@ -23,9 +23,19 @@ export async function GET(request: Request) {
     if (error instanceof UnauthorizedError) {
       return NextResponse.json({ error: "Workspace owner authorization required." }, { status: 403 });
     }
-    const errorCode = typeof error === "object" && error !== null && "code" in error
-      ? error.code
-      : undefined;
+    const errorDetails = typeof error === "object" && error !== null
+      ? error as Record<string, unknown>
+      : {};
+    const causeDetails = typeof errorDetails.cause === "object" && errorDetails.cause !== null
+      ? errorDetails.cause as Record<string, unknown>
+      : {};
+    const sourceErrorDetails = typeof errorDetails.sourceError === "object" && errorDetails.sourceError !== null
+      ? errorDetails.sourceError as Record<string, unknown>
+      : typeof causeDetails.sourceError === "object" && causeDetails.sourceError !== null
+        ? causeDetails.sourceError as Record<string, unknown>
+        : {};
+    const errorCode = [errorDetails.code, causeDetails.code, sourceErrorDetails.code]
+      .find((code) => typeof code === "string" || typeof code === "number");
     console.error("production_capacity_diagnostics_failed", {
       errorType: error instanceof Error ? error.name : typeof error,
       ...(typeof errorCode === "string" || typeof errorCode === "number" ? { errorCode } : {}),
