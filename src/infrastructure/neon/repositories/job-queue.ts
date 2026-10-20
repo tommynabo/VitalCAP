@@ -141,7 +141,7 @@ export function buildRecoverableRawProcessingJobsQuery(workspaceId: string, now:
       )
       SELECT campaign_id, 'process_raw_candidate',
         payload || jsonb_build_object(
-          'recoveryAttempt', ${MAX_RECOVERABLE_RAW_PROCESSING_ATTEMPTS},
+          'recoveryAttempt', ${MAX_RECOVERABLE_RAW_PROCESSING_ATTEMPTS}::int,
           'recoveryDisposition', 'recoverable',
           'skipMapsFastWebsiteRecovery', true
         ),

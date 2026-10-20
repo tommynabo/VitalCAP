@@ -122,10 +122,25 @@ describe("job queue SQL builders", () => {
   });
 
   it("creates one bounded retry for a recoverable dead-letter raw", () => {
-    const query = dialect.sqlToQuery(buildRecoverableRawProcessingJobsQuery("workspace-1", claimTime, 5));
+    const workspaceId = "00000000-0000-0000-0000-000000000001";
+    const now = new Date("2026-10-20T12:00:00.000Z");
+    const query = dialect.sqlToQuery(buildRecoverableRawProcessingJobsQuery(workspaceId, now, 5));
 
     expect(query.sql).toMatch(/LIMIT \$\d+\s*\),\s*inserted AS \(/);
     expect(query.sql).not.toMatch(/LIMIT \$\d+\s*\)\s*\),\s*inserted AS \(/);
+    const recoveryAttemptParameter = Number(query.sql.match(/'recoveryAttempt', \$(\d+)::int/)?.[1]);
+    expect(Number.isInteger(recoveryAttemptParameter)).toBe(true);
+    expect(query.params[recoveryAttemptParameter - 1]).toBe(MAX_RECOVERABLE_RAW_PROCESSING_ATTEMPTS);
+    expect(query.params).toEqual([
+      workspaceId,
+      now.toISOString(),
+      now.toISOString(),
+      "invalid|not[_ ]?found|unauthorized|forbidden|bad[_ ]?request",
+      5,
+      MAX_RECOVERABLE_RAW_PROCESSING_ATTEMPTS,
+      MAX_RECOVERABLE_RAW_PROCESSING_ATTEMPTS,
+      now.toISOString(),
+    ]);
     expect(query.sql).toContain("INSERT INTO processing_jobs");
     expect(query.sql).toContain("source_job.status = 'dead_letter'");
     expect(query.sql).toContain("source_job.attempt_count >= source_job.max_attempts");
