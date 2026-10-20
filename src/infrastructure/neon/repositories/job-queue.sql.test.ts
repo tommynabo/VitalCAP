@@ -1,6 +1,6 @@
 import { PgDialect } from "drizzle-orm/pg-core";
 import { describe, expect, it } from "vitest";
-import { buildClaimJobsQuery, buildDeadLetterExpiredJobsQuery, buildDeferJobQuery, buildRequeueStaleLockedJobsQuery } from "./job-queue";
+import { buildClaimJobsQuery, buildDeadLetterExpiredJobsQuery, buildDeferJobQuery, buildRequeueStaleLockedJobsQuery, buildRecoverableRawProcessingJobsQuery, MAX_RECOVERABLE_RAW_PROCESSING_ATTEMPTS } from "./job-queue";
 
 const dialect = new PgDialect();
 const claimTime = new Date("2026-10-18T09:00:00.000Z");
@@ -94,6 +94,12 @@ describe("job queue SQL builders", () => {
     expect(query.sql).toContain("locked_at + (");
     expect(query.sql).not.toContain("status = 'pending'");
     expect(query.sql).not.toMatch(/original_payload|final_error/);
+    if (table === "processing_jobs") {
+      expect(query.sql).toContain("payload->>'recoveryAttempt' IS NOT NULL");
+      expect(query.sql).toContain("'disposition', CASE WHEN payload->>'recoveryAttempt' IS NOT NULL OR last_error ~*");
+      expect(query.sql).toContain("THEN 'permanent' ELSE 'recoverable' END");
+      expect(query.sql).toContain("'recovery_attempt_exhausted'");
+    }
   });
 
   it.each(["discovery_jobs", "processing_jobs"] as const)("requeues only eligible stale %s locks", (table) => {
@@ -113,5 +119,66 @@ describe("job queue SQL builders", () => {
     expect(query.sql).toContain("SET status = 'pending'");
     expect(query.sql).not.toMatch(/attempt_count\s*=|idempotency_key\s*=|next_attempt_at\s*=/);
     expect(query.sql).not.toMatch(/completed|dead_letter/);
+  });
+
+  it("creates one bounded retry for a recoverable dead-letter raw", () => {
+    const query = dialect.sqlToQuery(buildRecoverableRawProcessingJobsQuery("workspace-1", claimTime, 5));
+
+    expect(query.sql).toContain("INSERT INTO processing_jobs");
+    expect(query.sql).toContain("source_job.status = 'dead_letter'");
+    expect(query.sql).toContain("source_job.attempt_count >= source_job.max_attempts");
+    expect(query.sql).toContain("'recoveryDisposition', 'recoverable'");
+    expect(query.sql).toContain("raw_candidate_recovery:");
+    expect(query.params).toContain(MAX_RECOVERABLE_RAW_PROCESSING_ATTEMPTS);
+  });
+
+  it("keeps permanent dead letters terminal and supports legacy watchdog retries", () => {
+    const query = dialect.sqlToQuery(buildRecoverableRawProcessingJobsQuery("workspace-1", claimTime, 5));
+
+    expect(query.sql).toContain("dead_letter.payload #>> '{_vitalcapRecovery,disposition}' = 'recoverable'");
+    expect(query.sql).toContain("source_job.last_error !~*");
+    expect(query.params).toContain("invalid|not[_ ]?found|unauthorized|forbidden|bad[_ ]?request");
+    expect(query.sql).toContain("source_job.last_error IS NULL AND dead_letter.last_error ~*");
+    expect(query.sql).toContain("'^Max attempts exceeded via watchdog'");
+  });
+
+  it("does not duplicate active or previously recovered processing jobs", () => {
+    const query = dialect.sqlToQuery(buildRecoverableRawProcessingJobsQuery("workspace-1", claimTime, 5));
+
+    expect(query.sql).toContain("active_job.status IN ('pending', 'processing')");
+    expect(query.sql).toContain("recovery_job.payload->>'recoveryAttempt' = '1'");
+    expect(query.sql).toContain("FOR UPDATE OF raw, source_job SKIP LOCKED");
+  });
+
+  it("never requeues raw candidates that are already processed", () => {
+    const query = dialect.sqlToQuery(buildRecoverableRawProcessingJobsQuery("workspace-1", claimTime, 5));
+
+    expect(query.sql).toContain("raw.processed = false");
+  });
+
+  it("caps recovery to one claim attempt and the requested batch size", () => {
+    const query = dialect.sqlToQuery(buildRecoverableRawProcessingJobsQuery("workspace-1", claimTime, 5));
+
+    expect(query.sql).toContain("'recoveryAttempt'");
+    const maxAttemptsParameter = Number(query.sql.match(/'pending', 0, \$(\d+)/)?.[1]);
+    expect(query.params[maxAttemptsParameter - 1]).toBe(MAX_RECOVERABLE_RAW_PROCESSING_ATTEMPTS);
+    const limitParameter = Number(query.sql.match(/LIMIT \$(\d+)/)?.[1]);
+    expect(query.params[limitParameter - 1]).toBe(5);
+    expect(query.sql).toContain("raw.discovered_at >=");
+  });
+
+  it("scopes recovery to active campaigns in one workspace", () => {
+    const query = dialect.sqlToQuery(buildRecoverableRawProcessingJobsQuery("workspace-1", claimTime, 5));
+
+    expect(query.sql).toContain("campaign.workspace_id = $1::uuid");
+    expect(query.sql).toContain("campaign.status = 'active'");
+    expect(query.params).toContain("workspace-1");
+  });
+
+  it("only inserts processing jobs and cannot invoke providers or sending", () => {
+    const query = dialect.sqlToQuery(buildRecoverableRawProcessingJobsQuery("workspace-1", claimTime, 5));
+
+    expect(query.sql).not.toMatch(/outreach_queue|provider_runs|autopilot_settings|UPDATE raw_candidates|INSERT INTO raw_candidates/i);
+    expect(query.sql).toContain("'skipMapsFastWebsiteRecovery', true");
   });
 });

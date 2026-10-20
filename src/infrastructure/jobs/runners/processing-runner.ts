@@ -43,6 +43,9 @@ import { createDeadlineSignal, DeadlineExceededError, raceWithAbort, runWithDead
 
 interface ProcessingJobPayload {
   rawCandidateId: string;
+  recoveryAttempt?: number;
+  recoveryDisposition?: "recoverable";
+  skipMapsFastWebsiteRecovery?: boolean;
 }
 
 export interface ProcessingRunnerOptions {
@@ -313,7 +316,7 @@ async function executeProcessingJob(
     now: new Date(),
     deferVerification: true,
     existingProcessingMetrics: raw.processingMetrics,
-    ...(raw.engineType === "maps_fast" && payload.kind === "maps" ? {
+    ...(raw.engineType === "maps_fast" && payload.kind === "maps" && !job.payload.skipMapsFastWebsiteRecovery ? {
       recoverMapsFastWebsite: async (place) => {
         const query = buildMapsFastWebsiteRecoveryQuery(place);
         if (!query) return { status: "blocked" as const };

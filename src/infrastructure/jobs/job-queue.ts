@@ -17,6 +17,7 @@ export interface ClaimOptions {
 }
 
 const DEFAULT_CLAIM_OPTIONS: ClaimOptions = { leaseMs: 5 * 60 * 1000 };
+export const PERMANENT_JOB_ERROR_PATTERN = "invalid|not[_ ]?found|unauthorized|forbidden|bad[_ ]?request";
 
 /** A job is claimable if pending-and-due, or if a previous lease expired without completion (crash recovery). */
 function isClaimable<T>(job: JobRecord<T>, now: Date, leaseMs: number): boolean {
@@ -57,7 +58,7 @@ export function completeJob<T>(job: JobRecord<T>, now: Date): JobRecord<T> {
 export function isPermanentError(error: unknown): boolean {
   if (error instanceof ProviderFailureError) return error.kind === "configuration";
   const message = error instanceof Error ? error.message : String(error);
-  return /invalid|not[_ ]?found|unauthorized|forbidden|bad[_ ]?request/i.test(message);
+  return new RegExp(PERMANENT_JOB_ERROR_PATTERN, "i").test(message);
 }
 
 /** Exponential backoff with a cap, so a persistently-failing job doesn't retry forever in a tight loop. */

@@ -5,10 +5,13 @@ import { discoveryJobs, processingJobs } from "../schema/discovery";
 import { deadLetterJobs } from "../schema/outreach";
 import type { JobRecord, JobStatus } from "@/domain/discovery/types";
 import { ProviderFailureError } from "@/domain/providers/errors";
-import { computeBackoffMs, isPermanentError } from "@/infrastructure/jobs/job-queue";
+import { computeBackoffMs, isPermanentError, PERMANENT_JOB_ERROR_PATTERN } from "@/infrastructure/jobs/job-queue";
 
 export const JOB_LEASE_MS = 5 * 60 * 1000;
 const MAX_CLAIM_BATCH_SIZE = 100;
+export const MAX_RECOVERABLE_RAW_PROCESSING_ATTEMPTS = 1;
+export const MAX_RECOVERABLE_RAW_PROCESSING_JOBS_PER_TICK = 5;
+const RECOVERABLE_RAW_PROCESSING_WINDOW_MS = 24 * 60 * 60 * 1000;
 
 export async function getCampaignQueueDepth(campaignId: string): Promise<number> {
   const db = getDb();
@@ -51,10 +54,16 @@ export function buildDeadLetterExpiredJobsQuery(table: QueueTable, leaseSeconds:
             AND attempt_count >= max_attempts
             AND locked_at IS NOT NULL
             AND locked_at + (${leaseSeconds} * interval '1 second') <= NOW()
-          RETURNING id, campaign_id, payload, attempt_count
+          RETURNING id, campaign_id, payload, attempt_count, last_error
         )
         INSERT INTO dead_letter_jobs (source_table, source_job_id, campaign_id, payload, attempt_count, last_error, created_at)
-        SELECT 'processing_jobs', id, campaign_id, payload, attempt_count, ${message}, NOW()
+        SELECT 'processing_jobs', id, campaign_id,
+          payload || jsonb_build_object('_vitalcapRecovery', jsonb_build_object(
+            'classification', CASE WHEN payload->>'recoveryAttempt' IS NOT NULL OR last_error ~* ${PERMANENT_JOB_ERROR_PATTERN} THEN 'permanent' ELSE 'transient' END,
+            'disposition', CASE WHEN payload->>'recoveryAttempt' IS NOT NULL OR last_error ~* ${PERMANENT_JOB_ERROR_PATTERN} THEN 'permanent' ELSE 'recoverable' END,
+            'reason', CASE WHEN payload->>'recoveryAttempt' IS NOT NULL THEN 'recovery_attempt_exhausted' ELSE 'lease_expired_at_max_attempts' END
+          )),
+          attempt_count, ${message}, NOW()
         FROM expired
         ON CONFLICT (source_table, source_job_id) DO NOTHING
         RETURNING source_job_id;
@@ -74,6 +83,77 @@ export function buildRequeueStaleLockedJobsQuery(table: QueueTable, now: Date, s
       AND attempt_count < max_attempts
     RETURNING id;
   `;
+}
+
+export function buildRecoverableRawProcessingJobsQuery(workspaceId: string, now: Date, limit: number) {
+  const windowStart = new Date(now.getTime() - RECOVERABLE_RAW_PROCESSING_WINDOW_MS).toISOString();
+  const boundedLimit = normalizeBatchSize(limit);
+  const nowIso = now.toISOString();
+
+  return sql`
+    WITH recoverable AS (
+      SELECT raw.id AS raw_id, raw.campaign_id, source_job.payload
+      FROM raw_candidates raw
+      JOIN campaigns campaign ON campaign.id = raw.campaign_id
+        AND campaign.workspace_id = ${workspaceId}::uuid
+        AND campaign.status = 'active'
+      JOIN processing_jobs source_job ON source_job.type = 'process_raw_candidate'
+        AND source_job.payload->>'rawCandidateId' = raw.id::text
+        AND source_job.status = 'dead_letter'
+        AND source_job.attempt_count >= source_job.max_attempts
+      JOIN dead_letter_jobs dead_letter ON dead_letter.source_table = 'processing_jobs'
+        AND dead_letter.source_job_id = source_job.id
+      WHERE raw.processed = false
+        AND raw.engine_type = 'maps_fast'
+        AND raw.discovered_at >= ${windowStart}::timestamptz
+        AND raw.discovered_at <= ${nowIso}::timestamptz
+        AND (
+          dead_letter.payload #>> '{_vitalcapRecovery,disposition}' = 'recoverable'
+          OR (
+            dead_letter.payload #>> '{_vitalcapRecovery,disposition}' IS NULL
+            AND (
+              (source_job.last_error IS NOT NULL AND source_job.last_error !~* ${PERMANENT_JOB_ERROR_PATTERN})
+              OR (source_job.last_error IS NULL AND dead_letter.last_error ~* '^Max attempts exceeded via watchdog')
+            )
+          )
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM processing_jobs active_job
+          WHERE active_job.type = 'process_raw_candidate'
+            AND active_job.payload->>'rawCandidateId' = raw.id::text
+            AND active_job.status IN ('pending', 'processing')
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM processing_jobs recovery_job
+          WHERE recovery_job.type = 'process_raw_candidate'
+            AND recovery_job.payload->>'rawCandidateId' = raw.id::text
+            AND recovery_job.payload->>'recoveryAttempt' = '1'
+        )
+      ORDER BY raw.discovered_at ASC, raw.id ASC
+      FOR UPDATE OF raw, source_job SKIP LOCKED
+      LIMIT ${boundedLimit}
+    )
+    INSERT INTO processing_jobs (
+      campaign_id, type, payload, status, attempt_count, max_attempts, idempotency_key, next_attempt_at
+    )
+    SELECT campaign_id, 'process_raw_candidate',
+      payload || jsonb_build_object(
+        'recoveryAttempt', ${MAX_RECOVERABLE_RAW_PROCESSING_ATTEMPTS},
+        'recoveryDisposition', 'recoverable',
+        'skipMapsFastWebsiteRecovery', true
+      ),
+      'pending', 0, ${MAX_RECOVERABLE_RAW_PROCESSING_ATTEMPTS},
+      'raw_candidate_recovery:' || raw_id::text || ':1', ${nowIso}::timestamptz
+    FROM recoverable
+    ON CONFLICT DO NOTHING
+    RETURNING id;
+  `;
+}
+
+export async function recoverDeadLetteredRawCandidates(workspaceId: string, now = new Date(), limit = MAX_RECOVERABLE_RAW_PROCESSING_JOBS_PER_TICK): Promise<number> {
+  const db = getDb();
+  const result = await db.execute(buildRecoverableRawProcessingJobsQuery(workspaceId, now, limit));
+  return result.rows.length;
 }
 
 export async function requeueStaleLockedJobs(table: QueueTable, now = new Date()): Promise<number> {
@@ -431,6 +511,17 @@ async function fail(table: QueueTable, input: FailJobInput): Promise<void> {
   const maxAttempts = input.options?.maxAttempts ?? input.job.maxAttempts;
   const message = input.error instanceof Error ? input.error.message : String(input.error);
   const classification = classifyFailure(input.error, input.classification);
+  const payload = input.job.payload && typeof input.job.payload === "object"
+    ? input.job.payload as Record<string, unknown>
+    : {};
+  const recoveryAttemptExhausted = input.job.type === "process_raw_candidate"
+    && Number(payload.recoveryAttempt) >= MAX_RECOVERABLE_RAW_PROCESSING_ATTEMPTS;
+  const recoveryDisposition = classification === "permanent" || recoveryAttemptExhausted ? "permanent" : "recoverable";
+  const recoveryReason = classification === "permanent"
+    ? "permanent_failure"
+    : recoveryAttemptExhausted
+      ? "recovery_attempt_exhausted"
+      : "attempts_exhausted";
   const deadLetter = classification === "permanent" || input.job.attemptCount >= maxAttempts;
 
   if (deadLetter) {
@@ -470,7 +561,13 @@ async function fail(table: QueueTable, input: FailJobInput): Promise<void> {
           RETURNING id, campaign_id, payload, attempt_count
         )
         INSERT INTO dead_letter_jobs (source_table, source_job_id, campaign_id, payload, attempt_count, last_error, created_at)
-        SELECT 'processing_jobs', id, campaign_id, payload, attempt_count, ${message}, ${nowIso}::timestamptz
+        SELECT 'processing_jobs', id, campaign_id,
+          payload || jsonb_build_object('_vitalcapRecovery', jsonb_build_object(
+            'classification', ${classification},
+            'disposition', ${recoveryDisposition},
+            'reason', ${recoveryReason}
+          )),
+          attempt_count, ${message}, ${nowIso}::timestamptz
         FROM moved
         ON CONFLICT (source_table, source_job_id) DO NOTHING
         RETURNING source_job_id;

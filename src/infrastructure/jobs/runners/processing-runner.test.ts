@@ -182,7 +182,7 @@ const mapsFastRecoveryPlace: MapsPlaceResult = {
   sourceUrl: "https://maps.example/place/maps-fast-recovery-place",
 };
 
-function prepareMapsFastRecoveryJob(processedOverride: Partial<ProcessedCandidateResult> = {}): void {
+function prepareMapsFastRecoveryJob(processedOverride: Partial<ProcessedCandidateResult> = {}, payloadExtras: Record<string, unknown> = {}): void {
   mocks.getRawCandidateById.mockResolvedValue({
     id: "raw-candidate-id",
     campaignId: "campaign-id",
@@ -196,7 +196,11 @@ function prepareMapsFastRecoveryJob(processedOverride: Partial<ProcessedCandidat
   });
   mocks.getCampaignById.mockResolvedValue({ id: "campaign-id", workspaceId: "workspace-id" });
   mocks.deriveIncomingIdentitySignals.mockReturnValue({ normalizedName: "farmacia ejemplo", normalizedDomain: null });
-  mocks.claimProcessingJobs.mockResolvedValueOnce([{ ...makeJob("maps-fast-recovery"), type: "process_raw_candidate" }]).mockResolvedValueOnce([]);
+  mocks.claimProcessingJobs.mockResolvedValueOnce([{
+    ...makeJob("maps-fast-recovery"),
+    type: "process_raw_candidate",
+    payload: { rawCandidateId: "raw-candidate-id", ...payloadExtras },
+  }]).mockResolvedValueOnce([]);
   mocks.processRawCandidate.mockImplementationOnce(async (_payload: unknown, engineType: string, context: ProcessingContext) => {
     const recovery = await context.recoverMapsFastWebsite?.(mapsFastRecoveryPlace) ?? { status: "blocked" as const };
     return {
@@ -431,6 +435,20 @@ describe("runProcessingCronTick", () => {
       recoveredWebsiteEnrichmentFetchFailed: 0,
       websiteAttributionCompletedAt: expect.any(String),
     }));
+  });
+
+  it("completes a bounded raw recovery attempt without invoking the Maps Fast Serper fallback", async () => {
+    prepareMapsFastRecoveryJob({}, {
+      recoveryAttempt: 1,
+      recoveryDisposition: "recoverable",
+      skipMapsFastWebsiteRecovery: true,
+    });
+
+    await runProcessingCronTick(1);
+
+    expect(mocks.createSerpDiscoveryProvider).not.toHaveBeenCalled();
+    expect(mocks.markRawCandidateProcessed).toHaveBeenCalledTimes(1);
+    expect(mocks.completeProcessingJob).toHaveBeenCalledWith(expect.objectContaining({ jobId: "maps-fast-recovery" }));
   });
 
   it("marks a recovered candidate incomplete when its email contact point already existed", async () => {
