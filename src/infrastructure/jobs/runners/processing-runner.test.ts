@@ -3,6 +3,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ProviderBudgetExceededError } from "@/domain/providers/errors";
 import type { MapsPlaceResult } from "@/domain/providers/types";
 import type { ProcessedCandidateResult, ProcessingContext } from "@/services/discovery/candidate-processor";
+import {
+  createProcessingCronDiagnosticsContext,
+  logProcessingCronFailure,
+  runProcessingWriteStage,
+} from "./processing-cron-diagnostics";
 
 const mocks = vi.hoisted(() => ({
   claimProcessingJobs: vi.fn(),
@@ -150,6 +155,41 @@ describe("evaluateStructuredWebsiteLocation", () => {
     expect(result.verdict.verdict).toBe("rejected");
     expect(result.accountUpdates.countryCode).toBeUndefined();
     expect(result.accountUpdates.postalCode).toBe("28001");
+  });
+});
+
+describe("processing write failure diagnostics", () => {
+  it("logs only safe nested PostgreSQL conflict metadata and the write stage", async () => {
+    const nestedError = Object.assign(new Error("private database message"), {
+      code: "23505",
+      constraint: "uq_account_sources_account_source",
+      table: "account_sources",
+      query: "INSERT INTO account_sources VALUES (...) RETURNING *",
+      parameters: ["person@example.com", "raw-sensitive-id"],
+    });
+    const error = new Error("outer wrapper", { cause: nestedError });
+    const errorLog = vi.spyOn(console, "error").mockImplementation(() => {});
+    const diagnostics = createProcessingCronDiagnosticsContext("correlation-safe-test");
+
+    await expect(runProcessingWriteStage(diagnostics, "INSERT_ACCOUNT_SOURCE", () => Promise.reject(error))).rejects.toBe(error);
+
+    const event = JSON.parse(String(errorLog.mock.calls[0]?.[0])) as {
+      message: string;
+      fields: Record<string, unknown>;
+    };
+    expect(event.message).toBe("processing_job_failed");
+    expect(event.fields).toMatchObject({
+      correlationId: "correlation-safe-test",
+      stage: "INSERT_ACCOUNT_SOURCE",
+      sqlState: "23505",
+      constraintName: "uq_account_sources_account_source",
+      tableName: "account_sources",
+      errorClass: "Error",
+    });
+    expect(JSON.stringify(event)).not.toMatch(/private database message|INSERT INTO|person@example\.com|raw-sensitive-id/);
+    logProcessingCronFailure(diagnostics, "RAW_PROCESSING", error);
+    expect(errorLog).toHaveBeenCalledTimes(1);
+    errorLog.mockRestore();
   });
 });
 

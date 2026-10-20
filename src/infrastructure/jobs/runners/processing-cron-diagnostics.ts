@@ -10,6 +10,20 @@ export type ProcessingCronStage =
   | "VERIFICATION_HANDOFF"
   | "CRON_RUN_PERSISTENCE";
 
+export type ProcessingWriteStage =
+  | "RESOLVE_CANONICAL_ACCOUNT"
+  | "UPDATE_ACCOUNT_FIELDS"
+  | "LINK_RAW_ACCOUNT"
+  | "INSERT_ACCOUNT_SOURCE"
+  | "INSERT_CONTACT_POINT"
+  | "UPSERT_CAMPAIGN_MEMBERSHIP"
+  | "UPSERT_WEBSITE_ENRICHMENT"
+  | "INSERT_WEBSITE_EVIDENCE"
+  | "ENQUEUE_VERIFICATION"
+  | "ENQUEUE_INTELLIGENCE"
+  | "MARK_RAW_PROCESSED"
+  | "ENQUEUE_PROCESSING_JOB";
+
 export interface ProcessingCronDiagnosticsContext {
   correlationId: string;
   startedAtMs: number;
@@ -30,22 +44,41 @@ function safeErrorClass(error: unknown): string {
   }
 }
 
-function safeSqlState(error: unknown): string | null {
+function safeIdentifier(value: unknown): string | null {
+  return typeof value === "string" && /^[A-Za-z_][A-Za-z0-9_]{0,127}$/.test(value) ? value : null;
+}
+
+function safePostgresMetadata(error: unknown): { sqlState: string | null; constraintName: string | null; tableName: string | null } {
   const seen = new Set<unknown>();
   let current: unknown = error;
+  let sqlState: string | null = null;
+  let constraintName: string | null = null;
+  let tableName: string | null = null;
   for (let depth = 0; depth < 5 && current && !seen.has(current); depth += 1) {
     seen.add(current);
     if (typeof current !== "object") break;
     try {
-      const record = current as { sqlState?: unknown; code?: unknown; cause?: unknown };
+      const record = current as {
+        sqlState?: unknown;
+        code?: unknown;
+        constraintName?: unknown;
+        constraint_name?: unknown;
+        constraint?: unknown;
+        tableName?: unknown;
+        table_name?: unknown;
+        table?: unknown;
+        cause?: unknown;
+      };
       const state = record.sqlState ?? record.code;
-      if (typeof state === "string" && /^[0-9A-Z]{5}$/.test(state)) return state;
+      if (sqlState === null && typeof state === "string" && /^[0-9A-Z]{5}$/.test(state)) sqlState = state;
+      constraintName ??= safeIdentifier(record.constraintName ?? record.constraint_name ?? record.constraint);
+      tableName ??= safeIdentifier(record.tableName ?? record.table_name ?? record.table);
       current = record.cause;
     } catch {
       break;
     }
   }
-  return null;
+  return { sqlState, constraintName, tableName };
 }
 
 export function logProcessingCronFailure(
@@ -55,13 +88,46 @@ export function logProcessingCronFailure(
 ): void {
   if (error !== undefined && context.reportedErrors.has(error)) return;
   if (error !== undefined) context.reportedErrors.add(error);
+  const postgres = safePostgresMetadata(error);
   logEvent("error", "processing_cron_failed", {
     correlationId: context.correlationId,
     stage,
-    sqlState: safeSqlState(error),
+    sqlState: postgres.sqlState,
     errorClass: error === undefined ? "UnknownError" : safeErrorClass(error),
     elapsedMs: Math.max(0, Date.now() - context.startedAtMs),
   });
+}
+
+export function logProcessingJobFailure(
+  context: ProcessingCronDiagnosticsContext,
+  stage: ProcessingWriteStage,
+  error: unknown,
+): void {
+  if (context.reportedErrors.has(error)) return;
+  context.reportedErrors.add(error);
+  const postgres = safePostgresMetadata(error);
+  logEvent("error", "processing_job_failed", {
+    correlationId: context.correlationId,
+    stage,
+    sqlState: postgres.sqlState,
+    constraintName: postgres.constraintName,
+    tableName: postgres.tableName,
+    errorClass: safeErrorClass(error),
+    elapsedMs: Math.max(0, Date.now() - context.startedAtMs),
+  });
+}
+
+export async function runProcessingWriteStage<T>(
+  context: ProcessingCronDiagnosticsContext,
+  stage: ProcessingWriteStage,
+  run: () => Promise<T> | T,
+): Promise<T> {
+  try {
+    return await run();
+  } catch (error) {
+    logProcessingJobFailure(context, stage, error);
+    throw error;
+  }
 }
 
 export async function runProcessingCronStage<T>(

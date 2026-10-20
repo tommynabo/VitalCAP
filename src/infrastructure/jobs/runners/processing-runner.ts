@@ -45,6 +45,7 @@ import { buildMapsFastWebsiteRecoveryQuery, selectMapsFastRecoveredWebsite } fro
 import { createDeadlineSignal, DeadlineExceededError, raceWithAbort, runWithDeadlineSignal } from "@/lib/async/deadline";
 import {
   createProcessingCronDiagnosticsContext,
+  runProcessingWriteStage,
   runProcessingCronStage,
 } from "./processing-cron-diagnostics";
 
@@ -265,6 +266,7 @@ async function executeProcessingJob(
   if (job.type === "maps_deep_owner_enrichment") {
     const raw = await getRawCandidateById(job.payload.rawCandidateId);
     if (!raw || raw.rawPayload === undefined || !raw.accountId) throw new Error(`Maps Deep owner enrichment has no processed account for raw_candidate ${job.payload.rawCandidateId}`);
+    const accountId = raw.accountId;
     const campaign = await getCampaignById(job.campaignId);
     if (!campaign) throw new Error(`Campaign not found: ${job.campaignId}`);
     const payload = raw.rawPayload as unknown as CandidateRawPayload;
@@ -277,14 +279,14 @@ async function executeProcessingJob(
     const output = await provider.search({ query, maxResults: 5, signal: options.signal });
     for (const result of output.results) {
       if (normalizeDomain(result.domain) !== domain) continue;
-      await insertAccountSource({
-        accountId: raw.accountId,
+      await runProcessingWriteStage(diagnostics, "INSERT_ACCOUNT_SOURCE", () => insertAccountSource({
+        accountId,
         sourceType: "maps_deep",
         sourceProvider: "serper",
         sourceExternalId: result.url,
         sourceUrl: result.url,
         rawSnapshot: { kind: "maps_deep_owner_enrichment", query, result, googlePlaceId: payload.place.externalPlaceId },
-      });
+      }));
     }
     return;
   }
@@ -301,7 +303,7 @@ async function executeProcessingJob(
   if (!hasLinkedInEmployerAccount(payload, existingAccounts)) {
     const processingMetrics = createInitialCandidateProcessingMetrics(raw.engineType, payload, raw.processingMetrics, new Date());
     finishWebsiteAttribution(processingMetrics);
-    await markRawCandidateProcessed(raw.id, processingMetrics);
+    await runProcessingWriteStage(diagnostics, "MARK_RAW_PROCESSED", () => markRawCandidateProcessed(raw.id, processingMetrics));
     return;
   }
 
@@ -428,7 +430,7 @@ async function executeProcessingJob(
   };
   const providerLabel = providerLabelForEngine(raw.engineType);
 
-  const canonicalResolution = await resolveCanonicalAccount(
+  const canonicalResolution = await runProcessingWriteStage(diagnostics, "RESOLVE_CANONICAL_ACCOUNT", () => resolveCanonicalAccount(
     campaign.workspaceId,
     accountIdentity,
     {
@@ -456,11 +458,11 @@ async function executeProcessingJob(
       status: resolveAccountStatus(processed),
     },
     { allowCreate: raw.engineType !== "linkedin_owner" },
-  );
+  ));
 
   if (canonicalResolution.kind === "needsReview") {
     finishWebsiteAttribution(processed.processingMetrics);
-    await markRawCandidateProcessed(raw.id, processed.processingMetrics);
+    await runProcessingWriteStage(diagnostics, "MARK_RAW_PROCESSED", () => markRawCandidateProcessed(raw.id, processed.processingMetrics));
     return;
   }
 
@@ -470,43 +472,44 @@ async function executeProcessingJob(
     const existingAccount = await getAccountById(accountId);
     if (existingAccount) {
       const missingFields = mergeMissingAccountFields(existingAccount, incomingAccountFields);
-      await updateAccountFields(accountId, missingFields);
+      await runProcessingWriteStage(diagnostics, "UPDATE_ACCOUNT_FIELDS", () => updateAccountFields(accountId, missingFields));
     }
-    await insertAccountSource({
+    await runProcessingWriteStage(diagnostics, "INSERT_ACCOUNT_SOURCE", () => insertAccountSource({
       accountId,
       sourceType: raw.engineType,
       sourceProvider: providerLabel,
       sourceExternalId: raw.sourceExternalId,
       sourceUrl: raw.sourceUrl,
       rawSnapshot: raw.rawPayload,
-    });
+    }));
   } else {
     accountId = canonicalResolution.accountId;
-    await insertAccountSource({
+    await runProcessingWriteStage(diagnostics, "INSERT_ACCOUNT_SOURCE", () => insertAccountSource({
       accountId,
       sourceType: raw.engineType,
       sourceProvider: providerLabel,
       sourceExternalId: raw.sourceExternalId,
       sourceUrl: raw.sourceUrl,
       rawSnapshot: raw.rawPayload,
-    });
+    }));
   }
 
-  if (processed.recoveredWebsite && payload.kind === "maps") {
-    await insertAccountSource({
+  const recoveredWebsite = processed.recoveredWebsite;
+  if (recoveredWebsite && payload.kind === "maps") {
+    await runProcessingWriteStage(diagnostics, "INSERT_ACCOUNT_SOURCE", () => insertAccountSource({
       accountId,
       sourceType: raw.engineType,
       sourceProvider: "serper",
-      sourceExternalId: processed.recoveredWebsite.evidence.url,
-      sourceUrl: processed.recoveredWebsite.evidence.url,
+      sourceExternalId: recoveredWebsite.evidence.url,
+      sourceUrl: recoveredWebsite.evidence.url,
       rawSnapshot: {
         kind: "maps_fast_website_recovery",
         provider: "serper",
-        websiteDomain: processed.recoveredWebsite.domain,
-        result: processed.recoveredWebsite.evidence,
+        websiteDomain: recoveredWebsite.domain,
+        result: recoveredWebsite.evidence,
         googlePlaceId: payload.place.externalPlaceId,
       },
-    });
+    }));
   }
 
   const websiteRecoveryCounters = {
@@ -524,8 +527,9 @@ async function executeProcessingJob(
   const currentWebsiteEmailFacts = new Map<string, WebsiteEvidenceFact>();
 
   // --- WEBSITE ENRICHMENT ---
-  if (accountFields.websiteUrl && accountIdentity.normalizedDomain && options.enrichContacts !== false) {
-    const cache = await getWebsiteEnrichmentStatus(accountId, accountIdentity.normalizedDomain);
+  const normalizedDomain = accountIdentity.normalizedDomain;
+  if (accountFields.websiteUrl && normalizedDomain && options.enrichContacts !== false) {
+    const cache = await getWebsiteEnrichmentStatus(accountId, normalizedDomain);
     const now = new Date();
     const transientCacheFailure = cache?.status === "timeout" || cache?.status === "transient_error";
     const transientRetryAt = transientCacheFailure && cache
@@ -592,10 +596,10 @@ async function executeProcessingJob(
         finalNextRefreshAt = failureRefreshAt;
       }
 
-      await upsertWebsiteEnrichmentStatus({
+      await runProcessingWriteStage(diagnostics, "UPSERT_WEBSITE_ENRICHMENT", () => upsertWebsiteEnrichmentStatus({
         workspaceId: campaign.workspaceId,
         accountId,
-        normalizedDomain: accountIdentity.normalizedDomain,
+        normalizedDomain,
         status: result.status,
         startedAt: now,
         completedAt: new Date(),
@@ -604,10 +608,10 @@ async function executeProcessingJob(
         pagesFetched: result.pagesFetched,
         error: result.errorDetails,
         nextRefreshAt: finalNextRefreshAt,
-      });
+      }));
 
       for (const fact of result.evidence) {
-        await insertWebsiteEvidence({
+        await runProcessingWriteStage(diagnostics, "INSERT_WEBSITE_EVIDENCE", () => insertWebsiteEvidence({
           workspaceId: campaign.workspaceId,
           accountId,
           normalizedDomain: incoming.normalizedDomain!,
@@ -617,13 +621,13 @@ async function executeProcessingJob(
           normalizedValue: fact.normalizedValue ?? fact.value,
           snippet: fact.snippet,
           contentHash: result.contentHash ?? "",
-        });
+        }));
 
         if (fact.evidenceType === "phone") {
           const phoneNorm = fact.normalizedValue ?? fact.value;
           // Note: duplicate checking for phones across the account should ideally happen here or rely on DB upsert logic.
           // For now we just insert it since contact points can have multiple.
-          await insertContactPoint({
+          await runProcessingWriteStage(diagnostics, "INSERT_CONTACT_POINT", () => insertContactPoint({
             workspaceId: campaign.workspaceId,
             accountId,
             type: "phone",
@@ -637,7 +641,7 @@ async function executeProcessingJob(
             verificationProvider: null,
             sourceUrl: fact.sourceUrl,
             sourceType: "website_enrichment",
-          });
+          }));
         }
       }
 
@@ -660,17 +664,17 @@ async function executeProcessingJob(
               : null;
           }
           if (Object.keys(accountUpdates).length > 0) {
-            await updateAccountFields(accountId, accountUpdates);
+            await runProcessingWriteStage(diagnostics, "UPDATE_ACCOUNT_FIELDS", () => updateAccountFields(accountId, accountUpdates));
           }
         }
       }
     }
 
-    const unlinkedEmailEvidence = await listUnlinkedWebsiteEmailEvidence(accountId, accountIdentity.normalizedDomain);
+    const unlinkedEmailEvidence = await listUnlinkedWebsiteEmailEvidence(accountId, normalizedDomain);
     for (const fact of unlinkedEmailEvidence) {
       const email = fact.normalizedValue.trim().toLowerCase();
       if (!email) continue;
-      const contactPoint = await insertContactPointWithStatus({
+      const contactPoint = await runProcessingWriteStage(diagnostics, "INSERT_CONTACT_POINT", () => insertContactPointWithStatus({
         workspaceId: campaign.workspaceId,
         accountId,
         type: "email",
@@ -684,7 +688,7 @@ async function executeProcessingJob(
         verificationProvider: null,
         sourceUrl: fact.sourceUrl,
         sourceType: "website_enrichment",
-      });
+      }));
       const currentEnrichmentFact = currentWebsiteEmailFacts.get(email);
       if (currentEnrichmentFact) {
         if (contactPoint.created) {
@@ -701,7 +705,7 @@ async function executeProcessingJob(
       if (contactPoint.created) websiteRecoveryCounters.contactPointsCreated += 1;
       else processingMetrics.emailDuplicate += 1;
       if (contactPoint.id && (contactPoint.created || contactPoint.verificationStatus === "unverified")) {
-        const verificationQueued = await runProcessingCronStage(diagnostics, "VERIFICATION_HANDOFF", () => enqueueVerificationJob({
+        const verificationQueued = await runProcessingWriteStage(diagnostics, "ENQUEUE_VERIFICATION", () => enqueueVerificationJob({
           workspaceId: campaign.workspaceId,
           contactPointId: contactPoint.id,
           normalizedEmail: email,
@@ -734,7 +738,7 @@ async function executeProcessingJob(
     verificationQueued: 0,
   };
   for (const contactPoint of processed.contactPoints) {
-    const insertedContactPoint = await insertContactPointWithStatus({
+    const insertedContactPoint = await runProcessingWriteStage(diagnostics, "INSERT_CONTACT_POINT", () => insertContactPointWithStatus({
       workspaceId: campaign.workspaceId,
       accountId,
       type: "email",
@@ -748,7 +752,7 @@ async function executeProcessingJob(
       verificationProvider: contactPoint.verificationProvider,
       sourceUrl: contactPoint.sourceUrl,
       sourceType: contactPoint.sourceType,
-    });
+    }));
     if (contactPoint.sourceType === "website") {
       if (insertedContactPoint.created) {
         processingMetrics.websiteContactPointsCreated = (processingMetrics.websiteContactPointsCreated ?? 0) + 1;
@@ -764,7 +768,7 @@ async function executeProcessingJob(
       else serperEmailDiagnostics.duplicatesSkipped += 1;
     }
     if (options.enrichContacts !== false && insertedContactPoint.id && (insertedContactPoint.created || insertedContactPoint.verificationStatus === "unverified")) {
-      const verificationQueued = await runProcessingCronStage(diagnostics, "VERIFICATION_HANDOFF", () => enqueueVerificationJob({
+      const verificationQueued = await runProcessingWriteStage(diagnostics, "ENQUEUE_VERIFICATION", () => enqueueVerificationJob({
         workspaceId: campaign.workspaceId,
         contactPointId: insertedContactPoint.id,
         normalizedEmail: contactPoint.email.toLowerCase(),
@@ -787,13 +791,13 @@ async function executeProcessingJob(
   }
 
   const membership = resolveMembershipStage(processed);
-  await upsertCampaignMembership({
+  await runProcessingWriteStage(diagnostics, "UPSERT_CAMPAIGN_MEMBERSHIP", () => upsertCampaignMembership({
     campaignId: campaign.id,
     accountId,
     stage: membership.stage,
     rejectionReason: membership.rejectionReason,
     readyAt: membership.stage === "ready" ? new Date() : null,
-  });
+  }));
 
   if (membership.stage === "qualified" || membership.stage === "ready") {
     // Dynamically import to avoid circular dependency issues if any
@@ -806,25 +810,25 @@ async function executeProcessingJob(
     
     if (context) {
       const inputHash = hashProspectContext(context);
-      await enqueueIntelligenceJob({
+      await runProcessingWriteStage(diagnostics, "ENQUEUE_INTELLIGENCE", () => enqueueIntelligenceJob({
         workspaceId: campaign.workspaceId,
         campaignId: campaign.id,
         accountId: accountId,
         idempotencyKey: inputHash,
-      });
+      }));
     }
   }
 
-  await updateRawCandidateAccountId(raw.id, accountId);
+  await runProcessingWriteStage(diagnostics, "LINK_RAW_ACCOUNT", () => updateRawCandidateAccountId(raw.id, accountId));
   finishWebsiteAttribution(processingMetrics);
-  await markRawCandidateProcessed(raw.id, processingMetrics);
+  await runProcessingWriteStage(diagnostics, "MARK_RAW_PROCESSED", () => markRawCandidateProcessed(raw.id, processingMetrics));
   if (raw.engineType === "maps_deep" && payload.kind === "maps" && incoming.normalizedDomain) {
-    await enqueueProcessingJob({
+    await runProcessingWriteStage(diagnostics, "ENQUEUE_PROCESSING_JOB", () => enqueueProcessingJob({
       campaignId: campaign.id,
       type: "maps_deep_owner_enrichment",
       payload: { rawCandidateId: raw.id },
       idempotencyKey: `maps_deep_owner:${raw.id}`,
-    });
+    }));
   }
 }
 
