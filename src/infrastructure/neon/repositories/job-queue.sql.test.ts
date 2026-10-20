@@ -1,6 +1,6 @@
 import { PgDialect } from "drizzle-orm/pg-core";
 import { describe, expect, it } from "vitest";
-import { buildClaimJobsQuery, buildDeadLetterExpiredJobsQuery, buildDeferJobQuery, buildRequeueStaleLockedJobsQuery, buildRecoverableRawProcessingJobsQuery, MAX_RECOVERABLE_RAW_PROCESSING_ATTEMPTS } from "./job-queue";
+import { buildClaimJobsQuery, buildDeadLetterExpiredJobsQuery, buildDeferJobQuery, buildRequeueStaleLockedJobsQuery, buildRecoverableRawProcessingJobsQuery, IDEMPOTENCY_PROBE_RECOVERY_VERSION, MAX_RECOVERABLE_RAW_PROCESSING_ATTEMPTS, MAX_RECOVERABLE_RAW_PROCESSING_JOBS_PER_TICK } from "./job-queue";
 
 const dialect = new PgDialect();
 const claimTime = new Date("2026-10-18T09:00:00.000Z");
@@ -140,6 +140,16 @@ describe("job queue SQL builders", () => {
       MAX_RECOVERABLE_RAW_PROCESSING_ATTEMPTS,
       MAX_RECOVERABLE_RAW_PROCESSING_ATTEMPTS,
       now.toISOString(),
+      workspaceId,
+      now.toISOString(),
+      now.toISOString(),
+      "invalid|not[_ ]?found|unauthorized|forbidden|bad[_ ]?request",
+      IDEMPOTENCY_PROBE_RECOVERY_VERSION,
+      5,
+      IDEMPOTENCY_PROBE_RECOVERY_VERSION,
+      MAX_RECOVERABLE_RAW_PROCESSING_ATTEMPTS,
+      IDEMPOTENCY_PROBE_RECOVERY_VERSION,
+      now.toISOString(),
     ]);
     expect(query.sql).toContain("INSERT INTO processing_jobs");
     expect(query.sql).toContain("source_job.status = 'dead_letter'");
@@ -164,7 +174,73 @@ describe("job queue SQL builders", () => {
 
     expect(query.sql).toContain("active_job.status IN ('pending', 'processing')");
     expect(query.sql).toContain("recovery_job.payload->>'recoveryAttempt' = '1'");
+    expect(query.sql).toContain("diagnostic_job.payload->>'recoveryVersion' = $13");
     expect(query.sql).toContain("FOR UPDATE OF raw, source_job SKIP LOCKED");
+  });
+
+  it("keeps the normal first recovery at one attempt and leaves its attempt-1 guard intact", () => {
+    const query = dialect.sqlToQuery(buildRecoverableRawProcessingJobsQuery("workspace-1", claimTime, 5));
+    const normalRecoverySql = query.sql.slice(0, query.sql.indexOf("diagnostic_recoverable"));
+
+    expect(normalRecoverySql).toContain("recovery_job.payload->>'recoveryAttempt' = '1'");
+    expect(normalRecoverySql).toContain("'recoveryAttempt', $6::int");
+    expect(normalRecoverySql).not.toContain("'recoveryAttempt', 2");
+    expect(normalRecoverySql).not.toContain("recoveryVersion");
+  });
+
+  it("selects only current-day failed attempt-1 raws with a recoverable legacy source", () => {
+    const query = dialect.sqlToQuery(buildRecoverableRawProcessingJobsQuery("workspace-1", claimTime, 5));
+    const diagnosticSelection = query.sql.slice(
+      query.sql.indexOf("diagnostic_recoverable AS MATERIALIZED"),
+      query.sql.indexOf("diagnostic_inserted AS"),
+    );
+
+    expect(diagnosticSelection).toContain("campaign.workspace_id = $9::uuid");
+    expect(diagnosticSelection).toContain("campaign.status = 'active'");
+    expect(diagnosticSelection).toContain("raw.processed = false");
+    expect(diagnosticSelection).toContain("raw.engine_type = 'maps_fast'");
+    expect(diagnosticSelection).toContain("raw.discovered_at >= (");
+    expect(diagnosticSelection).toContain("legacy_source.payload->>'recoveryAttempt' IS NULL");
+    expect(diagnosticSelection).toContain("legacy_source.status = 'dead_letter'");
+    expect(diagnosticSelection).toContain("legacy_source.attempt_count >= legacy_source.max_attempts");
+    expect(diagnosticSelection).toContain("legacy_dead_letter.payload #>> '{_vitalcapRecovery,disposition}' IS NULL");
+    expect(diagnosticSelection).toContain("legacy_source.last_error !~*");
+    expect(diagnosticSelection).toContain("legacy_dead_letter.last_error ~* '^Max attempts exceeded via watchdog'");
+    expect(diagnosticSelection).toContain("prior_recovery.payload->>'recoveryAttempt' = '1'");
+    expect(diagnosticSelection).toContain("prior_recovery.status = 'dead_letter'");
+    expect(diagnosticSelection).toContain("prior_recovery.attempt_count >= prior_recovery.max_attempts");
+  });
+
+  it("blocks active jobs, prevents another diagnostic version, and never creates attempt three", () => {
+    const query = dialect.sqlToQuery(buildRecoverableRawProcessingJobsQuery("workspace-1", claimTime, 5));
+    const diagnosticSelection = query.sql.slice(
+      query.sql.indexOf("diagnostic_recoverable AS MATERIALIZED"),
+      query.sql.indexOf("diagnostic_inserted AS"),
+    );
+    const diagnosticInsert = query.sql.slice(query.sql.indexOf("diagnostic_inserted AS"));
+
+    expect(diagnosticSelection).toContain("active_job.status IN ('pending', 'processing')");
+    expect(diagnosticSelection).toContain("diagnostic_job.payload->>'recoveryVersion' = $13");
+    expect(diagnosticInsert).toContain("'recoveryVersion', $15");
+    expect(diagnosticInsert).toContain("'recoveryAttempt', 2");
+    expect(diagnosticInsert).toContain("'pending', 0, $16");
+    expect(diagnosticInsert).not.toContain("'recoveryAttempt', 3");
+    expect(diagnosticInsert).toContain("raw_id::text || ':' || $17");
+    expect(query.params.filter((value) => value === IDEMPOTENCY_PROBE_RECOVERY_VERSION)).toHaveLength(3);
+    expect(query.params[15]).toBe(MAX_RECOVERABLE_RAW_PROCESSING_ATTEMPTS);
+  });
+
+  it("shares the five-job tick cap across normal and versioned recovery", () => {
+    const query = dialect.sqlToQuery(buildRecoverableRawProcessingJobsQuery("workspace-1", claimTime, MAX_RECOVERABLE_RAW_PROCESSING_JOBS_PER_TICK));
+    const diagnosticSelection = query.sql.slice(
+      query.sql.indexOf("diagnostic_recoverable AS MATERIALIZED"),
+      query.sql.indexOf("diagnostic_inserted AS"),
+    );
+
+    expect(query.params).toContain(MAX_RECOVERABLE_RAW_PROCESSING_JOBS_PER_TICK);
+    expect(diagnosticSelection).toMatch(/LIMIT GREATEST\(\$\d+ - \(SELECT COUNT\(\*\) FROM inserted\), 0\)/);
+    expect(query.sql).toContain("(SELECT COUNT(*) FROM recoverable) + (SELECT COUNT(*) FROM diagnostic_recoverable)");
+    expect(query.sql).toContain("(SELECT COUNT(*) FROM inserted) + (SELECT COUNT(*) FROM diagnostic_inserted)");
   });
 
   it("never requeues raw candidates that are already processed", () => {
