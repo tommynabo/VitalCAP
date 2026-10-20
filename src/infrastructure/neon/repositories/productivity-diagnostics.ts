@@ -381,7 +381,7 @@ export async function getProductivityDiagnostics(workspaceId: string, now = new 
           ${dayBounds.start.toISOString()}::timestamptz AS day_start,
           ${now.toISOString()}::timestamptz AS now_at
       ), today_raw AS (
-        SELECT raw.id, raw.discovered_at
+        SELECT raw.id, raw.discovered_at, raw.processed
         FROM raw_candidates raw
         JOIN campaigns campaign ON campaign.id = raw.campaign_id
         CROSS JOIN bounds

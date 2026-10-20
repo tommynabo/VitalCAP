@@ -139,6 +139,14 @@ describe("getProductivityDiagnostics", () => {
     expect(JSON.stringify(failure)).not.toContain("secret_table");
   });
 
+  it("projects the processed column used by final unprocessed-raw classification", async () => {
+    await getProductivityDiagnostics("workspace-1", new Date("2026-10-20T08:00:00.000Z"));
+
+    const query = observedQueries.find((statement) => statement.includes("today_raw AS")) ?? "";
+    expect(query).toMatch(/today_raw AS \(\s*SELECT raw\.id, raw\.discovered_at, raw\.processed\s+FROM raw_candidates raw/);
+    expect(query).toContain("NOT raw.processed");
+  });
+
   it("aggregates provider status, returned items, and unambiguous raw lineage", async () => {
     const diagnostics = await getProductivityDiagnostics("workspace-1", new Date("2026-10-20T08:00:00.000Z"));
 
