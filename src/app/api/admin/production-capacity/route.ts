@@ -23,6 +23,13 @@ export async function GET(request: Request) {
     if (error instanceof UnauthorizedError) {
       return NextResponse.json({ error: "Workspace owner authorization required." }, { status: 403 });
     }
+    const errorCode = typeof error === "object" && error !== null && "code" in error
+      ? error.code
+      : undefined;
+    console.error("production_capacity_diagnostics_failed", {
+      errorType: error instanceof Error ? error.name : typeof error,
+      ...(typeof errorCode === "string" || typeof errorCode === "number" ? { errorCode } : {}),
+    });
     return NextResponse.json({ error: "Production capacity diagnostics unavailable." }, { status: 500 });
   }
 }
