@@ -5,8 +5,6 @@ import { listWorkspaceIds } from "../../neon/repositories/workspace";
 import { getWatchdogWorkspaceSignals } from "../../neon/repositories/watchdog-signals";
 import {
   deadLetterExpiredJobs,
-  MAX_RECOVERABLE_RAW_PROCESSING_JOBS_PER_TICK,
-  recoverDeadLetteredRawCandidates,
   requeueStaleLockedJobs,
   STALE_JOB_LOCK_THRESHOLD_MS,
 } from "../../neon/repositories/job-queue";
@@ -17,7 +15,6 @@ export interface WatchdogCronResult {
   releasedDiscoveryLocks: number;
   releasedProcessingLocks: number;
   healedProcessingJobs: number;
-  recoveredDeadLetterProcessingJobs: number;
   stuckProviderRuns: number;
   orphanedSeedRuns: number;
   systemPaused: boolean;
@@ -51,14 +48,6 @@ export async function runWatchdogCronTick(): Promise<WatchdogCronResult> {
     RETURNING id
   `);
   const healedProcessingJobs = healedProcessing.rows.length;
-
-  let recoveredDeadLetterProcessingJobs = 0;
-  const recoveryNow = new Date();
-  for (const workspaceId of await listWorkspaceIds()) {
-    const remainingCapacity = MAX_RECOVERABLE_RAW_PROCESSING_JOBS_PER_TICK - recoveredDeadLetterProcessingJobs;
-    if (remainingCapacity <= 0) break;
-    recoveredDeadLetterProcessingJobs += await recoverDeadLetteredRawCandidates(workspaceId, recoveryNow, remainingCapacity);
-  }
 
   // 3. Old startup failures were historically escalated to manual
   // reconciliation. A missing external ID is a known, retryable startup
@@ -150,5 +139,5 @@ export async function runWatchdogCronTick(): Promise<WatchdogCronResult> {
   const pausedCount = await db.execute(sql`SELECT count(*) FROM autopilot_settings WHERE system_paused = true`);
   const systemPaused = Number(pausedCount.rows[0]?.count) > 0;
 
-  return { failedDiscoveryJobs, failedProcessingJobs, releasedDiscoveryLocks, releasedProcessingLocks, healedProcessingJobs, recoveredDeadLetterProcessingJobs, stuckProviderRuns, orphanedSeedRuns, systemPaused };
+  return { failedDiscoveryJobs, failedProcessingJobs, releasedDiscoveryLocks, releasedProcessingLocks, healedProcessingJobs, stuckProviderRuns, orphanedSeedRuns, systemPaused };
 }

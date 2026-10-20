@@ -178,7 +178,9 @@ describe("job queue SQL builders", () => {
   it("only inserts processing jobs and cannot invoke providers or sending", () => {
     const query = dialect.sqlToQuery(buildRecoverableRawProcessingJobsQuery("workspace-1", claimTime, 5));
 
-    expect(query.sql).not.toMatch(/outreach_queue|provider_runs|autopilot_settings|UPDATE raw_candidates|INSERT INTO raw_candidates/i);
+    expect(query.sql).not.toMatch(/outreach_queue|provider_runs|UPDATE raw_candidates|INSERT INTO raw_candidates/i);
     expect(query.sql).toContain("'skipMapsFastWebsiteRecovery', true");
+    expect(query.sql).toContain("date_trunc('day'");
+    expect(query.sql).toContain("'Europe/Madrid'");
   });
 });

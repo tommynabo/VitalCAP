@@ -10,6 +10,8 @@ const mocks = vi.hoisted(() => ({
   deferProcessingJob: vi.fn(),
   failProcessingJob: vi.fn(),
   enqueueProcessingJob: vi.fn(),
+  recoverDeadLetteredRawCandidates: vi.fn(),
+  listWorkspaceIds: vi.fn(),
   getRawCandidateById: vi.fn(),
   claimMapsFastWebsiteRecovery: vi.fn(),
   updateRawCandidateProcessingMetrics: vi.fn(),
@@ -41,11 +43,17 @@ const mocks = vi.hoisted(() => ({
 }));
 
 vi.mock("@/infrastructure/neon/repositories/job-queue", () => ({
+  MAX_RECOVERABLE_RAW_PROCESSING_JOBS_PER_TICK: 5,
   claimProcessingJobs: mocks.claimProcessingJobs,
   completeProcessingJob: mocks.completeProcessingJob,
   deferProcessingJob: mocks.deferProcessingJob,
   failProcessingJob: mocks.failProcessingJob,
   enqueueProcessingJob: mocks.enqueueProcessingJob,
+  recoverDeadLetteredRawCandidates: mocks.recoverDeadLetteredRawCandidates,
+}));
+
+vi.mock("@/infrastructure/neon/repositories/workspace", () => ({
+  listWorkspaceIds: mocks.listWorkspaceIds,
 }));
 
 vi.mock("@/infrastructure/neon/repositories/discovery", () => ({
@@ -240,6 +248,8 @@ beforeEach(() => {
   mocks.completeProcessingJob.mockResolvedValue(undefined);
   mocks.deferProcessingJob.mockResolvedValue(undefined);
   mocks.failProcessingJob.mockResolvedValue(undefined);
+  mocks.listWorkspaceIds.mockResolvedValue([]);
+  mocks.recoverDeadLetteredRawCandidates.mockResolvedValue(0);
   mocks.getCampaignById.mockResolvedValue({ workspaceId: "workspace-id" });
   mocks.markRawCandidateProcessed.mockResolvedValue(undefined);
   mocks.updateRawCandidateAccountId.mockResolvedValue(undefined);
@@ -318,6 +328,17 @@ afterEach(() => {
 });
 
 describe("runProcessingCronTick", () => {
+  it("runs bounded dead-letter recovery before the global processing claim", async () => {
+    mocks.listWorkspaceIds.mockResolvedValue(["workspace-1"]);
+    mocks.claimProcessingJobs.mockResolvedValue([]);
+    const recoveryTime = new Date("2026-10-20T12:00:00.000Z");
+
+    await runProcessingCronTick(1, recoveryTime);
+
+    expect(mocks.recoverDeadLetteredRawCandidates).toHaveBeenCalledWith("workspace-1", recoveryTime, 5);
+    expect(mocks.claimProcessingJobs).toHaveBeenCalledOnce();
+  });
+
   it("does not construct a Serper provider while Autopilot is paused", async () => {
     prepareMapsFastRecoveryJob();
     mocks.getAutopilotSettings.mockResolvedValue({ enabled: true, systemPaused: true, emergencyStopped: false, timezone: "Europe/Madrid" });

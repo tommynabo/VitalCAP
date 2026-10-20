@@ -12,7 +12,10 @@ import {
   deferProcessingJob,
   failProcessingJob,
   enqueueProcessingJob,
+  recoverDeadLetteredRawCandidates,
+  MAX_RECOVERABLE_RAW_PROCESSING_JOBS_PER_TICK,
 } from "@/infrastructure/neon/repositories/job-queue";
+import { listWorkspaceIds } from "@/infrastructure/neon/repositories/workspace";
 import { claimMapsFastWebsiteRecovery, getRawCandidateById, markRawCandidateProcessed, refreshSearchSeedQualification, updateRawCandidateAccountId, updateRawCandidateProcessingMetrics } from "@/infrastructure/neon/repositories/discovery";
 import {
   findCandidateAccountMatches,
@@ -852,6 +855,15 @@ export async function runProcessingCronTick(
   let cleanupFailures = 0;
 
   try {
+    if (options.campaignId === undefined) {
+      let recoveredJobs = 0;
+      for (const workspaceId of await listWorkspaceIds()) {
+        const remainingCapacity = MAX_RECOVERABLE_RAW_PROCESSING_JOBS_PER_TICK - recoveredJobs;
+        if (remainingCapacity <= 0) break;
+        recoveredJobs += await recoverDeadLetteredRawCandidates(workspaceId, now, remainingCapacity);
+      }
+    }
+
     while (jobsClaimed < maxJobsPerTick && performance.now() - startedAt < startAnotherJobBeforeMs && !cronDeadline.signal.aborted) {
       let job: Awaited<ReturnType<typeof claimProcessingJobs<ProcessingJobPayload>>>[number] | undefined;
       try {

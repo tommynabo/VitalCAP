@@ -11,7 +11,6 @@ export const JOB_LEASE_MS = 5 * 60 * 1000;
 const MAX_CLAIM_BATCH_SIZE = 100;
 export const MAX_RECOVERABLE_RAW_PROCESSING_ATTEMPTS = 1;
 export const MAX_RECOVERABLE_RAW_PROCESSING_JOBS_PER_TICK = 5;
-const RECOVERABLE_RAW_PROCESSING_WINDOW_MS = 24 * 60 * 60 * 1000;
 
 export async function getCampaignQueueDepth(campaignId: string): Promise<number> {
   const db = getDb();
@@ -86,7 +85,6 @@ export function buildRequeueStaleLockedJobsQuery(table: QueueTable, now: Date, s
 }
 
 export function buildRecoverableRawProcessingJobsQuery(workspaceId: string, now: Date, limit: number) {
-  const windowStart = new Date(now.getTime() - RECOVERABLE_RAW_PROCESSING_WINDOW_MS).toISOString();
   const boundedLimit = normalizeBatchSize(limit);
   const nowIso = now.toISOString();
 
@@ -97,6 +95,7 @@ export function buildRecoverableRawProcessingJobsQuery(workspaceId: string, now:
       JOIN campaigns campaign ON campaign.id = raw.campaign_id
         AND campaign.workspace_id = ${workspaceId}::uuid
         AND campaign.status = 'active'
+      LEFT JOIN autopilot_settings settings ON settings.workspace_id = campaign.workspace_id
       JOIN processing_jobs source_job ON source_job.type = 'process_raw_candidate'
         AND source_job.payload->>'rawCandidateId' = raw.id::text
         AND source_job.status = 'dead_letter'
@@ -105,7 +104,10 @@ export function buildRecoverableRawProcessingJobsQuery(workspaceId: string, now:
         AND dead_letter.source_job_id = source_job.id
       WHERE raw.processed = false
         AND raw.engine_type = 'maps_fast'
-        AND raw.discovered_at >= ${windowStart}::timestamptz
+        AND raw.discovered_at >= (
+          date_trunc('day', ${nowIso}::timestamptz AT TIME ZONE COALESCE(settings.timezone, 'Europe/Madrid'))
+          AT TIME ZONE COALESCE(settings.timezone, 'Europe/Madrid')
+        )
         AND raw.discovered_at <= ${nowIso}::timestamptz
         AND (
           dead_letter.payload #>> '{_vitalcapRecovery,disposition}' = 'recoverable'
