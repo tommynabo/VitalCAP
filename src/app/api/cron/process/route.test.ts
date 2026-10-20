@@ -50,7 +50,26 @@ describe("processing cron route", () => {
 
     expect(response.status).toBe(200);
     expect(mocks.runCronRoute).toHaveBeenCalledWith("process", expect.any(Function));
-    expect(mocks.runProcessingCronTick).toHaveBeenCalledWith(8, expect.any(Date), { timeBudgetMs: 240_000 });
+    expect(mocks.runProcessingCronTick).toHaveBeenCalledWith(8, expect.any(Date), expect.objectContaining({ timeBudgetMs: 240_000, correlationId: expect.any(String) }));
+  });
+
+  it("returns a generic failure when the processing work throws", async () => {
+    mocks.runCronRoute.mockImplementation(async (_route: string, work: () => Promise<unknown>) => {
+      try {
+        await work();
+      } catch {
+        return Response.json({ status: "failed", error: "sensitive database detail" }, { status: 500 });
+      }
+      return new Response(null, { status: 200 });
+    });
+    mocks.runProcessingCronTick.mockRejectedValue(new Error("sensitive database detail"));
+
+    const response = await GET({} as unknown as NextRequest);
+    const body = await response.text();
+
+    expect(response.status).toBe(500);
+    expect(body).not.toContain("sensitive database detail");
+    expect(body).toContain('"status":"failed"');
   });
 
   it("does not run queue work for an unauthorized request", async () => {

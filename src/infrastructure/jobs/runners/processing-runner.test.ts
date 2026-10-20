@@ -249,7 +249,7 @@ beforeEach(() => {
   mocks.deferProcessingJob.mockResolvedValue(undefined);
   mocks.failProcessingJob.mockResolvedValue(undefined);
   mocks.listWorkspaceIds.mockResolvedValue([]);
-  mocks.recoverDeadLetteredRawCandidates.mockResolvedValue(0);
+  mocks.recoverDeadLetteredRawCandidates.mockResolvedValue({ candidatesFound: 0, jobsEnqueued: 0 });
   mocks.getCampaignById.mockResolvedValue({ workspaceId: "workspace-id" });
   mocks.markRawCandidateProcessed.mockResolvedValue(undefined);
   mocks.updateRawCandidateAccountId.mockResolvedValue(undefined);
@@ -337,6 +337,67 @@ describe("runProcessingCronTick", () => {
 
     expect(mocks.recoverDeadLetteredRawCandidates).toHaveBeenCalledWith("workspace-1", recoveryTime, 5);
     expect(mocks.claimProcessingJobs).toHaveBeenCalledOnce();
+  });
+
+  it("reports a recovery workspace lookup failure at its actual stage", async () => {
+    const error = Object.assign(new Error("private database detail"), { name: "NeonDbError", cause: { code: "42703" } });
+    const loggedError = vi.spyOn(console, "error").mockImplementation(() => {});
+    mocks.listWorkspaceIds.mockRejectedValue(error);
+
+    await expect(runProcessingCronTick(1)).rejects.toBe(error);
+
+    const event = JSON.parse(String(loggedError.mock.calls[0]?.[0])) as { message: string; fields: Record<string, unknown> };
+    expect(event.message).toBe("processing_cron_failed");
+    expect(event.fields.stage).toBe("RECOVERY_WORKSPACE_DISCOVERY");
+    expect(event.fields.sqlState).toBe("42703");
+    expect(JSON.stringify(event)).not.toContain("private database detail");
+    expect(mocks.recoverDeadLetteredRawCandidates).not.toHaveBeenCalled();
+  });
+
+  it("reports an atomic recovery selection failure at the combined SQL boundary", async () => {
+    const loggedError = vi.spyOn(console, "error").mockImplementation(() => {});
+    mocks.listWorkspaceIds.mockResolvedValue(["workspace-1"]);
+    mocks.recoverDeadLetteredRawCandidates.mockRejectedValue(new Error("database detail"));
+
+    await expect(runProcessingCronTick(1)).rejects.toThrow("database detail");
+
+    const event = JSON.parse(String(loggedError.mock.calls[0]?.[0])) as { fields: Record<string, unknown> };
+    expect(event.fields.stage).toBe("RECOVERY_SELECTION_AND_ENQUEUE");
+    expect(mocks.claimProcessingJobs).not.toHaveBeenCalled();
+  });
+
+  it("reports a recovery enqueue failure at the combined atomic SQL boundary", async () => {
+    const loggedError = vi.spyOn(console, "error").mockImplementation(() => {});
+    mocks.listWorkspaceIds.mockResolvedValue(["workspace-1"]);
+    mocks.recoverDeadLetteredRawCandidates.mockRejectedValue(new Error("insert detail"));
+
+    await expect(runProcessingCronTick(1)).rejects.toThrow("insert detail");
+
+    const event = JSON.parse(String(loggedError.mock.calls[0]?.[0])) as { fields: Record<string, unknown> };
+    expect(event.fields.stage).toBe("RECOVERY_SELECTION_AND_ENQUEUE");
+  });
+
+  it("reports a normal processing claim failure at its actual stage", async () => {
+    const loggedError = vi.spyOn(console, "error").mockImplementation(() => {});
+    mocks.claimProcessingJobs.mockRejectedValue(new Error("claim detail"));
+
+    await expect(runProcessingCronTick(1)).rejects.toThrow("claim detail");
+
+    const event = JSON.parse(String(loggedError.mock.calls[0]?.[0])) as { fields: Record<string, unknown> };
+    expect(event.fields.stage).toBe("NORMAL_PROCESSING_CLAIM");
+  });
+
+  it("keeps recovery-only ticks provider-free and does not enable sending", async () => {
+    mocks.listWorkspaceIds.mockResolvedValue(["workspace-1"]);
+    mocks.recoverDeadLetteredRawCandidates.mockResolvedValue({ candidatesFound: 2, jobsEnqueued: 2 });
+    mocks.claimProcessingJobs.mockResolvedValue([]);
+
+    const result = await runProcessingCronTick(1);
+
+    expect(result.recoveryCandidatesFound).toBe(2);
+    expect(result.recoveryJobsEnqueued).toBe(2);
+    expect(mocks.createSerpDiscoveryProvider).not.toHaveBeenCalled();
+    expect("autoSendEnabled" in result).toBe(false);
   });
 
   it("does not construct a Serper provider while Autopilot is paused", async () => {

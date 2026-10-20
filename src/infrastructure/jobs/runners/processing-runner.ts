@@ -43,6 +43,10 @@ import { normalizeDomain } from "@/lib/normalization";
 import { getAutopilotSettings } from "@/infrastructure/neon/repositories/autopilot";
 import { buildMapsFastWebsiteRecoveryQuery, selectMapsFastRecoveredWebsite } from "@/services/discovery/maps-fast-website-recovery";
 import { createDeadlineSignal, DeadlineExceededError, raceWithAbort, runWithDeadlineSignal } from "@/lib/async/deadline";
+import {
+  createProcessingCronDiagnosticsContext,
+  runProcessingCronStage,
+} from "./processing-cron-diagnostics";
 
 interface ProcessingJobPayload {
   rawCandidateId: string;
@@ -54,6 +58,7 @@ interface ProcessingJobPayload {
 export interface ProcessingRunnerOptions {
   enrichContacts?: boolean;
   campaignId?: string;
+  correlationId?: string;
   timeBudgetMs?: number;
   perJobBudgetMs?: number;
   signal?: AbortSignal;
@@ -254,6 +259,7 @@ function extractAccountFields(payload: CandidateRawPayload): {
 async function executeProcessingJob(
   job: { id: string; campaignId: string; type: string; payload: ProcessingJobPayload },
   options: ProcessingRunnerOptions,
+  diagnostics: ReturnType<typeof createProcessingCronDiagnosticsContext>,
 ): Promise<void> {
   options.signal?.throwIfAborted();
   if (job.type === "maps_deep_owner_enrichment") {
@@ -326,7 +332,7 @@ async function executeProcessingJob(
 
         let attemptClaimed = false;
         try {
-          const settings = await getAutopilotSettings(campaign.workspaceId);
+          const settings = await runProcessingCronStage(diagnostics, "PROCESS_SETTINGS", () => getAutopilotSettings(campaign.workspaceId));
           if (getEffectiveAutopilotState(settings) !== "running") return { status: "blocked" as const };
 
           const provider = createSerpDiscoveryProvider(campaign.workspaceId, "maps_fast", campaign.id);
@@ -695,12 +701,12 @@ async function executeProcessingJob(
       if (contactPoint.created) websiteRecoveryCounters.contactPointsCreated += 1;
       else processingMetrics.emailDuplicate += 1;
       if (contactPoint.id && (contactPoint.created || contactPoint.verificationStatus === "unverified")) {
-        const verificationQueued = await enqueueVerificationJob({
+        const verificationQueued = await runProcessingCronStage(diagnostics, "VERIFICATION_HANDOFF", () => enqueueVerificationJob({
           workspaceId: campaign.workspaceId,
           contactPointId: contactPoint.id,
           normalizedEmail: email,
           provider: getVerificationEnv().EMAIL_VERIFICATION_PROVIDER,
-        });
+        }));
         if (verificationQueued) websiteRecoveryCounters.verificationQueued += 1;
       }
     }
@@ -758,12 +764,12 @@ async function executeProcessingJob(
       else serperEmailDiagnostics.duplicatesSkipped += 1;
     }
     if (options.enrichContacts !== false && insertedContactPoint.id && (insertedContactPoint.created || insertedContactPoint.verificationStatus === "unverified")) {
-      const verificationQueued = await enqueueVerificationJob({
+      const verificationQueued = await runProcessingCronStage(diagnostics, "VERIFICATION_HANDOFF", () => enqueueVerificationJob({
         workspaceId: campaign.workspaceId,
         contactPointId: insertedContactPoint.id,
         normalizedEmail: contactPoint.email.toLowerCase(),
         provider: getVerificationEnv().EMAIL_VERIFICATION_PROVIDER,
-      });
+      }));
       if (contactPoint.sourceType === "serper_snippet" && verificationQueued) {
         serperEmailDiagnostics.verificationQueued += 1;
       }
@@ -827,6 +833,8 @@ export interface ProcessingRunnerResult {
   jobsCompleted: number;
   jobsTimedOut: number;
   cleanupFailures: number;
+  recoveryCandidatesFound: number;
+  recoveryJobsEnqueued: number;
   durationMs: number;
 }
 
@@ -837,6 +845,7 @@ export async function runProcessingCronTick(
   options: ProcessingRunnerOptions = {},
 ): Promise<ProcessingRunnerResult> {
   const workerId = `cron-process-${randomUUID()}`;
+  const diagnostics = createProcessingCronDiagnosticsContext(options.correlationId ?? randomUUID());
   const startedAt = performance.now();
   const timeBudgetMs = options.timeBudgetMs ?? PROCESSING_CRON_TIME_BUDGET_MS;
   const cronDeadlineMs = Math.max(1, timeBudgetMs - Math.min(PROCESSING_JOB_CLEANUP_RESERVE_MS, timeBudgetMs / 2));
@@ -853,21 +862,28 @@ export async function runProcessingCronTick(
   let jobsCompleted = 0;
   let jobsTimedOut = 0;
   let cleanupFailures = 0;
+  let recoveryCandidatesFound = 0;
+  let recoveryJobsEnqueued = 0;
 
   try {
     if (options.campaignId === undefined) {
-      let recoveredJobs = 0;
-      for (const workspaceId of await listWorkspaceIds()) {
-        const remainingCapacity = MAX_RECOVERABLE_RAW_PROCESSING_JOBS_PER_TICK - recoveredJobs;
+      let enqueuedThisTick = 0;
+      const workspaceIds = await runProcessingCronStage(diagnostics, "RECOVERY_WORKSPACE_DISCOVERY", () => listWorkspaceIds());
+      for (const workspaceId of workspaceIds) {
+        const remainingCapacity = MAX_RECOVERABLE_RAW_PROCESSING_JOBS_PER_TICK - enqueuedThisTick;
         if (remainingCapacity <= 0) break;
-        recoveredJobs += await recoverDeadLetteredRawCandidates(workspaceId, now, remainingCapacity);
+        const recovery = await runProcessingCronStage(diagnostics, "RECOVERY_SELECTION_AND_ENQUEUE", () =>
+          recoverDeadLetteredRawCandidates(workspaceId, now, remainingCapacity));
+        recoveryCandidatesFound += recovery.candidatesFound;
+        recoveryJobsEnqueued += recovery.jobsEnqueued;
+        enqueuedThisTick += recovery.jobsEnqueued;
       }
     }
 
     while (jobsClaimed < maxJobsPerTick && performance.now() - startedAt < startAnotherJobBeforeMs && !cronDeadline.signal.aborted) {
       let job: Awaited<ReturnType<typeof claimProcessingJobs<ProcessingJobPayload>>>[number] | undefined;
       try {
-        [job] = await runWithDeadlineSignal(cronDeadline.signal, () => raceWithAbort(
+        [job] = await runProcessingCronStage(diagnostics, "NORMAL_PROCESSING_CLAIM", () => runWithDeadlineSignal(cronDeadline.signal, () => raceWithAbort(
           claimProcessingJobs<ProcessingJobPayload>({
             workerId,
             batchSize: 1,
@@ -876,7 +892,7 @@ export async function runProcessingCronTick(
             requireAutopilot: options.campaignId === undefined,
           }),
           cronDeadline.signal,
-        ));
+        )));
       } catch (error) {
         if (cronDeadline.signal.aborted) break;
         throw error;
@@ -916,7 +932,7 @@ export async function runProcessingCronTick(
       let jobCompletedPersisted = false;
       try {
         await runWithDeadlineSignal(jobDeadline.signal, () => raceWithAbort((async () => {
-          await executeProcessingJob(job, { ...options, signal: jobDeadline.signal });
+          await runProcessingCronStage(diagnostics, "RAW_PROCESSING", () => executeProcessingJob(job, { ...options, signal: jobDeadline.signal }, diagnostics));
           await completeProcessingJob({ jobId: job.id, workerId, now });
           jobCompletedPersisted = true;
           jobsCompleted += 1;
@@ -966,6 +982,8 @@ export async function runProcessingCronTick(
     jobsCompleted,
     jobsTimedOut,
     cleanupFailures,
+    recoveryCandidatesFound,
+    recoveryJobsEnqueued,
     durationMs: Math.round(performance.now() - startedAt),
   };
 }

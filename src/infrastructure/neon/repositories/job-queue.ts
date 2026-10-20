@@ -89,7 +89,7 @@ export function buildRecoverableRawProcessingJobsQuery(workspaceId: string, now:
   const nowIso = now.toISOString();
 
   return sql`
-    WITH recoverable AS (
+    WITH recoverable AS MATERIALIZED (
       SELECT raw.id AS raw_id, raw.campaign_id, source_job.payload
       FROM raw_candidates raw
       JOIN campaigns campaign ON campaign.id = raw.campaign_id
@@ -135,27 +135,40 @@ export function buildRecoverableRawProcessingJobsQuery(workspaceId: string, now:
       FOR UPDATE OF raw, source_job SKIP LOCKED
       LIMIT ${boundedLimit}
     )
-    INSERT INTO processing_jobs (
+    ), inserted AS (
+      INSERT INTO processing_jobs (
       campaign_id, type, payload, status, attempt_count, max_attempts, idempotency_key, next_attempt_at
+      )
+      SELECT campaign_id, 'process_raw_candidate',
+        payload || jsonb_build_object(
+          'recoveryAttempt', ${MAX_RECOVERABLE_RAW_PROCESSING_ATTEMPTS},
+          'recoveryDisposition', 'recoverable',
+          'skipMapsFastWebsiteRecovery', true
+        ),
+        'pending', 0, ${MAX_RECOVERABLE_RAW_PROCESSING_ATTEMPTS},
+        'raw_candidate_recovery:' || raw_id::text || ':1', ${nowIso}::timestamptz
+      FROM recoverable
+      ON CONFLICT DO NOTHING
+      RETURNING id
     )
-    SELECT campaign_id, 'process_raw_candidate',
-      payload || jsonb_build_object(
-        'recoveryAttempt', ${MAX_RECOVERABLE_RAW_PROCESSING_ATTEMPTS},
-        'recoveryDisposition', 'recoverable',
-        'skipMapsFastWebsiteRecovery', true
-      ),
-      'pending', 0, ${MAX_RECOVERABLE_RAW_PROCESSING_ATTEMPTS},
-      'raw_candidate_recovery:' || raw_id::text || ':1', ${nowIso}::timestamptz
-    FROM recoverable
-    ON CONFLICT DO NOTHING
-    RETURNING id;
+    SELECT (SELECT COUNT(*)::int FROM recoverable) AS candidates_found,
+      (SELECT COUNT(*)::int FROM inserted) AS jobs_enqueued;
   `;
 }
 
-export async function recoverDeadLetteredRawCandidates(workspaceId: string, now = new Date(), limit = MAX_RECOVERABLE_RAW_PROCESSING_JOBS_PER_TICK): Promise<number> {
+export interface DeadLetterRecoveryResult {
+  candidatesFound: number;
+  jobsEnqueued: number;
+}
+
+export async function recoverDeadLetteredRawCandidates(workspaceId: string, now = new Date(), limit = MAX_RECOVERABLE_RAW_PROCESSING_JOBS_PER_TICK): Promise<DeadLetterRecoveryResult> {
   const db = getDb();
   const result = await db.execute(buildRecoverableRawProcessingJobsQuery(workspaceId, now, limit));
-  return result.rows.length;
+  const [row] = result.rows as Array<{ candidates_found?: number | string; jobs_enqueued?: number | string }>;
+  return {
+    candidatesFound: Number(row?.candidates_found ?? 0),
+    jobsEnqueued: Number(row?.jobs_enqueued ?? 0),
+  };
 }
 
 export async function requeueStaleLockedJobs(table: QueueTable, now = new Date()): Promise<number> {

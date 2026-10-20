@@ -182,5 +182,7 @@ describe("job queue SQL builders", () => {
     expect(query.sql).toContain("'skipMapsFastWebsiteRecovery', true");
     expect(query.sql).toContain("date_trunc('day'");
     expect(query.sql).toContain("'Europe/Madrid'");
+    expect(query.sql).toContain("AS candidates_found");
+    expect(query.sql).toContain("AS jobs_enqueued");
   });
 });
