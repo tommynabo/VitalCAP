@@ -112,7 +112,7 @@ export function buildWebsiteRecoveryAttributionQuery(input: WebsiteRecoveryAttri
   return sql`
     WITH periods(name, start_at, end_at) AS ${periods},
     raw_scope AS (
-      SELECT periods.name AS window, periods.end_at,
+      SELECT periods.name AS period_name, periods.end_at,
         raw.id AS raw_id, raw.campaign_id, raw.account_id, raw.engine_type,
         campaign.workspace_id, COALESCE(raw.processing_metrics, '{}'::jsonb) AS metrics,
         NULLIF(raw.processing_metrics->>'websiteAttributionStartedAt', '')::timestamptz AS attribution_started_at,
@@ -123,7 +123,7 @@ export function buildWebsiteRecoveryAttributionQuery(input: WebsiteRecoveryAttri
         AND campaign.workspace_id = ${input.workspaceId}::uuid
     ),
     candidate_contact_points AS (
-      SELECT scope.window, scope.raw_id, contact_point.id AS contact_point_id,
+      SELECT scope.period_name, scope.raw_id, contact_point.id AS contact_point_id,
         contact_point.verification_status,
         membership.stage AS membership_stage,
         membership.selected_contact_point_id,
@@ -173,7 +173,7 @@ export function buildWebsiteRecoveryAttributionQuery(input: WebsiteRecoveryAttri
         )
     ),
     candidate_contact_rollup AS (
-      SELECT window, raw_id,
+      SELECT period_name, raw_id,
         BOOL_OR(verification_status = 'valid') AS has_valid_email,
         BOOL_OR(verification_status IN ('invalid', 'disposable', 'bounced')) AS has_invalid_email,
         BOOL_OR(verification_status IN ('unknown', 'unverified')) AS has_pending_email,
@@ -195,10 +195,10 @@ export function buildWebsiteRecoveryAttributionQuery(input: WebsiteRecoveryAttri
           ELSE 'unattributed'
         END AS selected_email_source
       FROM candidate_contact_points
-      JOIN raw_scope scope_metrics USING (window, raw_id)
-      GROUP BY window, raw_id
+      JOIN raw_scope scope_metrics USING (period_name, raw_id)
+      GROUP BY period_name, raw_id
     )
-    SELECT scope.window, scope.engine_type AS engine,
+    SELECT scope.period_name AS window, scope.engine_type AS engine,
       COUNT(*)::int AS raw_rows,
       COUNT(*) FILTER (WHERE scope.metrics ? 'websiteOrigin'
         OR scope.metrics ? 'websiteRecoveryAttempted')::int AS recovery_telemetry_rows,
@@ -288,9 +288,9 @@ export function buildWebsiteRecoveryAttributionQuery(input: WebsiteRecoveryAttri
         AND scope.metrics->>'websiteOrigin' = 'recovered'
         AND contact_rollup.selected_email_source = 'unattributed')::int AS selected_email_unattributed
     FROM raw_scope scope
-    LEFT JOIN candidate_contact_rollup contact_rollup ON contact_rollup.window = scope.window
+    LEFT JOIN candidate_contact_rollup contact_rollup ON contact_rollup.period_name = scope.period_name
       AND contact_rollup.raw_id = scope.raw_id
-    GROUP BY scope.window, scope.engine_type
+    GROUP BY scope.period_name, scope.engine_type
   `;
 }
 

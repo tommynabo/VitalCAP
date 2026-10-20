@@ -43,6 +43,7 @@ describe("website recovery attribution SQL", () => {
     }));
 
     expect(query.sql).toContain("raw.processing_metrics->>'websiteOrigin' = 'recovered'");
+    expect(query.sql).not.toContain("SELECT window, raw_id");
     expect(query.sql).toContain("contact_point.created_at >= scope.attribution_started_at");
     expect(query.sql).toContain("contact_point.created_at <= scope.attribution_completed_at");
     expect(query.sql).toContain("membership.selected_contact_point_id = contact_point.id");
@@ -67,7 +68,7 @@ describe("website recovery attribution SQL", () => {
       targetProviderCampaignId: null,
       periods: [{ name: "rolling7d", start: new Date(0), end: new Date(60_000) }],
     }));
-    const projection = query.sql.slice(query.sql.lastIndexOf("SELECT scope.window"));
+    const projection = query.sql.slice(query.sql.lastIndexOf("SELECT scope.period_name AS window"));
 
     expect(projection).toContain("recovered_email_found");
     expect(projection).toContain("selected_email_deobfuscated");
