@@ -494,6 +494,12 @@ export async function findCandidateAccountMatches(
     .select()
     .from(accounts)
     .where(and(eq(accounts.workspaceId, workspaceId), or(...clauses)))
+    .orderBy(sql`CASE
+      WHEN ${incoming.normalizedDomain ?? null}::text IS NOT NULL AND ${accounts.normalizedDomain} = ${incoming.normalizedDomain ?? null} THEN 0
+      WHEN ${incoming.googlePlaceId ?? null}::text IS NOT NULL AND ${accounts.googlePlaceId} = ${incoming.googlePlaceId ?? null} THEN 1
+      WHEN ${incoming.normalizedPhone ?? null}::text IS NOT NULL AND ${accounts.normalizedPhone} = ${incoming.normalizedPhone ?? null} THEN 2
+      ELSE 3
+    END`)
     .limit(20);
 
   return rows.map((row) => ({
@@ -539,6 +545,80 @@ export type CanonicalAccountResolution =
   | { kind: "createNewAccount"; accountId: string }
   | { kind: "needsReview"; matchedAccountId: string | null; matchedSignal: string };
 
+export function selectCanonicalAccountMatch(
+  incoming: Omit<AccountIdentitySignals, "accountId">,
+  candidates: AccountIdentitySignals[],
+): CanonicalAccountResolution | null {
+  const domainMatches = incoming.normalizedDomain
+    ? candidates.filter((candidate) => candidate.normalizedDomain === incoming.normalizedDomain)
+    : [];
+  if (domainMatches.length === 1) {
+    return {
+      kind: "existingAccount",
+      existingAccountId: domainMatches[0]!.accountId,
+      matchedSignal: "normalized_domain",
+    };
+  }
+  if (domainMatches.length > 1) {
+    return { kind: "needsReview", matchedAccountId: null, matchedSignal: "ambiguous_normalized_domain" };
+  }
+
+  const decision = evaluateAccountDedup(incoming, candidates);
+  if (decision.action === "merge" && decision.matches[0]) {
+    return {
+      kind: "existingAccount",
+      existingAccountId: decision.matches[0].accountId,
+      matchedSignal: decision.matches[0].signal,
+    };
+  }
+  if (decision.action === "flag_for_review" && decision.matches[0]) {
+    return {
+      kind: "needsReview",
+      matchedAccountId: decision.matches[0].accountId,
+      matchedSignal: decision.matches[0].signal,
+    };
+  }
+  return null;
+}
+
+export function omitIdentityValuesOwnedByOtherAccounts<T extends Partial<InsertAccountInput>>(
+  accountId: string,
+  fields: T,
+  candidates: AccountIdentitySignals[],
+): T {
+  const safeFields = { ...fields };
+  for (const field of ["normalizedDomain", "googlePlaceId", "normalizedPhone"] as const) {
+    const value = safeFields[field];
+    if (value === null || value === undefined) continue;
+    if (candidates.some((candidate) => candidate.accountId !== accountId && candidate[field] === value)) {
+      delete safeFields[field];
+    }
+  }
+  return safeFields;
+}
+
+export function isNormalizedDomainUniqueViolation(error: unknown): boolean {
+  const seen = new Set<unknown>();
+  let current: unknown = error;
+  for (let depth = 0; depth < 5 && current && !seen.has(current); depth += 1) {
+    seen.add(current);
+    if (typeof current !== "object") return false;
+    const record = current as {
+      code?: unknown;
+      sqlState?: unknown;
+      constraint?: unknown;
+      constraint_name?: unknown;
+      constraintName?: unknown;
+      cause?: unknown;
+    };
+    const code = record.sqlState ?? record.code;
+    const constraint = record.constraintName ?? record.constraint_name ?? record.constraint;
+    if (code === "23505" && constraint === "uq_accounts_normalized_domain") return true;
+    current = record.cause;
+  }
+  return false;
+}
+
 /**
  * Resolves and, when safe, creates an account in one transaction. The
  * transaction-scoped workspace lock serializes the read/insert decision even
@@ -559,8 +639,8 @@ export async function resolveCanonicalAccount(
       SELECT
         a.id,
         CASE
-          WHEN ${incoming.googlePlaceId ?? null}::text IS NOT NULL AND a.google_place_id = ${incoming.googlePlaceId ?? null} THEN 'google_place_id'
           WHEN ${incoming.normalizedDomain ?? null}::text IS NOT NULL AND a.normalized_domain = ${incoming.normalizedDomain ?? null} THEN 'normalized_domain'
+          WHEN ${incoming.googlePlaceId ?? null}::text IS NOT NULL AND a.google_place_id = ${incoming.googlePlaceId ?? null} THEN 'google_place_id'
           WHEN ${incoming.normalizedPhone ?? null}::text IS NOT NULL AND a.normalized_phone = ${incoming.normalizedPhone ?? null} THEN 'normalized_phone'
           WHEN ${incoming.normalizedName}::text IS NOT NULL AND ${incoming.normalizedAddress ?? null}::text IS NOT NULL
             AND a.normalized_name = ${incoming.normalizedName} AND a.normalized_address = ${incoming.normalizedAddress ?? null} THEN 'name_address'
@@ -599,8 +679,8 @@ export async function resolveCanonicalAccount(
         count(*) OVER (PARTITION BY matched_signal) AS signal_match_count
       FROM match_candidates
       ORDER BY CASE
-        WHEN matched_signal = 'google_place_id' THEN 1
-        WHEN matched_signal = 'normalized_domain' THEN 2
+        WHEN matched_signal = 'normalized_domain' THEN 1
+        WHEN matched_signal = 'google_place_id' THEN 2
         WHEN matched_signal = 'normalized_phone' THEN 3
         WHEN matched_signal = 'name_address' THEN 4
         WHEN matched_signal = 'name_postal_code' THEN 5
@@ -642,21 +722,8 @@ export async function resolveCanonicalAccount(
   const row = transactionResults[1]?.[0] as { resolution: string; account_id: string; matched_signal: string | null } | undefined;
   if (!row) {
     const concurrentCandidates = await findCandidateAccountMatches(workspaceId, incoming);
-    const concurrentDecision = evaluateAccountDedup(incoming, concurrentCandidates);
-    if (concurrentDecision.action === "merge" && concurrentDecision.matches[0]) {
-      return {
-        kind: "existingAccount",
-        existingAccountId: concurrentDecision.matches[0].accountId,
-        matchedSignal: concurrentDecision.matches[0].signal,
-      };
-    }
-    if (concurrentDecision.action === "flag_for_review" && concurrentDecision.matches[0]) {
-      return {
-        kind: "needsReview",
-        matchedAccountId: concurrentDecision.matches[0].accountId,
-        matchedSignal: concurrentDecision.matches[0].signal,
-      };
-    }
+    const concurrentResolution = selectCanonicalAccountMatch(incoming, concurrentCandidates);
+    if (concurrentResolution) return concurrentResolution;
     throw new Error("Canonical account insert conflicted but no matching account could be resolved; retry processing.");
   }
   if (row.resolution === "createNewAccount") return { kind: "createNewAccount", accountId: row.account_id };

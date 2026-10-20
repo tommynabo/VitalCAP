@@ -25,6 +25,8 @@ const mocks = vi.hoisted(() => ({
   markRawCandidateProcessed: vi.fn(),
   updateRawCandidateAccountId: vi.fn(),
   findCandidateAccountMatches: vi.fn(),
+  isNormalizedDomainUniqueViolation: vi.fn(),
+  omitIdentityValuesOwnedByOtherAccounts: vi.fn(),
   resolveCanonicalAccount: vi.fn(),
   getAccountById: vi.fn(),
   updateAccountFields: vi.fn(),
@@ -77,6 +79,8 @@ vi.mock("@/infrastructure/neon/repositories/campaigns", () => ({
 
 vi.mock("@/infrastructure/neon/repositories/accounts", () => ({
   findCandidateAccountMatches: mocks.findCandidateAccountMatches,
+  isNormalizedDomainUniqueViolation: mocks.isNormalizedDomainUniqueViolation,
+  omitIdentityValuesOwnedByOtherAccounts: mocks.omitIdentityValuesOwnedByOtherAccounts,
   resolveCanonicalAccount: mocks.resolveCanonicalAccount,
   getAccountById: mocks.getAccountById,
   updateAccountFields: mocks.updateAccountFields,
@@ -294,6 +298,17 @@ beforeEach(() => {
   mocks.markRawCandidateProcessed.mockResolvedValue(undefined);
   mocks.updateRawCandidateAccountId.mockResolvedValue(undefined);
   mocks.findCandidateAccountMatches.mockResolvedValue([]);
+  mocks.isNormalizedDomainUniqueViolation.mockImplementation((error: unknown) => {
+    const record = error as { code?: string; constraint?: string };
+    return record?.code === "23505" && record.constraint === "uq_accounts_normalized_domain";
+  });
+  mocks.omitIdentityValuesOwnedByOtherAccounts.mockImplementation((accountId: string, fields: Record<string, unknown>, candidates: Array<Record<string, unknown>>) => {
+    const safeFields = { ...fields };
+    for (const field of ["normalizedDomain", "googlePlaceId", "normalizedPhone"]) {
+      if (candidates.some((candidate) => candidate.accountId !== accountId && candidate[field] === safeFields[field])) delete safeFields[field];
+    }
+    return safeFields;
+  });
   mocks.resolveCanonicalAccount.mockResolvedValue({ kind: "createNewAccount", accountId: "account-id" });
   mocks.getAccountById.mockResolvedValue(null);
   mocks.updateAccountFields.mockResolvedValue(undefined);
@@ -438,6 +453,260 @@ describe("runProcessingCronTick", () => {
     expect(result.recoveryJobsEnqueued).toBe(2);
     expect(mocks.createSerpDiscoveryProvider).not.toHaveBeenCalled();
     expect("autoSendEnabled" in result).toBe(false);
+  });
+
+  it("replays a partially persisted raw through the domain owner without creating duplicate identities", async () => {
+    const placeIdOwner = {
+      accountId: "account-a",
+      normalizedName: "farmacia ejemplo",
+      googlePlaceId: "place-a",
+      normalizedDomain: null,
+      normalizedPhone: null,
+    };
+    const domainOwnerCandidate = {
+      accountId: "account-b",
+      normalizedName: "farmacia ejemplo",
+      googlePlaceId: null,
+      normalizedDomain: "farmacia-ejemplo.es",
+      normalizedPhone: null,
+    };
+    const domainOwner = {
+      id: "account-b",
+      workspaceId: "workspace-id",
+      normalizedName: "farmacia ejemplo",
+      googlePlaceId: null,
+      normalizedDomain: "farmacia-ejemplo.es",
+      normalizedPhone: null,
+      phone: null,
+      websiteUrl: "https://farmacia-ejemplo.es",
+      mapsUrl: null,
+      addressLine: null,
+      normalizedAddress: null,
+      city: null,
+      province: null,
+      postalCode: null,
+      latitude: null,
+      longitude: null,
+      rating: null,
+      reviewCount: null,
+      countryCode: "ES",
+      status: "discovered",
+    };
+    const raw = {
+      id: "raw-candidate-id",
+      accountId: null,
+      searchSeedRunId: null,
+      engineType: "maps_fast",
+      sourceExternalId: "place-a",
+      sourceUrl: "https://maps.example/place/place-a",
+      rawPayload: { kind: "maps", place: { ...mapsFastRecoveryPlace, externalPlaceId: "place-a", websiteUrl: null } },
+      processingMetrics: null,
+    };
+    mocks.getRawCandidateById.mockResolvedValue(raw);
+    mocks.getCampaignById.mockResolvedValue({ id: "campaign-id", workspaceId: "workspace-id" });
+    mocks.deriveIncomingIdentitySignals.mockReturnValue({
+      normalizedName: "farmacia ejemplo",
+      googlePlaceId: "place-a",
+      normalizedDomain: "farmacia-ejemplo.es",
+      normalizedPhone: null,
+    });
+    mocks.findCandidateAccountMatches.mockResolvedValue([placeIdOwner, domainOwnerCandidate]);
+    mocks.resolveCanonicalAccount.mockResolvedValue({ kind: "existingAccount", existingAccountId: "account-b", matchedSignal: "normalized_domain" });
+    mocks.getAccountById.mockResolvedValue(domainOwner);
+    mocks.processRawCandidate.mockResolvedValue({
+      engineType: "maps_fast",
+      accountKey: "domain:farmacia-ejemplo.es",
+      businessNameGuess: "Farmacia Ejemplo",
+      isDuplicate: false,
+      matchedAccountKey: null,
+      spainVerdict: "needs_review",
+      businessType: "pharmacy",
+      icpQualified: true,
+      contactPoints: [{
+        email: "info@farmacia-ejemplo.es",
+        label: "info",
+        isGeneric: true,
+        roleType: "generic_role",
+        priorityScore: 0,
+        verificationStatus: "unverified",
+        acceptable: false,
+        sourceUrl: "https://farmacia-ejemplo.es/contacto",
+        sourceType: "website",
+        verificationProvider: null,
+      }],
+      processingMetrics: { homepageFetchAttempted: 0, homepageFetchSucceeded: 0, homepageFetchFailed: 0, emailRejectedFormat: 0, emailDuplicate: 0 },
+      serperEmailRecovery: { candidatesFound: 0, candidatesRelevant: 0, duplicateCandidatesSkipped: 0 },
+      readyForOutreach: false,
+      rejectionReason: "Awaiting Spain evidence",
+    });
+    mocks.insertContactPointWithStatus
+      .mockResolvedValueOnce({ id: "contact-point-b", created: true, verificationStatus: "unverified" })
+      .mockResolvedValueOnce({ id: "contact-point-b", created: false, verificationStatus: "valid" });
+    const processJob = { ...makeJob("post-fix-recovery"), type: "process_raw_candidate" };
+    mocks.claimProcessingJobs
+      .mockResolvedValueOnce([processJob]).mockResolvedValueOnce([])
+      .mockResolvedValueOnce([{ ...processJob, id: "partial-retry" }]).mockResolvedValueOnce([]);
+
+    const firstAttempt = await runProcessingCronTick(1);
+    mocks.claimProcessingJobs.mockReset()
+      .mockResolvedValueOnce([{ ...processJob, id: "partial-retry" }])
+      .mockResolvedValueOnce([]);
+    const secondAttempt = await runProcessingCronTick(1);
+
+    expect(firstAttempt.jobsCompleted).toBe(1);
+    expect(secondAttempt.jobsCompleted).toBe(1);
+    expect(mocks.resolveCanonicalAccount).toHaveBeenCalledTimes(2);
+    expect(mocks.resolveCanonicalAccount).toHaveBeenCalledWith("workspace-id", expect.objectContaining({ normalizedDomain: "farmacia-ejemplo.es" }), expect.any(Object), { allowCreate: true });
+    expect(mocks.updateAccountFields).toHaveBeenCalledTimes(2);
+    for (const [targetId, fields] of mocks.updateAccountFields.mock.calls) {
+      expect(targetId).toBe("account-b");
+      expect(fields).not.toHaveProperty("googlePlaceId");
+    }
+    expect(mocks.insertAccountSource).toHaveBeenCalledTimes(2);
+    expect(mocks.insertAccountSource).toHaveBeenCalledWith(expect.objectContaining({ accountId: "account-b" }));
+    expect(mocks.insertContactPointWithStatus).toHaveBeenCalledTimes(2);
+    expect(mocks.insertContactPointWithStatus).toHaveBeenCalledWith(expect.objectContaining({ accountId: "account-b" }));
+    expect(mocks.upsertCampaignMembership).toHaveBeenCalledTimes(2);
+    expect(mocks.upsertCampaignMembership).toHaveBeenCalledWith(expect.objectContaining({ accountId: "account-b" }));
+    expect(mocks.updateRawCandidateAccountId).toHaveBeenCalledTimes(2);
+    expect(mocks.updateRawCandidateAccountId).toHaveBeenCalledWith("raw-candidate-id", "account-b");
+    expect(mocks.failProcessingJob).not.toHaveBeenCalled();
+    expect(firstAttempt).not.toHaveProperty("autoSendEnabled");
+  });
+
+  it("re-resolves once after the exact normalized-domain unique race", async () => {
+    const placeIdOwner = { accountId: "account-a", normalizedName: "farmacia ejemplo", googlePlaceId: "place-a", normalizedDomain: null, normalizedPhone: null };
+    const domainOwnerCandidate = { accountId: "account-b", normalizedName: "farmacia ejemplo", googlePlaceId: null, normalizedDomain: "farmacia-ejemplo.es", normalizedPhone: null };
+    const makeAccount = (id: string, normalizedDomain: string | null, googlePlaceId: string | null) => ({
+      id,
+      workspaceId: "workspace-id",
+      phone: null,
+      normalizedPhone: null,
+      websiteUrl: null,
+      normalizedDomain,
+      googlePlaceId,
+      mapsUrl: null,
+      addressLine: null,
+      normalizedAddress: null,
+      city: null,
+      province: null,
+      postalCode: null,
+      latitude: null,
+      longitude: null,
+      rating: null,
+      reviewCount: null,
+      countryCode: "ES",
+      status: "discovered",
+    });
+    mocks.getRawCandidateById.mockResolvedValue({
+      id: "raw-candidate-id",
+      accountId: null,
+      searchSeedRunId: null,
+      engineType: "maps_fast",
+      rawPayload: { kind: "maps", place: { ...mapsFastRecoveryPlace, externalPlaceId: "place-a", websiteUrl: null } },
+      processingMetrics: null,
+    });
+    mocks.getCampaignById.mockResolvedValue({ id: "campaign-id", workspaceId: "workspace-id" });
+    mocks.deriveIncomingIdentitySignals.mockReturnValue({ normalizedName: "farmacia ejemplo", googlePlaceId: "place-a", normalizedDomain: "farmacia-ejemplo.es" });
+    mocks.findCandidateAccountMatches
+      .mockResolvedValueOnce([placeIdOwner])
+      .mockResolvedValueOnce([placeIdOwner, domainOwnerCandidate]);
+    mocks.resolveCanonicalAccount
+      .mockResolvedValueOnce({ kind: "existingAccount", existingAccountId: "account-a", matchedSignal: "google_place_id" })
+      .mockResolvedValueOnce({ kind: "existingAccount", existingAccountId: "account-b", matchedSignal: "normalized_domain" });
+    mocks.getAccountById.mockResolvedValueOnce(makeAccount("account-a", null, "place-a"))
+      .mockResolvedValueOnce(makeAccount("account-b", "farmacia-ejemplo.es", null));
+    const conflict = Object.assign(new Error("duplicate key"), { code: "23505", constraint: "uq_accounts_normalized_domain" });
+    mocks.updateAccountFields.mockRejectedValueOnce(conflict).mockResolvedValueOnce(undefined);
+    mocks.getRawCandidateById.mockResolvedValue({
+      id: "raw-candidate-id", accountId: null, searchSeedRunId: null, engineType: "maps_fast",
+      sourceExternalId: "place-a", sourceUrl: null,
+      rawPayload: { kind: "maps", place: { ...mapsFastRecoveryPlace, externalPlaceId: "place-a", websiteUrl: null } }, processingMetrics: null,
+    });
+    mocks.claimProcessingJobs.mockResolvedValueOnce([{ ...makeJob("domain-race"), type: "process_raw_candidate" }]).mockResolvedValueOnce([]);
+
+    await runProcessingCronTick(1);
+
+    expect(mocks.resolveCanonicalAccount).toHaveBeenCalledTimes(2);
+    expect(mocks.resolveCanonicalAccount).toHaveBeenLastCalledWith("workspace-id", expect.objectContaining({ normalizedDomain: "farmacia-ejemplo.es" }), expect.any(Object), { allowCreate: false });
+    expect(mocks.updateAccountFields).toHaveBeenCalledTimes(2);
+    expect(mocks.updateAccountFields.mock.calls[0]?.[0]).toBe("account-a");
+    expect(mocks.updateAccountFields.mock.calls[1]?.[0]).toBe("account-b");
+    expect(mocks.updateAccountFields.mock.calls[1]?.[1]).not.toHaveProperty("googlePlaceId");
+    expect(mocks.updateRawCandidateAccountId).toHaveBeenCalledWith("raw-candidate-id", "account-b");
+    expect(mocks.failProcessingJob).not.toHaveBeenCalled();
+    expect(mocks.completeProcessingJob).toHaveBeenCalledOnce();
+  });
+
+  it("does not swallow unrelated unique violations or retry canonical resolution", async () => {
+    const placeIdOwner = { accountId: "account-a", normalizedName: "farmacia ejemplo", googlePlaceId: "place-a", normalizedDomain: null, normalizedPhone: null };
+    mocks.getRawCandidateById.mockResolvedValue({
+      id: "raw-candidate-id", accountId: null, searchSeedRunId: null, engineType: "maps_fast",
+      rawPayload: { kind: "maps", place: { ...mapsFastRecoveryPlace, externalPlaceId: "place-a", websiteUrl: null } }, processingMetrics: null,
+    });
+    mocks.getCampaignById.mockResolvedValue({ id: "campaign-id", workspaceId: "workspace-id" });
+    mocks.deriveIncomingIdentitySignals.mockReturnValue({ normalizedName: "farmacia ejemplo", googlePlaceId: "place-a", normalizedDomain: "farmacia-ejemplo.es" });
+    mocks.findCandidateAccountMatches.mockResolvedValue([placeIdOwner]);
+    mocks.resolveCanonicalAccount.mockResolvedValue({ kind: "existingAccount", existingAccountId: "account-a", matchedSignal: "google_place_id" });
+    mocks.getAccountById.mockResolvedValue({
+      id: "account-a", workspaceId: "workspace-id", phone: null, normalizedPhone: null, websiteUrl: null,
+      normalizedDomain: null, googlePlaceId: "place-a", mapsUrl: null, addressLine: null, normalizedAddress: null,
+      city: null, province: null, postalCode: null, latitude: null, longitude: null, rating: null, reviewCount: null,
+      countryCode: "ES", status: "discovered",
+    });
+    const conflict = Object.assign(new Error("different unique conflict"), { code: "23505", constraint: "uq_accounts_place_id" });
+    mocks.updateAccountFields.mockRejectedValueOnce(conflict);
+    mocks.claimProcessingJobs.mockResolvedValueOnce([{ ...makeJob("unrelated-conflict"), type: "process_raw_candidate" }]).mockResolvedValueOnce([]);
+
+    await runProcessingCronTick(1);
+
+    expect(mocks.resolveCanonicalAccount).toHaveBeenCalledOnce();
+    expect(mocks.updateAccountFields).toHaveBeenCalledOnce();
+    expect(mocks.failProcessingJob).toHaveBeenCalledWith(expect.objectContaining({
+      error: conflict,
+      failureDiagnostics: {
+        stage: "UPDATE_ACCOUNT_FIELDS",
+        sqlState: "23505",
+        constraintName: "uq_accounts_place_id",
+        tableName: null,
+        errorClass: "Error",
+      },
+    }));
+    expect(mocks.updateRawCandidateAccountId).not.toHaveBeenCalled();
+    expect(mocks.completeProcessingJob).not.toHaveBeenCalled();
+  });
+
+  it("stops after one reconciliation when the exact domain collision repeats", async () => {
+    const placeIdOwner = { accountId: "account-a", normalizedName: "farmacia ejemplo", googlePlaceId: "place-a", normalizedDomain: null, normalizedPhone: null };
+    const domainOwnerCandidate = { accountId: "account-b", normalizedName: "farmacia ejemplo", googlePlaceId: null, normalizedDomain: "farmacia-ejemplo.es", normalizedPhone: null };
+    const makeAccount = (id: string, normalizedDomain: string | null, googlePlaceId: string | null) => ({
+      id, workspaceId: "workspace-id", phone: null, normalizedPhone: null, websiteUrl: null, normalizedDomain, googlePlaceId,
+      mapsUrl: null, addressLine: null, normalizedAddress: null, city: null, province: null, postalCode: null,
+      latitude: null, longitude: null, rating: null, reviewCount: null, countryCode: "ES", status: "discovered",
+    });
+    mocks.getRawCandidateById.mockResolvedValue({
+      id: "raw-candidate-id", accountId: null, searchSeedRunId: null, engineType: "maps_fast",
+      rawPayload: { kind: "maps", place: { ...mapsFastRecoveryPlace, externalPlaceId: "place-a", websiteUrl: null } }, processingMetrics: null,
+    });
+    mocks.getCampaignById.mockResolvedValue({ id: "campaign-id", workspaceId: "workspace-id" });
+    mocks.deriveIncomingIdentitySignals.mockReturnValue({ normalizedName: "farmacia ejemplo", googlePlaceId: "place-a", normalizedDomain: "farmacia-ejemplo.es" });
+    mocks.findCandidateAccountMatches.mockResolvedValue([placeIdOwner, domainOwnerCandidate]);
+    mocks.resolveCanonicalAccount
+      .mockResolvedValueOnce({ kind: "existingAccount", existingAccountId: "account-a", matchedSignal: "google_place_id" })
+      .mockResolvedValueOnce({ kind: "existingAccount", existingAccountId: "account-b", matchedSignal: "normalized_domain" });
+    mocks.getAccountById.mockResolvedValueOnce(makeAccount("account-a", null, "place-a"))
+      .mockResolvedValueOnce(makeAccount("account-b", "farmacia-ejemplo.es", null));
+    const conflict = Object.assign(new Error("duplicate key"), { code: "23505", constraint: "uq_accounts_normalized_domain" });
+    mocks.updateAccountFields.mockRejectedValueOnce(conflict).mockRejectedValueOnce(conflict);
+    mocks.claimProcessingJobs.mockResolvedValueOnce([{ ...makeJob("repeated-domain-race"), type: "process_raw_candidate" }]).mockResolvedValueOnce([]);
+
+    await runProcessingCronTick(1);
+
+    expect(mocks.resolveCanonicalAccount).toHaveBeenCalledTimes(2);
+    expect(mocks.updateAccountFields).toHaveBeenCalledTimes(2);
+    expect(mocks.failProcessingJob).toHaveBeenCalledWith(expect.objectContaining({ error: conflict }));
+    expect(mocks.updateRawCandidateAccountId).not.toHaveBeenCalled();
+    expect(mocks.completeProcessingJob).not.toHaveBeenCalled();
   });
 
   it("does not construct a Serper provider while Autopilot is paused", async () => {

@@ -12,6 +12,7 @@ const MAX_CLAIM_BATCH_SIZE = 100;
 export const MAX_RECOVERABLE_RAW_PROCESSING_ATTEMPTS = 1;
 export const MAX_RECOVERABLE_RAW_PROCESSING_JOBS_PER_TICK = 5;
 export const IDEMPOTENCY_PROBE_RECOVERY_VERSION = "idempotency_probe_v1";
+export const ACCOUNT_DOMAIN_FIX_RECOVERY_VERSION = "account_domain_fix_v1";
 
 export async function getCampaignQueueDepth(campaignId: string): Promise<number> {
   const db = getDb();
@@ -216,9 +217,87 @@ export function buildRecoverableRawProcessingJobsQuery(workspaceId: string, now:
       FROM diagnostic_recoverable
       ON CONFLICT DO NOTHING
       RETURNING id
+    ), account_domain_fix_recoverable AS MATERIALIZED (
+      SELECT raw.id AS raw_id, raw.campaign_id, legacy_source.payload
+      FROM raw_candidates raw
+      JOIN campaigns campaign ON campaign.id = raw.campaign_id
+        AND campaign.workspace_id = ${workspaceId}::uuid
+        AND campaign.status = 'active'
+      LEFT JOIN autopilot_settings settings ON settings.workspace_id = campaign.workspace_id
+      JOIN processing_jobs legacy_source ON legacy_source.type = 'process_raw_candidate'
+        AND legacy_source.payload->>'rawCandidateId' = raw.id::text
+        AND legacy_source.payload->>'recoveryAttempt' IS NULL
+        AND legacy_source.status = 'dead_letter'
+        AND legacy_source.attempt_count >= legacy_source.max_attempts
+      JOIN dead_letter_jobs legacy_dead_letter ON legacy_dead_letter.source_table = 'processing_jobs'
+        AND legacy_dead_letter.source_job_id = legacy_source.id
+      JOIN processing_jobs prior_recovery ON prior_recovery.type = 'process_raw_candidate'
+        AND prior_recovery.payload->>'rawCandidateId' = raw.id::text
+        AND prior_recovery.payload->>'recoveryAttempt' = '1'
+        AND prior_recovery.status = 'dead_letter'
+        AND prior_recovery.attempt_count >= prior_recovery.max_attempts
+      JOIN processing_jobs diagnostic_job ON diagnostic_job.type = 'process_raw_candidate'
+        AND diagnostic_job.payload->>'rawCandidateId' = raw.id::text
+        AND diagnostic_job.payload->>'recoveryAttempt' = '2'
+        AND diagnostic_job.payload->>'recoveryVersion' = ${IDEMPOTENCY_PROBE_RECOVERY_VERSION}::text
+        AND diagnostic_job.status = 'dead_letter'
+        AND diagnostic_job.attempt_count >= diagnostic_job.max_attempts
+      JOIN dead_letter_jobs diagnostic_dead_letter ON diagnostic_dead_letter.source_table = 'processing_jobs'
+        AND diagnostic_dead_letter.source_job_id = diagnostic_job.id
+      WHERE raw.processed = false
+        AND raw.engine_type = 'maps_fast'
+        AND raw.discovered_at >= (
+          date_trunc('day', ${nowIso}::timestamptz AT TIME ZONE COALESCE(settings.timezone, 'Europe/Madrid'))
+          AT TIME ZONE COALESCE(settings.timezone, 'Europe/Madrid')
+        )
+        AND raw.discovered_at <= ${nowIso}::timestamptz
+        AND legacy_dead_letter.payload #>> '{_vitalcapRecovery,disposition}' IS NULL
+        AND (
+          (legacy_source.last_error IS NOT NULL AND legacy_source.last_error !~* ${PERMANENT_JOB_ERROR_PATTERN})
+          OR (legacy_source.last_error IS NULL AND legacy_dead_letter.last_error ~* '^Max attempts exceeded via watchdog')
+        )
+        AND (
+          (diagnostic_dead_letter.payload #>> '{recoveryFailure,stage}' = 'UPDATE_ACCOUNT_FIELDS'
+            AND diagnostic_dead_letter.payload #>> '{recoveryFailure,sqlState}' = '23505'
+            AND diagnostic_dead_letter.payload #>> '{recoveryFailure,constraintName}' = 'uq_accounts_normalized_domain')
+          OR (diagnostic_dead_letter.payload #>> '{recoveryFailure,stage}' IS NULL
+            AND diagnostic_dead_letter.last_error ~* 'duplicate key value violates unique constraint'
+            AND diagnostic_dead_letter.last_error ~* 'uq_accounts_normalized_domain')
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM processing_jobs active_job
+          WHERE active_job.type = 'process_raw_candidate'
+            AND active_job.payload->>'rawCandidateId' = raw.id::text
+            AND active_job.status IN ('pending', 'processing')
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM processing_jobs account_domain_fix_job
+          WHERE account_domain_fix_job.type = 'process_raw_candidate'
+            AND account_domain_fix_job.payload->>'rawCandidateId' = raw.id::text
+            AND account_domain_fix_job.payload->>'recoveryVersion' = ${ACCOUNT_DOMAIN_FIX_RECOVERY_VERSION}::text
+        )
+      ORDER BY raw.discovered_at ASC, raw.id ASC
+      FOR UPDATE OF raw, legacy_source SKIP LOCKED
+      LIMIT GREATEST(${boundedLimit} - (SELECT COUNT(*) FROM inserted) - (SELECT COUNT(*) FROM diagnostic_inserted), 0)
+    ), account_domain_fix_inserted AS (
+      INSERT INTO processing_jobs (
+        campaign_id, type, payload, status, attempt_count, max_attempts, idempotency_key, next_attempt_at
+      )
+      SELECT campaign_id, 'process_raw_candidate',
+        payload || jsonb_build_object(
+          'recoveryAttempt', 3,
+          'recoveryVersion', ${ACCOUNT_DOMAIN_FIX_RECOVERY_VERSION}::text,
+          'recoveryDisposition', 'recoverable',
+          'skipMapsFastWebsiteRecovery', true
+        ),
+        'pending', 0, ${MAX_RECOVERABLE_RAW_PROCESSING_ATTEMPTS},
+        'raw_candidate_recovery:' || raw_id::text || ':' || ${ACCOUNT_DOMAIN_FIX_RECOVERY_VERSION}::text, ${nowIso}::timestamptz
+      FROM account_domain_fix_recoverable
+      ON CONFLICT DO NOTHING
+      RETURNING id
     )
-    SELECT ((SELECT COUNT(*) FROM recoverable) + (SELECT COUNT(*) FROM diagnostic_recoverable))::int AS candidates_found,
-      ((SELECT COUNT(*) FROM inserted) + (SELECT COUNT(*) FROM diagnostic_inserted))::int AS jobs_enqueued;
+    SELECT ((SELECT COUNT(*) FROM recoverable) + (SELECT COUNT(*) FROM diagnostic_recoverable) + (SELECT COUNT(*) FROM account_domain_fix_recoverable))::int AS candidates_found,
+      ((SELECT COUNT(*) FROM inserted) + (SELECT COUNT(*) FROM diagnostic_inserted) + (SELECT COUNT(*) FROM account_domain_fix_inserted))::int AS jobs_enqueued;
   `;
 }
 
@@ -576,13 +655,28 @@ export interface FailJobOptions {
   maxAttempts?: number;
 }
 
+export interface ProcessingFailureDiagnostics {
+  stage: string;
+  sqlState: string | null;
+  constraintName: string | null;
+  tableName: string | null;
+  errorClass: string;
+}
+
 export interface FailJobInput {
   workerId: string;
   job: FailableJob;
   error: unknown;
+  failureDiagnostics?: ProcessingFailureDiagnostics;
   classification?: JobFailureClassification;
   now?: Date;
   options?: FailJobOptions;
+}
+
+export function buildRecoveryFailureMetadataSql(diagnostics?: ProcessingFailureDiagnostics) {
+  return diagnostics
+    ? sql`jsonb_build_object('recoveryFailure', ${JSON.stringify(diagnostics)}::jsonb)`
+    : sql`'{}'::jsonb`;
 }
 
 async function fail(table: QueueTable, input: FailJobInput): Promise<void> {
@@ -606,6 +700,7 @@ async function fail(table: QueueTable, input: FailJobInput): Promise<void> {
   const deadLetter = classification === "permanent" || input.job.attemptCount >= maxAttempts;
 
   if (deadLetter) {
+    const failureDiagnosticsPayload = buildRecoveryFailureMetadataSql(input.failureDiagnostics);
     const query = table === "discovery_jobs" 
       ? sql`
         WITH moved AS (
@@ -647,7 +742,7 @@ async function fail(table: QueueTable, input: FailJobInput): Promise<void> {
             'classification', ${classification},
             'disposition', ${recoveryDisposition},
             'reason', ${recoveryReason}
-          )),
+          )) || ${failureDiagnosticsPayload},
           attempt_count, ${message}, ${nowIso}::timestamptz
         FROM moved
         ON CONFLICT (source_table, source_job_id) DO NOTHING

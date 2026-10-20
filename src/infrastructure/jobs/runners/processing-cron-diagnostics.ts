@@ -30,6 +30,16 @@ export interface ProcessingCronDiagnosticsContext {
   reportedErrors: Set<unknown>;
 }
 
+export interface ProcessingJobFailureMetadata {
+  stage: ProcessingWriteStage;
+  sqlState: string | null;
+  constraintName: string | null;
+  tableName: string | null;
+  errorClass: string;
+}
+
+const processingJobFailures = new WeakMap<object, ProcessingJobFailureMetadata>();
+
 export function createProcessingCronDiagnosticsContext(correlationId: string): ProcessingCronDiagnosticsContext {
   return { correlationId, startedAtMs: Date.now(), reportedErrors: new Set() };
 }
@@ -81,6 +91,10 @@ function safePostgresMetadata(error: unknown): { sqlState: string | null; constr
   return { sqlState, constraintName, tableName };
 }
 
+export function getProcessingJobFailureMetadata(error: unknown): ProcessingJobFailureMetadata | null {
+  return error && typeof error === "object" ? processingJobFailures.get(error) ?? null : null;
+}
+
 export function logProcessingCronFailure(
   context: ProcessingCronDiagnosticsContext,
   stage: ProcessingCronStage,
@@ -106,6 +120,13 @@ export function logProcessingJobFailure(
   if (context.reportedErrors.has(error)) return;
   context.reportedErrors.add(error);
   const postgres = safePostgresMetadata(error);
+  if (typeof error === "object" && error !== null) {
+    processingJobFailures.set(error, {
+      stage,
+      ...postgres,
+      errorClass: safeErrorClass(error),
+    });
+  }
   logEvent("error", "processing_job_failed", {
     correlationId: context.correlationId,
     stage,

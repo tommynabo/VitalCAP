@@ -1,6 +1,6 @@
 import { PgDialect } from "drizzle-orm/pg-core";
 import { describe, expect, it } from "vitest";
-import { buildClaimJobsQuery, buildDeadLetterExpiredJobsQuery, buildDeferJobQuery, buildRequeueStaleLockedJobsQuery, buildRecoverableRawProcessingJobsQuery, IDEMPOTENCY_PROBE_RECOVERY_VERSION, MAX_RECOVERABLE_RAW_PROCESSING_ATTEMPTS, MAX_RECOVERABLE_RAW_PROCESSING_JOBS_PER_TICK } from "./job-queue";
+import { buildClaimJobsQuery, buildDeadLetterExpiredJobsQuery, buildDeferJobQuery, buildRecoveryFailureMetadataSql, buildRequeueStaleLockedJobsQuery, buildRecoverableRawProcessingJobsQuery, ACCOUNT_DOMAIN_FIX_RECOVERY_VERSION, IDEMPOTENCY_PROBE_RECOVERY_VERSION, MAX_RECOVERABLE_RAW_PROCESSING_ATTEMPTS, MAX_RECOVERABLE_RAW_PROCESSING_JOBS_PER_TICK } from "./job-queue";
 
 const dialect = new PgDialect();
 const claimTime = new Date("2026-10-18T09:00:00.000Z");
@@ -16,6 +16,25 @@ function buildDiscoveryClaimQuery(batchSize = 1) {
 }
 
 describe("job queue SQL builders", () => {
+  it("persists only the allowlisted processing failure metadata on dead-letter payloads", () => {
+    const query = dialect.sqlToQuery(buildRecoveryFailureMetadataSql({
+      stage: "UPDATE_ACCOUNT_FIELDS",
+      sqlState: "23505",
+      constraintName: "uq_accounts_normalized_domain",
+      tableName: "accounts",
+      errorClass: "Error",
+    }));
+
+    expect(query.sql).toBe("jsonb_build_object('recoveryFailure', $1::jsonb)");
+    expect(JSON.parse(String(query.params[0]))).toEqual({
+      stage: "UPDATE_ACCOUNT_FIELDS",
+      sqlState: "23505",
+      constraintName: "uq_accounts_normalized_domain",
+      tableName: "accounts",
+      errorClass: "Error",
+    });
+  });
+
   it("orders eligible recovery probes before other discovery jobs deterministically", () => {
     const query = buildDiscoveryClaimQuery();
     const orderClause = query.sql.slice(query.sql.indexOf("ORDER BY"), query.sql.indexOf("FOR UPDATE"));
@@ -150,6 +169,17 @@ describe("job queue SQL builders", () => {
       MAX_RECOVERABLE_RAW_PROCESSING_ATTEMPTS,
       IDEMPOTENCY_PROBE_RECOVERY_VERSION,
       now.toISOString(),
+      workspaceId,
+      IDEMPOTENCY_PROBE_RECOVERY_VERSION,
+      now.toISOString(),
+      now.toISOString(),
+      "invalid|not[_ ]?found|unauthorized|forbidden|bad[_ ]?request",
+      ACCOUNT_DOMAIN_FIX_RECOVERY_VERSION,
+      5,
+      ACCOUNT_DOMAIN_FIX_RECOVERY_VERSION,
+      MAX_RECOVERABLE_RAW_PROCESSING_ATTEMPTS,
+      ACCOUNT_DOMAIN_FIX_RECOVERY_VERSION,
+      now.toISOString(),
     ]);
     expect(query.sql).toContain("INSERT INTO processing_jobs");
     expect(query.sql).toContain("source_job.status = 'dead_letter'");
@@ -217,7 +247,10 @@ describe("job queue SQL builders", () => {
       query.sql.indexOf("diagnostic_recoverable AS MATERIALIZED"),
       query.sql.indexOf("diagnostic_inserted AS"),
     );
-    const diagnosticInsert = query.sql.slice(query.sql.indexOf("diagnostic_inserted AS"));
+    const diagnosticInsert = query.sql.slice(
+      query.sql.indexOf("diagnostic_inserted AS"),
+      query.sql.indexOf("account_domain_fix_recoverable AS MATERIALIZED"),
+    );
 
     expect(diagnosticSelection).toContain("active_job.status IN ('pending', 'processing')");
     expect(diagnosticSelection).toContain("diagnostic_job.payload->>'recoveryVersion' = $13::text");
@@ -226,8 +259,41 @@ describe("job queue SQL builders", () => {
     expect(diagnosticInsert).toContain("'pending', 0, $16");
     expect(diagnosticInsert).not.toContain("'recoveryAttempt', 3");
     expect(diagnosticInsert).toContain("raw_id::text || ':' || $17::text");
-    expect(query.params.filter((value) => value === IDEMPOTENCY_PROBE_RECOVERY_VERSION)).toHaveLength(3);
+    expect(query.params.filter((value) => value === IDEMPOTENCY_PROBE_RECOVERY_VERSION)).toHaveLength(4);
     expect(query.params[15]).toBe(MAX_RECOVERABLE_RAW_PROCESSING_ATTEMPTS);
+  });
+
+  it("enqueues account_domain_fix_v1 only for the exact failed diagnostic cohort", () => {
+    const query = dialect.sqlToQuery(buildRecoverableRawProcessingJobsQuery("workspace-1", claimTime, 5));
+    const fixSelection = query.sql.slice(
+      query.sql.indexOf("account_domain_fix_recoverable AS MATERIALIZED"),
+      query.sql.indexOf("account_domain_fix_inserted AS"),
+    );
+    const fixInsert = query.sql.slice(
+      query.sql.indexOf("account_domain_fix_inserted AS"),
+      query.sql.indexOf("SELECT ((SELECT COUNT(*) FROM recoverable)"),
+    );
+
+    expect(fixSelection).toContain("raw.processed = false");
+    expect(fixSelection).toContain("raw.engine_type = 'maps_fast'");
+    expect(fixSelection).toContain("legacy_source.payload->>'recoveryAttempt' IS NULL");
+    expect(fixSelection).toContain("diagnostic_job.payload->>'recoveryAttempt' = '2'");
+    expect(fixSelection).toContain("diagnostic_job.payload->>'recoveryVersion' = $20::text");
+    expect(fixSelection).toContain("diagnostic_dead_letter.payload #>> '{recoveryFailure,stage}' = 'UPDATE_ACCOUNT_FIELDS'");
+    expect(fixSelection).toContain("diagnostic_dead_letter.payload #>> '{recoveryFailure,sqlState}' = '23505'");
+    expect(fixSelection).toContain("diagnostic_dead_letter.payload #>> '{recoveryFailure,constraintName}' = 'uq_accounts_normalized_domain'");
+    expect(fixSelection).toContain("diagnostic_dead_letter.last_error ~* 'duplicate key value violates unique constraint'");
+    expect(fixSelection).toContain("diagnostic_dead_letter.last_error ~* 'uq_accounts_normalized_domain'");
+    expect(fixSelection).toContain("active_job.status IN ('pending', 'processing')");
+    expect(fixSelection).toContain("account_domain_fix_job.payload->>'recoveryVersion' = $24::text");
+    expect(fixSelection).toContain("LIMIT GREATEST($25 - (SELECT COUNT(*) FROM inserted) - (SELECT COUNT(*) FROM diagnostic_inserted), 0)");
+    expect(fixInsert).toContain("'recoveryAttempt', 3");
+    expect(fixInsert).toContain("'recoveryVersion', $26::text");
+    expect(fixInsert).toContain("raw_id::text || ':' || $28::text");
+    expect(fixInsert).not.toContain("'recoveryAttempt', 4");
+    expect(query.params.filter((value) => value === ACCOUNT_DOMAIN_FIX_RECOVERY_VERSION)).toHaveLength(3);
+    expect(query.sql).toContain("(SELECT COUNT(*) FROM diagnostic_recoverable) + (SELECT COUNT(*) FROM account_domain_fix_recoverable)");
+    expect(query.sql).toContain("(SELECT COUNT(*) FROM diagnostic_inserted) + (SELECT COUNT(*) FROM account_domain_fix_inserted)");
   });
 
   it("shares the five-job tick cap across normal and versioned recovery", () => {

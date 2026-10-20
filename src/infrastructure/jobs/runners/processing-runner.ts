@@ -24,6 +24,8 @@ import {
   insertContactPoint,
   insertContactPointWithStatus,
   resolveCanonicalAccount,
+  isNormalizedDomainUniqueViolation,
+  omitIdentityValuesOwnedByOtherAccounts,
   updateAccountFields,
   type InsertAccountInput,
 } from "@/infrastructure/neon/repositories/accounts";
@@ -45,6 +47,7 @@ import { buildMapsFastWebsiteRecoveryQuery, selectMapsFastRecoveredWebsite } fro
 import { createDeadlineSignal, DeadlineExceededError, raceWithAbort, runWithDeadlineSignal } from "@/lib/async/deadline";
 import {
   createProcessingCronDiagnosticsContext,
+  getProcessingJobFailureMetadata,
   runProcessingWriteStage,
   runProcessingCronStage,
 } from "./processing-cron-diagnostics";
@@ -409,6 +412,9 @@ async function executeProcessingJob(
   const accountIdentity = processed.recoveredWebsite
     ? { ...incoming, normalizedDomain: processed.recoveredWebsite.domain }
     : incoming;
+  const accountIdentityCandidates = accountIdentity.normalizedDomain === incoming.normalizedDomain
+    ? existingAccounts
+    : await findCandidateAccountMatches(campaign.workspaceId, accountIdentity);
   if (processed.recoveredWebsite) accountFields.websiteUrl = processed.recoveredWebsite.websiteUrl;
   const incomingAccountFields: IncomingAccountFields = {
     phone: accountFields.phone,
@@ -429,34 +435,35 @@ async function executeProcessingJob(
     countryCode: accountFields.countryCode,
   };
   const providerLabel = providerLabelForEngine(raw.engineType);
+  const canonicalAccountInput: InsertAccountInput = {
+    workspaceId: campaign.workspaceId,
+    canonicalName: accountFields.canonicalName,
+    normalizedName: incoming.normalizedName,
+    businessType: processed.businessType,
+    countryCode: accountFields.countryCode,
+    region: null,
+    province: accountFields.province,
+    city: accountFields.city,
+    postalCode: accountFields.postalCode,
+    addressLine: accountFields.addressLine,
+    normalizedAddress: incoming.normalizedAddress ?? null,
+    latitude: accountFields.latitude,
+    longitude: accountFields.longitude,
+    phone: accountFields.phone,
+    normalizedPhone: incoming.normalizedPhone ?? null,
+    websiteUrl: accountFields.websiteUrl,
+    normalizedDomain: accountIdentity.normalizedDomain ?? null,
+    googlePlaceId: accountFields.googlePlaceId,
+    mapsUrl: accountFields.mapsUrl,
+    rating: accountFields.rating,
+    reviewCount: accountFields.reviewCount,
+    status: resolveAccountStatus(processed),
+  };
 
   const canonicalResolution = await runProcessingWriteStage(diagnostics, "RESOLVE_CANONICAL_ACCOUNT", () => resolveCanonicalAccount(
     campaign.workspaceId,
     accountIdentity,
-    {
-      workspaceId: campaign.workspaceId,
-      canonicalName: accountFields.canonicalName,
-      normalizedName: incoming.normalizedName,
-      businessType: processed.businessType,
-      countryCode: accountFields.countryCode,
-      region: null,
-      province: accountFields.province,
-      city: accountFields.city,
-      postalCode: accountFields.postalCode,
-      addressLine: accountFields.addressLine,
-      normalizedAddress: incoming.normalizedAddress ?? null,
-      latitude: accountFields.latitude,
-      longitude: accountFields.longitude,
-      phone: accountFields.phone,
-      normalizedPhone: incoming.normalizedPhone ?? null,
-      websiteUrl: accountFields.websiteUrl,
-      normalizedDomain: accountIdentity.normalizedDomain ?? null,
-      googlePlaceId: accountFields.googlePlaceId,
-      mapsUrl: accountFields.mapsUrl,
-      rating: accountFields.rating,
-      reviewCount: accountFields.reviewCount,
-      status: resolveAccountStatus(processed),
-    },
+    canonicalAccountInput,
     { allowCreate: raw.engineType !== "linkedin_owner" },
   ));
 
@@ -471,8 +478,38 @@ async function executeProcessingJob(
     accountId = canonicalResolution.existingAccountId;
     const existingAccount = await getAccountById(accountId);
     if (existingAccount) {
-      const missingFields = mergeMissingAccountFields(existingAccount, incomingAccountFields);
-      await runProcessingWriteStage(diagnostics, "UPDATE_ACCOUNT_FIELDS", () => updateAccountFields(accountId, missingFields));
+      const missingFields = omitIdentityValuesOwnedByOtherAccounts(
+        accountId,
+        mergeMissingAccountFields(existingAccount, incomingAccountFields),
+        accountIdentityCandidates,
+      );
+      if (Object.keys(missingFields).length > 0) {
+        await runProcessingWriteStage(diagnostics, "UPDATE_ACCOUNT_FIELDS", async () => {
+          try {
+            await updateAccountFields(accountId, missingFields);
+          } catch (error) {
+            if (!isNormalizedDomainUniqueViolation(error) || !accountIdentity.normalizedDomain) throw error;
+
+            const reconciled = await runProcessingWriteStage(diagnostics, "RESOLVE_CANONICAL_ACCOUNT", () =>
+              resolveCanonicalAccount(campaign.workspaceId, accountIdentity, canonicalAccountInput, { allowCreate: false }));
+            if (reconciled.kind !== "existingAccount" || reconciled.existingAccountId === accountId) throw error;
+
+            const domainOwnerId = reconciled.existingAccountId;
+            const domainOwner = await getAccountById(domainOwnerId);
+            if (!domainOwner || domainOwner.workspaceId !== campaign.workspaceId
+              || domainOwner.normalizedDomain !== accountIdentity.normalizedDomain) throw error;
+
+            const retryCandidates = await findCandidateAccountMatches(campaign.workspaceId, accountIdentity);
+            const retryFields = omitIdentityValuesOwnedByOtherAccounts(
+              domainOwnerId,
+              mergeMissingAccountFields(domainOwner, incomingAccountFields),
+              retryCandidates,
+            );
+            if (Object.keys(retryFields).length > 0) await updateAccountFields(domainOwnerId, retryFields);
+            accountId = domainOwnerId;
+          }
+        });
+      }
     }
     await runProcessingWriteStage(diagnostics, "INSERT_ACCOUNT_SOURCE", () => insertAccountSource({
       accountId,
@@ -964,7 +1001,13 @@ export async function runProcessingCronTick(
                 await deferProcessingJob({ jobId: job.id, workerId, nextAttemptAt: jobError.retryAt, reason: jobError.message });
               } else {
                 const failureTime = jobError instanceof DeadlineExceededError ? new Date() : now;
-                await failProcessingJob({ workerId, job, error: jobError, now: failureTime });
+                await failProcessingJob({
+                  workerId,
+                  job,
+                  error: jobError,
+                  now: failureTime,
+                  failureDiagnostics: getProcessingJobFailureMetadata(jobError) ?? undefined,
+                });
               }
             }
             const raw = await getRawCandidateById(job.payload.rawCandidateId);
