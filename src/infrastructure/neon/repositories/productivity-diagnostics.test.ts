@@ -96,6 +96,49 @@ afterEach(() => {
 });
 
 describe("getProductivityDiagnostics", () => {
+  it.each([
+    ["provider_runs", "FROM provider_runs run", 1],
+    ["unprocessed_raw", "today_raw AS", 2],
+    ["instantly_today", "eligible_candidates AS", 3],
+  ] as const)("identifies failures in the %s stage", async (stage, queryMarker, expectedCalls) => {
+    mocks.execute.mockImplementation(async (statement: Parameters<typeof dialect.sqlToQuery>[0]) => {
+      const query = dialect.sqlToQuery(statement).sql;
+      if (query.includes(queryMarker)) throw new Error("private SQL and contact@example.com");
+      if (query.includes("FROM autopilot_settings")) return { rows: [{ timezone: "Europe/Madrid" }] };
+      return { rows: [] };
+    });
+
+    await expect(getProductivityDiagnostics("workspace-1", new Date("2026-10-20T08:00:00.000Z")))
+      .rejects.toMatchObject({
+        stage,
+        sqlState: null,
+        errorClass: "Error",
+        message: "Productivity diagnostics query failed",
+      });
+    expect(mocks.execute).toHaveBeenCalledTimes(expectedCalls + 1);
+  });
+
+  it("captures a nested SQLSTATE without retaining the original error details", async () => {
+    const originalError = Object.assign(new Error("SELECT private.email FROM secret_table for contact@example.com"), {
+      cause: Object.assign(new Error("database failure"), { code: "42703" }),
+    });
+    mocks.execute.mockImplementation(async (statement: Parameters<typeof dialect.sqlToQuery>[0]) => {
+      const query = dialect.sqlToQuery(statement).sql;
+      if (query.includes("today_raw AS")) throw originalError;
+      if (query.includes("FROM autopilot_settings")) return { rows: [{ timezone: "Europe/Madrid" }] };
+      return { rows: [] };
+    });
+
+    const failure = await getProductivityDiagnostics("workspace-1", new Date("2026-10-20T08:00:00.000Z"))
+      .catch((error: unknown) => error);
+
+    expect(failure).toMatchObject({ stage: "unprocessed_raw", sqlState: "42703", errorClass: "Error" });
+    expect((failure as Error).message).toBe("Productivity diagnostics query failed");
+    expect(JSON.stringify(failure)).not.toContain("private.email");
+    expect(JSON.stringify(failure)).not.toContain("contact@example.com");
+    expect(JSON.stringify(failure)).not.toContain("secret_table");
+  });
+
   it("aggregates provider status, returned items, and unambiguous raw lineage", async () => {
     const diagnostics = await getProductivityDiagnostics("workspace-1", new Date("2026-10-20T08:00:00.000Z"));
 

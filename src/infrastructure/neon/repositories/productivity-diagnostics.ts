@@ -257,20 +257,72 @@ function classifyRequestToRawRootCause(providerRuns: ReturnType<typeof aggregate
   return providerRuns.requestToRawRootCause;
 }
 
+export type ProductivityDiagnosticsStage = "timezone" | "provider_runs" | "unprocessed_raw" | "instantly_today";
+
+export class ProductivityDiagnosticsStageError extends Error {
+  readonly stage: ProductivityDiagnosticsStage;
+  readonly sqlState: string | null;
+  readonly errorClass: string;
+
+  constructor(stage: ProductivityDiagnosticsStage, originalError: unknown) {
+    super("Productivity diagnostics query failed");
+    this.name = "ProductivityDiagnosticsStageError";
+    this.stage = stage;
+    this.sqlState = getSafeSqlState(originalError);
+    this.errorClass = getSafeErrorClass(originalError);
+  }
+}
+
+function getSafeSqlState(error: unknown): string | null {
+  const seen = new Set<object>();
+  let current = error;
+  while (current && typeof current === "object" && !seen.has(current)) {
+    seen.add(current);
+    const properties = current as { code?: unknown; sqlState?: unknown; sqlstate?: unknown; cause?: unknown };
+    for (const value of [properties.code, properties.sqlState, properties.sqlstate]) {
+      if (typeof value === "string" && /^[0-9A-Z]{5}$/.test(value)) return value;
+    }
+    current = properties.cause;
+  }
+  return null;
+}
+
+function getSafeErrorClass(error: unknown): string {
+  const seen = new Set<object>();
+  let current = error;
+  while (current && typeof current === "object" && !seen.has(current)) {
+    seen.add(current);
+    const name = Object.getPrototypeOf(current)?.constructor?.name;
+    if (typeof name === "string" && name !== "Error" && name !== "Object" && /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(name)) {
+      return name;
+    }
+    current = (current as { cause?: unknown }).cause;
+  }
+  return "Error";
+}
+
+async function runDiagnosticStage<T>(stage: ProductivityDiagnosticsStage, run: () => Promise<T>): Promise<T> {
+  try {
+    return await run();
+  } catch (error) {
+    throw new ProductivityDiagnosticsStageError(stage, error);
+  }
+}
+
 export async function getProductivityDiagnostics(workspaceId: string, now = new Date()) {
   const db = getDb();
-  const [settings] = await db.execute(sql`
-    SELECT COALESCE(timezone, 'Europe/Madrid') AS timezone
-    FROM autopilot_settings
-    WHERE workspace_id = ${workspaceId}::uuid
-    LIMIT 1
-  `).then((result) => result.rows as RawRow[]);
+  const settingsResult = await runDiagnosticStage("timezone", () => db.execute(sql`
+      SELECT COALESCE(timezone, 'Europe/Madrid') AS timezone
+      FROM autopilot_settings
+      WHERE workspace_id = ${workspaceId}::uuid
+      LIMIT 1
+    `));
+  const [settings] = settingsResult.rows as RawRow[];
   const timezone = typeof settings?.timezone === "string" ? settings.timezone : "Europe/Madrid";
   const dayBounds = getDayBounds(timezone, now);
   const providerCampaignId = getDeliveryEnv().INSTANTLY_CAMPAIGN_ID;
 
-  const [providerResult, unprocessedResult, instantlyResult] = await Promise.all([
-    db.execute(sql`
+  const providerResult = await runDiagnosticStage("provider_runs", () => db.execute(sql`
       WITH bounds AS (
         SELECT ${workspaceId}::uuid AS workspace_id,
           ${dayBounds.start.toISOString()}::timestamptz AS day_start,
@@ -322,8 +374,8 @@ export async function getProductivityDiagnostics(workspaceId: string, now = new 
       FROM run_scope run
       LEFT JOIN linked_by_run linked ON linked.provider_run_id = run.id
       GROUP BY run.provider, run.operation, run.engine_type, run.status
-    `),
-    db.execute(sql`
+    `));
+  const unprocessedResult = await runDiagnosticStage("unprocessed_raw", () => db.execute(sql`
       WITH bounds AS (
         SELECT ${workspaceId}::uuid AS workspace_id,
           ${dayBounds.start.toISOString()}::timestamptz AS day_start,
@@ -378,8 +430,8 @@ export async function getProductivityDiagnostics(workspaceId: string, now = new 
       CROSS JOIN bounds
       LEFT JOIN jobs_by_raw jobs ON jobs.raw_id = raw.id
       GROUP BY bounds.now_at
-    `),
-    db.execute(sql`
+    `));
+  const instantlyResult = await runDiagnosticStage("instantly_today", () => db.execute(sql`
       WITH eligible_candidates AS (
         ${buildInstantEligibleCandidatesQuery({
           providerCampaignId,
@@ -480,8 +532,7 @@ export async function getProductivityDiagnostics(workspaceId: string, now = new 
                 )
             )
         ) AS circuit_open
-    `),
-  ]);
+    `));
 
   const providerRuns = aggregateProviderRuns(providerResult.rows as RawRow[]);
   const unprocessedRaw = aggregateUnprocessedRaw((unprocessedResult.rows as RawRow[])[0]);
