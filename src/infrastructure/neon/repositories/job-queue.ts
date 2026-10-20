@@ -195,7 +195,7 @@ export function buildRecoverableRawProcessingJobsQuery(workspaceId: string, now:
           SELECT 1 FROM processing_jobs diagnostic_job
           WHERE diagnostic_job.type = 'process_raw_candidate'
             AND diagnostic_job.payload->>'rawCandidateId' = raw.id::text
-            AND diagnostic_job.payload->>'recoveryVersion' = ${IDEMPOTENCY_PROBE_RECOVERY_VERSION}
+            AND diagnostic_job.payload->>'recoveryVersion' = ${IDEMPOTENCY_PROBE_RECOVERY_VERSION}::text
         )
       ORDER BY raw.discovered_at ASC, raw.id ASC
       FOR UPDATE OF raw, legacy_source SKIP LOCKED
@@ -207,12 +207,12 @@ export function buildRecoverableRawProcessingJobsQuery(workspaceId: string, now:
       SELECT campaign_id, 'process_raw_candidate',
         payload || jsonb_build_object(
           'recoveryAttempt', 2,
-          'recoveryVersion', ${IDEMPOTENCY_PROBE_RECOVERY_VERSION},
+          'recoveryVersion', ${IDEMPOTENCY_PROBE_RECOVERY_VERSION}::text,
           'recoveryDisposition', 'recoverable',
           'skipMapsFastWebsiteRecovery', true
         ),
         'pending', 0, ${MAX_RECOVERABLE_RAW_PROCESSING_ATTEMPTS},
-        'raw_candidate_recovery:' || raw_id::text || ':' || ${IDEMPOTENCY_PROBE_RECOVERY_VERSION}, ${nowIso}::timestamptz
+        'raw_candidate_recovery:' || raw_id::text || ':' || ${IDEMPOTENCY_PROBE_RECOVERY_VERSION}::text, ${nowIso}::timestamptz
       FROM diagnostic_recoverable
       ON CONFLICT DO NOTHING
       RETURNING id

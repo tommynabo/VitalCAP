@@ -220,12 +220,12 @@ describe("job queue SQL builders", () => {
     const diagnosticInsert = query.sql.slice(query.sql.indexOf("diagnostic_inserted AS"));
 
     expect(diagnosticSelection).toContain("active_job.status IN ('pending', 'processing')");
-    expect(diagnosticSelection).toContain("diagnostic_job.payload->>'recoveryVersion' = $13");
-    expect(diagnosticInsert).toContain("'recoveryVersion', $15");
+    expect(diagnosticSelection).toContain("diagnostic_job.payload->>'recoveryVersion' = $13::text");
+    expect(diagnosticInsert).toContain("'recoveryVersion', $15::text");
     expect(diagnosticInsert).toContain("'recoveryAttempt', 2");
     expect(diagnosticInsert).toContain("'pending', 0, $16");
     expect(diagnosticInsert).not.toContain("'recoveryAttempt', 3");
-    expect(diagnosticInsert).toContain("raw_id::text || ':' || $17");
+    expect(diagnosticInsert).toContain("raw_id::text || ':' || $17::text");
     expect(query.params.filter((value) => value === IDEMPOTENCY_PROBE_RECOVERY_VERSION)).toHaveLength(3);
     expect(query.params[15]).toBe(MAX_RECOVERABLE_RAW_PROCESSING_ATTEMPTS);
   });
