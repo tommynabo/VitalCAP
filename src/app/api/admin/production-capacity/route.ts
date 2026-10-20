@@ -36,9 +36,12 @@ export async function GET(request: Request) {
         : {};
     const errorCode = [errorDetails.code, causeDetails.code, sourceErrorDetails.code]
       .find((code) => typeof code === "string" || typeof code === "number");
+    const errorPosition = [errorDetails.position, causeDetails.position, sourceErrorDetails.position]
+      .find((position) => typeof position === "string" || typeof position === "number");
     console.error("production_capacity_diagnostics_failed", {
       errorType: error instanceof Error ? error.name : typeof error,
       ...(typeof errorCode === "string" || typeof errorCode === "number" ? { errorCode } : {}),
+      ...(typeof errorPosition === "string" || typeof errorPosition === "number" ? { errorPosition } : {}),
     });
     return NextResponse.json({ error: "Production capacity diagnostics unavailable." }, { status: 500 });
   }
