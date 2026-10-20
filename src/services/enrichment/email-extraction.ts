@@ -9,6 +9,7 @@ export interface ExtractedEmail {
   email: string;
   sourceUrl: string;
   sourceType: "website" | "serper_snippet";
+  extractionMethod: "literal" | "deobfuscated";
   context: string;
   label: string;
   isGeneric: boolean;
@@ -141,6 +142,7 @@ export function extractCandidateEmailsWithDiagnostics(
       email: normalized,
       sourceUrl,
       sourceType,
+      extractionMethod: deobfuscated ? "deobfuscated" : "literal",
       context: contextAround(html, index, matchLength),
       label: local,
       isGeneric: GENERIC_LOCAL_PARTS.has(local),

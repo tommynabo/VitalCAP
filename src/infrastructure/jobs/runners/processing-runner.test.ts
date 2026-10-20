@@ -32,6 +32,7 @@ const mocks = vi.hoisted(() => ({
   enqueueVerificationJob: vi.fn(),
   getVerificationEnv: vi.fn(),
   deriveIncomingIdentitySignals: vi.fn(),
+  createInitialCandidateProcessingMetrics: vi.fn(),
   hasLinkedInEmployerAccount: vi.fn(),
   processRawCandidate: vi.fn(),
   enrichWebsite: vi.fn(),
@@ -93,6 +94,7 @@ vi.mock("@/infrastructure/providers/provider-factory", () => ({
 
 vi.mock("@/services/discovery/candidate-processor", () => ({
   deriveIncomingIdentitySignals: mocks.deriveIncomingIdentitySignals,
+  createInitialCandidateProcessingMetrics: mocks.createInitialCandidateProcessingMetrics,
   hasLinkedInEmployerAccount: mocks.hasLinkedInEmployerAccount,
   processRawCandidate: mocks.processRawCandidate,
 }));
@@ -256,6 +258,15 @@ beforeEach(() => {
     normalizedDomain: "farmacia-ejemplo.es",
   });
   mocks.hasLinkedInEmployerAccount.mockReturnValue(true);
+  mocks.createInitialCandidateProcessingMetrics.mockReturnValue({
+    homepageFetchAttempted: 0,
+    homepageFetchSucceeded: 0,
+    homepageFetchFailed: 0,
+    emailRejectedFormat: 0,
+    emailDuplicate: 0,
+    websiteOrigin: "none",
+    websiteEmailAttributionComplete: true,
+  });
   mocks.processRawCandidate.mockResolvedValue({
     engineType: "maps_fast",
     accountKey: "domain:farmacia-ejemplo.es",
@@ -377,6 +388,98 @@ describe("runProcessingCronTick", () => {
       rawSnapshot: expect.objectContaining({ kind: "maps_fast_website_recovery", provider: "serper" }),
     }));
     expect(mocks.getWebsiteEnrichmentStatus).toHaveBeenCalledWith("account-id", "farmacia-ejemplo.es");
+  });
+
+  it("persists recovered deep-fetch attribution separately from the candidate homepage fetch", async () => {
+    prepareMapsFastRecoveryJob({
+      processingMetrics: {
+        homepageFetchAttempted: 1,
+        homepageFetchSucceeded: 1,
+        homepageFetchFailed: 0,
+        emailRejectedFormat: 0,
+        emailDuplicate: 0,
+        websiteOrigin: "recovered",
+        websiteRecoveryStatus: "succeeded",
+        websiteRecoveryAttempted: 1,
+        websiteRecoverySucceeded: 1,
+        websiteRecoveryFailed: 0,
+        recoveredWebsiteDomain: recoveredWebsite.domain,
+        recoveredWebsiteUrl: recoveredWebsite.websiteUrl,
+        recoveredWebsiteFetchAttempted: 1,
+        recoveredWebsiteFetchSucceeded: 1,
+        recoveredWebsiteFetchFailed: 0,
+        websiteAttributionStartedAt: "2026-10-20T08:00:00.000Z",
+        websiteEmailAttributionComplete: true,
+      },
+    });
+    const search = vi.fn().mockResolvedValue({
+      results: [recoveredWebsite.evidence],
+      usage: { calls: 1, items: 1, errors: 0, totalLatencyMs: 10, costUsd: 0.001, quotaRemaining: null },
+    });
+    mocks.createSerpDiscoveryProvider.mockReturnValue({ providerName: "serper", search });
+
+    await runProcessingCronTick(1);
+
+    expect(mocks.markRawCandidateProcessed).toHaveBeenCalledWith("raw-candidate-id", expect.objectContaining({
+      websiteOrigin: "recovered",
+      homepageFetchSucceeded: 1,
+      recoveredWebsiteFetchAttempted: 1,
+      recoveredWebsiteFetchSucceeded: 1,
+      recoveredWebsiteFetchFailed: 0,
+      recoveredWebsiteEnrichmentFetchAttempted: 1,
+      recoveredWebsiteEnrichmentFetchSucceeded: 1,
+      recoveredWebsiteEnrichmentFetchFailed: 0,
+      websiteAttributionCompletedAt: expect.any(String),
+    }));
+  });
+
+  it("marks a recovered candidate incomplete when its email contact point already existed", async () => {
+    prepareMapsFastRecoveryJob({
+      processingMetrics: {
+        homepageFetchAttempted: 1,
+        homepageFetchSucceeded: 1,
+        homepageFetchFailed: 0,
+        emailRejectedFormat: 0,
+        emailDuplicate: 0,
+        websiteOrigin: "recovered",
+        websiteRecoveryStatus: "succeeded",
+        websiteRecoveryAttempted: 1,
+        websiteRecoverySucceeded: 1,
+        websiteRecoveryFailed: 0,
+        recoveredWebsiteDomain: recoveredWebsite.domain,
+        recoveredWebsiteUrl: recoveredWebsite.websiteUrl,
+        recoveredWebsiteFetchAttempted: 1,
+        recoveredWebsiteFetchSucceeded: 1,
+        recoveredWebsiteFetchFailed: 0,
+        websiteEmailAttributionComplete: true,
+      },
+      contactPoints: [{
+        email: "info@farmacia-ejemplo.es",
+        label: "info",
+        isGeneric: true,
+        roleType: "generic_role",
+        priorityScore: 1,
+        verificationStatus: "valid",
+        acceptable: true,
+        sourceUrl: recoveredWebsite.websiteUrl,
+        sourceType: "website",
+        extractionMethod: "literal",
+        verificationProvider: "millionverifier",
+      }],
+    });
+    mocks.createSerpDiscoveryProvider.mockReturnValue({ providerName: "serper", search: vi.fn().mockResolvedValue({
+      results: [recoveredWebsite.evidence],
+      usage: { calls: 1, items: 1, errors: 0, totalLatencyMs: 10, costUsd: 0.001, quotaRemaining: null },
+    }) });
+    mocks.insertContactPointWithStatus.mockResolvedValueOnce({ id: "existing-contact-point", created: false, verificationStatus: "valid" });
+
+    await runProcessingCronTick(1);
+
+    expect(mocks.markRawCandidateProcessed).toHaveBeenCalledWith("raw-candidate-id", expect.objectContaining({
+      websiteContactPointDuplicates: 1,
+      websiteEmailAttributionComplete: false,
+      websiteEmailSource: "unattributed",
+    }));
   });
 
   it("stops claiming before the time budget and leaves later work retryable", async () => {

@@ -119,7 +119,12 @@ describe("processRawCandidate — maps candidates", () => {
     );
 
     expect(recoverMapsFastWebsite).not.toHaveBeenCalled();
-    expect(result.processingMetrics.websiteRecoveryAttempted).toBe(0);
+    expect(result.processingMetrics).toMatchObject({
+      websiteRecoveryAttempted: 0,
+      websiteRecoveryStatus: "not_needed",
+      websiteOrigin: "source",
+      recoveredWebsiteFetchAttempted: 0,
+    });
   });
 
   it("fetches a recovered Maps Fast site through normal website extraction with website provenance", async () => {
@@ -159,6 +164,14 @@ describe("processRawCandidate — maps candidates", () => {
       websiteRecoveryAttempted: 1,
       websiteRecoverySucceeded: 1,
       websiteRecoveryFailed: 0,
+      websiteOrigin: "recovered",
+      recoveredWebsiteDomain: "farmacia-ejemplo.es",
+      recoveredWebsiteFetchAttempted: 1,
+      recoveredWebsiteFetchSucceeded: 1,
+      recoveredWebsiteFetchFailed: 0,
+      websiteEmailsFound: 1,
+      emailExtractionLiteralFound: 0,
+      emailExtractionDeobfuscatedFound: 1,
       websiteRecoveryProvider: "serper",
       websiteEmailExtractionDeobfuscatedFound: 1,
     });
@@ -166,7 +179,100 @@ describe("processRawCandidate — maps candidates", () => {
       email: "info@farmacia-ejemplo.es",
       sourceType: "website",
       sourceUrl: "https://farmacia-ejemplo.es/",
+      extractionMethod: "deobfuscated",
     }));
+    expect(JSON.stringify(result.processingMetrics)).not.toContain("info@farmacia-ejemplo.es");
+  });
+
+  it("tracks a failed fetch against the recovered website, not the original source", async () => {
+    const website = {
+      domain: "farmacia-ejemplo.es",
+      websiteUrl: "https://farmacia-ejemplo.es/",
+      evidence: { title: "Farmacia Ejemplo", url: "https://farmacia-ejemplo.es", snippet: "Farmacia Ejemplo", domain: "farmacia-ejemplo.es" },
+    };
+    const result = await processRawCandidate(
+      mapsPayload(),
+      "maps_fast",
+      baseContext({
+        recoverMapsFastWebsite: vi.fn().mockResolvedValue({ status: "recovered", website }),
+        websiteFetcher: { fetchPage: vi.fn().mockRejectedValue(new Error("fetch failed")) },
+      }),
+    );
+
+    expect(result.processingMetrics).toMatchObject({
+      websiteOrigin: "recovered",
+      recoveredWebsiteDomain: "farmacia-ejemplo.es",
+      homepageFetchAttempted: 1,
+      homepageFetchSucceeded: 0,
+      homepageFetchFailed: 1,
+      recoveredWebsiteFetchAttempted: 1,
+      recoveredWebsiteFetchSucceeded: 0,
+      recoveredWebsiteFetchFailed: 1,
+    });
+  });
+
+  it("tracks a recovered literal email through valid verification", async () => {
+    const website = {
+      domain: "farmacia-ejemplo.es",
+      websiteUrl: "https://farmacia-ejemplo.es/",
+      evidence: { title: "Farmacia Ejemplo", url: "https://farmacia-ejemplo.es", snippet: "Farmacia Ejemplo", domain: "farmacia-ejemplo.es" },
+    };
+    const result = await processRawCandidate(
+      mapsPayload(),
+      "maps_fast",
+      baseContext({
+        recoverMapsFastWebsite: vi.fn().mockResolvedValue({ status: "recovered", website }),
+        websiteFetcher: fetcherReturning("<html>contacto@farmacia-ejemplo.es</html>"),
+      }),
+    );
+
+    expect(result.processingMetrics).toMatchObject({
+      websiteOrigin: "recovered",
+      websiteEmailSource: "literal",
+      emailExtractionLiteralFound: 1,
+      emailExtractionDeobfuscatedFound: 0,
+      websiteEmailsFound: 1,
+      websiteValidEmails: 1,
+      websiteEligible: 1,
+    });
+    expect(result.contactPoints).toContainEqual(expect.objectContaining({
+      sourceType: "website",
+      extractionMethod: "literal",
+      verificationStatus: "valid",
+    }));
+    expect(result.readyForOutreach).toBe(true);
+  });
+
+  it("does not infer recovered origin from legacy recovery status", async () => {
+    const result = await processRawCandidate(
+      mapsPayload(),
+      "maps_fast",
+      baseContext({
+        existingProcessingMetrics: {
+          homepageFetchAttempted: 1,
+          homepageFetchSucceeded: 1,
+          homepageFetchFailed: 0,
+          emailRejectedFormat: 0,
+          emailDuplicate: 0,
+          websiteRecoveryAttempted: 1,
+          websiteRecoverySucceeded: 1,
+          websiteRecoveryFailed: 0,
+          websiteRecoveryProvider: "serper",
+          websiteRecoveryStatus: "succeeded",
+          websiteRecoveryDomain: "farmacia-ejemplo.es",
+          websiteRecoveryUrl: "https://farmacia-ejemplo.es/",
+          websiteRecoveryEvidence: { title: "Farmacia Ejemplo", url: "https://farmacia-ejemplo.es", snippet: "Farmacia Ejemplo", domain: "farmacia-ejemplo.es" },
+        },
+      }),
+    );
+
+    expect(result.processingMetrics).toMatchObject({
+      websiteOrigin: "none",
+      recoveredWebsiteDomain: null,
+      websiteEmailAttributionComplete: false,
+      websiteRecoveryEvidence: null,
+    });
+    expect(result.recoveredWebsite?.evidence).toMatchObject({ title: "Farmacia Ejemplo", snippet: "Farmacia Ejemplo" });
   });
 
   it("keeps a no-result recovery on the ordinary no-email path", async () => {
@@ -180,7 +286,13 @@ describe("processRawCandidate — maps candidates", () => {
 
     expect(fetchPage).not.toHaveBeenCalled();
     expect(result.rejectionReason).toBe("no_email");
-    expect(result.processingMetrics).toMatchObject({ websiteRecoveryAttempted: 1, websiteRecoverySucceeded: 0, websiteRecoveryFailed: 1 });
+    expect(result.processingMetrics).toMatchObject({
+      websiteRecoveryAttempted: 1,
+      websiteRecoverySucceeded: 0,
+      websiteRecoveryFailed: 1,
+      websiteRecoveryStatus: "failed",
+      websiteOrigin: "none",
+    });
   });
 
   it("does not recover a duplicate whose matched account already has a domain", async () => {

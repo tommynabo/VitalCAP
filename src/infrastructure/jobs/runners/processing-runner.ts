@@ -29,7 +29,7 @@ import { createInMemoryVerificationCacheStore } from "@/services/verification/em
 import type { EmailVerificationProvider, WebsiteFetcher } from "@/domain/providers/types";
 import { enqueueVerificationJob } from "@/infrastructure/neon/repositories/verification-queue";
 import { getVerificationEnv } from "@/lib/config/env";
-import { processRawCandidate, deriveIncomingIdentitySignals, hasLinkedInEmployerAccount, type CandidateRawPayload, type ProcessedCandidateResult } from "@/services/discovery/candidate-processor";
+import { processRawCandidate, createInitialCandidateProcessingMetrics, deriveIncomingIdentitySignals, hasLinkedInEmployerAccount, type CandidateRawPayload, type ProcessedCandidateResult } from "@/services/discovery/candidate-processor";
 import { mergeMissingAccountFields, type IncomingAccountFields } from "@/services/accounts/account-enrichment-merge";
 import { realWebsiteFetcher, providerLabelForEngine } from "./engine-factory";
 import { WebsiteEnrichmentService, type WebsiteEvidenceFact } from "@/services/enrichment/website-enrichment-service";
@@ -87,6 +87,32 @@ function resolveMembershipStage(processed: ProcessedCandidateResult): { stage: C
   if (!processed.icpQualified) return { stage: "rejected", rejectionReason: processed.rejectionReason };
   if (processed.spainVerdict === "needs_review") return { stage: "discovered", rejectionReason: processed.rejectionReason };
   return { stage: "qualified", rejectionReason: processed.rejectionReason };
+}
+
+function mergeWebsiteEmailSource(
+  current: CandidateProcessingMetrics["websiteEmailSource"],
+  next: "literal" | "deobfuscated" | "other_enrichment",
+): NonNullable<CandidateProcessingMetrics["websiteEmailSource"]> {
+  if (current === "unattributed") return current;
+  if (!current || current === "none") return next;
+  if (current === "mixed") return current;
+  return current === next ? current : "mixed";
+}
+
+function updateRecoveredFetchSummary(metrics: CandidateProcessingMetrics): void {
+  if (metrics.websiteOrigin !== "recovered") return;
+  const attempted = (metrics.recoveredWebsiteFetchAttempted ?? 0) > 0
+    || (metrics.recoveredWebsiteEnrichmentFetchAttempted ?? 0) > 0;
+  const succeeded = (metrics.recoveredWebsiteFetchSucceeded ?? 0) > 0
+    || (metrics.recoveredWebsiteEnrichmentFetchSucceeded ?? 0) > 0;
+  metrics.recoveredWebsiteFetchAttempted = attempted ? 1 : 0;
+  metrics.recoveredWebsiteFetchSucceeded = succeeded ? 1 : 0;
+  metrics.recoveredWebsiteFetchFailed = attempted && !succeeded ? 1 : 0;
+}
+
+function finishWebsiteAttribution(metrics: CandidateProcessingMetrics): void {
+  updateRecoveredFetchSummary(metrics);
+  metrics.websiteAttributionCompletedAt = new Date().toISOString();
 }
 
 function uniqueLocationValue(
@@ -261,17 +287,9 @@ async function executeProcessingJob(
   const incoming = deriveIncomingIdentitySignals(payload);
   const existingAccounts = await findCandidateAccountMatches(campaign.workspaceId, incoming);
   if (!hasLinkedInEmployerAccount(payload, existingAccounts)) {
-    await markRawCandidateProcessed(raw.id, {
-      homepageFetchAttempted: 0,
-      homepageFetchSucceeded: 0,
-      homepageFetchFailed: 0,
-      emailRejectedFormat: 0,
-      emailDuplicate: 0,
-      websiteRecoveryAttempted: 0,
-      websiteRecoverySucceeded: 0,
-      websiteRecoveryFailed: 0,
-      websiteRecoveryProvider: null,
-    });
+    const processingMetrics = createInitialCandidateProcessingMetrics(raw.engineType, payload, raw.processingMetrics, new Date());
+    finishWebsiteAttribution(processingMetrics);
+    await markRawCandidateProcessed(raw.id, processingMetrics);
     return;
   }
 
@@ -315,6 +333,8 @@ async function executeProcessingJob(
           const website = selectMapsFastRecoveredWebsite(place, output.results);
           if (!website) {
             await updateRawCandidateProcessingMetrics(raw.id, {
+              websiteOrigin: "none",
+              websiteRecoverySource: "serper",
               websiteRecoveryAttempted: 1,
               websiteRecoverySucceeded: 0,
               websiteRecoveryFailed: 1,
@@ -325,6 +345,8 @@ async function executeProcessingJob(
           }
 
           await updateRawCandidateProcessingMetrics(raw.id, {
+            websiteOrigin: "recovered",
+            websiteRecoverySource: "serper",
             websiteRecoveryAttempted: 1,
             websiteRecoverySucceeded: 1,
             websiteRecoveryFailed: 0,
@@ -332,7 +354,9 @@ async function executeProcessingJob(
             websiteRecoveryStatus: "succeeded",
             websiteRecoveryDomain: website.domain,
             websiteRecoveryUrl: website.websiteUrl,
-            websiteRecoveryEvidence: website.evidence,
+            recoveredWebsiteDomain: website.domain,
+            recoveredWebsiteUrl: website.websiteUrl,
+            websiteRecoveryEvidence: null,
           });
           return { status: "recovered" as const, website };
         } catch (error) {
@@ -340,6 +364,8 @@ async function executeProcessingJob(
           if (error instanceof ProviderBudgetExceededError) {
             if (attemptClaimed) {
               await updateRawCandidateProcessingMetrics(raw.id, {
+                websiteOrigin: "none",
+                websiteRecoverySource: null,
                 websiteRecoveryAttempted: 0,
                 websiteRecoverySucceeded: 0,
                 websiteRecoveryFailed: 0,
@@ -351,6 +377,8 @@ async function executeProcessingJob(
           }
           if (!attemptClaimed || error instanceof ProviderDisabledError) return { status: "blocked" as const };
           await updateRawCandidateProcessingMetrics(raw.id, {
+            websiteOrigin: "none",
+            websiteRecoverySource: "serper",
             websiteRecoveryAttempted: 1,
             websiteRecoverySucceeded: 0,
             websiteRecoveryFailed: 1,
@@ -419,6 +447,7 @@ async function executeProcessingJob(
   );
 
   if (canonicalResolution.kind === "needsReview") {
+    finishWebsiteAttribution(processed.processingMetrics);
     await markRawCandidateProcessed(raw.id, processed.processingMetrics);
     return;
   }
@@ -480,6 +509,7 @@ async function executeProcessingJob(
     verificationQueued: 0,
   };
   const processingMetrics: CandidateProcessingMetrics = { ...processed.processingMetrics };
+  const currentWebsiteEmailFacts = new Map<string, WebsiteEvidenceFact>();
 
   // --- WEBSITE ENRICHMENT ---
   if (accountFields.websiteUrl && accountIdentity.normalizedDomain && options.enrichContacts !== false) {
@@ -494,6 +524,7 @@ async function executeProcessingJob(
 
     if (needsRefresh) {
       websiteRecoveryCounters.accountsAttempted += 1;
+      processingMetrics.websiteEnrichmentFetchAttempted = 1;
       const service = new WebsiteEnrichmentService(cachedFetcher);
       const result = await service.enrich({
         workspaceId: campaign.workspaceId,
@@ -504,8 +535,19 @@ async function executeProcessingJob(
       if (result.status !== "completed" && result.status !== "no_website") {
         websiteRecoveryCounters.fetchFailed += 1;
       }
+      processingMetrics.websiteEnrichmentFetchSucceeded = result.status === "completed" ? 1 : 0;
+      processingMetrics.websiteEnrichmentFetchFailed = result.status !== "completed" && result.status !== "no_website" ? 1 : 0;
+      if (processingMetrics.websiteOrigin === "recovered") {
+        processingMetrics.recoveredWebsiteEnrichmentFetchAttempted = 1;
+        processingMetrics.recoveredWebsiteEnrichmentFetchSucceeded = processingMetrics.websiteEnrichmentFetchSucceeded;
+        processingMetrics.recoveredWebsiteEnrichmentFetchFailed = processingMetrics.websiteEnrichmentFetchFailed;
+      }
       websiteRecoveryCounters.internalPagesFetched += result.internalPagesFetched ?? 0;
       websiteRecoveryCounters.emailCandidatesFound += result.emailCandidatesFound ?? 0;
+      processingMetrics.websiteEmailsFound = (processingMetrics.websiteEmailsFound ?? 0) + (result.emailCandidatesFound ?? 0);
+      processingMetrics.websiteEmailRejectedFormat = (processingMetrics.websiteEmailRejectedFormat ?? 0) + (result.emailRejectedFormat ?? 0);
+      processingMetrics.emailExtractionLiteralFound = (processingMetrics.emailExtractionLiteralFound ?? 0) + (result.emailExtractionLiteralFound ?? 0);
+      processingMetrics.emailExtractionDeobfuscatedFound = (processingMetrics.emailExtractionDeobfuscatedFound ?? 0) + (result.emailExtractionDeobfuscatedFound ?? 0);
       websiteRecoveryCounters.emailExtractionLiteralFound += result.emailExtractionLiteralFound ?? 0;
       websiteRecoveryCounters.emailExtractionDeobfuscatedFound += result.emailExtractionDeobfuscatedFound ?? 0;
       websiteRecoveryCounters.targetContactPagesFetched += result.targetContactPagesFetched ?? 0;
@@ -515,6 +557,11 @@ async function executeProcessingJob(
         (processingMetrics.websiteEmailExtractionDeobfuscatedFound ?? 0) + websiteRecoveryCounters.emailExtractionDeobfuscatedFound;
       processingMetrics.websiteTargetContactPagesFetched =
         (processingMetrics.websiteTargetContactPagesFetched ?? 0) + websiteRecoveryCounters.targetContactPagesFetched;
+      for (const fact of result.evidence) {
+        if (fact.evidenceType !== "email") continue;
+        const normalizedEmail = (fact.normalizedValue ?? fact.value).trim().toLowerCase();
+        if (normalizedEmail) currentWebsiteEmailFacts.set(normalizedEmail, fact);
+      }
 
       const nextRefreshAt = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000); // 30 days
       const failureBackoffMs = result.status === "timeout" || result.status === "transient_error"
@@ -626,6 +673,19 @@ async function executeProcessingJob(
         sourceUrl: fact.sourceUrl,
         sourceType: "website_enrichment",
       });
+      const currentEnrichmentFact = currentWebsiteEmailFacts.get(email);
+      if (currentEnrichmentFact) {
+        if (contactPoint.created) {
+          processingMetrics.websiteContactPointsCreated = (processingMetrics.websiteContactPointsCreated ?? 0) + 1;
+          processingMetrics.websiteEmailOtherEnrichmentFound = (processingMetrics.websiteEmailOtherEnrichmentFound ?? 0) + 1;
+          processingMetrics.websiteEmailSource = mergeWebsiteEmailSource(processingMetrics.websiteEmailSource, "other_enrichment");
+        } else {
+          processingMetrics.websiteContactPointDuplicates = (processingMetrics.websiteContactPointDuplicates ?? 0) + 1;
+          processingMetrics.websiteEmailAttributionComplete = false;
+          processingMetrics.websiteEmailSource = "unattributed";
+        }
+        currentWebsiteEmailFacts.delete(email);
+      }
       if (contactPoint.created) websiteRecoveryCounters.contactPointsCreated += 1;
       else processingMetrics.emailDuplicate += 1;
       if (contactPoint.id && (contactPoint.created || contactPoint.verificationStatus === "unverified")) {
@@ -677,6 +737,15 @@ async function executeProcessingJob(
       sourceUrl: contactPoint.sourceUrl,
       sourceType: contactPoint.sourceType,
     });
+    if (contactPoint.sourceType === "website") {
+      if (insertedContactPoint.created) {
+        processingMetrics.websiteContactPointsCreated = (processingMetrics.websiteContactPointsCreated ?? 0) + 1;
+      } else {
+        processingMetrics.websiteContactPointDuplicates = (processingMetrics.websiteContactPointDuplicates ?? 0) + 1;
+        processingMetrics.websiteEmailAttributionComplete = false;
+        processingMetrics.websiteEmailSource = "unattributed";
+      }
+    }
     if (!insertedContactPoint.created) processingMetrics.emailDuplicate += 1;
     if (contactPoint.sourceType === "serper_snippet") {
       if (insertedContactPoint.created) serperEmailDiagnostics.contactPointsCreated += 1;
@@ -735,6 +804,7 @@ async function executeProcessingJob(
   }
 
   await updateRawCandidateAccountId(raw.id, accountId);
+  finishWebsiteAttribution(processingMetrics);
   await markRawCandidateProcessed(raw.id, processingMetrics);
   if (raw.engineType === "maps_deep" && payload.kind === "maps" && incoming.normalizedDomain) {
     await enqueueProcessingJob({

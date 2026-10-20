@@ -19,6 +19,96 @@ export type ProductionPrimaryLossStage =
   | "ICP_FILTER_LOSS"
   | "OTHER";
 
+export type RecoveryPrimaryLossStage =
+  | "NO_WEBSITE_ORIGINAL"
+  | "RECOVERY_NOT_ATTEMPTED"
+  | "RECOVERY_FAILED"
+  | "RECOVERED_FETCH_FAILED"
+  | "RECOVERED_FETCH_SUCCEEDED_NO_EMAIL"
+  | "RECOVERED_EMAIL_INVALID"
+  | "RECOVERED_VALID_NOT_ELIGIBLE"
+  | "RECOVERED_ELIGIBLE_NOT_IMPORTED"
+  | "UNCLASSIFIED_DUE_TO_MISSING_TELEMETRY";
+
+export interface RecoveryAttributionCounts {
+  recoveryTelemetryCoveragePct: number | null;
+  recoveredFetchAttributionCoveragePct: number | null;
+  recoveredEmailAttributionCoveragePct: number | null;
+  recoveryAttempted: number;
+  recoverySucceeded: number;
+  recoveredFetchAttempted: number;
+  recoveredFetchSucceeded: number;
+  recoveredEmailFound: number;
+  recoveredValidEmail: number;
+  recoveredEligible: number;
+  recoveredImported: number;
+  minimumCoveragePct?: number;
+}
+
+function recoveryRate(numerator: number, denominator: number): number | null {
+  return denominator > 0 ? numerator / denominator : null;
+}
+
+export function calculateRecoveryAttributionRates(input: RecoveryAttributionCounts) {
+  const minimumCoveragePct = input.minimumCoveragePct ?? 95;
+  const coverageSufficient = input.recoveryTelemetryCoveragePct !== null
+    && input.recoveryTelemetryCoveragePct >= minimumCoveragePct
+    && input.recoveredFetchAttributionCoveragePct !== null
+    && input.recoveredFetchAttributionCoveragePct >= minimumCoveragePct
+    && input.recoveredEmailAttributionCoveragePct !== null
+    && input.recoveredEmailAttributionCoveragePct >= minimumCoveragePct;
+  const calculate = (numerator: number, denominator: number) =>
+    coverageSufficient ? recoveryRate(numerator, denominator) : null;
+
+  return {
+    recoverySuccessRate: calculate(input.recoverySucceeded, input.recoveryAttempted),
+    recoveredFetchSuccessRate: calculate(input.recoveredFetchSucceeded, input.recoveredFetchAttempted),
+    recoveredFetchToEmailRate: calculate(input.recoveredEmailFound, input.recoveredFetchSucceeded),
+    recoveredFetchToValidRate: calculate(input.recoveredValidEmail, input.recoveredFetchSucceeded),
+    recoveredValidToEligibleRate: calculate(input.recoveredEligible, input.recoveredValidEmail),
+    recoveredEligibleToImportRate: calculate(input.recoveredImported, input.recoveredEligible),
+  };
+}
+
+export function classifyRecoveryPrimaryLossStage(input: {
+  totalRows: number;
+  recoveryTelemetryCoveragePct: number | null;
+  recoveredFetchAttributionCoveragePct: number | null;
+  recoveredEmailAttributionCoveragePct: number | null;
+  minimumCoveragePct?: number;
+  noWebsiteOriginal: number;
+  recoveryNotAttempted: number;
+  recoveryFailed: number;
+  recoveredFetchFailed: number;
+  recoveredFetchSucceededNoEmail: number;
+  recoveredEmailInvalid: number;
+  recoveredValidNotEligible: number;
+  recoveredEligibleNotImported: number;
+}): RecoveryPrimaryLossStage | null {
+  const minimumCoveragePct = input.minimumCoveragePct ?? 95;
+  if (input.totalRows === 0 || input.recoveryTelemetryCoveragePct === null
+    || input.recoveryTelemetryCoveragePct < minimumCoveragePct
+    || input.recoveredFetchAttributionCoveragePct === null
+    || input.recoveredFetchAttributionCoveragePct < minimumCoveragePct
+    || input.recoveredEmailAttributionCoveragePct === null
+    || input.recoveredEmailAttributionCoveragePct < minimumCoveragePct) {
+    return "UNCLASSIFIED_DUE_TO_MISSING_TELEMETRY";
+  }
+
+  const losses: Array<{ stage: RecoveryPrimaryLossStage; count: number }> = [
+    { stage: "NO_WEBSITE_ORIGINAL", count: input.noWebsiteOriginal },
+    { stage: "RECOVERY_NOT_ATTEMPTED", count: input.recoveryNotAttempted },
+    { stage: "RECOVERY_FAILED", count: input.recoveryFailed },
+    { stage: "RECOVERED_FETCH_FAILED", count: input.recoveredFetchFailed },
+    { stage: "RECOVERED_FETCH_SUCCEEDED_NO_EMAIL", count: input.recoveredFetchSucceededNoEmail },
+    { stage: "RECOVERED_EMAIL_INVALID", count: input.recoveredEmailInvalid },
+    { stage: "RECOVERED_VALID_NOT_ELIGIBLE", count: input.recoveredValidNotEligible },
+    { stage: "RECOVERED_ELIGIBLE_NOT_IMPORTED", count: input.recoveredEligibleNotImported },
+  ];
+  const largest = losses.reduce((current, loss) => loss.count > current.count ? loss : current);
+  return largest.count > 0 ? largest.stage : null;
+}
+
 export function classifyProductionPrimaryLossStage(input: {
   rawCandidates: number;
   accountsLinked: number;

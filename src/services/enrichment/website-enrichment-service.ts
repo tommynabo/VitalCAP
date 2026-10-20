@@ -25,6 +25,7 @@ export interface WebsiteEvidenceFact {
   normalizedValue?: string;
   snippet: string | null;
   sourceUrl: string;
+  emailExtractionMethod?: "literal" | "deobfuscated";
   isGeneric?: boolean;
   isPersonalOrNamed?: boolean;
 }
@@ -35,6 +36,7 @@ export interface WebsiteEnrichmentResult {
   pagesFetched: number;
   internalPagesFetched: number;
   emailCandidatesFound: number;
+  emailRejectedFormat?: number;
   emailExtractionLiteralFound?: number;
   emailExtractionDeobfuscatedFound?: number;
   targetContactPagesFetched?: number;
@@ -565,6 +567,7 @@ export class WebsiteEnrichmentService {
     const seenEvidence = new Set<string>();
     let emailExtractionLiteralFound = 0;
     let emailExtractionDeobfuscatedFound = 0;
+    let emailRejectedFormat = 0;
 
     const addFact = (fact: WebsiteEvidenceFact) => {
       const provenanceKey = fact.evidenceType.startsWith("location_") ? `:${fact.sourceUrl}` : "";
@@ -584,6 +587,7 @@ export class WebsiteEnrichmentService {
       );
       emailExtractionLiteralFound += extraction.literalFound;
       emailExtractionDeobfuscatedFound += extraction.deobfuscatedFound;
+      emailRejectedFormat += extraction.rejectedFormat;
       for (const email of extraction.emails) {
         addFact({
           evidenceType: "email",
@@ -591,6 +595,7 @@ export class WebsiteEnrichmentService {
           normalizedValue: email.email,
           snippet: email.context,
           sourceUrl: page.url,
+          emailExtractionMethod: email.extractionMethod,
           isGeneric: email.isGeneric,
           isPersonalOrNamed: false, // Do not assume personhood just because it's not in the generic list
         });
@@ -621,6 +626,7 @@ export class WebsiteEnrichmentService {
       pagesFetched: pages.length,
       internalPagesFetched: Math.max(0, pages.length - 1),
       emailCandidatesFound: evidence.filter((fact) => fact.evidenceType === "email").length,
+      emailRejectedFormat,
       emailExtractionLiteralFound,
       emailExtractionDeobfuscatedFound,
       targetContactPagesFetched: pages.filter((page) => page.contactTarget).length,

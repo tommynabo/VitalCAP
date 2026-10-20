@@ -136,6 +136,12 @@ describe("WebsiteEnrichmentService", () => {
       "ventas@farmacia.es",
     ]);
     expect(emails.every((fact) => fact.sourceUrl === contactUrl)).toBe(true);
+    expect(Object.fromEntries(emails.map((fact) => [fact.value, fact.emailExtractionMethod]))).toEqual({
+      "info@farmacia.es": "deobfuscated",
+      "ventas@farmacia.es": "literal",
+      "hola@farmacia.es": "literal",
+      "pedidos@farmacia.es": "deobfuscated",
+    });
     expect(result.emailExtractionLiteralFound).toBe(2);
     expect(result.emailExtractionDeobfuscatedFound).toBe(2);
     expect(result.targetContactPagesFetched).toBe(1);

@@ -6,7 +6,7 @@ import { getDeliveryEnv, getMapsEnv, getSerperEnv, getVerificationEnv, getCoreEn
 import { getDayBounds } from "@/lib/time/day-bounds";
 import { emailChannelEligibilitySql } from "@/services/compliance/email-channel-policy";
 import { actualPriorColdOutreachSql } from "./actual-outreach";
-import { buildDeadLetterAggregateQuery } from "./production-capacity-diagnostics-sql";
+import { buildDeadLetterAggregateQuery, buildWebsiteRecoveryAttributionQuery } from "./production-capacity-diagnostics-sql";
 import { getDailyRawRequestCapSnapshot } from "./daily-raw-request-cap";
 import { getSystemHealthDiagnostics } from "./health-diagnostics";
 import { getDb } from "../db";
@@ -27,7 +27,12 @@ import {
   type CapacityWindow,
   type ConfirmedImportFact,
 } from "@/services/admin/production-capacity-metrics";
-import { calculateProductionPipelineRates, classifyProductionPrimaryLossStage } from "@/services/admin/production-pipeline-metrics";
+import {
+  calculateProductionPipelineRates,
+  calculateRecoveryAttributionRates,
+  classifyProductionPrimaryLossStage,
+  classifyRecoveryPrimaryLossStage,
+} from "@/services/admin/production-pipeline-metrics";
 import { evaluateProviderHealth } from "@/services/discovery/provider-health";
 
 type RawRow = Record<string, unknown>;
@@ -52,6 +57,119 @@ function roundCost(value: number): number {
   return Number(value.toFixed(6));
 }
 
+function percent(numerator: number, denominator: number): number | null {
+  return denominator > 0 ? Number((numerator * 100 / denominator).toFixed(2)) : null;
+}
+
+const RECOVERY_AGGREGATE_FIELDS = [
+  "raw_rows",
+  "recovery_telemetry_rows",
+  "recovery_telemetry_complete_rows",
+  "recovered_fetch_attribution_complete_rows",
+  "recovered_email_attribution_complete_rows",
+  "recovery_missing_website",
+  "source_website_rows",
+  "recovered_website_rows",
+  "no_website_rows",
+  "recovery_attempted",
+  "recovery_succeeded",
+  "recovery_failed",
+  "recovered_fetch_attempted",
+  "recovered_fetch_succeeded",
+  "recovered_fetch_failed",
+  "recovered_email_found",
+  "recovered_valid_email",
+  "recovered_eligible",
+  "recovered_instantly_added",
+  "loss_no_website_original",
+  "loss_recovery_not_attempted",
+  "loss_recovery_failed",
+  "loss_recovered_fetch_failed",
+  "loss_recovered_fetch_no_email",
+  "loss_recovered_email_invalid",
+  "loss_recovered_valid_not_eligible",
+  "loss_recovered_eligible_not_imported",
+  "selected_email_literal",
+  "selected_email_deobfuscated",
+  "selected_email_other_enrichment",
+  "selected_email_unattributed",
+] as const;
+
+function recoveryAttributionStats(row?: RawRow) {
+  const counts = Object.fromEntries(RECOVERY_AGGREGATE_FIELDS.map((field) => [field, asNumber(row?.[field])])) as Record<typeof RECOVERY_AGGREGATE_FIELDS[number], number>;
+  const telemetryCoveragePct = percent(counts.recovery_telemetry_complete_rows, counts.raw_rows);
+  const recoveredFetchCoveragePct = percent(counts.recovered_fetch_attribution_complete_rows, counts.raw_rows);
+  const recoveredEmailCoveragePct = percent(counts.recovered_email_attribution_complete_rows, counts.raw_rows);
+  const completeCoveragePct = telemetryCoveragePct === null || recoveredFetchCoveragePct === null || recoveredEmailCoveragePct === null
+    ? null
+    : Math.min(telemetryCoveragePct, recoveredFetchCoveragePct, recoveredEmailCoveragePct);
+  return {
+    rawRows: counts.raw_rows,
+    recoveryTelemetryRows: counts.recovery_telemetry_rows,
+    recoveryTelemetryCompleteRows: counts.recovery_telemetry_complete_rows,
+    recoveryTelemetryCoveragePct: telemetryCoveragePct,
+    recoveredFetchAttributionCompleteRows: counts.recovered_fetch_attribution_complete_rows,
+    recoveredFetchAttributionCoveragePct: recoveredFetchCoveragePct,
+    recoveredEmailAttributionCompleteRows: counts.recovered_email_attribution_complete_rows,
+    recoveredEmailAttributionCoveragePct: recoveredEmailCoveragePct,
+    recoveryMissingWebsite: counts.recovery_missing_website,
+    sourceWebsiteRows: counts.source_website_rows,
+    recoveredWebsiteRows: counts.recovered_website_rows,
+    noWebsiteRows: counts.no_website_rows,
+    recoveryAttempted: counts.recovery_attempted,
+    recoverySucceeded: counts.recovery_succeeded,
+    recoveryFailed: counts.recovery_failed,
+    recoveredFetchAttempted: counts.recovered_fetch_attempted,
+    recoveredFetchSucceeded: counts.recovered_fetch_succeeded,
+    recoveredFetchFailed: counts.recovered_fetch_failed,
+    recoveredEmailFound: counts.recovered_email_found,
+    recoveredValidEmail: counts.recovered_valid_email,
+    recoveredEligible: counts.recovered_eligible,
+    recoveredInstantlyAdded: counts.recovered_instantly_added,
+    selectedEmailSource: {
+      literal: counts.selected_email_literal,
+      deobfuscated: counts.selected_email_deobfuscated,
+      otherEnrichment: counts.selected_email_other_enrichment,
+      unattributed: counts.selected_email_unattributed,
+    },
+    rates: calculateRecoveryAttributionRates({
+      recoveryTelemetryCoveragePct: telemetryCoveragePct,
+      recoveredFetchAttributionCoveragePct: recoveredFetchCoveragePct,
+      recoveredEmailAttributionCoveragePct: recoveredEmailCoveragePct,
+      recoveryAttempted: counts.recovery_attempted,
+      recoverySucceeded: counts.recovery_succeeded,
+      recoveredFetchAttempted: counts.recovered_fetch_attempted,
+      recoveredFetchSucceeded: counts.recovered_fetch_succeeded,
+      recoveredEmailFound: counts.recovered_email_found,
+      recoveredValidEmail: counts.recovered_valid_email,
+      recoveredEligible: counts.recovered_eligible,
+      recoveredImported: counts.recovered_instantly_added,
+    }),
+    primaryLossStage: classifyRecoveryPrimaryLossStage({
+      totalRows: counts.raw_rows,
+      recoveryTelemetryCoveragePct: telemetryCoveragePct,
+      recoveredFetchAttributionCoveragePct: recoveredFetchCoveragePct,
+      recoveredEmailAttributionCoveragePct: recoveredEmailCoveragePct,
+      noWebsiteOriginal: counts.loss_no_website_original,
+      recoveryNotAttempted: counts.loss_recovery_not_attempted,
+      recoveryFailed: counts.loss_recovery_failed,
+      recoveredFetchFailed: counts.loss_recovered_fetch_failed,
+      recoveredFetchSucceededNoEmail: counts.loss_recovered_fetch_no_email,
+      recoveredEmailInvalid: counts.loss_recovered_email_invalid,
+      recoveredValidNotEligible: counts.loss_recovered_valid_not_eligible,
+      recoveredEligibleNotImported: counts.loss_recovered_eligible_not_imported,
+    }),
+  };
+}
+
+function aggregateRecoveryAttributionRows(rows: RawRow[]) {
+  const totals = Object.fromEntries(RECOVERY_AGGREGATE_FIELDS.map((field) => [
+    field,
+    rows.reduce((total, row) => total + asNumber(row[field]), 0),
+  ])) as Record<typeof RECOVERY_AGGREGATE_FIELDS[number], number>;
+  return recoveryAttributionStats(totals);
+}
+
 function localDateKey(date: Date, timezone: string): string {
   const parts = new Intl.DateTimeFormat("en-CA", {
     timeZone: timezone,
@@ -63,7 +181,11 @@ function localDateKey(date: Date, timezone: string): string {
   return `${values.year}-${values.month}-${values.day}`;
 }
 
-export async function getProductionCapacityDiagnostics(workspaceId: string, now = new Date()) {
+export async function getProductionCapacityDiagnostics(
+  workspaceId: string,
+  now = new Date(),
+  recoveryAttributionCohortStart: Date | null = null,
+) {
   const db = getDb();
   const [[settings], activeCampaigns, dailyRawRequestCap] = await Promise.all([
     db.select({ timezone: autopilotSettings.timezone, maxDailyApifySpendUsd: autopilotSettings.maxDailyApifySpendUsd })
@@ -100,8 +222,14 @@ export async function getProductionCapacityDiagnostics(workspaceId: string, now 
     (${"rolling3d"}, ${windows.rolling3d.start.toISOString()}::timestamptz, ${windows.rolling3d.end.toISOString()}::timestamptz),
     (${"rolling7d"}, ${windows.rolling7d.start.toISOString()}::timestamptz, ${windows.rolling7d.end.toISOString()}::timestamptz)
   )`;
+  const recoveryAttributionPeriods = [
+    { name: "today", start: windows.today.start, end: windows.today.end },
+    { name: "rolling3d", start: windows.rolling3d.start, end: windows.rolling3d.end },
+    { name: "rolling7d", start: windows.rolling7d.start, end: windows.rolling7d.end },
+    ...(recoveryAttributionCohortStart ? [{ name: "new_cohort", start: recoveryAttributionCohortStart, end: now }] : []),
+  ];
 
-  const [sourceResult, requestResult, spendResult, importResult, dailyRequestResult, deadLetterResult] = await Promise.all([
+  const [sourceResult, requestResult, spendResult, importResult, dailyRequestResult, deadLetterResult, recoveryAttributionResult] = await Promise.all([
     db.execute(sql`
       WITH periods(name, start_at, end_at) AS ${periodValues}
       SELECT periods.name AS window, raw.engine_type AS engine,
@@ -332,6 +460,11 @@ export async function getProductionCapacityDiagnostics(workspaceId: string, now 
       GROUP BY day
     `),
     db.execute(buildDeadLetterAggregateQuery(workspaceId, now)),
+    db.execute(buildWebsiteRecoveryAttributionQuery({
+      workspaceId,
+      targetProviderCampaignId,
+      periods: recoveryAttributionPeriods,
+    })),
   ]);
 
   const confirmedImportFacts: ConfirmedImportFact[] = importResult.rows.map((row: RawRow) => ({
@@ -368,6 +501,10 @@ export async function getProductionCapacityDiagnostics(workspaceId: string, now 
 
   const sourceMetrics = new Map<string, RawRow>();
   for (const row of sourceResult.rows as RawRow[]) sourceMetrics.set(`${row.window}:${row.engine}`, row);
+  const recoveryMetrics = new Map<string, RawRow>();
+  for (const row of recoveryAttributionResult.rows as RawRow[]) {
+    recoveryMetrics.set(`${row.window}:${row.engine}`, row);
+  }
   const requestMetrics = new Map<string, RawRow>();
   for (const row of requestResult.rows as RawRow[]) {
     requestMetrics.set(`${row.window}:${row.engine}:${row.provider}`, row);
@@ -394,6 +531,7 @@ export async function getProductionCapacityDiagnostics(workspaceId: string, now 
   const engineTypes = new Set<string>([
     ...activeEngineTypes,
     ...Array.from(sourceMetrics.values(), (row) => String(row.engine)),
+    ...Array.from(recoveryMetrics.values(), (row) => String(row.engine)),
     ...Array.from(requestMetrics.values(), (row) => String(row.engine)),
     ...Object.keys(importRollup.byWindow.rolling7d.sameCohortByEngine),
     ...Object.keys(importRollup.byWindow.rolling7d.backlogByEngine),
@@ -446,6 +584,7 @@ export async function getProductionCapacityDiagnostics(workspaceId: string, now 
       noEmailFound: number;
       emailRejectedFormat: number | null;
       emailDuplicate: number | null;
+      websiteRecoveryAttribution: ReturnType<typeof recoveryAttributionStats>;
       emailComplianceRejected: number;
       icpRejected: number;
       verificationQueued: number;
@@ -477,6 +616,7 @@ export async function getProductionCapacityDiagnostics(workspaceId: string, now 
       const backlogConfirmedImports = importRollup.byWindow[window].backlogByEngine[engine] ?? 0;
       const eligible = asNumber(source?.eligible);
       const sourceRows = asNumber(source?.source_rows);
+      const websiteRecoveryAttribution = recoveryAttributionStats(recoveryMetrics.get(`${window}:${engine}`));
       const processingMetricsRows = asNumber(source?.processing_metrics_rows);
       const processingMetricsComplete = sourceRows === 0 || processingMetricsRows === sourceRows;
       const websiteRecoveryMetricsRows = asNumber(source?.website_recovery_metrics_rows);
@@ -495,6 +635,7 @@ export async function getProductionCapacityDiagnostics(workspaceId: string, now 
         websiteRecoveryAttempted: websiteRecoveryMetricsComplete ? asNumber(source?.website_recovery_attempted) : null,
         websiteRecoverySucceeded: websiteRecoveryMetricsComplete ? asNumber(source?.website_recovery_succeeded) : null,
         websiteRecoveryFailed: websiteRecoveryMetricsComplete ? asNumber(source?.website_recovery_failed) : null,
+        websiteRecoveryAttribution,
         uniqueAccounts,
         accountsCreated: asNumber(source?.accounts_created),
         websitePresent: asNumber(source?.website_present),
@@ -672,6 +813,21 @@ export async function getProductionCapacityDiagnostics(workspaceId: string, now 
       confidence: period.emailRejectedFormat === null || period.emailDuplicate === null ? "partial" : "complete",
     }];
   }));
+  const recoveryRows = recoveryAttributionResult.rows as RawRow[];
+  const recoveryAttributionByWindow = (window: string) =>
+    aggregateRecoveryAttributionRows(recoveryRows.filter((row) => row.window === window));
+  const newCohortRows = recoveryRows.filter((row) => row.window === "new_cohort");
+  const recoveryAttributionByEngine = Object.fromEntries(engineMetrics.map((metric) => [
+    metric.engine,
+    {
+      today: metric.periods.today.websiteRecoveryAttribution,
+      rolling3d: metric.periods.rolling3d.websiteRecoveryAttribution,
+      rolling7d: metric.periods.rolling7d.websiteRecoveryAttribution,
+      newCohort: recoveryAttributionCohortStart
+        ? recoveryAttributionStats(newCohortRows.find((row) => row.engine === metric.engine))
+        : null,
+    },
+  ]));
   const instantlySupports250NewLeadsPerDay = deliveryCapacity.supportsTarget;
   const canSupport250FinalLeadsPerDayNow = instantlySupports250NewLeadsPerDay === true
     && baseRawRequestsWithBuffer !== null
@@ -753,6 +909,22 @@ export async function getProductionCapacityDiagnostics(workspaceId: string, now 
     globalRawRequestCap: coreEnv.ACTIVATION_MAX_DAILY_RAW_REQUESTS,
     safeRawCapNow: currentRawRequestCap,
     dailyRawRequestCap,
+    recoveryAttribution: {
+      cohortStart: recoveryAttributionCohortStart?.toISOString() ?? null,
+      minimumCoveragePct: 95,
+      periods: {
+        today: recoveryAttributionByWindow("today"),
+        rolling3d: recoveryAttributionByWindow("rolling3d"),
+        rolling7d: recoveryAttributionByWindow("rolling7d"),
+      },
+      newCohort: recoveryAttributionCohortStart
+        ? {
+          ...aggregateRecoveryAttributionRows(newCohortRows),
+          byEngine: recoveryAttributionByEngine,
+        }
+        : null,
+      byEngine: recoveryAttributionByEngine,
+    },
     engines: engineMetrics,
     pipelineFunnel: {
       attribution: "Stage populations are account-level by raw-candidate engine and discovery window; email rejection and duplicate totals are processing events. Source, website, and Serper email counts can overlap when an account has multiple email origins. Legacy engine-labeled contact points are not counted as provider-source emails because their origin is ambiguous.",
@@ -777,6 +949,7 @@ export async function getProductionCapacityDiagnostics(workspaceId: string, now 
           websiteRecoveryAttempted: period.websiteRecoveryAttempted,
           websiteRecoverySucceeded: period.websiteRecoverySucceeded,
           websiteRecoveryFailed: period.websiteRecoveryFailed,
+          websiteRecoveryAttribution: period.websiteRecoveryAttribution,
           accountsCreated: period.accountsCreated,
           accountsLinked: period.uniqueAccounts,
           websitePresent: period.websitePresent,

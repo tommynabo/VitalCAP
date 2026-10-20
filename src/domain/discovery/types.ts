@@ -15,20 +15,49 @@ export type JobStatus =
   | "failed"
   | "dead_letter";
 
+export type WebsiteEmailSource = "literal" | "deobfuscated" | "other_enrichment" | "mixed" | "none" | "unattributed";
+
 export interface CandidateProcessingMetrics {
   homepageFetchAttempted: number;
   homepageFetchSucceeded: number;
   homepageFetchFailed: number;
   emailRejectedFormat: number;
   emailDuplicate: number;
+  websiteOrigin?: "source" | "recovered" | "none";
+  websiteRecoverySource?: "serper" | null;
   websiteRecoveryAttempted?: number;
   websiteRecoverySucceeded?: number;
   websiteRecoveryFailed?: number;
   websiteRecoveryProvider?: "serper" | null;
-  websiteRecoveryStatus?: "started" | "succeeded" | "failed" | "budget_blocked" | "blocked";
+  websiteRecoveryStatus?: "not_attempted" | "not_needed" | "not_applicable" | "started" | "succeeded" | "failed" | "budget_blocked" | "blocked";
   websiteRecoveryDomain?: string | null;
   websiteRecoveryUrl?: string | null;
   websiteRecoveryEvidence?: SerpResult | null;
+  recoveredWebsiteDomain?: string | null;
+  recoveredWebsiteUrl?: string | null;
+  recoveredWebsiteFetchAttempted?: number;
+  recoveredWebsiteFetchSucceeded?: number;
+  recoveredWebsiteFetchFailed?: number;
+  websiteEnrichmentFetchAttempted?: number;
+  websiteEnrichmentFetchSucceeded?: number;
+  websiteEnrichmentFetchFailed?: number;
+  recoveredWebsiteEnrichmentFetchAttempted?: number;
+  recoveredWebsiteEnrichmentFetchSucceeded?: number;
+  recoveredWebsiteEnrichmentFetchFailed?: number;
+  emailExtractionLiteralFound?: number;
+  emailExtractionDeobfuscatedFound?: number;
+  websiteEmailRejectedFormat?: number;
+  websiteEmailsFound?: number;
+  websiteEmailOtherEnrichmentFound?: number;
+  websiteEmailSource?: WebsiteEmailSource;
+  websiteEmailAttributionComplete?: boolean;
+  websiteContactPointsCreated?: number;
+  websiteContactPointDuplicates?: number;
+  websiteValidEmails?: number | null;
+  websiteEligible?: number | null;
+  websiteImported?: number | null;
+  websiteAttributionStartedAt?: string | null;
+  websiteAttributionCompletedAt?: string | null;
   websiteEmailExtractionLiteralFound?: number;
   websiteEmailExtractionDeobfuscatedFound?: number;
   websiteTargetContactPagesFetched?: number;

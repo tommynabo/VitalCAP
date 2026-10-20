@@ -58,6 +58,7 @@ export interface ProcessedContactPoint {
   acceptable: boolean;
   sourceUrl: string;
   sourceType: "website" | "serper_snippet";
+  extractionMethod: "literal" | "deobfuscated";
   verificationProvider: string | null;
 }
 
@@ -197,6 +198,15 @@ export function deriveIncomingIdentitySignals(payload: CandidateRawPayload): Omi
   return identitySignalsFor(payload).incoming;
 }
 
+export function createInitialCandidateProcessingMetrics(
+  engineType: EngineType,
+  payload: CandidateRawPayload,
+  existing: CandidateProcessingMetrics | null | undefined,
+  now: Date,
+): CandidateProcessingMetrics {
+  return initialProcessingMetrics(engineType, payload, identitySignalsFor(payload).websiteUrl, existing, now);
+}
+
 export function hasLinkedInEmployerAccount(
   payload: CandidateRawPayload,
   existingAccounts: readonly AccountIdentitySignals[],
@@ -211,6 +221,64 @@ function accountKeyFor(incoming: Omit<AccountIdentitySignals, "accountId">, busi
   if (incoming.normalizedDomain) return `domain:${incoming.normalizedDomain}`;
   if (incoming.normalizedPhone) return `phone:${incoming.normalizedPhone}`;
   return `name:${normalizeBusinessName(businessNameGuess)}|geo:${geography.toLowerCase()}`;
+}
+
+function initialProcessingMetrics(
+  engineType: EngineType,
+  payload: CandidateRawPayload,
+  websiteUrl: string | null,
+  existing: CandidateProcessingMetrics | null | undefined,
+  now: Date,
+): CandidateProcessingMetrics {
+  const sourceWebsitePresent = Boolean(normalizeDomain(websiteUrl))
+    || (payload.kind === "maps" && Boolean(payload.crawledPages?.length));
+  const recoveredWebsitePresent = existing?.websiteOrigin === "recovered";
+  const legacyRecoveryOutcome = existing?.websiteOrigin === undefined
+    && ["started", "succeeded", "failed"].includes(existing?.websiteRecoveryStatus ?? "");
+  const websiteOrigin = recoveredWebsitePresent ? "recovered" : sourceWebsitePresent ? "source" : "none";
+
+  return {
+    homepageFetchAttempted: 0,
+    homepageFetchSucceeded: 0,
+    homepageFetchFailed: 0,
+    emailRejectedFormat: 0,
+    emailDuplicate: 0,
+    websiteOrigin,
+    websiteRecoverySource: existing?.websiteRecoverySource ?? null,
+    websiteRecoveryAttempted: existing?.websiteRecoveryAttempted ?? 0,
+    websiteRecoverySucceeded: existing?.websiteRecoverySucceeded ?? 0,
+    websiteRecoveryFailed: existing?.websiteRecoveryFailed ?? 0,
+    websiteRecoveryProvider: existing?.websiteRecoveryProvider ?? null,
+    websiteRecoveryStatus: existing?.websiteRecoveryStatus
+      ?? (sourceWebsitePresent ? "not_needed" : engineType === "maps_fast" ? "not_attempted" : "not_applicable"),
+    websiteRecoveryDomain: existing?.websiteRecoveryDomain ?? null,
+    websiteRecoveryUrl: existing?.websiteRecoveryUrl ?? null,
+    websiteRecoveryEvidence: null,
+    recoveredWebsiteDomain: existing?.recoveredWebsiteDomain ?? null,
+    recoveredWebsiteUrl: existing?.recoveredWebsiteUrl ?? null,
+    recoveredWebsiteFetchAttempted: 0,
+    recoveredWebsiteFetchSucceeded: 0,
+    recoveredWebsiteFetchFailed: 0,
+    websiteEnrichmentFetchAttempted: 0,
+    websiteEnrichmentFetchSucceeded: 0,
+    websiteEnrichmentFetchFailed: 0,
+    recoveredWebsiteEnrichmentFetchAttempted: 0,
+    recoveredWebsiteEnrichmentFetchSucceeded: 0,
+    recoveredWebsiteEnrichmentFetchFailed: 0,
+    emailExtractionLiteralFound: existing?.emailExtractionLiteralFound ?? 0,
+    emailExtractionDeobfuscatedFound: existing?.emailExtractionDeobfuscatedFound ?? 0,
+    websiteEmailsFound: existing?.websiteEmailsFound ?? 0,
+    websiteEmailOtherEnrichmentFound: existing?.websiteEmailOtherEnrichmentFound ?? 0,
+    websiteEmailSource: existing?.websiteEmailSource ?? "none",
+    websiteEmailAttributionComplete: existing?.websiteEmailAttributionComplete ?? !legacyRecoveryOutcome,
+    websiteContactPointsCreated: existing?.websiteContactPointsCreated ?? 0,
+    websiteContactPointDuplicates: existing?.websiteContactPointDuplicates ?? 0,
+    websiteValidEmails: null,
+    websiteEligible: null,
+    websiteImported: null,
+    websiteAttributionStartedAt: existing?.websiteAttributionStartedAt ?? now.toISOString(),
+    websiteAttributionCompletedAt: existing?.websiteAttributionCompletedAt ?? null,
+  };
 }
 
 function isRelevantSerperEmail(
@@ -258,17 +326,7 @@ export async function processRawCandidate(
       businessType,
       icpQualified: false,
       contactPoints: [],
-      processingMetrics: {
-        homepageFetchAttempted: 0,
-        homepageFetchSucceeded: 0,
-        homepageFetchFailed: 0,
-        emailRejectedFormat: 0,
-        emailDuplicate: 0,
-        websiteRecoveryAttempted: 0,
-        websiteRecoverySucceeded: 0,
-        websiteRecoveryFailed: 0,
-        websiteRecoveryProvider: null,
-      },
+      processingMetrics: initialProcessingMetrics(engineType, payload, websiteUrl, context.existingProcessingMetrics, context.now),
       serperEmailRecovery: { candidatesFound: 0, candidatesRelevant: 0, duplicateCandidatesSkipped: 0 },
       readyForOutreach: false,
       rejectionReason: `Rejected: ${spainResult.reason}`,
@@ -288,17 +346,7 @@ export async function processRawCandidate(
       businessType,
       icpQualified: false,
       contactPoints: [],
-      processingMetrics: {
-        homepageFetchAttempted: 0,
-        homepageFetchSucceeded: 0,
-        homepageFetchFailed: 0,
-        emailRejectedFormat: 0,
-        emailDuplicate: 0,
-        websiteRecoveryAttempted: 0,
-        websiteRecoverySucceeded: 0,
-        websiteRecoveryFailed: 0,
-        websiteRecoveryProvider: null,
-      },
+      processingMetrics: initialProcessingMetrics(engineType, payload, websiteUrl, context.existingProcessingMetrics, context.now),
       serperEmailRecovery: { candidatesFound: 0, candidatesRelevant: 0, duplicateCandidatesSkipped: 0 },
       readyForOutreach: false,
       rejectionReason: `Rejected ICP: ${businessType} is outside the pharmacy, parapharmacy, and herbal-shop scope`,
@@ -310,31 +358,23 @@ export async function processRawCandidate(
   const pages: Array<{ url: string; body: string }> = [];
   let effectiveWebsiteUrl = websiteUrl;
   let recoveredWebsite: RecoveredBusinessWebsite | null = null;
-  const processingMetrics: CandidateProcessingMetrics = {
-    homepageFetchAttempted: 0,
-    homepageFetchSucceeded: 0,
-    homepageFetchFailed: 0,
-    emailRejectedFormat: 0,
-    emailDuplicate: 0,
-    websiteRecoveryAttempted: context.existingProcessingMetrics?.websiteRecoveryAttempted ?? 0,
-    websiteRecoverySucceeded: context.existingProcessingMetrics?.websiteRecoverySucceeded ?? 0,
-    websiteRecoveryFailed: context.existingProcessingMetrics?.websiteRecoveryFailed ?? 0,
-    websiteRecoveryProvider: context.existingProcessingMetrics?.websiteRecoveryProvider ?? null,
-    websiteRecoveryStatus: context.existingProcessingMetrics?.websiteRecoveryStatus,
-    websiteRecoveryDomain: context.existingProcessingMetrics?.websiteRecoveryDomain ?? null,
-    websiteRecoveryUrl: context.existingProcessingMetrics?.websiteRecoveryUrl ?? null,
-    websiteRecoveryEvidence: context.existingProcessingMetrics?.websiteRecoveryEvidence ?? null,
-  };
+  const processingMetrics = initialProcessingMetrics(engineType, payload, websiteUrl, context.existingProcessingMetrics, context.now);
   if (
     processingMetrics.websiteRecoveryStatus === "succeeded"
     && processingMetrics.websiteRecoveryDomain
     && processingMetrics.websiteRecoveryUrl
-    && processingMetrics.websiteRecoveryEvidence
   ) {
     recoveredWebsite = {
       domain: processingMetrics.websiteRecoveryDomain,
       websiteUrl: processingMetrics.websiteRecoveryUrl,
-      evidence: processingMetrics.websiteRecoveryEvidence,
+      evidence: {
+        ...(context.existingProcessingMetrics?.websiteRecoveryEvidence ?? {
+          title: "",
+          url: processingMetrics.websiteRecoveryUrl,
+          snippet: "",
+          domain: processingMetrics.websiteRecoveryDomain,
+        }),
+      },
     };
     effectiveWebsiteUrl = recoveredWebsite.websiteUrl;
   }
@@ -360,21 +400,30 @@ export async function processRawCandidate(
         processingMetrics.websiteRecoveryAttempted = 1;
         processingMetrics.websiteRecoverySucceeded = 1;
         processingMetrics.websiteRecoveryFailed = 0;
+        processingMetrics.websiteEmailAttributionComplete = true;
+        processingMetrics.websiteOrigin = "recovered";
+        processingMetrics.websiteRecoverySource = "serper";
         processingMetrics.websiteRecoveryProvider = "serper";
         processingMetrics.websiteRecoveryStatus = "succeeded";
         processingMetrics.websiteRecoveryDomain = recovery.website.domain;
         processingMetrics.websiteRecoveryUrl = recovery.website.websiteUrl;
-        processingMetrics.websiteRecoveryEvidence = recovery.website.evidence;
+        processingMetrics.recoveredWebsiteDomain = recovery.website.domain;
+        processingMetrics.recoveredWebsiteUrl = recovery.website.websiteUrl;
+        processingMetrics.websiteRecoveryEvidence = null;
       } else if (recovery.status === "failed" || recovery.status === "no_match") {
         processingMetrics.websiteRecoveryAttempted = 1;
         processingMetrics.websiteRecoverySucceeded = 0;
         processingMetrics.websiteRecoveryFailed = 1;
+        processingMetrics.websiteEmailAttributionComplete = true;
+        processingMetrics.websiteRecoverySource = "serper";
         processingMetrics.websiteRecoveryProvider = "serper";
         processingMetrics.websiteRecoveryStatus = "failed";
       } else {
         processingMetrics.websiteRecoveryAttempted = 0;
         processingMetrics.websiteRecoverySucceeded = 0;
         processingMetrics.websiteRecoveryFailed = 0;
+        processingMetrics.websiteEmailAttributionComplete = true;
+        processingMetrics.websiteRecoverySource = null;
         processingMetrics.websiteRecoveryProvider = null;
         processingMetrics.websiteRecoveryStatus = "blocked";
       }
@@ -383,6 +432,8 @@ export async function processRawCandidate(
       processingMetrics.websiteRecoveryAttempted = 1;
       processingMetrics.websiteRecoverySucceeded = 0;
       processingMetrics.websiteRecoveryFailed = 1;
+      processingMetrics.websiteEmailAttributionComplete = true;
+      processingMetrics.websiteRecoverySource = "serper";
       processingMetrics.websiteRecoveryProvider = "serper";
       processingMetrics.websiteRecoveryStatus = "failed";
     }
@@ -395,9 +446,17 @@ export async function processRawCandidate(
       const fetched = await context.websiteFetcher.fetchPage(effectiveWebsiteUrl, { signal: context.signal });
       pages.push({ url: fetched.url, body: fetched.body });
       processingMetrics.homepageFetchSucceeded = 1;
+      if (processingMetrics.websiteOrigin === "recovered") {
+        processingMetrics.recoveredWebsiteFetchAttempted = 1;
+        processingMetrics.recoveredWebsiteFetchSucceeded = 1;
+      }
     } catch {
       if (context.signal?.aborted) throw context.signal.reason;
       processingMetrics.homepageFetchFailed = 1;
+      if (processingMetrics.websiteOrigin === "recovered") {
+        processingMetrics.recoveredWebsiteFetchAttempted = 1;
+        processingMetrics.recoveredWebsiteFetchFailed = 1;
+      }
       // A single unreachable/blocked website must not fail the whole candidate — it just yields zero contact points.
     }
   }
@@ -405,11 +464,19 @@ export async function processRawCandidate(
   const pageExtractionResults = pages.map((page) =>
     extractCandidateEmailsWithDiagnostics(page.body, page.url, "website", { allowEncodedAndObfuscated: true }),
   );
-  const extractedEmails = pageExtractionResults.flatMap((result) => result.emails);
+  const websiteEmails = pageExtractionResults.flatMap((result) => result.emails);
+  const extractedEmails = [...websiteEmails];
   processingMetrics.emailRejectedFormat += pageExtractionResults.reduce((total, result) => total + result.rejectedFormat, 0);
   processingMetrics.emailDuplicate += pageExtractionResults.reduce((total, result) => total + result.duplicates, 0);
   processingMetrics.websiteEmailExtractionLiteralFound = pageExtractionResults.reduce((total, result) => total + result.literalFound, 0);
   processingMetrics.websiteEmailExtractionDeobfuscatedFound = pageExtractionResults.reduce((total, result) => total + result.deobfuscatedFound, 0);
+  processingMetrics.emailExtractionLiteralFound = processingMetrics.websiteEmailExtractionLiteralFound;
+  processingMetrics.emailExtractionDeobfuscatedFound = processingMetrics.websiteEmailExtractionDeobfuscatedFound;
+  processingMetrics.websiteEmailRejectedFormat = pageExtractionResults.reduce((total, result) => total + result.rejectedFormat, 0);
+  const websiteExtractionMethods = new Set(websiteEmails.map((email) => email.extractionMethod));
+  processingMetrics.websiteEmailSource = websiteExtractionMethods.size > 1
+    ? "mixed"
+    : websiteExtractionMethods.values().next().value ?? "none";
   const serperEmailRecovery: SerperEmailRecoveryDiagnostics = {
     candidatesFound: 0,
     candidatesRelevant: 0,
@@ -435,6 +502,7 @@ export async function processRawCandidate(
   }
   const uniqueEmails = Array.from(new Map(extractedEmails.map((e) => [e.email, e])).values());
   processingMetrics.emailDuplicate += extractedEmails.length - uniqueEmails.length;
+  processingMetrics.websiteEmailsFound = new Set(websiteEmails.map((email) => email.email)).size;
 
   // Prompt 6 §6.1 Flow F (provider outage): a verification-provider failure
   // must never crash candidate processing or produce an invalid send — it
@@ -472,13 +540,23 @@ export async function processRawCandidate(
       acceptable: isContactPointAcceptable(verificationStatus, policy),
       sourceUrl: extracted.sourceUrl,
       sourceType: extracted.sourceType,
+      extractionMethod: extracted.extractionMethod,
       verificationProvider: verification ? context.verificationProvider.providerName : null,
     };
   });
+  processingMetrics.websiteValidEmails = context.deferVerification
+    ? null
+    : contactPoints.filter((contactPoint) => contactPoint.sourceType === "website" && contactPoint.verificationStatus === "valid").length;
 
   const hasAcceptableContact = contactPoints.some((cp) => cp.acceptable);
   const verificationEnabled = context.verificationProvider.providerName !== "disabled" && context.verificationProvider.providerName !== "disabled-smoke";
   const readyForOutreach = verificationEnabled && spainResult.verdict === "verified" && hasAcceptableContact;
+  if (processingMetrics.websiteOrigin === "recovered" && !context.deferVerification) {
+    processingMetrics.websiteEligible = readyForOutreach
+      && contactPoints.some((contactPoint) => contactPoint.sourceType === "website" && contactPoint.acceptable)
+      ? 1
+      : 0;
+  }
 
   let rejectionReason: string | null = null;
   if (spainResult.verdict === "needs_review") rejectionReason = "Awaiting Spain eligibility review";
