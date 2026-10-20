@@ -134,8 +134,8 @@ export function buildRecoverableRawProcessingJobsQuery(workspaceId: string, now:
       ORDER BY raw.discovered_at ASC, raw.id ASC
       FOR UPDATE OF raw, source_job SKIP LOCKED
       LIMIT ${boundedLimit}
-    )
-    ), inserted AS (
+    ),
+    inserted AS (
       INSERT INTO processing_jobs (
       campaign_id, type, payload, status, attempt_count, max_attempts, idempotency_key, next_attempt_at
       )

@@ -124,6 +124,8 @@ describe("job queue SQL builders", () => {
   it("creates one bounded retry for a recoverable dead-letter raw", () => {
     const query = dialect.sqlToQuery(buildRecoverableRawProcessingJobsQuery("workspace-1", claimTime, 5));
 
+    expect(query.sql).toMatch(/LIMIT \$\d+\s*\),\s*inserted AS \(/);
+    expect(query.sql).not.toMatch(/LIMIT \$\d+\s*\)\s*\),\s*inserted AS \(/);
     expect(query.sql).toContain("INSERT INTO processing_jobs");
     expect(query.sql).toContain("source_job.status = 'dead_letter'");
     expect(query.sql).toContain("source_job.attempt_count >= source_job.max_attempts");
