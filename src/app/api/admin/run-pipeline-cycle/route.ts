@@ -140,7 +140,6 @@ export async function POST() {
     const processing = await runProcessingCronTick(4, startedAt, { timeBudgetMs: 60_000 });
     const createdSince = new Date(startedAt.getTime() - 48 * 60 * 60_000);
     stage = "VERIFICATION";
-    verificationStage = "VERIFICATION_CLAIM";
     const verificationEnqueued = await enqueueVerificationJobs({ createdSince });
     const verification = await runVerificationCronTick(10, {
       createdSince,

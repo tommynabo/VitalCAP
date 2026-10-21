@@ -148,6 +148,18 @@ describe("/api/admin/run-pipeline-cycle", () => {
     logSpy.mockRestore();
   });
 
+  it("keeps verification enqueue failures distinct from verification claims", async () => {
+    mocks.enqueueVerificationJobs.mockRejectedValueOnce(new Error("private query detail"));
+
+    const response = await POST();
+    const body = await response.json();
+
+    expect(response.status).toBe(500);
+    expect(body.failedStage).toBe("VERIFICATION");
+    expect(JSON.stringify(body)).not.toContain("private query detail");
+    expect(mocks.runVerificationCronTick).not.toHaveBeenCalled();
+  });
+
   it("runs one bounded cycle and returns aggregate-only counters", async () => {
     const response = await POST();
     const body = await response.json();
