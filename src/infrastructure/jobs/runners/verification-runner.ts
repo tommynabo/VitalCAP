@@ -35,6 +35,8 @@ export interface VerificationRunnerResult {
   instantly?: InstantlyImportTickResult;
 }
 
+export type VerificationExecutionStage = "VERIFICATION_CLAIM" | "VERIFICATION_PROVIDER" | "VERIFICATION_PERSIST" | "VERIFICATION_COMPLETE";
+
 export interface ProviderDisabledVerificationRepairResult {
   inspected: number;
   resolvedFromCurrentResult: number;
@@ -682,7 +684,7 @@ export async function getHistoricalBackfillPreview(): Promise<HistoricalBackfill
 
 export async function runVerificationCronTick(
   maxJobs: number = BATCH_SIZE,
-  options: { createdSince?: Date; backfillAll?: boolean; skipInstantlyImport?: boolean } = {},
+  options: { createdSince?: Date; backfillAll?: boolean; skipInstantlyImport?: boolean; onStage?: (stage: VerificationExecutionStage) => void } = {},
 ): Promise<VerificationRunnerResult> {
   const db = getDb();
   const now = new Date();
@@ -693,6 +695,7 @@ export async function runVerificationCronTick(
   const providerName = env.EMAIL_VERIFICATION_PROVIDER;
 
   // 1. Lease jobs
+  options.onStage?.("VERIFICATION_CLAIM");
   const leased = await db.execute(sql`
     WITH available AS (
       SELECT id FROM verification_jobs
@@ -716,6 +719,7 @@ export async function runVerificationCronTick(
   `);
 
   if (leased.rows.length === 0) {
+    options.onStage?.("VERIFICATION_COMPLETE");
     const instantly = options.skipInstantlyImport ? undefined : await runInstantlyImportTick({
       ...(options.backfillAll
         ? { backfillAll: true }
@@ -734,6 +738,7 @@ export async function runVerificationCronTick(
 
   // 2. Handle provider disabled
   if (providerName === "disabled") {
+    options.onStage?.("VERIFICATION_PERSIST");
     for (const job of leased.rows as any[]) {
       await db.update(schema.verificationJobs)
         .set({
@@ -744,6 +749,7 @@ export async function runVerificationCronTick(
           nextAttemptAt: null,
         })
         .where(eq(schema.verificationJobs.id, job.id));
+      options.onStage?.("VERIFICATION_COMPLETE");
     }
     const instantly = options.skipInstantlyImport ? undefined : await runInstantlyImportTick({
       ...(options.backfillAll
@@ -782,6 +788,7 @@ export async function runVerificationCronTick(
 
   for (const [workspaceId, workspaceJobs] of jobsByWorkspace.entries()) {
     const workspaceJobIds = workspaceJobs.map((job) => job.id);
+    options.onStage?.("VERIFICATION_PERSIST");
     const blockedRows = await db.execute(sql`
       SELECT vj.id
       FROM verification_jobs vj
@@ -838,6 +845,7 @@ export async function runVerificationCronTick(
     if (safeWorkspaceJobs.length === 0) continue;
 
     let provider;
+    options.onStage?.("VERIFICATION_PROVIDER");
     try {
       provider = createEmailVerificationProvider(workspaceId);
     } catch (error) {
@@ -877,6 +885,7 @@ export async function runVerificationCronTick(
     }
     
     // Process results
+    options.onStage?.("VERIFICATION_PERSIST");
     for (const job of safeWorkspaceJobs) {
       const cp = cpMap.get(job.contact_point_id);
       if (!cp) {
@@ -950,6 +959,7 @@ export async function runVerificationCronTick(
     }
   }
 
+  options.onStage?.("VERIFICATION_COMPLETE");
   const instantly = options.skipInstantlyImport ? undefined : await runInstantlyImportTick({
     ...(verifiedContactPointIds.size > 0 ? { contactPointIds: Array.from(verifiedContactPointIds) } : {}),
     ...(options.backfillAll

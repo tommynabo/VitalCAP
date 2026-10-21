@@ -15,13 +15,13 @@ import { runAutopilotCronTick } from "@/infrastructure/jobs/runners/autopilot-ru
 import { runDiscoveryCronTick } from "@/infrastructure/jobs/runners/discovery-runner";
 import { runProviderRunsCronTick } from "@/infrastructure/jobs/runners/provider-runs-runner";
 import { runProcessingCronTick } from "@/infrastructure/jobs/runners/processing-runner";
-import { enqueueVerificationJobs, runVerificationCronTick } from "@/infrastructure/jobs/runners/verification-runner";
+import { enqueueVerificationJobs, runVerificationCronTick, type VerificationExecutionStage } from "@/infrastructure/jobs/runners/verification-runner";
 import { runInstantlyImportTick } from "@/infrastructure/jobs/runners/instantly-import-runner";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 300;
 
-type PipelineCycleStage = "PROVIDER_HEALTH" | "DISCOVERY" | "PROVIDER_RUNS" | "PROCESSING" | "VERIFICATION" | "INSTANTLY_DRAIN";
+type PipelineCycleStage = "PROVIDER_HEALTH" | "DISCOVERY" | "PROVIDER_RUNS" | "PROCESSING" | "VERIFICATION" | "INSTANTLY_DRAIN" | VerificationExecutionStage;
 
 function getSafeFailureMetadata(error: unknown) {
   const record = typeof error === "object" && error !== null ? error as Record<string, unknown> : {};
@@ -118,6 +118,7 @@ export async function POST() {
   const correlationId = randomUUID();
   const requestStartedAt = Date.now();
   let stage: PipelineCycleStage = "PROVIDER_HEALTH";
+  let verificationStage: VerificationExecutionStage | null = null;
   try {
     const context = await requireWorkspaceOwner();
     const workspaceId = context.workspaceId;
@@ -139,8 +140,13 @@ export async function POST() {
     const processing = await runProcessingCronTick(4, startedAt, { timeBudgetMs: 60_000 });
     const createdSince = new Date(startedAt.getTime() - 48 * 60 * 60_000);
     stage = "VERIFICATION";
+    verificationStage = "VERIFICATION_CLAIM";
     const verificationEnqueued = await enqueueVerificationJobs({ createdSince });
-    const verification = await runVerificationCronTick(10, { createdSince, skipInstantlyImport: true });
+    const verification = await runVerificationCronTick(10, {
+      createdSince,
+      skipInstantlyImport: true,
+      onStage: (currentStage) => { verificationStage = currentStage; },
+    });
     stage = "INSTANTLY_DRAIN";
     const finalDrain = await runInstantlyImportTick({ processQueueOnly: true, reconcileEligible: true, now: new Date() });
 
@@ -213,15 +219,16 @@ export async function POST() {
     }
     const failure = getSafeFailureMetadata(error);
     const elapsedMs = Math.max(0, Date.now() - requestStartedAt);
+    const failedStage = stage === "VERIFICATION" ? verificationStage ?? stage : stage;
     console.error("pipeline_cycle_failed", {
-      stage,
+      stage: failedStage,
       sqlState: failure.sqlState,
       errorClass: failure.errorClass,
       constraintName: failure.constraintName,
       elapsedMs,
       correlationId,
     });
-    return NextResponse.json({ status: "failed", failedStage: stage, correlationId }, {
+    return NextResponse.json({ status: "failed", failedStage, correlationId }, {
       status: 500,
       headers: { "Cache-Control": "no-store" },
     });

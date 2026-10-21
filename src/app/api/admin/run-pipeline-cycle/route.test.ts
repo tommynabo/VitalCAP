@@ -119,25 +119,28 @@ describe("/api/admin/run-pipeline-cycle", () => {
   it("reports the failed stage and logs only approved safe metadata", async () => {
     const logSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     const failure = Object.assign(new Error("private SQL and contact details"), {
-      code: "23505",
-      constraint: "campaign_domain_key",
+      code: "23503",
+      constraint: "fk_verification_jobs_contact_points",
     });
-    mocks.runAutopilotCronTick.mockRejectedValueOnce(failure);
+    mocks.runVerificationCronTick.mockImplementationOnce(async (_maxJobs, options) => {
+      options.onStage("VERIFICATION_PROVIDER");
+      throw failure;
+    });
 
     const response = await POST();
     const body = await response.json();
 
     expect(response.status).toBe(500);
-    expect(body.failedStage).toBe("DISCOVERY");
+    expect(body.failedStage).toBe("VERIFICATION_PROVIDER");
     expect(body.correlationId).toEqual(expect.any(String));
     expect(JSON.stringify(body)).not.toContain("private SQL");
     expect(logSpy).toHaveBeenCalledOnce();
     expect(logSpy.mock.calls[0]?.[0]).toBe("pipeline_cycle_failed");
     expect(logSpy.mock.calls[0]?.[1]).toEqual({
-      stage: "DISCOVERY",
-      sqlState: "23505",
+      stage: "VERIFICATION_PROVIDER",
+      sqlState: "23503",
       errorClass: "Error",
-      constraintName: "campaign_domain_key",
+      constraintName: "fk_verification_jobs_contact_points",
       elapsedMs: expect.any(Number),
       correlationId: body.correlationId,
     });
