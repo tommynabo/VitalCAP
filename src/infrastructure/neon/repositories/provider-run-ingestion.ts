@@ -14,6 +14,17 @@ export interface IngestApifyProviderRunInput {
   finishedAt: Date;
   costUsd: number;
   itemsReturned: number;
+  invalidOrUnmappableItems: number;
+}
+
+export interface ProviderRunIngestionAccounting {
+  INSERTED_NEW_RAW: number;
+  DUPLICATE_EXISTING_RAW: number;
+  CANONICAL_DEDUPE: number;
+  INVALID_OR_UNMAPPABLE: number;
+  FILTERED_BY_POLICY: number;
+  FAILED_INSERT: number;
+  UNKNOWN: number;
 }
 
 export interface IngestApifyProviderRunResult {
@@ -22,6 +33,29 @@ export interface IngestApifyProviderRunResult {
   processingJobsEnsured: number;
   seedMetricsUpdated: boolean;
   alreadyIngested: boolean;
+  ingestionAccounting: ProviderRunIngestionAccounting | null;
+}
+
+export function buildProviderRunIngestionAccounting(input: {
+  itemsReturned: number;
+  candidatesTotal: number;
+  candidatesInserted: number;
+  invalidOrUnmappableItems: number;
+}): ProviderRunIngestionAccounting {
+  const accountedItems = input.candidatesTotal + input.invalidOrUnmappableItems;
+  if (accountedItems !== input.itemsReturned || input.candidatesInserted > input.candidatesTotal) {
+    throw new Error("Provider items do not reconcile to ingestion outcomes.");
+  }
+
+  return {
+    INSERTED_NEW_RAW: input.candidatesInserted,
+    DUPLICATE_EXISTING_RAW: input.candidatesTotal - input.candidatesInserted,
+    CANONICAL_DEDUPE: 0,
+    INVALID_OR_UNMAPPABLE: input.invalidOrUnmappableItems,
+    FILTERED_BY_POLICY: 0,
+    FAILED_INSERT: 0,
+    UNKNOWN: 0,
+  };
 }
 
 type Transaction = any;
@@ -77,7 +111,7 @@ export async function ingestApifyProviderRun(input: IngestApifyProviderRunInput)
     const providerRun = locked.rows[0] as { status: string, ingestion_claim_token: string | null } | undefined;
     if (!providerRun) throw new Error(`Provider run ${input.providerRunId} was not found.`);
     if (providerRun.status === "ingested") {
-      return { rawCandidatesTotal: input.candidates.length, rawCandidatesInserted: 0, processingJobsEnsured: 0, seedMetricsUpdated: false, alreadyIngested: true };
+      return { rawCandidatesTotal: input.candidates.length, rawCandidatesInserted: 0, processingJobsEnsured: 0, seedMetricsUpdated: false, alreadyIngested: true, ingestionAccounting: null };
     }
     if (providerRun.status !== "ingesting") {
       throw new Error(`Provider run ${input.providerRunId} is not in ingesting state, got ${providerRun.status}`);
@@ -94,6 +128,12 @@ export async function ingestApifyProviderRun(input: IngestApifyProviderRunInput)
       resolvedIds.add(resolved.id);
       if (resolved.inserted) rawCandidatesInserted += 1;
     }
+    const ingestionAccounting = buildProviderRunIngestionAccounting({
+      itemsReturned: input.itemsReturned,
+      candidatesTotal: input.candidates.length,
+      candidatesInserted: rawCandidatesInserted,
+      invalidOrUnmappableItems: input.invalidOrUnmappableItems,
+    });
     for (const rawCandidateId of resolvedIds) {
       if (await ensureProcessingJob(tx, input.campaignId, rawCandidateId)) processingJobsEnsured += 1;
     }
@@ -114,6 +154,7 @@ export async function ingestApifyProviderRun(input: IngestApifyProviderRunInput)
     const finalUpdate = await tx.execute(sql`
       UPDATE provider_runs
       SET status = 'ingested', items_returned = ${input.itemsReturned}, cost_usd = ${input.costUsd},
+          metadata = COALESCE(metadata, '{}'::jsonb) || ${JSON.stringify({ ingestionAccounting })}::jsonb,
           external_dataset_id = ${input.externalDatasetId},
           ingested_at = ${input.finishedAt.toISOString()}::timestamptz, finished_at = COALESCE(finished_at, ${input.finishedAt.toISOString()}::timestamptz), error = NULL,
           ingestion_claim_token = NULL, ingestion_started_at = NULL
@@ -123,7 +164,7 @@ export async function ingestApifyProviderRun(input: IngestApifyProviderRunInput)
     if (finalUpdate.rowCount !== 1) {
       throw new Error("claim-lost/stale-worker error: unable to finalize provider_run, zero rows affected");
     }
-  const result = { rawCandidatesTotal: input.candidates.length, rawCandidatesInserted, processingJobsEnsured, seedMetricsUpdated: false, alreadyIngested: false };
+  const result = { rawCandidatesTotal: input.candidates.length, rawCandidatesInserted, processingJobsEnsured, seedMetricsUpdated: false, alreadyIngested: false, ingestionAccounting };
   if (input.seedRunId) await refreshSearchSeedQualification(input.seedRunId);
   return { ...result, seedMetricsUpdated: Boolean(input.seedRunId) };
 }

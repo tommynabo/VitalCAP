@@ -126,7 +126,8 @@ export async function runProviderRunsCronTick(maxRuns = MAX_RUNS_PER_TICK): Prom
 
       const rawItems = await fetchBoundedDatasetItems(client, datasetId, providerRun.itemsRequested || 1);
 
-      const places = rawItems.map(mapCompassItemToPlaceResult).filter((place): place is NonNullable<ReturnType<typeof mapCompassItemToPlaceResult>> => place !== null);
+      const mappedPlaces = rawItems.map(mapCompassItemToPlaceResult);
+      const places = mappedPlaces.filter((place): place is NonNullable<ReturnType<typeof mapCompassItemToPlaceResult>> => place !== null);
 
       
       const ingestion = await ingestApifyProviderRun({
@@ -153,7 +154,8 @@ export async function runProviderRunsCronTick(maxRuns = MAX_RUNS_PER_TICK): Prom
         }),
         finishedAt: run.finishedAt ? new Date(run.finishedAt) : new Date(),
         costUsd: usageCost,
-        itemsReturned: places.length,
+        itemsReturned: rawItems.length,
+        invalidOrUnmappableItems: rawItems.length - places.length,
       });
       if (!ingestion.alreadyIngested) {
         runsIngested += 1;
