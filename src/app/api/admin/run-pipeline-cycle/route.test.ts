@@ -49,7 +49,7 @@ const { POST } = await import("./route");
 
 describe("/api/admin/run-pipeline-cycle", () => {
   beforeEach(() => {
-    vi.clearAllMocks();
+    vi.resetAllMocks();
     mocks.requireWorkspaceOwner.mockResolvedValue({ workspaceId: "workspace-1", role: "owner" });
     mocks.getApifyRecoverySnapshot.mockResolvedValue({
       recoveryProbeEligible: true,
@@ -114,6 +114,35 @@ describe("/api/admin/run-pipeline-cycle", () => {
     expect(response.status).toBe(403);
     expect(mocks.runAutopilotCronTick).not.toHaveBeenCalled();
     expect(mocks.runInstantlyImportTick).not.toHaveBeenCalled();
+  });
+
+  it("reports the failed stage and logs only approved safe metadata", async () => {
+    const logSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const failure = Object.assign(new Error("private SQL and contact details"), {
+      code: "23505",
+      constraint: "campaign_domain_key",
+    });
+    mocks.runAutopilotCronTick.mockRejectedValueOnce(failure);
+
+    const response = await POST();
+    const body = await response.json();
+
+    expect(response.status).toBe(500);
+    expect(body.failedStage).toBe("DISCOVERY");
+    expect(body.correlationId).toEqual(expect.any(String));
+    expect(JSON.stringify(body)).not.toContain("private SQL");
+    expect(logSpy).toHaveBeenCalledOnce();
+    expect(logSpy.mock.calls[0]?.[0]).toBe("pipeline_cycle_failed");
+    expect(logSpy.mock.calls[0]?.[1]).toEqual({
+      stage: "DISCOVERY",
+      sqlState: "23505",
+      errorClass: "Error",
+      constraintName: "campaign_domain_key",
+      elapsedMs: expect.any(Number),
+      correlationId: body.correlationId,
+    });
+    expect(JSON.stringify(logSpy.mock.calls[0])).not.toContain("private SQL");
+    logSpy.mockRestore();
   });
 
   it("runs one bounded cycle and returns aggregate-only counters", async () => {

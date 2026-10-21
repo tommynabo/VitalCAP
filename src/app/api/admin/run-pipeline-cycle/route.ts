@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { sql } from "drizzle-orm";
 import { NextResponse } from "next/server";
 import { UnauthorizedError, requireWorkspaceOwner } from "@/lib/auth/workspace";
@@ -19,6 +20,28 @@ import { runInstantlyImportTick } from "@/infrastructure/jobs/runners/instantly-
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 300;
+
+type PipelineCycleStage = "PROVIDER_HEALTH" | "DISCOVERY" | "PROVIDER_RUNS" | "PROCESSING" | "VERIFICATION" | "INSTANTLY_DRAIN";
+
+function getSafeFailureMetadata(error: unknown) {
+  const record = typeof error === "object" && error !== null ? error as Record<string, unknown> : {};
+  const cause = typeof record.cause === "object" && record.cause !== null
+    ? record.cause as Record<string, unknown>
+    : {};
+  const candidateSqlState = record.code ?? cause.code;
+  const candidateConstraint = record.constraint ?? cause.constraint;
+  const errorClass = error instanceof Error ? error.constructor.name : "NonError";
+
+  return {
+    sqlState: typeof candidateSqlState === "string" && /^[A-Z0-9]{5}$/.test(candidateSqlState)
+      ? candidateSqlState
+      : null,
+    errorClass: /^[A-Za-z_$][A-Za-z0-9_$]{0,79}$/.test(errorClass) ? errorClass : "Error",
+    constraintName: typeof candidateConstraint === "string" && /^[A-Za-z0-9_]+$/.test(candidateConstraint)
+      ? candidateConstraint
+      : null,
+  };
+}
 
 async function readMapsState(workspaceId: string, now: Date) {
   const mapsEnv = getMapsEnv();
@@ -92,6 +115,9 @@ async function readCycleMetrics(workspaceId: string, startedAt: Date, completedA
 }
 
 export async function POST() {
+  const correlationId = randomUUID();
+  const requestStartedAt = Date.now();
+  let stage: PipelineCycleStage = "PROVIDER_HEALTH";
   try {
     const context = await requireWorkspaceOwner();
     const workspaceId = context.workspaceId;
@@ -102,23 +128,31 @@ export async function POST() {
       getProductionCapacityDiagnostics(workspaceId, startedAt),
     ]);
 
+    stage = "INSTANTLY_DRAIN";
     const existingDrain = await runInstantlyImportTick({ processQueueOnly: true, reconcileEligible: true, now: startedAt });
+    stage = "DISCOVERY";
     const autopilot = await runAutopilotCronTick(startedAt);
     const discovery = await runDiscoveryCronTick(1, startedAt);
+    stage = "PROVIDER_RUNS";
     const providerRuns = await runProviderRunsCronTick(5);
+    stage = "PROCESSING";
     const processing = await runProcessingCronTick(4, startedAt, { timeBudgetMs: 60_000 });
     const createdSince = new Date(startedAt.getTime() - 48 * 60 * 60_000);
+    stage = "VERIFICATION";
     const verificationEnqueued = await enqueueVerificationJobs({ createdSince });
     const verification = await runVerificationCronTick(10, { createdSince, skipInstantlyImport: true });
+    stage = "INSTANTLY_DRAIN";
     const finalDrain = await runInstantlyImportTick({ processQueueOnly: true, reconcileEligible: true, now: new Date() });
 
     const completedAt = new Date();
+    stage = "PROVIDER_HEALTH";
     const [mapsAfter, productivityAfter, capacityAfter, cycleMetrics] = await Promise.all([
       readMapsState(workspaceId, completedAt),
       getProductivityDiagnostics(workspaceId, completedAt),
       getProductionCapacityDiagnostics(workspaceId, completedAt),
       readCycleMetrics(workspaceId, startedAt, completedAt),
     ]);
+    stage = "INSTANTLY_DRAIN";
     const deliveryEnv = getDeliveryEnv();
     const dayBounds = getDayBounds(productivityAfter.timezone, completedAt);
     const importedToday = await getDb().execute(sql`
@@ -177,6 +211,19 @@ export async function POST() {
     if (error instanceof UnauthorizedError) {
       return NextResponse.json({ error: "Workspace owner authorization required." }, { status: 403 });
     }
-    return NextResponse.json({ status: "failed" }, { status: 500 });
+    const failure = getSafeFailureMetadata(error);
+    const elapsedMs = Math.max(0, Date.now() - requestStartedAt);
+    console.error("pipeline_cycle_failed", {
+      stage,
+      sqlState: failure.sqlState,
+      errorClass: failure.errorClass,
+      constraintName: failure.constraintName,
+      elapsedMs,
+      correlationId,
+    });
+    return NextResponse.json({ status: "failed", failedStage: stage, correlationId }, {
+      status: 500,
+      headers: { "Cache-Control": "no-store" },
+    });
   }
 }
