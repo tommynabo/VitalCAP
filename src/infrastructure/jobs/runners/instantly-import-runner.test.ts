@@ -850,7 +850,7 @@ describe("runInstantlyImportTick", () => {
     expect(mocks.addLeadToCampaign).toHaveBeenCalledOnce();
   });
 
-  it("stops at contact and monthly plan limits before claiming jobs", async () => {
+  it("stops at the contact plan limit before claiming jobs", async () => {
     setupWithoutClaimedJobs([candidate()]);
     mocks.getPlanUsage.mockResolvedValue({ currentLeadCount: 1000, totalLeadLimit: 5000 });
     mocks.getMonthlyEmailUsage.mockResolvedValue({ emailsSent: 5000 });
@@ -868,6 +868,20 @@ describe("runInstantlyImportTick", () => {
     expect(mocks.deferByPlanLimit).toHaveBeenCalledWith(campaignId, expect.any(Date));
     expect(mocks.claimImports).not.toHaveBeenCalled();
     expect(mocks.addLeads).not.toHaveBeenCalled();
+  });
+
+  it("allows contact imports when monthly email-send usage is at its limit", async () => {
+    setupWithOneClaimedJob([candidate()]);
+    mocks.getPlanUsage.mockResolvedValue({ currentLeadCount: 432, totalLeadLimit: 5000 });
+    mocks.getMonthlyEmailUsage.mockResolvedValue({ emailsSent: 5000 });
+
+    const result = await runInstantlyImportTick({ contactPointIds: ["contact-point-1"] });
+
+    expect(result.leadsAdded).toBe(1);
+    expect(result.quota).toMatchObject({ monthlyEmailsSent: 5000, monthlyEmailLimit: 5000 });
+    expect(mocks.claimImports).toHaveBeenCalledOnce();
+    expect(mocks.deferByPlanLimit).not.toHaveBeenCalled();
+    expect(mocks.addLeadToCampaign).toHaveBeenCalledOnce();
   });
 
   it("limits claims to remaining contact slots near the hard limit", async () => {

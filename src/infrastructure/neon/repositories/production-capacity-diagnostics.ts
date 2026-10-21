@@ -748,6 +748,8 @@ export async function getProductionCapacityDiagnostics(
   const planningDays = 30;
   const initialEmailsPerDay = targetLeadsPerDay;
   const expectedFollowupsPerDay = null;
+  const instantlyProviderConfigured = deliveryEnv.EMAIL_DELIVERY_PROVIDER === "instantly" && Boolean(deliveryEnv.INSTANTLY_API_KEY);
+  const instantlyTargetCampaignConfigured = instantlyProviderConfigured && Boolean(deliveryEnv.INSTANTLY_CAMPAIGN_ID);
   const deliveryCapacity = evaluateInstantlyDeliveryCapacity({
     targetLeadsPerDay,
     planningDays,
@@ -759,6 +761,12 @@ export async function getProductionCapacityDiagnostics(
     followupEmailsPerLead: null,
     autoSendEnabled: false,
   });
+  const contactImportCapacityStatus = !instantlyTargetCampaignConfigured
+    ? "blocked"
+    : deliveryCapacity.remainingContactSlots === null
+      ? "unknown"
+      : deliveryCapacity.remainingContactSlots > 0 ? "available" : "blocked";
+  const emailSendCapacityStatus = deliveryCapacity.initialEmailCapacityStatus;
   const currentMonthlySendHeadroom = deliveryCapacity.monthlyEmailHeadroom;
   const requiredMonthlySendCapacity = deliveryCapacity.projectedInitialMonthlyEmails;
   const currentRawRequestCap = coreEnv.ACTIVATION_MAX_DAILY_RAW_REQUESTS;
@@ -1036,9 +1044,8 @@ export async function getProductionCapacityDiagnostics(
       },
     },
     instantly: {
-      providerConfigured: deliveryEnv.EMAIL_DELIVERY_PROVIDER === "instantly" && Boolean(deliveryEnv.INSTANTLY_API_KEY),
-      targetCampaignConfigured: deliveryEnv.EMAIL_DELIVERY_PROVIDER === "instantly"
-        && Boolean(deliveryEnv.INSTANTLY_API_KEY && deliveryEnv.INSTANTLY_CAMPAIGN_ID),
+      providerConfigured: instantlyProviderConfigured,
+      targetCampaignConfigured: instantlyTargetCampaignConfigured,
       providerPlanTelemetryAvailable: planUsage !== null,
       monthlyEmailTelemetryAvailable: monthlyUsage !== null,
       monthlyEmailTelemetryScope: "all_campaigns",
@@ -1050,6 +1057,8 @@ export async function getProductionCapacityDiagnostics(
       contactShortfallFor30Days: deliveryCapacity.contactShortfall,
       contactRunwayDaysAt250PerDay: deliveryCapacity.contactRunwayDays,
       contactCapacityStatus: deliveryCapacity.contactCapacityStatus,
+      contactImportCapacityStatus,
+      emailSendCapacityStatus,
       dailyWriteLimit: null,
       batchLimitPerTick: 50,
       writeConcurrency: 2,

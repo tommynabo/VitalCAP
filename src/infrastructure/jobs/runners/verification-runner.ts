@@ -698,15 +698,40 @@ export async function runVerificationCronTick(
   options.onStage?.("VERIFICATION_CLAIM");
   const leased = await db.execute(sql`
     WITH available AS (
-      SELECT id FROM verification_jobs
-      WHERE (locked_at IS NULL OR locked_at < ${lockExpiry.toISOString()})
-        AND (next_attempt_at IS NULL OR next_attempt_at <= ${now.toISOString()})
-        AND status IN ('pending', 'failed', 'processing')
-        AND attempt_count < max_attempts
-        AND provider = ${providerName}
-      ORDER BY created_at ASC
+      SELECT candidate.id FROM verification_jobs AS candidate
+      WHERE (candidate.locked_at IS NULL OR candidate.locked_at < ${lockExpiry.toISOString()})
+        AND (candidate.next_attempt_at IS NULL OR candidate.next_attempt_at <= ${now.toISOString()})
+        AND candidate.status IN ('pending', 'failed', 'processing')
+        AND candidate.attempt_count < candidate.max_attempts
+        AND candidate.provider = ${providerName}
+        AND (
+          candidate.status <> 'failed'
+          OR NOT EXISTS (
+            SELECT 1 FROM verification_jobs AS active
+            WHERE active.workspace_id = candidate.workspace_id
+              AND active.idempotency_key = candidate.idempotency_key
+              AND active.id <> candidate.id
+              AND active.status IN ('pending', 'processing')
+          )
+        )
+        AND (
+          candidate.idempotency_key IS NULL
+          OR NOT EXISTS (
+            SELECT 1 FROM verification_jobs AS earlier
+            WHERE earlier.workspace_id = candidate.workspace_id
+              AND earlier.idempotency_key = candidate.idempotency_key
+              AND earlier.id <> candidate.id
+              AND earlier.status IN ('pending', 'failed', 'processing')
+              AND earlier.attempt_count < earlier.max_attempts
+              AND (earlier.next_attempt_at IS NULL OR earlier.next_attempt_at <= ${now.toISOString()})
+              AND (earlier.locked_at IS NULL OR earlier.locked_at < ${lockExpiry.toISOString()})
+              AND (candidate.status = 'failed' OR earlier.status IN ('pending', 'processing'))
+              AND (earlier.created_at, earlier.id) < (candidate.created_at, candidate.id)
+          )
+        )
+      ORDER BY candidate.created_at ASC, candidate.id ASC
       LIMIT ${maxJobs}
-      FOR UPDATE SKIP LOCKED
+      FOR UPDATE OF candidate SKIP LOCKED
     )
     UPDATE verification_jobs
     SET locked_at = ${now.toISOString()},

@@ -145,6 +145,19 @@ describe("runVerificationCronTick eligibility recheck", () => {
 
   afterEach(() => vi.clearAllMocks());
 
+  it("claims at most one due failed verification retry per active idempotency key", async () => {
+    mocks.execute.mockReset().mockResolvedValueOnce({ rows: [] });
+
+    await runVerificationCronTick(10, { skipInstantlyImport: true });
+
+    const claimQuery = sqlParts(mocks.execute.mock.calls[0]?.[0]);
+    expect(claimQuery.text).toContain("candidate.idempotency_key IS NULL");
+    expect(claimQuery.text).toContain("active.status IN ('pending', 'processing')");
+    expect(claimQuery.text).toContain("candidate.status = 'failed' OR earlier.status IN ('pending', 'processing')");
+    expect(claimQuery.text).toContain("(earlier.created_at, earlier.id) < (candidate.created_at, candidate.id)");
+    expect(claimQuery.text).toContain("FOR UPDATE OF candidate SKIP LOCKED");
+  });
+
   it("suppresses a previously claimed job before creating or calling the provider", async () => {
     const result = await runVerificationCronTick();
 

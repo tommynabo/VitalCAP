@@ -511,7 +511,7 @@ export async function runInstantlyImportTick(options: {
       monthlyWarning: localMonthlyUsage >= env.INSTANTLY_MONTHLY_EMAIL_WARNING_THRESHOLD,
     };
     result.providerStatus = "ready";
-    if (!quotaDecision.allowed || localMonthlyUsage >= env.INSTANTLY_MAX_MONTHLY_EMAILS) {
+    if (!quotaDecision.allowed) {
       result.leadsDeferred = await deferInstantlyLeadImportsForPlanLimit(env.INSTANTLY_CAMPAIGN_ID, now);
       result.metrics = await readPipelineMetrics();
       return result;
