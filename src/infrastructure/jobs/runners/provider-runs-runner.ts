@@ -4,13 +4,34 @@ import { getMapsEnv } from "@/lib/config/env";
 import { getAutopilotSettings } from "@/infrastructure/neon/repositories/autopilot";
 import { ApifyClient, classifyApifyRunFailure, getApifyFailureClass, getApifyFailureKind } from "@/infrastructure/providers/maps/apify-client";
 import { mapCompassItemToPlaceResult } from "@/infrastructure/providers/maps/apify-actors/compass-adapter";
-import { ingestApifyProviderRun } from "@/infrastructure/neon/repositories/provider-run-ingestion";
+import { ingestApifyProviderRun, type ProviderRunIngestionAccounting } from "@/infrastructure/neon/repositories/provider-run-ingestion";
 import { ProviderFailureError } from "@/domain/providers/errors";
 import { createApifyConfigurationFingerprint, createApifyCredentialFingerprint } from "@/services/discovery/provider-health";
 
 const MONITORED_PROVIDERS = ["apify", "serper", "email_verification"] as const;
 const MAX_RUNS_PER_TICK = 20;
 const DATASET_PAGE_SIZE = 100;
+
+function emptyIngestionAccounting(): ProviderRunIngestionAccounting {
+  return {
+    INSERTED_NEW_RAW: 0,
+    DUPLICATE_EXISTING_RAW: 0,
+    CANONICAL_DEDUPE: 0,
+    INVALID_OR_UNMAPPABLE: 0,
+    FILTERED_BY_POLICY: 0,
+    FAILED_INSERT: 0,
+    UNKNOWN: 0,
+  };
+}
+
+function addIngestionAccounting(
+  totals: ProviderRunIngestionAccounting,
+  increment: ProviderRunIngestionAccounting,
+): void {
+  for (const key of Object.keys(totals) as (keyof ProviderRunIngestionAccounting)[]) {
+    totals[key] += increment[key];
+  }
+}
 
 export async function fetchBoundedDatasetItems(
   client: Pick<ApifyClient, "getDatasetItems">,
@@ -37,22 +58,27 @@ export interface ProviderRunsCronResult {
   runsChecked: number;
   runsIngested: number;
   candidatesInserted: number;
+  itemsReturned: number;
+  ingestionAccounting: ProviderRunIngestionAccounting;
   warnings: string[];
 }
 
 /** Polls a bounded number of durable Compass runs; it never waits for an Actor. */
 export async function runProviderRunsCronTick(maxRuns = MAX_RUNS_PER_TICK): Promise<ProviderRunsCronResult> {
   const env = getMapsEnv();
-  if (!env.APIFY_API_TOKEN) return { runsChecked: 0, runsIngested: 0, candidatesInserted: 0, warnings: ["APIFY_API_TOKEN is not configured."] };
+  if (!env.APIFY_API_TOKEN) return { runsChecked: 0, runsIngested: 0, candidatesInserted: 0, itemsReturned: 0, ingestionAccounting: emptyIngestionAccounting(), warnings: ["APIFY_API_TOKEN is not configured."] };
 
   const client = new ApifyClient({ apiToken: env.APIFY_API_TOKEN });
   const runs = await listApifyRunsForPolling(maxRuns);
   let runsIngested = 0;
   let candidatesInserted = 0;
+  let itemsReturned = 0;
+  const ingestionAccounting = emptyIngestionAccounting();
   const warnings: string[] = [];
 
   for (const providerRun of runs) {
     let token = "";
+    let rawItems: Record<string, unknown>[] | null = null;
     try {
       if (!providerRun.externalRunId) {
         await updateProviderRun(providerRun.id, {
@@ -124,7 +150,7 @@ export async function runProviderRunsCronTick(maxRuns = MAX_RUNS_PER_TICK): Prom
         continue;
       }
 
-      const rawItems = await fetchBoundedDatasetItems(client, datasetId, providerRun.itemsRequested || 1);
+      rawItems = await fetchBoundedDatasetItems(client, datasetId, providerRun.itemsRequested || 1);
 
       const mappedPlaces = rawItems.map(mapCompassItemToPlaceResult);
       const places = mappedPlaces.filter((place): place is NonNullable<ReturnType<typeof mapCompassItemToPlaceResult>> => place !== null);
@@ -160,8 +186,15 @@ export async function runProviderRunsCronTick(maxRuns = MAX_RUNS_PER_TICK): Prom
       if (!ingestion.alreadyIngested) {
         runsIngested += 1;
         candidatesInserted += ingestion.rawCandidatesInserted;
+        itemsReturned += rawItems.length;
+        if (ingestion.ingestionAccounting) addIngestionAccounting(ingestionAccounting, ingestion.ingestionAccounting);
+        else ingestionAccounting.UNKNOWN += rawItems.length;
       }
     } catch (error) {
+      if (rawItems) {
+        itemsReturned += rawItems.length;
+        ingestionAccounting.UNKNOWN += rawItems.length;
+      }
       const message = error instanceof Error ? error.message : String(error);
       warnings.push(`provider_run ${providerRun.id}: ${message}`);
       if (error instanceof ProviderFailureError && error.retryAt) {
@@ -180,7 +213,7 @@ export async function runProviderRunsCronTick(maxRuns = MAX_RUNS_PER_TICK): Prom
     }
   }
 
-  return { runsChecked: runs.length, runsIngested, candidatesInserted, warnings };
+  return { runsChecked: runs.length, runsIngested, candidatesInserted, itemsReturned, ingestionAccounting, warnings };
 }
 
 /** Cost/health audit retained alongside the async poller. */

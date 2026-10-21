@@ -180,6 +180,8 @@ interface DiscoveryHandoffCounters {
   providerRunsStarted: number;
   providerStartsFailed: number;
   providerJobsDeferred: number;
+  rawCandidatesInserted: number;
+  rawCandidatesDuplicate: number;
 }
 
 async function executeDiscoveryJob(
@@ -569,6 +571,8 @@ async function executeDiscoveryJob(
             })),
           )
         : [];
+      counters.rawCandidatesInserted += insertedIds.length;
+      counters.rawCandidatesDuplicate += result.rawCandidates.length - insertedIds.length;
 
     for (const rawCandidateId of insertedIds) {
       await enqueueProcessingJob({
@@ -592,6 +596,8 @@ async function executeDiscoveryJob(
 export interface DiscoveryRunnerResult {
   jobsClaimed: number;
   rawCandidatesProduced: number;
+  rawCandidatesInserted: number;
+  rawCandidatesDuplicate: number;
   providerReservationsCreated: number;
   providerReservationsSkipped: number;
   providerRunsStarted: number;
@@ -617,6 +623,8 @@ export async function runDiscoveryCronTick(maxJobsPerTick: number, now: Date = n
     providerRunsStarted: 0,
     providerStartsFailed: 0,
     providerJobsDeferred: 0,
+    rawCandidatesInserted: 0,
+    rawCandidatesDuplicate: 0,
   };
   let pausedWorkspaces = 0;
   let emergencyStoppedWorkspaces = 0;
