@@ -227,7 +227,12 @@ export async function POST() {
       elapsedMs,
       correlationId,
     });
-    return NextResponse.json({ status: "failed", failedStage, correlationId }, {
+    return NextResponse.json({
+      stage: failedStage,
+      sqlState: failure.sqlState,
+      constraintName: failure.constraintName,
+      errorClass: failure.errorClass,
+    }, {
       status: 500,
       headers: { "Cache-Control": "no-store" },
     });

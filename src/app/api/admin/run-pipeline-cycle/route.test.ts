@@ -131,8 +131,12 @@ describe("/api/admin/run-pipeline-cycle", () => {
     const body = await response.json();
 
     expect(response.status).toBe(500);
-    expect(body.failedStage).toBe("VERIFICATION_PROVIDER");
-    expect(body.correlationId).toEqual(expect.any(String));
+    expect(body).toEqual({
+      stage: "VERIFICATION_PROVIDER",
+      sqlState: "23503",
+      constraintName: "fk_verification_jobs_contact_points",
+      errorClass: "Error",
+    });
     expect(JSON.stringify(body)).not.toContain("private SQL");
     expect(logSpy).toHaveBeenCalledOnce();
     expect(logSpy.mock.calls[0]?.[0]).toBe("pipeline_cycle_failed");
@@ -142,7 +146,7 @@ describe("/api/admin/run-pipeline-cycle", () => {
       errorClass: "Error",
       constraintName: "fk_verification_jobs_contact_points",
       elapsedMs: expect.any(Number),
-      correlationId: body.correlationId,
+      correlationId: expect.any(String),
     });
     expect(JSON.stringify(logSpy.mock.calls[0])).not.toContain("private SQL");
     logSpy.mockRestore();
@@ -155,7 +159,7 @@ describe("/api/admin/run-pipeline-cycle", () => {
     const body = await response.json();
 
     expect(response.status).toBe(500);
-    expect(body.failedStage).toBe("VERIFICATION");
+    expect(body.stage).toBe("VERIFICATION");
     expect(JSON.stringify(body)).not.toContain("private query detail");
     expect(mocks.runVerificationCronTick).not.toHaveBeenCalled();
   });
