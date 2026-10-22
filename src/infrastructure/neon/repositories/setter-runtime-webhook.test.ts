@@ -292,13 +292,20 @@ describe("Instantly webhook persistence", () => {
 
   it("keeps webhook persistence methods free of interactive transactions", () => {
     const source = readFileSync(new URL("./setter-runtime.ts", import.meta.url), "utf8");
-    for (const name of ["persistIncoming", "persistResult", "persistFailure", "processInstantlyComplianceEvent", "processInstantlySentEvent"]) {
+    for (const name of ["persistIncoming", "persistResult", "persistFailure", "processInstantlyComplianceEvent", "processInstantlySentEvent", "sendReviewedSetterReply", "recordReplySendFailure"]) {
       const start = source.indexOf(`${name}(`);
       expect(start, `${name} exists`).toBeGreaterThanOrEqual(0);
       const nextExport = source.indexOf("\nexport ", start + 1);
       const body = source.slice(start, nextExport === -1 ? source.length : nextExport);
       expect(body, `${name} avoids transaction()`).not.toContain(".transaction(");
     }
+
+    const senderStart = source.indexOf("export async function sendReviewedSetterReply(");
+    const senderEnd = source.indexOf("\nasync function recordReplySendFailure(", senderStart);
+    const sender = source.slice(senderStart, senderEnd);
+    expect(sender).toContain("conversation.state = 'approved_pending_send'");
+    expect(sender).toContain("IS DISTINCT FROM 'send_unknown'");
+    expect(sender).toContain("UPDATE conversation_messages AS message");
 
     const incomingStart = source.indexOf("async function persistIncoming(");
     const incomingEnd = source.indexOf("\nexport const neonSetterInboundRuntimeStore", incomingStart);

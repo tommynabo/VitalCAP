@@ -1160,52 +1160,91 @@ export async function sendReviewedSetterReply(workspaceId: string, draftId: stri
   }
 
   const db = getDb();
-  const claim = await db.transaction(async (tx) => {
-    const [item] = await tx
-      .select({ draft: schema.setterDrafts, message: schema.conversationMessages, conversation: schema.conversations, feedback: schema.setterFeedback })
-      .from(schema.setterDrafts)
-      .innerJoin(schema.conversationMessages, eq(schema.setterDrafts.conversationMessageId, schema.conversationMessages.id))
-      .innerJoin(schema.conversations, eq(schema.conversationMessages.conversationId, schema.conversations.id))
-      .innerJoin(schema.setterFeedback, eq(schema.setterFeedback.conversationMessageId, schema.conversationMessages.id))
-      .where(and(eq(schema.setterDrafts.id, draftId), eq(schema.conversations.workspaceId, workspaceId)))
-      .limit(1);
-    if (!item || item.conversation.state !== "approved_pending_send" || !item.feedback.finalText?.trim()) return null;
-    const previousDelivery = jsonObject(item.message.metadata).replyDelivery;
-    if (jsonObject(previousDelivery).status === "send_unknown") {
-      await tx.update(schema.conversations).set({ state: "send_unknown", updatedAt: new Date() })
-        .where(eq(schema.conversations.id, item.conversation.id));
-      return { reconciliationRequired: true as const };
-    }
-
-    const now = new Date();
-    const [claimed] = await tx.update(schema.conversations).set({ state: "sending", updatedAt: now })
-      .where(and(
-        eq(schema.conversations.id, item.conversation.id),
-        eq(schema.conversations.workspaceId, workspaceId),
-        eq(schema.conversations.state, "approved_pending_send"),
-      ))
-      .returning({ id: schema.conversations.id });
-    if (!claimed) return null;
-
-    const metadata = jsonObject(item.message.metadata);
-    await tx.update(schema.conversationMessages).set({
-      metadata: {
-        ...metadata,
-        replyDelivery: {
-          status: "sending",
-          attemptedAt: now.toISOString(),
-          setterDraftId: item.draft.id,
-          reviewDecision: item.feedback.decision,
-        },
-      },
-    }).where(eq(schema.conversationMessages.id, item.message.id));
-
-    return { ...item, messageMetadata: metadata };
-  });
-  if (!claim) return { status: "already_claimed" };
-  if ("reconciliationRequired" in claim) {
+  const unknownClaim = await db.execute(sql`
+    UPDATE conversations AS conversation
+    SET state = 'send_unknown', updated_at = now()
+    FROM conversation_messages AS message
+    INNER JOIN setter_drafts AS draft ON draft.conversation_message_id = message.id
+    WHERE draft.id = ${draftId}::uuid
+      AND message.conversation_id = conversation.id
+      AND conversation.workspace_id = ${workspaceId}::uuid
+      AND conversation.state = 'approved_pending_send'
+      AND message.metadata->'replyDelivery'->>'status' = 'send_unknown'
+    RETURNING conversation.id
+  `);
+  if (unknownClaim.rows.length > 0) {
     return { status: "reconciliation_required", errorCode: "SEND_UNKNOWN_REQUIRES_RECONCILIATION" };
   }
+
+  const claimResult = await db.execute(sql`
+    WITH claimable AS (
+      SELECT
+        draft.id AS draft_id,
+        message.id AS message_id,
+        conversation.id AS conversation_id,
+        message.provider_message_id,
+        message.metadata AS message_metadata,
+        feedback.final_text,
+        feedback.decision AS review_decision
+      FROM setter_drafts AS draft
+      INNER JOIN conversation_messages AS message ON message.id = draft.conversation_message_id
+      INNER JOIN conversations AS conversation ON conversation.id = message.conversation_id
+      INNER JOIN setter_feedback AS feedback ON feedback.conversation_message_id = message.id
+      WHERE draft.id = ${draftId}::uuid
+        AND conversation.workspace_id = ${workspaceId}::uuid
+        AND conversation.state = 'approved_pending_send'
+        AND nullif(btrim(feedback.final_text), '') IS NOT NULL
+        AND message.metadata->'replyDelivery'->>'status' IS DISTINCT FROM 'send_unknown'
+    ), claimed AS (
+      UPDATE conversations AS conversation
+      SET state = 'sending', updated_at = now()
+      FROM claimable
+      WHERE conversation.id = claimable.conversation_id
+        AND conversation.workspace_id = ${workspaceId}::uuid
+        AND conversation.state = 'approved_pending_send'
+      RETURNING conversation.id
+    )
+    UPDATE conversation_messages AS message
+    SET metadata = jsonb_set(
+      coalesce(message.metadata, '{}'::jsonb),
+      '{replyDelivery}',
+      coalesce(message.metadata->'replyDelivery', '{}'::jsonb) || jsonb_build_object(
+        'status', 'sending',
+        'attemptedAt', now(),
+        'setterDraftId', claimable.draft_id,
+        'reviewDecision', claimable.review_decision
+      ),
+      true
+    )
+    FROM claimable
+    INNER JOIN claimed ON claimed.id = claimable.conversation_id
+    WHERE message.id = claimable.message_id
+    RETURNING
+      claimable.draft_id,
+      claimable.message_id,
+      claimable.conversation_id,
+      claimable.provider_message_id,
+      claimable.message_metadata,
+      claimable.final_text,
+      claimable.review_decision
+  `);
+  const claimed = claimResult.rows[0] as {
+    draft_id: string;
+    message_id: string;
+    conversation_id: string;
+    provider_message_id: string | null;
+    message_metadata: unknown;
+    final_text: string;
+    review_decision: string;
+  } | undefined;
+  const claim = claimed ? {
+    draft: { id: claimed.draft_id },
+    message: { id: claimed.message_id, providerMessageId: claimed.provider_message_id, metadata: claimed.message_metadata },
+    conversation: { id: claimed.conversation_id },
+    feedback: { finalText: claimed.final_text, decision: claimed.review_decision },
+    messageMetadata: jsonObject(claimed.message_metadata),
+  } : null;
+  if (!claim) return { status: "already_claimed" };
 
   const provider = new InstantlyReplyProvider(env.INSTANTLY_API_KEY);
   const replyToUuid = typeof claim.messageMetadata.replyToUuid === "string"
@@ -1272,12 +1311,20 @@ export async function sendReviewedSetterReply(workspaceId: string, draftId: stri
     },
   };
   try {
-    await db.transaction(async (tx) => {
-      await tx.update(schema.conversations).set({ state: "send_accepted", updatedAt: acceptedAt })
-        .where(and(eq(schema.conversations.id, claim.conversation.id), eq(schema.conversations.state, "sending")));
-      await tx.update(schema.conversationMessages).set({ metadata: acceptedMetadata })
-        .where(eq(schema.conversationMessages.id, claim.message.id));
-    });
+    const finalized = await db.execute(sql`
+      WITH transitioned AS (
+        UPDATE conversations
+        SET state = 'send_accepted', updated_at = ${acceptedAt}
+        WHERE id = ${claim.conversation.id}::uuid AND state = 'sending'
+        RETURNING id
+      )
+      UPDATE conversation_messages AS message
+      SET metadata = ${JSON.stringify(acceptedMetadata)}::jsonb
+      FROM transitioned
+      WHERE message.id = ${claim.message.id}::uuid
+      RETURNING message.id
+    `);
+    if (finalized.rows.length !== 1) throw new Error("Accepted reply finalization did not update the claimed message.");
   } catch {
     await recordReplySendFailure(db, claim.conversation.id, claim.message, "send_unknown", "PROVIDER_ACCEPTED_PERSISTENCE_UNCERTAIN", {
       providerMessageId: providerResponse.providerMessageId,
@@ -1299,12 +1346,29 @@ async function recordReplySendFailure(
   errorCode: string,
   deliveryDetails: Record<string, unknown> = {},
 ): Promise<void> {
-  const metadata = jsonObject(message.metadata);
-  await db.transaction(async (tx) => {
-    await tx.update(schema.conversations).set({ state, updatedAt: new Date() })
-      .where(eq(schema.conversations.id, conversationId));
-    await tx.update(schema.conversationMessages).set({
-      metadata: { ...metadata, replyDelivery: { ...deliveryDetails, status: state, errorCode, failedAt: new Date().toISOString() } },
-    }).where(eq(schema.conversationMessages.id, message.id));
-  });
+  const deliveryMetadata = {
+    ...deliveryDetails,
+    status: state,
+    errorCode,
+    failedAt: new Date().toISOString(),
+  };
+  const result = await db.execute(sql`
+    WITH transitioned AS (
+      UPDATE conversations
+      SET state = ${state}, updated_at = now()
+      WHERE id = ${conversationId}::uuid
+      RETURNING id
+    )
+    UPDATE conversation_messages AS message
+    SET metadata = jsonb_set(
+      coalesce(message.metadata, '{}'::jsonb),
+      '{replyDelivery}',
+      coalesce(message.metadata->'replyDelivery', '{}'::jsonb) || ${JSON.stringify(deliveryMetadata)}::jsonb,
+      true
+    )
+    FROM transitioned
+    WHERE message.id = ${message.id}::uuid
+    RETURNING message.id
+  `);
+  if (result.rows.length !== 1) throw new Error("Reply delivery failure state could not be persisted.");
 }
