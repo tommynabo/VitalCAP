@@ -3,8 +3,16 @@ import { getDb, schema } from "@/infrastructure/neon/db";
 
 export interface ConfiguredInstantlyCampaign {
   providerCampaignId: string;
-  campaignId: string;
   workspaceId: string;
+}
+
+export interface InstantlyInboxCampaignDiscoveryCounts {
+  configuredCampaignCount: number;
+  mappingTableCampaignCount: number;
+  engineConfigCampaignCount: number;
+  importProviderCampaignCount: number;
+  importRowsForTargetCampaign: number;
+  envTargetCampaignConfigured: boolean;
 }
 
 export interface InstantlyInboxCheckpoint {
@@ -29,6 +37,21 @@ export interface SetterReplyReadbackCandidate {
   setterDraftId: string;
 }
 
+const ACTIVE_IMPORT_STATUSES = ["instantly_added", "skipped_existing"] as const;
+
+export function dedupeConfiguredInstantlyCampaigns(
+  ...sources: ConfiguredInstantlyCampaign[][]
+): ConfiguredInstantlyCampaign[] {
+  const targets = new Map<string, ConfiguredInstantlyCampaign>();
+  for (const source of sources) {
+    for (const target of source) {
+      const key = `${target.workspaceId}:${target.providerCampaignId}`;
+      if (!targets.has(key)) targets.set(key, target);
+    }
+  }
+  return [...targets.values()];
+}
+
 export async function listConfiguredInstantlyCampaigns(workspaceId?: string): Promise<ConfiguredInstantlyCampaign[]> {
   const db = getDb();
   const mappedConditions = [
@@ -38,7 +61,6 @@ export async function listConfiguredInstantlyCampaigns(workspaceId?: string): Pr
   if (workspaceId) mappedConditions.push(eq(schema.campaignProviderMappings.workspaceId, workspaceId));
   const mappings = await db.select({
     providerCampaignId: schema.campaignProviderMappings.providerCampaignId,
-    campaignId: schema.campaignProviderMappings.campaignId,
     workspaceId: schema.campaignProviderMappings.workspaceId,
   })
     .from(schema.campaignProviderMappings)
@@ -50,32 +72,84 @@ export async function listConfiguredInstantlyCampaigns(workspaceId?: string): Pr
   )!];
   if (workspaceId) campaignConditions.push(eq(schema.campaigns.workspaceId, workspaceId));
   const configuredCampaigns = await db.select({
-    campaignId: schema.campaigns.id,
     workspaceId: schema.campaigns.workspaceId,
     engineConfig: schema.campaigns.engineConfig,
   })
     .from(schema.campaigns)
     .where(and(...campaignConditions));
 
-  const byProviderId = new Map<string, ConfiguredInstantlyCampaign>();
-  for (const mapping of mappings) {
-    byProviderId.set(mapping.providerCampaignId, mapping);
-  }
+  const engineConfigTargets: ConfiguredInstantlyCampaign[] = [];
   for (const campaign of configuredCampaigns) {
     const config = campaign.engineConfig !== null && typeof campaign.engineConfig === "object" && !Array.isArray(campaign.engineConfig)
       ? campaign.engineConfig as Record<string, unknown>
       : {};
     const providerCampaignId = [config.instantlyCampaignId, config.providerCampaignId]
       .find((value): value is string => typeof value === "string" && value.trim().length > 0)?.trim();
-    if (providerCampaignId && !byProviderId.has(providerCampaignId)) {
-      byProviderId.set(providerCampaignId, {
-        providerCampaignId,
-        campaignId: campaign.campaignId,
-        workspaceId: campaign.workspaceId,
-      });
-    }
+    if (providerCampaignId) engineConfigTargets.push({ providerCampaignId, workspaceId: campaign.workspaceId });
   }
-  return [...byProviderId.values()];
+
+  const importConditions = [inArray(schema.instantlyLeadImports.status, [...ACTIVE_IMPORT_STATUSES])];
+  if (workspaceId) importConditions.push(eq(schema.instantlyLeadImports.workspaceId, workspaceId));
+  const importedTargets = await db.selectDistinct({
+    providerCampaignId: schema.instantlyLeadImports.providerCampaignId,
+    workspaceId: schema.instantlyLeadImports.workspaceId,
+  })
+    .from(schema.instantlyLeadImports)
+    .where(and(...importConditions));
+
+  return dedupeConfiguredInstantlyCampaigns(
+    mappings,
+    engineConfigTargets,
+    importedTargets,
+  );
+}
+
+export async function getInstantlyInboxCampaignDiscoveryCounts(
+  workspaceId: string,
+  envTargetCampaignId: string,
+): Promise<InstantlyInboxCampaignDiscoveryCounts> {
+  const db = getDb();
+  const mappingRows = await db.selectDistinct({ providerCampaignId: schema.campaignProviderMappings.providerCampaignId })
+    .from(schema.campaignProviderMappings)
+    .where(and(
+      eq(schema.campaignProviderMappings.provider, "instantly"),
+      eq(schema.campaignProviderMappings.enabled, true),
+      eq(schema.campaignProviderMappings.workspaceId, workspaceId),
+    ));
+  const campaignRows = await db.select({ engineConfig: schema.campaigns.engineConfig })
+    .from(schema.campaigns)
+    .where(eq(schema.campaigns.workspaceId, workspaceId));
+  const engineConfigCampaignIds = new Set<string>();
+  for (const row of campaignRows) {
+    const config = row.engineConfig !== null && typeof row.engineConfig === "object" && !Array.isArray(row.engineConfig)
+      ? row.engineConfig as Record<string, unknown>
+      : {};
+    const providerCampaignId = [config.instantlyCampaignId, config.providerCampaignId]
+      .find((value): value is string => typeof value === "string" && value.trim().length > 0)?.trim();
+    if (providerCampaignId) engineConfigCampaignIds.add(providerCampaignId);
+  }
+  const importedTargets = await db.selectDistinct({ providerCampaignId: schema.instantlyLeadImports.providerCampaignId })
+    .from(schema.instantlyLeadImports)
+    .where(and(
+      eq(schema.instantlyLeadImports.workspaceId, workspaceId),
+      inArray(schema.instantlyLeadImports.status, [...ACTIVE_IMPORT_STATUSES]),
+    ));
+  const [targetImportCount] = await db.select({ count: sql<number>`count(*)::int` })
+    .from(schema.instantlyLeadImports)
+    .where(and(
+      eq(schema.instantlyLeadImports.workspaceId, workspaceId),
+      eq(schema.instantlyLeadImports.providerCampaignId, envTargetCampaignId),
+      inArray(schema.instantlyLeadImports.status, [...ACTIVE_IMPORT_STATUSES]),
+    ));
+  const configured = await listConfiguredInstantlyCampaigns(workspaceId);
+  return {
+    configuredCampaignCount: configured.length,
+    mappingTableCampaignCount: mappingRows.length,
+    engineConfigCampaignCount: engineConfigCampaignIds.size,
+    importProviderCampaignCount: importedTargets.length,
+    importRowsForTargetCampaign: Number(targetImportCount?.count ?? 0),
+    envTargetCampaignConfigured: Boolean(envTargetCampaignId && configured.some((target) => target.providerCampaignId === envTargetCampaignId)),
+  };
 }
 
 export async function getInstantlyInboxCheckpoint(providerCampaignId: string): Promise<InstantlyInboxCheckpoint | null> {

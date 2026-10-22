@@ -87,7 +87,7 @@ function normalizeReceivedEmail(raw: Record<string, unknown>, expectedCampaignId
   const occurredAtValue = firstString(raw.timestamp_email, raw.timestamp_created);
   const occurredAt = occurredAtValue ? new Date(occurredAtValue) : null;
   const bodyText = firstString(body?.text);
-  if (!providerMessageId || !campaignId || campaignId !== expectedCampaignId || !email || !bodyText || !occurredAt || Number.isNaN(occurredAt.getTime())) {
+  if (raw.ue_type !== 2 || !providerMessageId || !campaignId || campaignId !== expectedCampaignId || !email || !bodyText || !occurredAt || Number.isNaN(occurredAt.getTime())) {
     return null;
   }
 

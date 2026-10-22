@@ -15,6 +15,7 @@ function email(id: string) {
     eaccount: "sender@example.es",
     subject: "Re: Details",
     body: { text: `Reply ${id}` },
+    ue_type: 2,
     thread_id: "thread-1",
     timestamp_email: "2026-10-22T11:00:00.000Z",
   };
@@ -110,6 +111,17 @@ describe("runInstantlyInboxReconcile", () => {
       windowStartedAt: null,
       nextStartingAfter: null,
     });
+  });
+
+  it("rejects records that do not have the documented received-email type", async () => {
+    const deps = dependencies({
+      listReceivedEmails: vi.fn(async () => ({ items: [{ ...email("sent-record"), ue_type: 3 }], nextStartingAfter: null })),
+    });
+
+    const result = await runInstantlyInboxReconcile(deps, { now });
+
+    expect(result).toMatchObject({ repliesFound: 1, invalidOrUnmappable: 1, newRepliesImported: 0 });
+    expect(deps.ingest).not.toHaveBeenCalled();
   });
 
   it("confirms an accepted reply by its exact provider message ID", async () => {

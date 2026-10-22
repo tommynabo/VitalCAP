@@ -32,6 +32,29 @@ describe("InstantlyInboxProvider", () => {
     expect(page).toEqual({ items: [{ id: "provider-email-1" }], nextStartingAfter: "cursor-1" });
   });
 
+  it("supports an unfiltered received-email comparison", async () => {
+    const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(response({ items: [] }));
+    const provider = new InstantlyInboxProvider("not-a-real-key", fetchImpl);
+
+    await provider.listReceivedEmails({
+      minTimestampCreated: "2026-10-20T00:00:00.000Z",
+      limit: 100,
+      startingAfter: null,
+    });
+
+    const url = new URL(String(fetchImpl.mock.calls[0]?.[0]));
+    expect(url.searchParams.get("email_type")).toBe("received");
+    expect(url.searchParams.has("campaign_id")).toBe(false);
+  });
+
+  it("identifies the workspace associated with the API key", async () => {
+    const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(response({ id: "workspace-id" }));
+    const provider = new InstantlyInboxProvider("not-a-real-key", fetchImpl);
+
+    await expect(provider.getCurrentWorkspaceId()).resolves.toBe("workspace-id");
+    expect(String(fetchImpl.mock.calls[0]?.[0])).toBe("https://api.instantly.ai/api/v2/workspaces/current");
+  });
+
   it("retrieves details by the provider email id for truncated list bodies", async () => {
     const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(response({ id: "provider-email-1", body: { text: "Full reply" } }));
     const provider = new InstantlyInboxProvider("not-a-real-key", fetchImpl);
