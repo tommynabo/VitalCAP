@@ -375,7 +375,7 @@ async function persistIncoming(event: InboundEmailReply, payloadHash: string): P
         campaignName: event.campaignName ?? null,
         workspace: event.workspace ?? null,
         emailAccount: event.emailAccount ?? null,
-        replyToUuid: event.providerMessageId,
+        replyToUuid: event.replyToUuid ?? event.providerMessageId,
         subject: event.subject,
       },
       createdAt: receivedAt,
@@ -702,9 +702,110 @@ export async function processInstantlyComplianceEvent(input: {
   }
 }
 
+export async function confirmSetterReplySent(input: {
+  workspaceId: string;
+  campaignId: string;
+  email: string;
+  providerMessageId: string;
+  occurredAt: string;
+  confirmationSource: "webhook" | "readback";
+  providerEventId?: string;
+}): Promise<"confirmed" | "already_confirmed" | "not_found" | "ambiguous"> {
+  const db = getDb();
+  const matchingReplies = await db.select({
+    message: schema.conversationMessages,
+    conversation: schema.conversations,
+    finalText: schema.setterFeedback.finalText,
+  })
+    .from(schema.conversationMessages)
+    .innerJoin(schema.conversations, eq(schema.conversationMessages.conversationId, schema.conversations.id))
+    .innerJoin(schema.setterFeedback, eq(schema.setterFeedback.conversationMessageId, schema.conversationMessages.id))
+    .where(and(
+      eq(schema.conversations.workspaceId, input.workspaceId),
+      eq(schema.conversations.campaignId, input.campaignId),
+      sql`${schema.conversationMessages.metadata}->>'leadEmail' = ${input.email.trim().toLowerCase()}`,
+      or(
+        eq(schema.conversationMessages.providerMessageId, `instantly:${input.providerMessageId}`),
+        sql`${schema.conversationMessages.metadata}->'replyDelivery'->>'providerMessageId' = ${input.providerMessageId}`,
+      ),
+    ))
+    .limit(2);
+  if (matchingReplies.length === 0) return "not_found";
+  if (matchingReplies.length > 1) return "ambiguous";
+
+  const match = matchingReplies[0]!;
+  if (!["sending", "send_accepted", "send_unknown", "sent"].includes(match.conversation.state)) return "not_found";
+  const sentAt = new Date(input.occurredAt);
+  const metadata = jsonObject(match.message.metadata);
+  const previousDelivery = jsonObject(metadata.replyDelivery);
+  const providerMessageId = `instantly:${input.providerMessageId}`;
+  const [insertedOutgoing] = await db.insert(schema.conversationMessages).values({
+    conversationId: match.conversation.id,
+    direction: "outgoing",
+    body: match.finalText ?? "",
+    channel: "email",
+    providerMessageId,
+    metadata: {
+      provider: "instantly",
+      replyToUuid: metadata.replyToUuid ?? null,
+      eaccount: metadata.emailAccount ?? metadata.eaccount ?? null,
+      setterDraftId: previousDelivery.setterDraftId ?? null,
+      reviewDecision: previousDelivery.reviewDecision ?? null,
+      providerMessageId: input.providerMessageId,
+      ...(input.providerEventId ? { providerConfirmationEventId: input.providerEventId } : {}),
+      confirmationSource: input.confirmationSource,
+    },
+    createdAt: sentAt,
+  }).onConflictDoNothing().returning({ id: schema.conversationMessages.id });
+  if (!insertedOutgoing) {
+    const [existingOutgoing] = await db.select({ conversationId: schema.conversationMessages.conversationId })
+      .from(schema.conversationMessages)
+      .where(eq(schema.conversationMessages.providerMessageId, providerMessageId))
+      .limit(1);
+    if (existingOutgoing?.conversationId !== match.conversation.id) return "ambiguous";
+  }
+
+  const [transitioned] = await db.update(schema.conversations).set({ state: "sent", updatedAt: sentAt })
+    .where(and(
+      eq(schema.conversations.id, match.conversation.id),
+      inArray(schema.conversations.state, ["sending", "send_accepted", "send_unknown"]),
+    ))
+    .returning({ id: schema.conversations.id });
+  await db.update(schema.conversationMessages).set({
+    metadata: {
+      ...metadata,
+      replyDelivery: {
+        ...previousDelivery,
+        status: "sent",
+        providerMessageId: input.providerMessageId,
+        ...(input.providerEventId ? { providerConfirmationEventId: input.providerEventId } : {}),
+        confirmationSource: input.confirmationSource,
+        sentAt: sentAt.toISOString(),
+      },
+    },
+  }).where(eq(schema.conversationMessages.id, match.message.id));
+
+  if (transitioned) {
+    await insertAuditLog({
+      workspaceId: input.workspaceId,
+      actorUserId: null,
+      action: "setter.reply.sent",
+      entityType: "setter_draft",
+      entityId: String(previousDelivery.setterDraftId ?? ""),
+      metadata: {
+        confirmationSource: input.confirmationSource,
+        providerMessageId: input.providerMessageId,
+      },
+    });
+    return "confirmed";
+  }
+  return "already_confirmed";
+}
+
 export async function processInstantlySentEvent(input: {
   providerEventId: string;
   providerMessageId: string;
+  sentProviderMessageId?: string;
   providerCampaignId: string;
   email: string;
   occurredAt: string;
@@ -743,6 +844,29 @@ export async function processInstantlySentEvent(input: {
   }
 
   const campaign = campaignRows[0]!;
+  if (input.sentProviderMessageId) {
+    const confirmation = await confirmSetterReplySent({
+      workspaceId: campaign.workspaceId,
+      campaignId: campaign.id,
+      email: input.email,
+      providerMessageId: input.sentProviderMessageId,
+      occurredAt: input.occurredAt,
+      confirmationSource: "webhook",
+      providerEventId: input.providerEventId,
+    });
+    if (confirmation === "confirmed" || confirmation === "already_confirmed") {
+      await db.update(schema.setterWebhookEvents).set({
+        workspaceId: campaign.workspaceId,
+        status: "processed",
+        processedAt: new Date(input.occurredAt),
+      }).where(and(
+        eq(schema.setterWebhookEvents.provider, "instantly"),
+        eq(schema.setterWebhookEvents.providerEventId, input.providerEventId),
+      ));
+      return { outcome: "processed" };
+    }
+  }
+
   const contactPointRows = await db.select({
     id: schema.contactPoints.id,
     accountId: schema.contactPoints.accountId,
@@ -953,7 +1077,7 @@ export async function persistSetterReviewDecision(
 }
 
 export type SetterReplyDeliveryResult =
-  | { status: "sent"; providerMessageId: string | null }
+  | { status: "accepted"; providerMessageId: string | null }
   | { status: "failed"; errorCode: string }
   | { status: "uncertain"; errorCode: string }
   | { status: "reconciliation_required"; errorCode: "SEND_UNKNOWN_REQUIRES_RECONCILIATION" }
@@ -1084,7 +1208,7 @@ export async function sendReviewedSetterReply(workspaceId: string, draftId: stri
     emailAccount,
     replyToUuid,
     replyDelivery: {
-      status: "provider_accepted",
+      status: "send_accepted",
       acceptedAt: acceptedAt.toISOString(),
       providerMessageId: providerResponse.providerMessageId,
       providerResponseIdentifiers: providerResponse.responseIdentifiers,
@@ -1109,38 +1233,7 @@ export async function sendReviewedSetterReply(workspaceId: string, draftId: stri
     return { status: "uncertain", errorCode: "PROVIDER_ACCEPTED_PERSISTENCE_UNCERTAIN" };
   }
 
-  try {
-    await db.transaction(async (tx) => {
-      await tx.insert(schema.conversationMessages).values({
-        conversationId: claim.conversation.id,
-        direction: "outgoing",
-        body: feedback.finalText!,
-        channel: "email",
-        providerMessageId: providerResponse.providerMessageId ? `instantly:${providerResponse.providerMessageId}` : null,
-        metadata: {
-          provider: "instantly",
-          replyToUuid,
-          eaccount: emailAccount,
-          reviewDecision: feedback.decision,
-          setterDraftId: claim.draft.id,
-          providerResponseIdentifiers: providerResponse.responseIdentifiers,
-        },
-        createdAt: acceptedAt,
-      }).onConflictDoNothing();
-      await tx.update(schema.conversations).set({ state: "sent", updatedAt: acceptedAt })
-        .where(and(eq(schema.conversations.id, claim.conversation.id), eq(schema.conversations.state, "send_accepted")));
-    });
-  } catch {
-    await recordReplySendFailure(db, claim.conversation.id, claim.message, "send_unknown", "PROVIDER_ACCEPTED_FINALIZATION_UNCERTAIN", {
-      providerMessageId: providerResponse.providerMessageId,
-      providerResponseIdentifiers: providerResponse.responseIdentifiers,
-      eaccount: emailAccount,
-      replyToUuid,
-    });
-    return { status: "uncertain", errorCode: "PROVIDER_ACCEPTED_FINALIZATION_UNCERTAIN" };
-  }
-
-  return { status: "sent", providerMessageId: providerResponse.providerMessageId };
+  return { status: "accepted", providerMessageId: providerResponse.providerMessageId };
 }
 
 async function recordReplySendFailure(

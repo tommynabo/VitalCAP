@@ -8,7 +8,7 @@ export const SETTER_REVIEW_QUEUE_LIMIT = 25;
 export type SetterQueueCursor = Pick<Conversation, "id" | "updatedAt">;
 export type SetterQueueConversation = Pick<Conversation, "id" | "accountId" | "contactId" | "campaignId" | "state" | "latestIntent" | "updatedAt">;
 export type SetterQueueMessage = Pick<ConversationMessage, "id" | "conversationId" | "direction" | "body" | "createdAt">;
-export type SetterQueueDraft = Pick<SetterDraft, "id" | "conversationMessageId" | "draft" | "confidence" | "riskFlags">;
+export type SetterQueueDraft = Pick<SetterDraft, "id" | "conversationMessageId" | "draft" | "confidence" | "riskFlags" | "branch" | "reasonForHuman">;
 export type SetterQueueAccount = {
   account: Pick<Account, "id" | "canonicalName">;
   contacts: Array<Pick<Contact, "id" | "firstName" | "fullName">>;

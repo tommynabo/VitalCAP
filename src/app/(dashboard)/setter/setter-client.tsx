@@ -36,7 +36,7 @@ export function SetterClient({
   const [actionError, setActionError] = useState<string | null>(null);
   const [expandedDraftId, setExpandedDraftId] = useState<string | null>(null);
   const [editingDraftId, setEditingDraftId] = useState<string | null>(null);
-  const [reviewedDraftIds, setReviewedDraftIds] = useState<string[]>([]);
+  const [deliveryNotice, setDeliveryNotice] = useState<string | null>(null);
   const [loadingMore, setLoadingMore] = useState(false);
   const [historyByConversationId, setHistoryByConversationId] = useState<Record<string, ConversationHistoryPage>>({});
   const [historyLoadingIds, setHistoryLoadingIds] = useState<string[]>([]);
@@ -57,14 +57,12 @@ export function SetterClient({
   const draftByMessageId = new Map(setterDrafts.map((draft) => [draft.conversationMessageId, draft]));
   const latestInboundByConversationId = new Map(latestInboundMessages.map((message) => [message.conversationId, message]));
   const queueItems = conversations.flatMap((conversation) => {
-    if (conversation.state !== "pending_review") return [];
     const incoming = latestInboundByConversationId.get(conversation.id);
     const draft = incoming ? draftByMessageId.get(incoming.id) : null;
     return incoming && draft ? [{ conversation, message: incoming, draft }] : [];
   });
   const now = Date.parse(renderedAt);
   const pendingItems = queueItems
-    .filter(({ draft }) => !reviewedDraftIds.includes(draft.id))
     .sort((left, right) => Date.parse(left.message.createdAt) - Date.parse(right.message.createdAt));
 
   async function fetchHistoryPage(conversationId: string, cursor: ConversationHistoryPage["nextCursor"] = null) {
@@ -131,6 +129,7 @@ export function SetterClient({
   async function submitReview(draft: (typeof setterDrafts)[number], decision: "approve" | "edit_and_send" | "reject") {
     setBusyDraftId(draft.id);
     setActionError(null);
+    setDeliveryNotice(null);
     try {
       const response = await fetch(`/api/setter/reviews/${draft.id}`, {
         method: "PATCH",
@@ -147,9 +146,15 @@ export function SetterClient({
         if (result.state || result.delivery) router.refresh();
         throw new Error(result.error ?? result.errorCode ?? "Review decision could not be saved.");
       }
-      setReviewedDraftIds((current) => [...current, draft.id]);
+      const notice = result.delivery?.status === "accepted" ? "Respuesta aceptada por Instantly"
+        : result.delivery?.status === "sent" ? "Enviado"
+          : result.delivery?.status === "failed" ? "Error al enviar"
+            : result.delivery?.status === "uncertain" ? "Estado de envío pendiente de reconciliación"
+              : result.delivery?.status === "already_claimed" ? "El envío ya está en curso"
+                : decision === "reject" ? "Rechazo registrado" : null;
+      setDeliveryNotice(notice);
       setEditingDraftId(null);
-      const nextDraft = pendingItems.find(({ draft: pendingDraft }) => pendingDraft.id !== draft.id)?.draft;
+      const nextDraft = pendingItems.find(({ draft: pendingDraft, conversation }) => pendingDraft.id !== draft.id && conversation.state === "pending_review")?.draft;
       if (nextDraft) {
         setExpandedDraftId(nextDraft.id);
       } else if (queuePage.nextCursor) {
@@ -183,9 +188,10 @@ export function SetterClient({
       <section className="space-y-3" aria-labelledby="setter-review-heading">
         <div className="flex flex-wrap items-baseline justify-between gap-3">
           <h2 id="setter-review-heading" className="text-base font-semibold text-text">Cola de conversaciones</h2>
-          <span className="text-sm text-text-muted">{pendingItems.length} pendientes</span>
+          <span className="text-sm text-text-muted">{queuePage.pendingCount} pendientes · {pendingItems.length} visibles</span>
         </div>
         {actionError && <p role="alert" className="text-sm text-danger">{actionError}</p>}
+        {deliveryNotice && <p role="status" className="text-sm text-text-muted">{deliveryNotice}</p>}
         {pendingItems.length === 0 ? (
           <p className="border-y border-border py-5 text-sm text-text-muted">No hay conversaciones pendientes de revisión.</p>
         ) : (
@@ -208,7 +214,13 @@ export function SetterClient({
                     <span className="min-w-0 flex-1 truncate text-sm font-medium text-text">{leadName}</span>
                     <span className="max-w-48 truncate text-xs text-text-muted">{campaignById.get(conversation.campaignId)?.name ?? "Campaña"}</span>
                     <time className="text-xs text-text-muted" dateTime={message.createdAt}>{new Date(message.createdAt).toLocaleString("es-ES", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" })}</time>
-                    <Badge variant="warning">Pendiente</Badge>
+                    {conversation.state === "pending_review" && draft.branch === "HUMAN_REQUIRED" ? <Badge variant="danger">Requiere atención humana</Badge> : null}
+                    {conversation.state === "pending_review" ? <Badge variant="warning">Pendiente</Badge>
+                      : conversation.state === "send_accepted" ? <Badge variant="warning">Aceptado · confirmación pendiente</Badge>
+                        : conversation.state === "sending" || conversation.state === "approved_pending_send" ? <Badge variant="warning">Envío en curso</Badge>
+                          : conversation.state === "send_failed" ? <Badge variant="danger">Error al enviar</Badge>
+                            : conversation.state === "send_unknown" ? <Badge variant="danger">Reconciliación pendiente</Badge>
+                              : conversation.state === "sent" ? <Badge variant="success">Enviado</Badge> : null}
                     {conversation.latestIntent && <Badge variant="neutral">{conversation.latestIntent}</Badge>}
                     {expanded ? <ChevronDown size={16} aria-hidden="true" /> : <ChevronRight size={16} aria-hidden="true" />}
                   </button>
@@ -244,11 +256,11 @@ export function SetterClient({
                         )}
                       </section>
 
-                      <div className="flex flex-wrap gap-2 pt-1">
+                      {conversation.state === "pending_review" && <div className="flex flex-wrap gap-2 pt-1">
                         {editingDraftId === draft.id ? (
                           <>
                             <Button size="sm" className="min-h-11" disabled={busyDraftId === draft.id || !(editedDrafts[draft.id] ?? draft.draft).trim()} onClick={() => submitReview(draft, "edit_and_send")}>
-                              <Check size={15} aria-hidden="true" /> {busyDraftId === draft.id ? "Guardando..." : "Guardar y aprobar"}
+                              <Check size={15} aria-hidden="true" /> {busyDraftId === draft.id ? "Enviando..." : "Guardar y enviar"}
                             </Button>
                             <Button
                               size="sm"
@@ -267,9 +279,9 @@ export function SetterClient({
                           </>
                         ) : (
                           <>
-                            <Button size="sm" className="min-h-11" disabled={busyDraftId === draft.id} onClick={() => submitReview(draft, "approve")}>
-                              <Check size={15} aria-hidden="true" /> {busyDraftId === draft.id ? "Guardando..." : "Aprobar"}
-                            </Button>
+                            {draft.branch !== "HUMAN_REQUIRED" && <Button size="sm" className="min-h-11" disabled={busyDraftId === draft.id} onClick={() => submitReview(draft, "approve")}>
+                              <Check size={15} aria-hidden="true" /> {busyDraftId === draft.id ? "Enviando..." : "Aprobar y enviar"}
+                            </Button>}
                             <Button size="sm" variant="secondary" className="min-h-11" disabled={busyDraftId === draft.id} onClick={() => setEditingDraftId(draft.id)}>
                               <FilePenLine size={15} aria-hidden="true" /> Editar
                             </Button>
@@ -278,7 +290,7 @@ export function SetterClient({
                             </Button>
                           </>
                         )}
-                      </div>
+                      </div>}
 
                       <details
                         className="border-t border-border pt-3"

@@ -145,6 +145,14 @@ export const setterWebhookEvents = pgTable(
   ],
 );
 
+export const instantlyInboxReconcileState = pgTable("instantly_inbox_reconcile_state", {
+  providerCampaignId: text("provider_campaign_id").primaryKey(),
+  checkpointAt: timestamp("checkpoint_at", { withTimezone: true }),
+  windowStartedAt: timestamp("window_started_at", { withTimezone: true }),
+  nextStartingAfter: text("next_starting_after"),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
 export const meetings = pgTable(
   "meetings",
   {

@@ -72,7 +72,7 @@ describe("PATCH /api/setter/reviews/[draftId]", () => {
     requireWorkspaceMember.mockResolvedValue({ workspaceId, user: { userId: "member-1" }, role: "member" });
     getSetterReviewItem.mockResolvedValue(item);
     persistSetterReviewDecision.mockResolvedValue(true);
-    sendReviewedSetterReply.mockResolvedValue({ status: "sent", providerMessageId: "sent-message-1" });
+    sendReviewedSetterReply.mockResolvedValue({ status: "accepted", providerMessageId: "sent-message-1" });
     insertAuditLog.mockResolvedValue(undefined);
   });
 
@@ -81,7 +81,7 @@ describe("PATCH /api/setter/reviews/[draftId]", () => {
     ["edit_and_send", "Human-edited response", "approved_pending_send", "Human-edited response"],
     ["reject", undefined, "rejected", null],
     ["take_over", undefined, "human_owned", null],
-  ])("persists %s without sending", async (decision, finalText, state, expectedFinalText) => {
+  ])("persists %s and sends only approved decisions", async (decision, finalText, state, expectedFinalText) => {
     const response = await review(decision, finalText);
     const responseBody = await response.json();
     const [, , result] = persistSetterReviewDecision.mock.calls[0] as [string, typeof item, {
@@ -91,14 +91,19 @@ describe("PATCH /api/setter/reviews/[draftId]", () => {
     }];
 
     expect(response.status).toBe(200);
-    expect(responseBody.delivery).toBe("not_sent");
+    expect(responseBody.delivery.status).toBe(decision === "approve" || decision === "edit_and_send" ? "accepted" : "not_sent");
     expect(getSetterReviewItem).toHaveBeenCalledWith(workspaceId, draft.id);
     expect(result.conversation.state).toBe(state);
     expect(result.feedback.finalText).toBe(expectedFinalText);
     expect(result.feedback.reviewerId).toBe("member-1");
     expect(result.feedback.reasonCategory).toBe("other");
     expect(result.outgoingMessage).toBeNull();
-    expect(sendReviewedSetterReply).not.toHaveBeenCalled();
+    if (decision === "approve" || decision === "edit_and_send") {
+      expect(sendReviewedSetterReply).toHaveBeenCalledOnce();
+      expect(sendReviewedSetterReply).toHaveBeenCalledWith(workspaceId, draft.id);
+    } else {
+      expect(sendReviewedSetterReply).not.toHaveBeenCalled();
+    }
   });
 
   it("returns not found for a draft outside the authenticated workspace", async () => {
@@ -110,15 +115,6 @@ describe("PATCH /api/setter/reviews/[draftId]", () => {
     expect(getSetterReviewItem).toHaveBeenCalledWith(workspaceId, draft.id);
     expect(persistSetterReviewDecision).not.toHaveBeenCalled();
     expect(insertAuditLog).not.toHaveBeenCalled();
-  });
-
-  it("never calls outbound network from a review action", async () => {
-    const outboundFetch = vi.spyOn(globalThis, "fetch");
-
-    const response = await review("approve");
-
-    expect(response.status).toBe(200);
-    expect(outboundFetch).not.toHaveBeenCalled();
   });
 
   it("handles a repeated review safely when another request already persisted it", async () => {

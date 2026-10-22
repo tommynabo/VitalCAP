@@ -26,7 +26,7 @@ export function normalizeInstantlyWebhook(
   if (!domainCode) return null;
 
   const lead = record(data.lead);
-  const providerLeadId = firstString(data.lead_id, data.lead_email, data.email, lead?.email);
+  const providerLeadId = firstString(data.lead_email, data.email, lead?.email, data.from_email, data.lead_id);
   if (!providerLeadId) return null;
 
   return {
@@ -34,7 +34,8 @@ export function normalizeInstantlyWebhook(
     providerEventId,
     code: domainCode,
     occurredAt: occurredAt.toISOString(),
-    raw: data
+    raw: data,
+    providerMessageId: firstString(data.email_id, data.message_id, data.id),
   };
 }
 
@@ -60,15 +61,17 @@ export function normalizeInstantlyInboundReply(payload: unknown, now = new Date(
   const campaign = record(data.campaign);
   const lead = record(data.lead);
   const reply = record(data.reply);
-  const providerCampaignId = firstString(data.campaign_id, data.campaignId, campaign?.id);
-  const email = firstString(data.lead_email, data.email, lead?.email, data.from_email)?.toLowerCase() ?? null;
-  const providerMessageId = firstString(data.message_id, data.email_id, data.reply_id, reply?.id);
+  const emailData = record(data.email);
+  const providerCampaignId = firstString(data.campaign_id, data.campaignId, data.campaign_uuid, campaign?.id);
+  const email = firstString(data.lead_email, data.email_address, data.from_email, data.from_address_email, data.email, lead?.email)?.toLowerCase() ?? null;
+  const providerMessageId = firstString(data.reply_id, data.reply_uuid, data.message_id, data.email_id, reply?.id, reply?.uuid, emailData?.id);
   const providerEventId = firstString(data.event_id, root.event_id, data.webhook_event_id, root.webhook_event_id, data.id, root.id, providerMessageId);
-  const body = firstString(data.reply_text, data.text, data.body, data.email_body, reply?.text);
+  const bodyData = record(data.body);
+  const body = firstString(data.reply_text, data.reply_text_snippet, data.reply_html, data.text, data.email_body, bodyData?.text, reply?.text, reply?.body);
   if (!providerCampaignId || !email || !providerEventId || !providerMessageId || !body) return null;
 
-  const explicitThreadId = firstString(data.thread_id, data.email_thread_id, data.conversation_id, reply?.thread_id);
-  const occurredAtValue = firstString(data.timestamp, data.created_at, data.event_timestamp, root.timestamp);
+  const explicitThreadId = firstString(data.thread_id, data.email_thread_id, data.conversation_id, reply?.thread_id, emailData?.thread_id);
+  const occurredAtValue = firstString(data.timestamp, data.created_at, data.timestamp_created, data.timestamp_email, data.event_timestamp, root.timestamp);
   const parsedAt = occurredAtValue ? new Date(occurredAtValue) : now;
 
   return {
@@ -78,10 +81,11 @@ export function normalizeInstantlyInboundReply(payload: unknown, now = new Date(
     providerThreadId: explicitThreadId ?? `${providerCampaignId}:${email}`,
     providerCampaignId,
     email,
-    subject: firstString(data.reply_subject, data.subject, data.email_subject, reply?.subject) ?? "",
+    subject: firstString(data.reply_subject, data.subject, data.email_subject, reply?.subject, emailData?.subject) ?? "",
     body,
     occurredAt: Number.isNaN(parsedAt.getTime()) ? now.toISOString() : parsedAt.toISOString(),
-    emailAccount: firstString(data.email_account, data.eaccount),
+    ...(firstString(data.reply_to_uuid, data.email_id) ? { replyToUuid: firstString(data.reply_to_uuid, data.email_id) } : {}),
+    emailAccount: firstString(data.email_account, data.eaccount, data.sending_email, data.email_account_email),
     workspace: firstString(data.workspace),
     campaignName: firstString(data.campaign_name, campaign?.name),
   };

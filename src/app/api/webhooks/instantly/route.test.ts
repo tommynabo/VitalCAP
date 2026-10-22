@@ -131,7 +131,7 @@ describe("POST /api/webhooks/instantly", () => {
     const response = await POST(request(replyPayload, secret));
 
     expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({ ok: true, outcome: "duplicate_skipped" });
+    expect(await response.json()).toEqual({ ok: true, outcome: "DUPLICATE" });
   });
 
   it("acknowledges replies from unmapped campaigns as ignored", async () => {
@@ -139,7 +139,7 @@ describe("POST /api/webhooks/instantly", () => {
     const response = await POST(request(replyPayload, secret));
 
     expect(response.status).toBe(202);
-    expect(await response.json()).toEqual({ ok: true, outcome: "ignored_unknown_campaign" });
+    expect(await response.json()).toEqual({ ok: true, outcome: "UNKNOWN_CAMPAIGN" });
   });
 
   it("does not expose the configured secret in processing errors or logs", async () => {
@@ -149,8 +149,9 @@ describe("POST /api/webhooks/instantly", () => {
     const response = await POST(request(replyPayload, secret));
     const responseText = await response.text();
 
-    expect(response.status).toBe(422);
+    expect(response.status).toBe(500);
     expect(responseText).not.toContain(secret);
+    expect(responseText).toContain("PROCESSING_FAILURE");
     expect(errorLog.mock.calls.flat().join(" ")).not.toContain(secret);
   });
 });

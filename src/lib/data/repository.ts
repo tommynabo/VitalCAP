@@ -206,7 +206,7 @@ export async function getAccountBundleForWorkspace(workspaceId: string, accountI
 function getSeedSetterReviewQueuePage(cursor: SetterQueueCursor | null): Promise<SetterReviewQueuePage> {
   return loadSetterReviewQueuePage({
     listPendingConversations: async (limit, pageCursor) => seed.seedConversations
-      .filter((conversation) => conversation.state === "pending_review")
+      .filter((conversation) => ["pending_review", "approved_pending_send", "sending", "send_accepted", "send_failed", "send_unknown", "sent"].includes(conversation.state))
       .filter((conversation) => !pageCursor
         || conversation.updatedAt < pageCursor.updatedAt
         || (conversation.updatedAt === pageCursor.updatedAt && conversation.id < pageCursor.id))
@@ -239,7 +239,9 @@ function getSeedSetterReviewQueuePage(cursor: SetterQueueCursor | null): Promise
       const ids = new Set(messageIds);
       return seed.seedSetterDrafts
         .filter((draft) => ids.has(draft.conversationMessageId))
-        .map(({ id, conversationMessageId, draft, confidence, riskFlags }) => ({ id, conversationMessageId, draft, confidence, riskFlags }));
+        .map(({ id, conversationMessageId, draft, confidence, riskFlags, branch, reasonForHuman }) => ({
+          id, conversationMessageId, draft, confidence, riskFlags, branch, reasonForHuman,
+        }));
     },
     listAccounts: async (accountIds, contactIds) => {
       const ids = new Set(accountIds);

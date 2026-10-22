@@ -15,6 +15,7 @@ const mocks = vi.hoisted(() => ({
   runDiscoveryCronTick: vi.fn(),
   runProviderRunsCronTick: vi.fn(),
   runProcessingCronTick: vi.fn(),
+  refreshWatchdogPauseForWorkspace: vi.fn(),
   enqueueVerificationJobs: vi.fn(),
   runVerificationCronTick: vi.fn(),
   runInstantlyImportTick: vi.fn(),
@@ -39,6 +40,7 @@ vi.mock("@/infrastructure/jobs/runners/autopilot-runner", () => ({ runAutopilotC
 vi.mock("@/infrastructure/jobs/runners/discovery-runner", () => ({ runDiscoveryCronTick: mocks.runDiscoveryCronTick }));
 vi.mock("@/infrastructure/jobs/runners/provider-runs-runner", () => ({ runProviderRunsCronTick: mocks.runProviderRunsCronTick }));
 vi.mock("@/infrastructure/jobs/runners/processing-runner", () => ({ runProcessingCronTick: mocks.runProcessingCronTick }));
+vi.mock("@/infrastructure/jobs/runners/watchdog-runner", () => ({ refreshWatchdogPauseForWorkspace: mocks.refreshWatchdogPauseForWorkspace }));
 vi.mock("@/infrastructure/jobs/runners/verification-runner", () => ({
   enqueueVerificationJobs: mocks.enqueueVerificationJobs,
   runVerificationCronTick: mocks.runVerificationCronTick,
@@ -101,6 +103,7 @@ describe("/api/admin/run-pipeline-cycle", () => {
       warnings: [],
     });
     mocks.runProcessingCronTick.mockResolvedValue({ jobsCompleted: 1 });
+    mocks.refreshWatchdogPauseForWorkspace.mockResolvedValue(undefined);
     mocks.enqueueVerificationJobs.mockResolvedValue(1);
     mocks.runVerificationCronTick.mockResolvedValue({ emailsVerified: 1, verificationValid: 1 });
   });
@@ -114,6 +117,7 @@ describe("/api/admin/run-pipeline-cycle", () => {
     expect(response.status).toBe(403);
     expect(mocks.runAutopilotCronTick).not.toHaveBeenCalled();
     expect(mocks.runInstantlyImportTick).not.toHaveBeenCalled();
+    expect(mocks.refreshWatchdogPauseForWorkspace).not.toHaveBeenCalled();
   });
 
   it("reports the failed stage and logs only approved safe metadata", async () => {
@@ -189,6 +193,10 @@ describe("/api/admin/run-pipeline-cycle", () => {
       autoSendEnabled: false,
     });
     expect(mocks.runInstantlyImportTick).toHaveBeenCalledTimes(2);
+    expect(mocks.refreshWatchdogPauseForWorkspace).toHaveBeenCalledOnce();
+    expect(mocks.refreshWatchdogPauseForWorkspace).toHaveBeenCalledWith("workspace-1");
+    expect(mocks.runInstantlyImportTick.mock.invocationCallOrder[0]!).toBeLessThan(mocks.refreshWatchdogPauseForWorkspace.mock.invocationCallOrder[0]!);
+    expect(mocks.refreshWatchdogPauseForWorkspace.mock.invocationCallOrder[0]!).toBeLessThan(mocks.runAutopilotCronTick.mock.invocationCallOrder[0]!);
     expect(mocks.runAutopilotCronTick).toHaveBeenCalledOnce();
     expect(mocks.runDiscoveryCronTick).toHaveBeenCalledOnce();
     expect(mocks.runProviderRunsCronTick).toHaveBeenCalledWith(5);

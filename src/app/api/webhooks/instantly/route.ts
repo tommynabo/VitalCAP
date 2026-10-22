@@ -1,9 +1,10 @@
-import { createHash, timingSafeEqual } from "node:crypto";
+import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { NextResponse } from "next/server";
 import { normalizeInstantlyInboundReply, normalizeInstantlyWebhook } from "@/infrastructure/providers/instantly/webhook-normalizer";
 import { neonSetterInboundRuntimeStore, processInstantlyComplianceEvent, processInstantlySentEvent, recordInstantlyIgnoredEvent } from "@/infrastructure/neon/repositories/setter-runtime";
 import { getDeliveryEnv } from "@/lib/config/env";
 import { processInstantlyInboundReply } from "@/services/setter/inbound-runtime";
+import { logEvent } from "@/lib/observability/structured-logger";
 
 export const dynamic = "force-dynamic";
 
@@ -34,6 +35,7 @@ export async function POST(request: Request) {
   if (!matchesWebhookSecret(request.headers.get("x-vitalcap-webhook-secret"), secret)) {
     return NextResponse.json({ error: "Unauthorized." }, { status: 401 });
   }
+  const correlationId = randomUUID();
 
   let payload: unknown;
   try {
@@ -56,16 +58,19 @@ export async function POST(request: Request) {
       const lead = record(eventData?.lead);
       const timestamp = firstString(eventData?.timestamp, eventData?.created_at, root?.timestamp);
       const occurredAt = timestamp ? new Date(timestamp) : new Date();
-      const eventId = firstString(eventData?.event_id, root?.event_id, eventData?.webhook_event_id, eventData?.id, root?.id) ?? payloadHash;
+      const eventId = firstString(eventData?.event_id, root?.event_id, eventData?.webhook_event_id, eventData?.id, root?.id, eventData?.email_id, eventData?.message_id);
+      if (!eventId) return NextResponse.json({ ok: true, outcome: "INVALID_PAYLOAD" }, { status: 202 });
       const statusEvent = normalizeInstantlyWebhook(payload, eventId, occurredAt);
       const email = firstString(eventData?.lead_email, eventData?.email, lead?.email)?.toLowerCase();
-      const campaignId = firstString(eventData?.campaign_id, eventData?.campaignId);
+      const campaign = record(eventData?.campaign);
+      const campaignId = firstString(eventData?.campaign_id, eventData?.campaignId, campaign?.id);
       if (!statusEvent || statusEvent.code !== "sent" || !email || !campaignId || Number.isNaN(occurredAt.getTime())) {
-        return NextResponse.json({ ok: true, ignored: true, eventType, errorCode: "INVALID_SENT_PAYLOAD" }, { status: 202 });
+        return NextResponse.json({ ok: true, outcome: "INVALID_PAYLOAD" }, { status: 202 });
       }
       const result = await processInstantlySentEvent({
         providerEventId: statusEvent.providerEventId,
         providerMessageId: statusEvent.providerLeadId,
+        ...(statusEvent.providerMessageId ? { sentProviderMessageId: statusEvent.providerMessageId } : {}),
         providerCampaignId: campaignId,
         email,
         occurredAt: statusEvent.occurredAt,
@@ -116,17 +121,31 @@ export async function POST(request: Request) {
   }
 
   const event = normalizeInstantlyInboundReply(payload);
-  if (!event) return NextResponse.json({ error: "Inbound reply is missing required event, message, campaign, email, or body fields." }, { status: 400 });
+  if (!event) {
+    logEvent("warn", "webhook.instantly.inbound", { correlationId, outcome: "INVALID_PAYLOAD" });
+    return NextResponse.json({ ok: false, outcome: "INVALID_PAYLOAD" }, { status: 400 });
+  }
 
   const payloadHash = createHash("sha256").update(rawBody).digest("hex");
   try {
     const result = await processInstantlyInboundReply(event, payloadHash, neonSetterInboundRuntimeStore);
-    return NextResponse.json(
-      { ok: true, outcome: result.outcome, ...(result.outcome === "human_required" ? { errorCode: result.failureCode } : {}) },
-      { status: result.outcome === "ignored_unknown_campaign" ? 202 : 200 },
-    );
+    const outcome = result.outcome === "processed" ? "PROCESSED"
+      : result.outcome === "duplicate_skipped" ? "DUPLICATE"
+        : result.outcome === "ignored_unknown_campaign" ? "UNKNOWN_CAMPAIGN"
+          : result.failureCode === "AMBIGUOUS_CAMPAIGN" ? "AMBIGUOUS_CAMPAIGN"
+            : result.failureCode === "CONTACT_NOT_FOUND" ? "CONTACT_NOT_FOUND"
+              : result.failureCode === "AMBIGUOUS_CONTACT_MATCH" ? "AMBIGUOUS_CONTACT"
+                : "HUMAN_REQUIRED";
+    logEvent(outcome === "PROCESSED" || outcome === "DUPLICATE" ? "info" : "warn", "webhook.instantly.inbound", {
+      correlationId,
+      outcome,
+      ...(result.outcome === "human_required" ? { errorCode: result.failureCode } : {}),
+    });
+    return NextResponse.json({ ok: true, outcome }, {
+      status: outcome === "UNKNOWN_CAMPAIGN" ? 202 : 200,
+    });
   } catch {
-    console.error("Instantly inbound Setter processing failed.");
-    return NextResponse.json({ error: "Inbound reply was recorded but could not be resolved for Setter processing." }, { status: 422 });
+    logEvent("error", "webhook.instantly.inbound", { correlationId, outcome: "PROCESSING_FAILURE" });
+    return NextResponse.json({ ok: false, outcome: "PROCESSING_FAILURE" }, { status: 500 });
   }
 }

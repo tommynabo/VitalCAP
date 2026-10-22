@@ -15,6 +15,7 @@ import { runAutopilotCronTick } from "@/infrastructure/jobs/runners/autopilot-ru
 import { runDiscoveryCronTick } from "@/infrastructure/jobs/runners/discovery-runner";
 import { runProviderRunsCronTick } from "@/infrastructure/jobs/runners/provider-runs-runner";
 import { runProcessingCronTick } from "@/infrastructure/jobs/runners/processing-runner";
+import { refreshWatchdogPauseForWorkspace } from "@/infrastructure/jobs/runners/watchdog-runner";
 import { enqueueVerificationJobs, runVerificationCronTick, type VerificationExecutionStage } from "@/infrastructure/jobs/runners/verification-runner";
 import { runInstantlyImportTick } from "@/infrastructure/jobs/runners/instantly-import-runner";
 
@@ -131,6 +132,7 @@ export async function POST() {
 
     stage = "INSTANTLY_DRAIN";
     const existingDrain = await runInstantlyImportTick({ processQueueOnly: true, reconcileEligible: true, now: startedAt });
+    await refreshWatchdogPauseForWorkspace(workspaceId);
     stage = "DISCOVERY";
     const autopilot = await runAutopilotCronTick(startedAt);
     const discovery = await runDiscoveryCronTick(1, startedAt);

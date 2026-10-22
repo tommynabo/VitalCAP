@@ -72,7 +72,10 @@ describe("job queue SQL builders", () => {
     const query = buildDiscoveryClaimQuery();
 
     expect(query.sql).toContain("c.status = 'active'");
-    expect(query.sql).toContain("c.autopilot_enabled = true AND aps.enabled = true AND aps.emergency_stopped = false AND aps.system_paused = false");
+    expect(query.sql).toContain("c.autopilot_enabled = true");
+    expect(query.sql).toContain("aps.enabled = true");
+    expect(query.sql).toContain("aps.emergency_stopped = false");
+    expect(query.sql).toContain("aps.system_paused = false OR aps.system_pause_reason = 'Queue health deteriorated (watchdog)'");
     expect(query.sql).toContain("j.campaign_id =");
     expect(query.sql).toContain("j.status IN ('pending', 'processing')");
     expect(query.sql).toContain("j.locked_at + (");

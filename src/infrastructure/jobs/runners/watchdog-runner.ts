@@ -2,7 +2,7 @@ import { sql } from "drizzle-orm";
 import { evaluateWatchdogPause } from "@/services/autopilot/watchdog-pause-policy";
 import { getDb } from "../../neon/db";
 import { listWorkspaceIds } from "../../neon/repositories/workspace";
-import { getWatchdogWorkspaceSignals } from "../../neon/repositories/watchdog-signals";
+import { getWatchdogWorkspaceSignals, type WatchdogWorkspaceSignals } from "../../neon/repositories/watchdog-signals";
 import {
   deadLetterExpiredJobs,
   requeueStaleLockedJobs,
@@ -18,6 +18,34 @@ export interface WatchdogCronResult {
   stuckProviderRuns: number;
   orphanedSeedRuns: number;
   systemPaused: boolean;
+}
+
+async function applyWatchdogPauseDecision(row: WatchdogWorkspaceSignals): Promise<boolean> {
+  const current = {
+    systemPaused: row.systemPaused,
+    systemPauseReason: row.systemPauseReason,
+    systemPausedAt: row.systemPausedAt,
+  };
+  const decision = evaluateWatchdogPause(current, row, new Date());
+
+  if (decision.systemPaused !== current.systemPaused
+    || decision.systemPauseReason !== current.systemPauseReason
+    || decision.systemPausedAt?.getTime() !== current.systemPausedAt?.getTime()) {
+    await getDb().execute(sql`
+      UPDATE autopilot_settings
+      SET system_paused = ${decision.systemPaused},
+          system_pause_reason = ${decision.systemPauseReason},
+          system_paused_at = ${decision.systemPausedAt?.toISOString() ?? null}::timestamptz
+      WHERE workspace_id = ${row.workspaceId}::uuid AND enabled = true
+    `);
+  }
+
+  return decision.systemPaused;
+}
+
+export async function refreshWatchdogPauseForWorkspace(workspaceId: string): Promise<void> {
+  const healthRows = await getWatchdogWorkspaceSignals(workspaceId);
+  for (const row of healthRows) await applyWatchdogPauseDecision(row);
 }
 
 export async function runWatchdogCronTick(): Promise<WatchdogCronResult> {
@@ -114,26 +142,8 @@ export async function runWatchdogCronTick(): Promise<WatchdogCronResult> {
 
   // 6. Autopilot System Pause Check (Queue Health) - Workspace Scoped
   const healthRows = await getWatchdogWorkspaceSignals();
-
   for (const row of healthRows) {
-    const current = {
-      systemPaused: row.systemPaused,
-      systemPauseReason: row.systemPauseReason,
-      systemPausedAt: row.systemPausedAt,
-    };
-    const decision = evaluateWatchdogPause(current, row, new Date());
-
-    if (decision.systemPaused !== current.systemPaused
-      || decision.systemPauseReason !== current.systemPauseReason
-      || decision.systemPausedAt?.getTime() !== current.systemPausedAt?.getTime()) {
-      await db.execute(sql`
-        UPDATE autopilot_settings
-        SET system_paused = ${decision.systemPaused},
-            system_pause_reason = ${decision.systemPauseReason},
-            system_paused_at = ${decision.systemPausedAt?.toISOString() ?? null}::timestamptz
-        WHERE workspace_id = ${row.workspaceId}::uuid AND enabled = true
-      `);
-    }
+    await applyWatchdogPauseDecision(row);
   }
 
   const pausedCount = await db.execute(sql`SELECT count(*) FROM autopilot_settings WHERE system_paused = true`);

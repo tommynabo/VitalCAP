@@ -142,6 +142,7 @@ export interface EmailDeliveryStatusEvent {
   code: EmailDeliveryStatusCode;
   occurredAt: string;
   raw: Record<string, unknown>;
+  providerMessageId?: string | null;
 }
 
 export interface EmailDeliveryProvider {
@@ -254,6 +255,7 @@ export interface InboundEmailReply {
   subject: string;
   body: string;
   occurredAt: string;
+  replyToUuid?: string | null;
   emailAccount?: string | null;
   workspace?: string | null;
   campaignName?: string | null;

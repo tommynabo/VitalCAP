@@ -115,7 +115,10 @@ export async function listPendingReviewConversations(
 ): Promise<SetterQueueConversation[]> {
   const db = getDb();
   const cursorDate = cursor ? new Date(cursor.updatedAt) : null;
-  const conditions = [eq(conversations.workspaceId, workspaceId), eq(conversations.state, "pending_review")];
+  const conditions = [
+    eq(conversations.workspaceId, workspaceId),
+    inArray(conversations.state, ["pending_review", "approved_pending_send", "sending", "send_accepted", "send_failed", "send_unknown", "sent"]),
+  ];
   if (cursor && cursorDate) {
     conditions.push(or(
       lt(conversations.updatedAt, cursorDate),
@@ -242,12 +245,14 @@ export async function listSetterQueueDrafts(
       draft: setterDrafts.draft,
       confidence: setterDrafts.confidence,
       riskFlags: setterDrafts.riskFlags,
+      branch: setterDrafts.branch,
+      reasonForHuman: setterDrafts.reasonForHuman,
     })
     .from(setterDrafts)
     .innerJoin(conversationMessages, eq(setterDrafts.conversationMessageId, conversationMessages.id))
     .innerJoin(conversations, eq(conversationMessages.conversationId, conversations.id))
     .where(and(eq(conversations.workspaceId, workspaceId), inArray(conversationMessages.id, inboundMessageIds)));
-  return rows.map((row) => ({ ...row, riskFlags: row.riskFlags as string[] }));
+  return rows.map((row) => ({ ...row, riskFlags: row.riskFlags as string[], branch: row.branch as SetterQueueDraft["branch"] }));
 }
 
 export async function listConversationMessages(workspaceId: string): Promise<ConversationMessage[]> {

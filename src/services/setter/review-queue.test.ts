@@ -36,7 +36,9 @@ function createDependencies(total: number, withoutDraftAt?: number): SetterRevie
     id: `draft-${index}`,
     conversationMessageId: `latest-inbound-${index}`,
     draft: `Suggested response ${index}`,
+    branch: "INTEREST",
     confidence: 0.9,
+    reasonForHuman: null,
     riskFlags: [],
   }]);
 
