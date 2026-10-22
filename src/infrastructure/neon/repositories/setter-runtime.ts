@@ -559,6 +559,61 @@ export async function getSetterReviewItem(workspaceId: string, draftId: string):
   return { draft: toDraft(row.draft), message: toMessage(row.message), conversation: toConversation(row.conversation) };
 }
 
+export async function getSetterReviewSendDiagnostics(workspaceId: string, draftId: string) {
+  const db = getDb();
+  const result = await db.execute(sql`
+    SELECT
+      draft.id AS draft_id,
+      conversation.state AS conversation_state,
+      feedback.id IS NOT NULL AS review_feedback_exists,
+      nullif(btrim(feedback.final_text), '') IS NOT NULL AS final_text_exists,
+      message.provider_message_id AS incoming_provider_message_id,
+      message.metadata->>'replyToUuid' AS reply_to_uuid,
+      coalesce(nullif(message.metadata->>'emailAccount', ''), nullif(message.metadata->>'eaccount', '')) AS email_account,
+      message.metadata->'replyDelivery'->>'status' AS reply_delivery_status,
+      message.metadata->'replyDelivery'->>'errorCode' AS reply_delivery_error_code,
+      message.metadata->'replyDelivery'->>'providerMessageId' AS sent_provider_message_id,
+      message.metadata->'replyDelivery'->>'attemptedAt' AS send_attempted_at,
+      EXISTS (
+        SELECT 1 FROM audit_log
+        WHERE audit_log.workspace_id = conversation.workspace_id
+          AND audit_log.entity_type = 'setter_draft'
+          AND audit_log.entity_id = draft.id::text
+          AND audit_log.action = 'setter.review.approve'
+      ) AS review_audit_exists
+    FROM setter_drafts AS draft
+    JOIN conversation_messages AS message ON message.id = draft.conversation_message_id
+    JOIN conversations AS conversation ON conversation.id = message.conversation_id
+    LEFT JOIN setter_feedback AS feedback ON feedback.conversation_message_id = message.id
+    WHERE draft.id = ${draftId} AND conversation.workspace_id = ${workspaceId}
+    LIMIT 1
+  `);
+  const row = result.rows[0] as Record<string, unknown> | undefined;
+  if (!row) return null;
+
+  const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  const providerMessageId = typeof row.incoming_provider_message_id === "string"
+    ? row.incoming_provider_message_id.replace(/^instantly:/, "")
+    : "";
+  const replyToUuid = typeof row.reply_to_uuid === "string" ? row.reply_to_uuid : "";
+  return {
+    draftExists: true,
+    conversationState: row.conversation_state,
+    reviewFeedbackExists: row.review_feedback_exists === true,
+    reviewAuditExists: row.review_audit_exists === true,
+    finalTextExists: row.final_text_exists === true,
+    incomingProviderMessageIdExists: Boolean(row.incoming_provider_message_id),
+    incomingProviderMessageIdValid: uuidPattern.test(providerMessageId),
+    replyToUuidExists: Boolean(replyToUuid),
+    replyToUuidValid: uuidPattern.test(replyToUuid),
+    emailAccountExists: Boolean(row.email_account),
+    replyDeliveryStatus: typeof row.reply_delivery_status === "string" ? row.reply_delivery_status : null,
+    replyDeliveryErrorCode: typeof row.reply_delivery_error_code === "string" ? row.reply_delivery_error_code : null,
+    providerMessageIdExists: Boolean(row.sent_provider_message_id),
+    sendAttempted: Boolean(row.send_attempted_at),
+  };
+}
+
 export async function listSetterWebhookEvents(workspaceId: string): Promise<SetterWebhookEventSummary[]> {
   const db = getDb();
   const rows = await db

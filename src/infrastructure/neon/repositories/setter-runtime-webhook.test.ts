@@ -305,6 +305,8 @@ describe("Instantly webhook persistence", () => {
     const incoming = source.slice(incomingStart, incomingEnd);
     expect(incoming).toContain("eq(schema.conversationMessages.providerMessageId, messageId)");
     expect(incoming).toContain("eq(schema.conversations.providerThreadId, threadId)");
+    expect(incoming).toContain("replyToUuid: event.replyToUuid ?? event.providerMessageId");
+    expect(incoming).toContain("emailAccount: event.emailAccount ?? null");
     expect(incoming).toContain(".onConflictDoNothing()");
     expect(incoming).toContain('.set({ state: "reply_received", updatedAt: receivedAt })');
 

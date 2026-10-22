@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Conversation, SetterDraft } from "@/domain/conversations/types";
 
 const getSetterReviewItem = vi.fn();
+const getSetterReviewSendDiagnostics = vi.fn();
 const persistSetterReviewDecision = vi.fn();
 const sendReviewedSetterReply = vi.fn();
 const insertAuditLog = vi.fn();
@@ -9,11 +10,11 @@ const requireWorkspaceMember = vi.fn();
 
 class UnauthorizedError extends Error {}
 
-vi.mock("@/infrastructure/neon/repositories/setter-runtime", () => ({ getSetterReviewItem, persistSetterReviewDecision, sendReviewedSetterReply }));
+vi.mock("@/infrastructure/neon/repositories/setter-runtime", () => ({ getSetterReviewItem, getSetterReviewSendDiagnostics, persistSetterReviewDecision, sendReviewedSetterReply }));
 vi.mock("@/infrastructure/neon/repositories/audit", () => ({ insertAuditLog }));
 vi.mock("@/lib/auth/workspace", () => ({ UnauthorizedError, requireWorkspaceMember }));
 
-const { PATCH } = await import("./route");
+const { GET, PATCH } = await import("./route");
 
 const workspaceId = "00000000-0000-4000-8000-000000000001";
 const draft: SetterDraft = {
@@ -71,9 +72,42 @@ describe("PATCH /api/setter/reviews/[draftId]", () => {
     vi.clearAllMocks();
     requireWorkspaceMember.mockResolvedValue({ workspaceId, user: { userId: "member-1" }, role: "member" });
     getSetterReviewItem.mockResolvedValue(item);
+    getSetterReviewSendDiagnostics.mockResolvedValue({
+      draftExists: true,
+      conversationState: "approved_pending_send",
+      reviewFeedbackExists: true,
+      reviewAuditExists: true,
+      finalTextExists: true,
+      incomingProviderMessageIdExists: true,
+      incomingProviderMessageIdValid: true,
+      replyToUuidExists: true,
+      replyToUuidValid: true,
+      emailAccountExists: false,
+      replyDeliveryStatus: null,
+      replyDeliveryErrorCode: null,
+      providerMessageIdExists: false,
+      sendAttempted: false,
+    });
     persistSetterReviewDecision.mockResolvedValue(true);
     sendReviewedSetterReply.mockResolvedValue({ status: "accepted", providerMessageId: "sent-message-1" });
     insertAuditLog.mockResolvedValue(undefined);
+  });
+
+  it("returns only safe, workspace-scoped send diagnostics", async () => {
+    const response = await GET(new Request("http://localhost/api/setter/reviews/draft"), { params: Promise.resolve({ draftId: draft.id }) });
+    const result = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(result).toMatchObject({
+      draftExists: true,
+      conversationState: "approved_pending_send",
+      reviewFeedbackExists: true,
+      finalTextExists: true,
+      replyToUuidValid: true,
+      sendAttempted: false,
+    });
+    expect(result).not.toHaveProperty("finalText");
+    expect(getSetterReviewSendDiagnostics).toHaveBeenCalledWith(workspaceId, draft.id);
   });
 
   it.each([
@@ -125,6 +159,51 @@ describe("PATCH /api/setter/reviews/[draftId]", () => {
     expect(response.status).toBe(409);
     expect(sendReviewedSetterReply).not.toHaveBeenCalled();
     expect(insertAuditLog).not.toHaveBeenCalled();
+  });
+
+  it("preserves the persisted review and returns provider failure separately", async () => {
+    sendReviewedSetterReply.mockResolvedValue({ status: "failed", errorCode: "INSTANTLY_REPLY_REJECTED" });
+
+    const response = await review("approve");
+    const responseBody = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(persistSetterReviewDecision).toHaveBeenCalledOnce();
+    expect(responseBody).toMatchObject({ state: "send_failed", delivery: { status: "failed", errorCode: "INSTANTLY_REPLY_REJECTED" } });
+    expect(responseBody.error).toBeUndefined();
+  });
+
+  it("does not call the sender when the review audit write fails after persistence", async () => {
+    insertAuditLog.mockRejectedValueOnce(new Error("simulated audit failure"));
+    getSetterReviewItem
+      .mockResolvedValueOnce(item)
+      .mockResolvedValue({ ...item, conversation: { ...conversation, state: "approved_pending_send" } });
+
+    const response = await review("approve");
+    const responseBody = await response.json();
+
+    expect(response.status).toBe(500);
+    expect(responseBody).toMatchObject({
+      state: "approved_pending_send",
+      delivery: { status: "not_sent", errorCode: "REVIEW_AUDIT_PERSIST_FAILED" },
+    });
+    expect(responseBody.error).not.toBe("Review decision could not be saved.");
+    expect(sendReviewedSetterReply).not.toHaveBeenCalled();
+  });
+
+  it("never retries a send_unknown item on another approve request", async () => {
+    getSetterReviewItem.mockResolvedValue({
+      ...item,
+      conversation: { ...conversation, state: "send_unknown" },
+      message: { ...item.message, metadata: { replyDelivery: { status: "send_unknown", errorCode: "INSTANTLY_REPLY_RESULT_UNCERTAIN" } } },
+    });
+
+    const response = await review("approve");
+    const responseBody = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(responseBody).toMatchObject({ state: "send_unknown", delivery: { status: "uncertain" } });
+    expect(sendReviewedSetterReply).not.toHaveBeenCalled();
   });
 
   it("returns 400 for invalid decisions and missing correction text", async () => {

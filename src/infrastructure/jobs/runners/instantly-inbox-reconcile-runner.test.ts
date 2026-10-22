@@ -59,6 +59,20 @@ describe("runInstantlyInboxReconcile", () => {
     });
   });
 
+  it("preserves the provider email UUID as replyToUuid for reviewed replies", async () => {
+    const providerEmailId = "01956fbd-0eb1-72db-a565-82977a586084";
+    const deps = dependencies({
+      listReceivedEmails: vi.fn(async () => ({ items: [email(providerEmailId)], nextStartingAfter: null })),
+    });
+
+    await runInstantlyInboxReconcile(deps, { now });
+
+    expect(deps.ingest).toHaveBeenCalledWith(expect.objectContaining({
+      providerMessageId: providerEmailId,
+      replyToUuid: providerEmailId,
+    }), expect.any(String));
+  });
+
   it("resumes provider pagination and caps the total messages per run", async () => {
     const deps = dependencies({
       listReceivedEmails: vi.fn()

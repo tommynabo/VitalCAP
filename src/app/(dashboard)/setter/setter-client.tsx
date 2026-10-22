@@ -144,6 +144,10 @@ export function SetterClient({
       const result = await response.json().catch(() => ({}));
       if (!response.ok) {
         if (result.state || result.delivery) router.refresh();
+        const failedDeliveryNotice = result.delivery?.status === "failed" ? "Error al enviar"
+          : result.delivery?.status === "uncertain" ? "Estado de envío pendiente de reconciliación"
+            : result.delivery?.status === "accepted" ? "Respuesta aceptada por Instantly" : null;
+        if (failedDeliveryNotice) setDeliveryNotice(failedDeliveryNotice);
         throw new Error(result.error ?? result.errorCode ?? "Review decision could not be saved.");
       }
       const notice = result.delivery?.status === "accepted" ? "Respuesta aceptada por Instantly"
@@ -216,10 +220,10 @@ export function SetterClient({
                     <time className="text-xs text-text-muted" dateTime={message.createdAt}>{new Date(message.createdAt).toLocaleString("es-ES", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" })}</time>
                     {conversation.state === "pending_review" && draft.branch === "HUMAN_REQUIRED" ? <Badge variant="danger">Requiere atención humana</Badge> : null}
                     {conversation.state === "pending_review" ? <Badge variant="warning">Pendiente</Badge>
-                      : conversation.state === "send_accepted" ? <Badge variant="warning">Aceptado · confirmación pendiente</Badge>
+                        : conversation.state === "send_accepted" ? <Badge variant="warning">Respuesta aceptada por Instantly</Badge>
                         : conversation.state === "sending" || conversation.state === "approved_pending_send" ? <Badge variant="warning">Envío en curso</Badge>
                           : conversation.state === "send_failed" ? <Badge variant="danger">Error al enviar</Badge>
-                            : conversation.state === "send_unknown" ? <Badge variant="danger">Reconciliación pendiente</Badge>
+                            : conversation.state === "send_unknown" ? <Badge variant="danger">Estado de envío pendiente de reconciliación</Badge>
                               : conversation.state === "sent" ? <Badge variant="success">Enviado</Badge> : null}
                     {conversation.latestIntent && <Badge variant="neutral">{conversation.latestIntent}</Badge>}
                     {expanded ? <ChevronDown size={16} aria-hidden="true" /> : <ChevronRight size={16} aria-hidden="true" />}
@@ -290,6 +294,12 @@ export function SetterClient({
                             </Button>
                           </>
                         )}
+                      </div>}
+
+                      {conversation.state === "approved_pending_send" && <div className="flex flex-wrap gap-2 pt-1">
+                        <Button size="sm" className="min-h-11" disabled={busyDraftId === draft.id} onClick={() => submitReview(draft, "approve")}>
+                          <Check size={15} aria-hidden="true" /> {busyDraftId === draft.id ? "Enviando..." : "Reintentar envío"}
+                        </Button>
                       </div>}
 
                       <details
