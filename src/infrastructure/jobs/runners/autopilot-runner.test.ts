@@ -17,15 +17,18 @@ const mocks = vi.hoisted(() => ({
   buildEngineCapabilities: vi.fn(),
   evaluateProviderHealth: vi.fn(),
   getApifyAllocationHealth: vi.fn(),
+  createApifyCredentialFingerprint: vi.fn(() => "credential-fingerprint"),
   decideHybridFill: vi.fn(),
   buildMapsSeedCatalog: vi.fn(),
   buildSerpSeedCatalog: vi.fn(),
   getDeliveryEnv: vi.fn(),
   getMapsEnv: vi.fn(),
   getSerperEnv: vi.fn(),
+  refreshWatchdogPauseForWorkspace: vi.fn(),
 }));
 
 vi.mock("@/infrastructure/neon/repositories/workspace", () => ({ listWorkspaceIds: mocks.listWorkspaceIds }));
+vi.mock("./watchdog-runner", () => ({ refreshWatchdogPauseForWorkspace: mocks.refreshWatchdogPauseForWorkspace }));
 vi.mock("@/infrastructure/neon/repositories/campaigns", () => ({ listAutopilotEnabledCampaigns: mocks.listAutopilotEnabledCampaigns }));
 vi.mock("@/infrastructure/neon/repositories/autopilot", () => ({
   getAutopilotSettings: mocks.getAutopilotSettings,
@@ -54,6 +57,7 @@ vi.mock("@/services/autopilot/engine-capability", () => ({ buildEngineCapabiliti
 vi.mock("@/services/discovery/provider-health", () => ({
   evaluateProviderHealth: mocks.evaluateProviderHealth,
   getApifyAllocationHealth: mocks.getApifyAllocationHealth,
+  createApifyCredentialFingerprint: mocks.createApifyCredentialFingerprint,
 }));
 vi.mock("@/services/discovery/hybrid-fill-decision", () => ({ decideHybridFill: mocks.decideHybridFill }));
 vi.mock("@/services/discovery/spain-search-catalog", () => ({
@@ -212,5 +216,65 @@ describe("runAutopilotCronTick", () => {
 
     expect(result.ordersScheduled).toBe(3);
     expect(result.ordersScheduled).toBeLessThanOrEqual(3);
+  });
+
+  it("refreshes a watchdog-owned pause and schedules one bounded probe even when provider-paused pacing has zero normal demand", async () => {
+    const now = new Date("2025-06-15T12:00:00Z");
+    mocks.getAutopilotSettings
+      .mockResolvedValueOnce({
+        enabled: true,
+        emergencyStopped: false,
+        systemPaused: true,
+        systemPauseReason: "Queue health deteriorated (watchdog)",
+        timezone: "Europe/Madrid",
+      })
+      .mockResolvedValueOnce({
+        enabled: true,
+        emergencyStopped: false,
+        systemPaused: false,
+        systemPauseReason: null,
+        timezone: "Europe/Madrid",
+      });
+    mocks.getAutopilotPacingState.mockResolvedValue(computeAutopilotPacing({
+      workspaceId: "workspace-1", timeZone: "Europe/Madrid", targetMetric: "instantly_imported",
+      dailyTarget: 250, targetAchievedToday: 0, instantlyImportedToday: 0, eligibleImportBacklog: 0,
+      expectedImportsFromBacklog: 0, rawRequestedToday: 0, rawReturnedToday: 0, processingInFlight: 0,
+      providerRunsInFlight: 0, expectedQualifiedFromInFlight: 0, apifySpendToday: 0,
+      apifyDailyBudgetRemaining: 9, providerHealth: "paused", availableDiscoveryCapacity: false,
+      estimatedYield: 0.1, yieldSampleSize: 0, now, operatingStartHour: 7, operatingEndHour: 22,
+      maxDailyRawRequests: 1_000,
+    }));
+    mocks.getApifyRecoverySnapshot.mockResolvedValue({
+      recoveryProbeEligible: true,
+      recoveryProbeInFlight: false,
+      nextRecoveryAttemptAt: now,
+      credentialChangedSinceLatestFailure: true,
+    });
+
+    const result = await runAutopilotCronTick(now);
+
+    expect(mocks.refreshWatchdogPauseForWorkspace).toHaveBeenCalledWith("workspace-1");
+    expect(result.ordersScheduled).toBe(10);
+    expect(mocks.enqueueDiscoveryOrdersWithinDailyRawCap).toHaveBeenCalledWith([
+      expect.objectContaining({
+        payload: expect.objectContaining({
+          origin: "recovery_probe",
+          recoveryCredentialFingerprint: "credential-fingerprint",
+          desiredRawCount: 10,
+        }),
+      }),
+    ], now);
+  });
+
+  it.each([
+    { emergencyStopped: false, systemPaused: true, systemPauseReason: "operator_hold" },
+    { emergencyStopped: true, systemPaused: false, systemPauseReason: null },
+  ])("does not refresh or schedule through an operator safety pause", async (settings) => {
+    mocks.getAutopilotSettings.mockResolvedValue({ enabled: true, timezone: "Europe/Madrid", ...settings });
+
+    await runAutopilotCronTick(new Date("2025-06-15T12:00:00Z"));
+
+    expect(mocks.refreshWatchdogPauseForWorkspace).not.toHaveBeenCalled();
+    expect(mocks.enqueueDiscoveryOrdersWithinDailyRawCap).not.toHaveBeenCalled();
   });
 });

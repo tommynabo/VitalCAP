@@ -652,6 +652,26 @@ export async function deferDiscoveryJob(input: DeferJobInput): Promise<void> {
   });
 }
 
+export function buildWakeProviderDeferredMapsDiscoveryJobsQuery(workspaceId: string, now: Date) {
+  return sql`
+    UPDATE discovery_jobs job
+    SET next_attempt_at = ${now.toISOString()}::timestamptz,
+        updated_at = ${now.toISOString()}::timestamptz
+    FROM campaigns campaign
+    WHERE campaign.id = job.campaign_id
+      AND campaign.workspace_id = ${workspaceId}::uuid
+      AND campaign.engine_type IN ('maps_fast', 'maps_deep')
+      AND job.status = 'pending'
+      AND LEFT(COALESCE(job.last_error, ''), ${PROVIDER_DEFERRED_JOB_ERROR_PREFIX.length}) = ${PROVIDER_DEFERRED_JOB_ERROR_PREFIX}
+    RETURNING job.id
+  `;
+}
+
+export async function wakeProviderDeferredMapsDiscoveryJobs(workspaceId: string, now = new Date()): Promise<number> {
+  const result = await getDb().execute(buildWakeProviderDeferredMapsDiscoveryJobsQuery(workspaceId, now));
+  return result.rows.length;
+}
+
 export async function deferProcessingJob(input: DeferJobInput): Promise<void> {
   return defer("processing_jobs", input);
 }

@@ -1,6 +1,7 @@
 import { PgDialect } from "drizzle-orm/pg-core";
 import { describe, expect, it } from "vitest";
-import { buildClaimJobsQuery, buildDeadLetterExpiredJobsQuery, buildDeferJobQuery, buildRecoveryFailureMetadataSql, buildRequeueStaleLockedJobsQuery, buildRecoverableRawProcessingJobsQuery, ACCOUNT_DOMAIN_FIX_RECOVERY_VERSION, IDEMPOTENCY_PROBE_RECOVERY_VERSION, MAX_RECOVERABLE_RAW_PROCESSING_ATTEMPTS, MAX_RECOVERABLE_RAW_PROCESSING_JOBS_PER_TICK } from "./job-queue";
+import { PROVIDER_DEFERRED_JOB_ERROR_PREFIX } from "@/domain/discovery/types";
+import { buildClaimJobsQuery, buildDeadLetterExpiredJobsQuery, buildDeferJobQuery, buildRecoveryFailureMetadataSql, buildRequeueStaleLockedJobsQuery, buildRecoverableRawProcessingJobsQuery, buildWakeProviderDeferredMapsDiscoveryJobsQuery, ACCOUNT_DOMAIN_FIX_RECOVERY_VERSION, IDEMPOTENCY_PROBE_RECOVERY_VERSION, MAX_RECOVERABLE_RAW_PROCESSING_ATTEMPTS, MAX_RECOVERABLE_RAW_PROCESSING_JOBS_PER_TICK } from "./job-queue";
 
 const dialect = new PgDialect();
 const claimTime = new Date("2026-10-18T09:00:00.000Z");
@@ -42,6 +43,18 @@ describe("job queue SQL builders", () => {
     expect(orderClause.replace(/\s+/g, " ").trim()).toBe(
       "ORDER BY CASE WHEN j.payload->>'origin' = 'recovery_probe' THEN 0 ELSE 1 END ASC, j.next_attempt_at ASC NULLS FIRST, j.created_at ASC, j.id ASC",
     );
+  });
+
+  it("wakes only pending provider-deferred Maps jobs without touching attempts or other engines", () => {
+    const query = dialect.sqlToQuery(buildWakeProviderDeferredMapsDiscoveryJobsQuery("workspace-1", claimTime));
+
+    expect(query.sql).toContain("campaign.engine_type IN ('maps_fast', 'maps_deep')");
+    expect(query.sql).toContain("job.status = 'pending'");
+    expect(query.sql).toContain("LEFT(COALESCE(job.last_error, ''),");
+    expect(query.sql).toContain("SET next_attempt_at =");
+    expect(query.sql).not.toContain("attempt_count =");
+    expect(query.sql).not.toContain("UPDATE dead_letter_jobs");
+    expect(query.params).toContain(PROVIDER_DEFERRED_JOB_ERROR_PREFIX);
   });
 
   it("keeps future recovery retries ineligible under the shared due-time guard", () => {

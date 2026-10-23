@@ -15,11 +15,13 @@ import { getAutopilotPacingMetrics } from "./autopilot-pacing";
 import { getApifyRecoverySnapshot, getRecentProviderUsage, getTodaySpendUsd } from "./provider-runs";
 import { getDeliveryEnv, getMapsEnv, getSerperEnv } from "@/lib/config/env";
 import {
-  computeEngineHealthSummary,
   ENGINE_TYPES,
   engineProviderHealthForType,
   evaluateProviderHealth,
+  buildProviderHealthSnapshot,
+  getApifyAllocationHealth,
   isProviderAvailableForDiscovery,
+  summarizeEngineHealthStatuses,
   type EngineHealthSummary,
 } from "@/services/discovery/provider-health";
 import { classifyAutopilotTargetRisk, computeAutopilotPacing } from "@/services/autopilot/pacing-service";
@@ -118,30 +120,30 @@ export function buildEngineHealthUsageSummaryQuery(workspaceId: string, since: D
 }
 
 export async function getEngineHealthSummary(workspaceId: string): Promise<EngineHealthSummary> {
-  const db = getDb();
-  const since = new Date(Date.now() - 24 * 60 * 60 * 1000);
-  const result = await db.execute(buildEngineHealthUsageSummaryQuery(workspaceId, since));
-  const usageByProvider = new Map((result.rows as Array<{ provider: string; calls: number; errors: number }>).map((row) => [
-    row.provider,
-    { calls: Number(row.calls), errors: Number(row.errors) },
-  ]));
-  const mapsEnv = getMapsEnv();
-  const serpEnv = getSerperEnv();
-
-  return computeEngineHealthSummary({
-    mapsConfigured: mapsEnv.MAPS_PROVIDER === "apify" && Boolean(mapsEnv.APIFY_API_TOKEN),
-    serpConfigured: serpEnv.SERP_PROVIDER === "serper" && Boolean(serpEnv.SERPER_API_KEY),
-    mapsUsage: usageByProvider.get("apify") ?? { calls: 0, errors: 0 },
-    serpUsage: usageByProvider.get("serper") ?? { calls: 0, errors: 0 },
-  });
+  const engines = await listEngineTargets(workspaceId);
+  return summarizeEngineHealthStatuses(engines.map((engine) => engine.providerHealth));
 }
 
 async function getEngineProviderHealth(workspaceId: string, engineType: EngineType): Promise<ProviderHealthStatus> {
   const mapsEnv = getMapsEnv();
   const serpEnv = getSerperEnv();
-  const maps = mapsEnv.MAPS_PROVIDER === "apify" && Boolean(mapsEnv.APIFY_API_TOKEN)
-    ? evaluateProviderHealth(await getRecentProviderUsage(workspaceId, "apify"))
-    : "paused";
+  const apifyRecovery = await getApifyRecoverySnapshot(workspaceId);
+  const settings = await getAutopilotSettings(workspaceId);
+  const apifySpendToday = await getTodaySpendUsd(workspaceId, "apify", settings.timezone);
+  const apifyDailyBudget = Math.min(
+    mapsEnv.APIFY_DAILY_COST_LIMIT_USD,
+    settings.maxDailyApifySpendUsd ?? Number.POSITIVE_INFINITY,
+  );
+  const mapsSnapshot = buildProviderHealthSnapshot({
+    provider: "apify",
+    configured: mapsEnv.MAPS_PROVIDER === "apify" && Boolean(mapsEnv.APIFY_API_TOKEN),
+    budgetAllowed: apifyDailyBudget - apifySpendToday > 0,
+    usage: apifyRecovery.usage,
+    recovery: apifyRecovery,
+  });
+  const maps = mapsSnapshot.allocationHealth === "missing_configuration"
+    ? "paused"
+    : mapsSnapshot.allocationHealth;
   const serp = serpEnv.SERP_PROVIDER === "serper" && Boolean(serpEnv.SERPER_API_KEY)
     ? evaluateProviderHealth(await getRecentProviderUsage(workspaceId, "serper"))
     : "paused";
@@ -152,7 +154,8 @@ export async function getAutopilotPacingState(workspaceId: string, now = new Dat
   const settings = await getAutopilotSettings(workspaceId);
   const instantlyCampaignId = getDeliveryEnv().INSTANTLY_CAMPAIGN_ID;
   const metrics = await getAutopilotPacingMetrics(workspaceId, settings.timezone, now, instantlyCampaignId);
-  const providerHealth = evaluateProviderHealth((await getApifyRecoverySnapshot(workspaceId, now)).usage);
+  const apifyRecovery = await getApifyRecoverySnapshot(workspaceId, now);
+  const providerHealth = getApifyAllocationHealth(apifyRecovery);
   const serpHealth = evaluateProviderHealth(await getRecentProviderUsage(workspaceId, "serper"));
   const importTarget = settings.targetMetric === "instantly_imported";
   const estimatedYield = importTarget

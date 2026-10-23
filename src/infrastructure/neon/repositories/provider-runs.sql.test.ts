@@ -14,6 +14,7 @@ describe("Apify provider run reservation SQL", () => {
       seedId: "00000000-0000-0000-0000-000000000003",
       itemsRequested: 10,
       recoveryProbe: true,
+      metadata: { credentialFingerprint: "safe-credential-fingerprint" },
     }, 1500, 15, new Date("2026-10-11T00:00:00.000Z"), 0.05));
 
     expect(query.sql).toContain("status = 'manual_reconciliation_required'");
@@ -24,6 +25,8 @@ describe("Apify provider run reservation SQL", () => {
     expect(query.sql).toContain("<=");
     expect(query.sql).toContain("safety.cost_today +");
     expect(query.sql).toContain("safety.recovery_probe_count = 0");
+    expect(query.sql).toContain("metadata->>'credentialFingerprint'");
+    expect(query.params).toContain("safe-credential-fingerprint");
     expect(query.sql).toContain("safety.concurrent_apify_run_count <");
     expect(query.sql).toContain("provider = 'apify' AND status IN ('starting', 'queued', 'running')");
     expect(query.sql).toContain("ON CONFLICT (request_key) WHERE request_key IS NOT NULL DO NOTHING");

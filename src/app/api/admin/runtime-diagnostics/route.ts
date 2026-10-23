@@ -169,6 +169,7 @@ export async function GET() {
         nextRecoveryAttemptAt: formatDiagnosticDate(apifyRecovery.nextRecoveryAttemptAt),
         latestFailureKind: apifyRecovery.latestFailureKind,
         latestFailureAt: formatDiagnosticDate(apifyRecovery.latestFailureAt),
+        credentialChangedSinceLatestFailure: apifyRecovery.credentialChangedSinceLatestFailure,
         latestFailureMessage: sanitizeApifyFailureMessage(apifyRecovery.latestFailureMessage),
         latestSuccessAt: formatDiagnosticDate(apifyRecovery.latestSuccessAt),
       },

@@ -62,6 +62,22 @@ export interface ApifyRecoverySnapshot {
 
 export type ApifyDiscoveryWorkMode = "normal" | "recovery_probe" | "defer" | "skip";
 
+export function isCurrentApifyRecoveryCredential(
+  jobCredentialFingerprint: string | undefined,
+  currentCredentialFingerprint: string | null,
+): boolean {
+  return currentCredentialFingerprint !== null && jobCredentialFingerprint === currentCredentialFingerprint;
+}
+
+export function hasCurrentCredentialRecoveryProbeInFlight(
+  runs: readonly ApifyRecoveryRun[],
+  currentCredentialFingerprint: string | null,
+): boolean {
+  return currentCredentialFingerprint !== null && runs.some((run) => run.recoveryProbe
+    && ["starting", "queued", "running", "succeeded", "ingesting"].includes(run.status)
+    && run.credentialFingerprint === currentCredentialFingerprint);
+}
+
 export function getApifyAllocationHealth(snapshot: ApifyRecoverySnapshot): ProviderHealthStatus {
   return snapshot.safetyBlocked || snapshot.recoveryProbeEligible || snapshot.nextRecoveryAttemptAt !== null
     ? "paused"
@@ -194,11 +210,14 @@ export function evaluateApifyRecovery(
   now = new Date(),
   currentCredentialFingerprint: string | null = null,
   currentConfigurationFingerprint: string | null = null,
+  latestSuccessCredentialFingerprint: string | null = null,
 ): ApifyRecoverySnapshot {
   const emptyUsage: ProviderUsageStats = { calls: 0, items: 0, errors: 0, totalLatencyMs: 0, costUsd: 0, quotaRemaining: null };
   const successAt = runDate(latestSuccessAt);
   const failureAt = latestFailure ? runDate(latestFailure.finishedAt) ?? runDate(latestFailure.startedAt) : null;
-  const successAfterFailure = successAt !== null && failureAt !== null && successAt > failureAt;
+  const successUsesCurrentCredential = currentCredentialFingerprint === null
+    || latestSuccessCredentialFingerprint === currentCredentialFingerprint;
+  const successAfterFailure = successAt !== null && failureAt !== null && successAt > failureAt && successUsesCurrentCredential;
   const usageRuns = successAfterFailure
     ? recentRuns.filter((run) => (runDate(run.finishedAt)?.getTime() ?? runDate(run.startedAt)?.getTime() ?? 0) >= successAt.getTime())
     : recentRuns;
@@ -246,7 +265,9 @@ export function evaluateApifyRecovery(
     : latestFailure.failureKind === "safety"
       ? 60 * 60 * 1000
       : APIFY_RECOVERY_COOLDOWN_MS;
-  const nextRecoveryAttemptAt = failureAt ? new Date(failureAt.getTime() + cooldownMs) : null;
+  const nextRecoveryAttemptAt = credentialChanged
+    ? new Date(now)
+    : failureAt ? new Date(failureAt.getTime() + cooldownMs) : null;
   if (!nextRecoveryAttemptAt || now < nextRecoveryAttemptAt || recoveryProbeInFlight) {
     return {
       usage,

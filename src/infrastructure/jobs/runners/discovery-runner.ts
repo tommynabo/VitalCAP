@@ -27,7 +27,7 @@ import { getEffectiveAutopilotState } from "@/domain/autopilot/types";
 import { buildMapsSeedCatalog, buildSerpSeedCatalog, LINKEDIN_OWNER_ROLE_QUERIES, ICP_CATEGORY_TERMS } from "@/services/discovery/spain-search-catalog";
 import { createDiscoveryEngine } from "./engine-factory";
 import type { SearchSeed } from "@/domain/discovery/types";
-import { createApifyConfigurationFingerprint, createApifyCredentialFingerprint, evaluateProviderHealth, getApifyAllocationHealth, resolveApifyDiscoveryWorkMode } from "@/services/discovery/provider-health";
+import { createApifyConfigurationFingerprint, createApifyCredentialFingerprint, evaluateProviderHealth, getApifyAllocationHealth, isCurrentApifyRecoveryCredential, resolveApifyDiscoveryWorkMode } from "@/services/discovery/provider-health";
 import { createProviderRequestKey, normalizeProviderQuery } from "@/services/discovery/provider-request-key";
 import { resolvePlanningWindow } from "@/services/autopilot/target-planner";
 import { getMapsEnv } from "@/lib/config/env";
@@ -69,6 +69,7 @@ interface DiscoveryJobPayload {
   planningWindow?: string;
   reason?: string;
   origin?: "normal" | "rebalance" | "hybrid_fill" | "recovery_probe";
+  recoveryCredentialFingerprint?: string;
   seedQuery?: string;
   seedGeography?: string;
 }
@@ -188,6 +189,19 @@ async function executeDiscoveryJob(
   job: { id: string; campaignId: string; payload: DiscoveryJobPayload },
   counters: DiscoveryHandoffCounters,
 ): Promise<number> {
+  if (job.payload.origin === "recovery_probe") {
+    const currentCredentialFingerprint = createApifyCredentialFingerprint(getMapsEnv().APIFY_API_TOKEN);
+    if (!isCurrentApifyRecoveryCredential(job.payload.recoveryCredentialFingerprint, currentCredentialFingerprint)) {
+      logEvent("warn", "apify.recovery_probe_stale_credential", {
+        correlationId: job.id,
+        discoveryJobId: job.id,
+        recoveryCredentialFingerprintPresent: Boolean(job.payload.recoveryCredentialFingerprint),
+        currentCredentialConfigured: Boolean(currentCredentialFingerprint),
+      });
+      return 0;
+    }
+  }
+
   const campaign = await runPreProviderStage(job, "campaign_guard", async () => {
     const currentCampaign = await getCampaignById(job.campaignId);
     if (!currentCampaign) throw new Error("Discovery campaign is unavailable.");
@@ -412,6 +426,9 @@ async function executeDiscoveryJob(
             geography: seed.geography,
             planningWindow,
             recoveryProbe,
+            ...(mapsEnv?.APIFY_API_TOKEN
+              ? { credentialFingerprint: createApifyCredentialFingerprint(mapsEnv.APIFY_API_TOKEN) }
+              : {}),
             ...(recoveryProbe && apifyConfigurationFingerprint ? { configurationFingerprint: apifyConfigurationFingerprint } : {}),
           },
         });
@@ -458,7 +475,21 @@ async function executeDiscoveryJob(
         readyCount: 0,
         error: null,
       });
-      await updateProviderRun(reservationId, { metadata: { engineType: job.payload.engineType, seedId: seed.id, seedRunId, discoveryJobId: job.id, query: seed.query, normalizedQuery, geography: seed.geography, planningWindow, recoveryProbe } });
+      await updateProviderRun(reservationId, { metadata: {
+        engineType: job.payload.engineType,
+        seedId: seed.id,
+        seedRunId,
+        discoveryJobId: job.id,
+        query: seed.query,
+        normalizedQuery,
+        geography: seed.geography,
+        planningWindow,
+        recoveryProbe,
+        ...(mapsEnv?.APIFY_API_TOKEN
+          ? { credentialFingerprint: createApifyCredentialFingerprint(mapsEnv.APIFY_API_TOKEN) }
+          : {}),
+        ...(recoveryProbe && apifyConfigurationFingerprint ? { configurationFingerprint: apifyConfigurationFingerprint } : {}),
+      } });
     }
 
     let result;
@@ -651,6 +682,13 @@ export async function runDiscoveryCronTick(maxJobsPerTick: number, now: Date = n
         ...(failureKind ? { failureKind } : {}),
         ...(retryAt ? { retryAt: retryAt.toISOString() } : {}),
       });
+      if (job.payload.origin === "recovery_probe") {
+        logEvent("error", "apify.recovery_probe_failed", {
+          correlationId: job.id,
+          discoveryJobId: job.id,
+          failureKind: failureKind ?? "provider_error",
+        });
+      }
       if (error instanceof ProviderBudgetExceededError) {
         handoffCounters.providerJobsDeferred += 1;
         await deferDiscoveryJob({ jobId: job.id, workerId, nextAttemptAt: error.retryAt, reason: error.message });

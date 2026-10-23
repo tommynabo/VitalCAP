@@ -62,6 +62,7 @@ describe("GET /api/admin/runtime-diagnostics recovery errors", () => {
       latestFailureAt: null,
       latestFailureMessage: null,
       latestSuccessAt: null,
+      credentialChangedSinceLatestFailure: true,
       usage: { calls: 0, errors: 0, items: 0, costUsd: 0, totalLatencyMs: 0, quotaRemaining: null },
     });
     getSystemHealthDiagnostics.mockResolvedValue({
@@ -133,6 +134,7 @@ describe("GET /api/admin/runtime-diagnostics recovery errors", () => {
       recentErrorRate: 0.3,
       budgetAllowed: true,
     });
+    expect(body.apify.credentialChangedSinceLatestFailure).toBe(true);
     expect(body.serper).toMatchObject({
       reliabilityHealth: "healthy",
       allocationHealth: "healthy",

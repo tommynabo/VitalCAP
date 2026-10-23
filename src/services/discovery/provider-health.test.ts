@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { aggregateProviderHealthSnapshots, buildProviderHealthSnapshot, createApifyConfigurationFingerprint, createApifyCredentialFingerprint, evaluateApifyRecovery, evaluateProviderHealth, getApifyAllocationHealth, hasUnavailableRequiredDiscoveryProvider, isProviderAvailableForDiscovery, resolveApifyDiscoveryWorkMode } from "./provider-health";
+import { aggregateProviderHealthSnapshots, buildProviderHealthSnapshot, createApifyConfigurationFingerprint, createApifyCredentialFingerprint, evaluateApifyRecovery, evaluateProviderHealth, getApifyAllocationHealth, hasCurrentCredentialRecoveryProbeInFlight, hasUnavailableRequiredDiscoveryProvider, isCurrentApifyRecoveryCredential, isProviderAvailableForDiscovery, resolveApifyDiscoveryWorkMode } from "./provider-health";
 
 describe("provider health cold start", () => {
   it("reports zero historical calls as untested", () => {
@@ -178,6 +178,122 @@ describe("Apify recovery health", () => {
     );
 
     expect(snapshot.recoveryProbeEligible).toBe(true);
+  });
+
+  it("re-enters cooldown when the rotated credential itself fails billing", () => {
+    const currentCredentialFingerprint = createApifyCredentialFingerprint("new-test-token");
+    const currentFailure = {
+      ...failedRun,
+      startedAt: "2026-10-11T11:58:00.000Z",
+      finishedAt: "2026-10-11T11:59:00.000Z",
+      failureKind: "billing" as const,
+      credentialFingerprint: currentCredentialFingerprint!,
+    };
+    const snapshot = evaluateApifyRecovery(
+      [currentFailure], currentFailure, null, false, false, now, currentCredentialFingerprint,
+    );
+
+    expect(snapshot.recoveryProbeEligible).toBe(false);
+    expect(snapshot.nextRecoveryAttemptAt?.toISOString()).toBe("2026-10-11T12:29:00.000Z");
+  });
+
+  it.each(["billing", "authentication"] as const)("recovers immediately after a 3-day-old %s failure when the credential changes", (failureKind) => {
+    const oldCredentialFingerprint = createApifyCredentialFingerprint("old-test-token");
+    const newCredentialFingerprint = createApifyCredentialFingerprint("new-test-token");
+    const oldFailure = {
+      ...failedRun,
+      startedAt: "2026-10-08T11:58:00.000Z",
+      finishedAt: "2026-10-08T11:59:00.000Z",
+      failureKind,
+      credentialFingerprint: oldCredentialFingerprint!,
+    };
+    const snapshot = evaluateApifyRecovery(
+      [oldFailure], oldFailure, null, false, false, now, newCredentialFingerprint,
+    );
+
+    expect(snapshot.recoveryProbeEligible).toBe(true);
+    expect(snapshot.nextRecoveryAttemptAt?.toISOString()).toBe(now.toISOString());
+    expect(getApifyAllocationHealth(snapshot)).toBe("paused");
+  });
+
+  it("does not let a success from the old credential clear the current credential failure", () => {
+    const oldCredentialFingerprint = createApifyCredentialFingerprint("old-test-token");
+    const newCredentialFingerprint = createApifyCredentialFingerprint("new-test-token");
+    const oldFailure = { ...failedRun, failureKind: "billing" as const, credentialFingerprint: oldCredentialFingerprint! };
+    const oldSuccess = {
+      status: "succeeded",
+      startedAt: "2026-10-11T10:05:00.000Z",
+      finishedAt: "2026-10-11T10:10:00.000Z",
+      itemsReturned: 8,
+      costUsd: 0.1,
+    };
+    const snapshot = evaluateApifyRecovery(
+      [oldFailure, oldSuccess], oldFailure, oldSuccess.finishedAt, false, false,
+      now, newCredentialFingerprint, null, oldCredentialFingerprint,
+    );
+
+    expect(snapshot.recoveryProbeEligible).toBe(true);
+    expect(getApifyAllocationHealth(snapshot)).toBe("paused");
+  });
+
+  it("ignores stale and legacy recovery jobs for current-credential in-flight state", () => {
+    const oldCredentialFingerprint = createApifyCredentialFingerprint("old-test-token");
+    const newCredentialFingerprint = createApifyCredentialFingerprint("new-test-token");
+    const staleProbe = {
+      status: "running",
+      startedAt: now,
+      finishedAt: null,
+      itemsReturned: 0,
+      costUsd: 0,
+      recoveryProbe: true,
+      credentialFingerprint: oldCredentialFingerprint!,
+    };
+
+    expect(isCurrentApifyRecoveryCredential(oldCredentialFingerprint!, newCredentialFingerprint)).toBe(false);
+    expect(isCurrentApifyRecoveryCredential(undefined, newCredentialFingerprint)).toBe(false);
+    expect(hasCurrentCredentialRecoveryProbeInFlight([staleProbe], newCredentialFingerprint)).toBe(false);
+  });
+
+  it("keeps historical reliability degraded while current allocation follows recovery health", () => {
+    const oldCredentialFingerprint = createApifyCredentialFingerprint("old-test-token");
+    const newCredentialFingerprint = createApifyCredentialFingerprint("new-test-token");
+    const oldFailure = { ...failedRun, failureKind: "billing" as const, credentialFingerprint: oldCredentialFingerprint! };
+    const currentSuccess = {
+      status: "ingested",
+      startedAt: "2026-10-11T11:55:00.000Z",
+      finishedAt: "2026-10-11T11:59:00.000Z",
+      itemsReturned: 8,
+      costUsd: 0.1,
+    };
+    const recovery = evaluateApifyRecovery(
+      [oldFailure, currentSuccess], oldFailure, currentSuccess.finishedAt, false, false,
+      now, newCredentialFingerprint, null, newCredentialFingerprint,
+    );
+    const health = buildProviderHealthSnapshot({
+      provider: "apify",
+      configured: true,
+      budgetAllowed: true,
+      usage: { calls: 3, items: 0, errors: 3, totalLatencyMs: 0, costUsd: 0, quotaRemaining: null },
+      recovery,
+    });
+
+    expect(health.reliabilityHealth).toBe("paused");
+    expect(health.allocationHealth).toBe("healthy");
+    expect(health.providerAvailable).toBe(true);
+  });
+
+  it("keeps internal daily budget enforcement independent of credential rotation", () => {
+    const health = buildProviderHealthSnapshot({
+      provider: "apify",
+      configured: true,
+      budgetAllowed: false,
+      usage: { calls: 0, items: 0, errors: 0, totalLatencyMs: 0, costUsd: 0, quotaRemaining: null },
+      recovery: { usage: { calls: 0, items: 0, errors: 0, totalLatencyMs: 0, costUsd: 0, quotaRemaining: null }, recoveryProbeEligible: true, nextRecoveryAttemptAt: now },
+    });
+
+    expect(health.allocationHealth).toBe("paused");
+    expect(health.budgetAllowed).toBe(false);
+    expect(health.providerAvailable).toBe(false);
   });
 
   it("creates a deterministic fingerprint from the safe Apify configuration only", () => {

@@ -7,6 +7,8 @@ import { mapCompassItemToPlaceResult } from "@/infrastructure/providers/maps/api
 import { ingestApifyProviderRun, type ProviderRunIngestionAccounting } from "@/infrastructure/neon/repositories/provider-run-ingestion";
 import { ProviderFailureError } from "@/domain/providers/errors";
 import { createApifyConfigurationFingerprint, createApifyCredentialFingerprint } from "@/services/discovery/provider-health";
+import { wakeProviderDeferredMapsDiscoveryJobs } from "@/infrastructure/neon/repositories/job-queue";
+import { logEvent } from "@/lib/observability/structured-logger";
 
 const MONITORED_PROVIDERS = ["apify", "serper", "email_verification"] as const;
 const MAX_RUNS_PER_TICK = 20;
@@ -120,6 +122,14 @@ export async function runProviderRunsCronTick(maxRuns = MAX_RUNS_PER_TICK): Prom
             ...(configurationFingerprint ? { configurationFingerprint } : {}),
           },
         });
+        if (providerRun.metadata && (providerRun.metadata as Record<string, unknown>).recoveryProbe === true) {
+          logEvent("error", "apify.recovery_probe_failed", {
+            correlationId: providerRun.id,
+            workspaceId: providerRun.workspaceId,
+            providerRunId: providerRun.id,
+            failureKind,
+          });
+        }
         continue;
       }
 
@@ -189,6 +199,22 @@ export async function runProviderRunsCronTick(maxRuns = MAX_RUNS_PER_TICK): Prom
         itemsReturned += rawItems.length;
         if (ingestion.ingestionAccounting) addIngestionAccounting(ingestionAccounting, ingestion.ingestionAccounting);
         else ingestionAccounting.UNKNOWN += rawItems.length;
+      }
+      if (metadata.recoveryProbe === true) {
+        logEvent("info", "apify.recovery_probe_succeeded", {
+          correlationId: providerRun.id,
+          workspaceId: providerRun.workspaceId,
+          providerRunId: providerRun.id,
+          itemsReturned: rawItems.length,
+        });
+        const jobsWoken = await wakeProviderDeferredMapsDiscoveryJobs(providerRun.workspaceId);
+        if (jobsWoken > 0) {
+          logEvent("info", "apify.provider_deferred_jobs_woken", {
+            correlationId: providerRun.id,
+            workspaceId: providerRun.workspaceId,
+            jobsWoken,
+          });
+        }
       }
     } catch (error) {
       if (rawItems) {

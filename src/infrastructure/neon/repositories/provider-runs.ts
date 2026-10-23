@@ -5,7 +5,7 @@ import { buildDailyRawRequestCommitmentCtes, executeUnderGlobalDailyRawCapLock }
 import { providerRuns } from "../schema/providers";
 import type { ProviderUsageStats } from "@/domain/providers/types";
 import { ProviderBudgetExceededError, ProviderFailureError, ProviderSafetyError } from "@/domain/providers/errors";
-import { createApifyConfigurationFingerprint, createApifyCredentialFingerprint, evaluateApifyRecovery, type ApifyRecoveryRun } from "@/services/discovery/provider-health";
+import { createApifyConfigurationFingerprint, createApifyCredentialFingerprint, evaluateApifyRecovery, hasCurrentCredentialRecoveryProbeInFlight, type ApifyRecoveryRun } from "@/services/discovery/provider-health";
 import { getCoreEnv, getMapsEnv } from "@/lib/config/env";
 
 export interface RecordProviderRunInput {
@@ -266,6 +266,9 @@ export function buildReserveApifyProviderRunQuery(
   const configurationFingerprint = typeof input.metadata?.configurationFingerprint === "string"
     ? input.metadata.configurationFingerprint
     : null;
+  const credentialFingerprint = typeof input.metadata?.credentialFingerprint === "string"
+    ? input.metadata.credentialFingerprint
+    : null;
   return sql`
     WITH ${buildDailyRawRequestCommitmentCtes(now)},
     raw_safety AS (
@@ -285,7 +288,7 @@ export function buildReserveApifyProviderRunQuery(
         (SELECT COUNT(*) FROM provider_runs WHERE workspace_id = ${input.workspaceId}::uuid AND status = 'manual_reconciliation_required')::int AS unreconciled_count,
         (SELECT COUNT(*) FROM provider_runs WHERE workspace_id = ${input.workspaceId}::uuid AND provider = 'apify' AND status IN ('starting', 'queued', 'running'))::int AS concurrent_apify_run_count,
         (SELECT COALESCE(SUM(cost_usd), 0) FROM provider_runs WHERE workspace_id = ${input.workspaceId}::uuid AND provider = 'apify' AND started_at >= ${dayStart.toISOString()}::timestamptz)::numeric AS cost_today,
-        (SELECT COUNT(*) FROM provider_runs WHERE workspace_id = ${input.workspaceId}::uuid AND provider = 'apify' AND status IN ('starting', 'queued', 'running', 'succeeded', 'ingesting') AND COALESCE((metadata->>'recoveryProbe')::boolean, false) = true)::int AS recovery_probe_count
+        (SELECT COUNT(*) FROM provider_runs WHERE workspace_id = ${input.workspaceId}::uuid AND provider = 'apify' AND status IN ('starting', 'queued', 'running', 'succeeded', 'ingesting') AND COALESCE((metadata->>'recoveryProbe')::boolean, false) = true AND metadata->>'credentialFingerprint' = ${credentialFingerprint}::text)::int AS recovery_probe_count
       FROM daily_raw_commitment
     ),
     safety AS (
@@ -373,6 +376,7 @@ export async function getApifyRecoverySnapshot(workspaceId: string, now = new Da
     db.select({
       startedAt: providerRuns.startedAt,
       finishedAt: providerRuns.finishedAt,
+      metadata: providerRuns.metadata,
     }).from(providerRuns).where(and(
       eq(providerRuns.workspaceId, workspaceId),
       eq(providerRuns.provider, "apify"),
@@ -411,11 +415,16 @@ export async function getApifyRecoverySnapshot(workspaceId: string, now = new Da
       ? { failureKind }
       : {}),
   } : null;
-  const probeInFlight = runs.some((run) => run.recoveryProbe && ["starting", "queued", "running", "succeeded", "ingesting"].includes(run.status));
+  const currentCredentialFingerprint = createApifyCredentialFingerprint(mapsEnv.APIFY_API_TOKEN);
+  const probeInFlight = hasCurrentCredentialRecoveryProbeInFlight(runs, currentCredentialFingerprint);
   const unreconciled = await db.select({ id: providerRuns.id }).from(providerRuns).where(and(
     eq(providerRuns.workspaceId, workspaceId),
     eq(providerRuns.status, "manual_reconciliation_required"),
   )).limit(1);
+  const latestSuccessMetadata = (successRows[0]?.metadata ?? {}) as Record<string, unknown>;
+  const latestSuccessCredentialFingerprint = typeof latestSuccessMetadata.credentialFingerprint === "string"
+    ? latestSuccessMetadata.credentialFingerprint
+    : null;
   const recoverySnapshot = evaluateApifyRecovery(
     runs,
     latestFailure,
@@ -423,8 +432,9 @@ export async function getApifyRecoverySnapshot(workspaceId: string, now = new Da
     probeInFlight,
     unreconciled.length > 0,
     now,
-    createApifyCredentialFingerprint(mapsEnv.APIFY_API_TOKEN),
+    currentCredentialFingerprint,
     createApifyConfigurationFingerprint(mapsEnv),
+    latestSuccessCredentialFingerprint,
   );
   return {
     ...recoverySnapshot,
@@ -434,6 +444,11 @@ export async function getApifyRecoverySnapshot(workspaceId: string, now = new Da
     latestFailureAt: latestFailure?.finishedAt ?? latestFailure?.startedAt ?? null,
     latestFailureMessage: failureRow?.error ?? null,
     latestSuccessAt: successRows[0]?.finishedAt ?? successRows[0]?.startedAt ?? null,
+    credentialChangedSinceLatestFailure: latestFailure
+      ? currentCredentialFingerprint !== null && latestFailure.credentialFingerprint !== undefined
+        ? latestFailure.credentialFingerprint !== currentCredentialFingerprint
+        : null
+      : null,
   };
 }
 

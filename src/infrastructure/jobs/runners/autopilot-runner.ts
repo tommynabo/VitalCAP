@@ -1,6 +1,7 @@
 import type { Campaign, EngineType } from "@/domain/campaigns/types";
 import type { ProviderHealthStatus } from "@/domain/autopilot/types";
 import { getEffectiveAutopilotState } from "@/domain/autopilot/types";
+import { WATCHDOG_QUEUE_PAUSE_REASON } from "@/services/autopilot/watchdog-pause-policy";
 import { listAutopilotEnabledCampaigns } from "@/infrastructure/neon/repositories/campaigns";
 import { listWorkspaceIds } from "@/infrastructure/neon/repositories/workspace";
 import { getAutopilotSettings, getAutopilotPacingState, insertRebalanceDecision } from "@/infrastructure/neon/repositories/autopilot";
@@ -8,15 +9,17 @@ import { getCampaignQueueDepth } from "@/infrastructure/neon/repositories/job-qu
 import { enqueueDiscoveryOrdersWithinDailyRawCap } from "@/infrastructure/neon/repositories/daily-raw-request-cap";
 import { bootstrapSearchSeeds, listSearchSeedsForCampaignEngine } from "@/infrastructure/neon/repositories/discovery";
 import { getApifyRecoverySnapshot, getRecentProviderUsage, getTodaySpendUsd } from "@/infrastructure/neon/repositories/provider-runs";
-import { allocateEngineWork, MAX_RAW_PER_PLANNING_WINDOW, planApifyRecoveryProbe, rerouteEngineOrders, type EnginePlanningPerformance } from "@/services/autopilot/target-planner";
+import { allocateEngineWork, MAX_APIFY_RECOVERY_PROBE_RAW, MAX_RAW_PER_PLANNING_WINDOW, planApifyRecoveryProbe, rerouteEngineOrders, type EnginePlanningPerformance } from "@/services/autopilot/target-planner";
 import { getAutopilotEnginePerformance } from "@/infrastructure/neon/repositories/autopilot-engine-performance";
 import { decideHybridFill } from "@/services/discovery/hybrid-fill-decision";
 import { buildEngineCapabilities } from "@/services/autopilot/engine-capability";
-import { getApifyAllocationHealth, evaluateProviderHealth } from "@/services/discovery/provider-health";
+import { createApifyCredentialFingerprint, getApifyAllocationHealth, evaluateProviderHealth } from "@/services/discovery/provider-health";
 import { buildMapsSeedCatalog, buildSerpSeedCatalog, ICP_CATEGORY_TERMS, LINKEDIN_OWNER_ROLE_QUERIES } from "@/services/discovery/spain-search-catalog";
 import { getDeliveryEnv, getMapsEnv, getSerperEnv } from "@/lib/config/env";
 import { SERPER_ESTIMATED_COST_PER_QUERY_USD } from "@/infrastructure/providers/serp/serper-provider";
 import type { SearchSeed } from "@/domain/discovery/types";
+import { refreshWatchdogPauseForWorkspace } from "./watchdog-runner";
+import { logEvent } from "@/lib/observability/structured-logger";
 
 export interface AutopilotRunnerResult {
   campaignsTicked: number;
@@ -65,7 +68,11 @@ export async function runAutopilotCronTick(now: Date = new Date()): Promise<Auto
   const pacingStates: AutopilotRunnerResult["pacingStates"] = [];
 
   for (const workspaceId of workspaceIds) {
-    const settings = await getAutopilotSettings(workspaceId);
+    let settings = await getAutopilotSettings(workspaceId);
+    if (settings.systemPaused && settings.systemPauseReason === WATCHDOG_QUEUE_PAUSE_REASON) {
+      await refreshWatchdogPauseForWorkspace(workspaceId);
+      settings = await getAutopilotSettings(workspaceId);
+    }
     const effectiveState = getEffectiveAutopilotState(settings);
     if (effectiveState !== "running") {
       if (effectiveState === "paused") pausedWorkspaces += 1;
@@ -85,7 +92,7 @@ export async function runAutopilotCronTick(now: Date = new Date()): Promise<Auto
     pacingStates.push(pacing);
     campaignsTicked += campaigns.length;
     // The target and budget are workspace-wide, never multiplied by engines.
-    if (pacing.remainingTarget <= 0 || pacing.targetNeededToPlan <= 0 || pacing.rawNeededToPlan <= 0 || pacing.status !== "behind_pace") continue;
+    if (pacing.remainingTarget <= 0) continue;
 
     const mapsEnv = getMapsEnv();
     const serperEnv = getSerperEnv();
@@ -129,7 +136,13 @@ export async function runAutopilotCronTick(now: Date = new Date()): Promise<Auto
           : 0,
       };
     }));
-    const planningRawLimit = Math.min(MAX_RAW_PER_PLANNING_WINDOW, Math.ceil(pacing.rawNeededToPlan));
+    const recoveryRawNeed = apifyRecovery.recoveryProbeEligible
+      ? Math.min(MAX_APIFY_RECOVERY_PROBE_RAW, pacing.rawRequestsRemaining)
+      : 0;
+    const planningRawLimit = Math.min(
+      MAX_RAW_PER_PLANNING_WINDOW,
+      Math.max(Math.ceil(pacing.rawNeededToPlan), recoveryRawNeed),
+    );
     const recoveryProbeOrders = planApifyRecoveryProbe({
       workspaceId,
       campaigns: concreteCampaigns,
@@ -137,9 +150,29 @@ export async function runAutopilotCronTick(now: Date = new Date()): Promise<Auto
       eligible: apifyRecovery.recoveryProbeEligible,
       dailyBudgetAllowed: pacing.apifyDailyBudgetRemaining > 0,
       cooldownAt: apifyRecovery.nextRecoveryAttemptAt,
+      credentialFingerprint: createApifyCredentialFingerprint(mapsEnv.APIFY_API_TOKEN) ?? "unconfigured",
+      failureEpoch: apifyRecovery.latestFailureAt
+        ? new Date(apifyRecovery.latestFailureAt).toISOString()
+        : apifyRecovery.nextRecoveryAttemptAt?.toISOString() ?? "unknown",
       now,
       timeZone: settings.timezone,
     });
+    if (apifyRecovery.credentialChangedSinceLatestFailure === true) {
+      logEvent("info", "apify.credential_rotation_detected", {
+        correlationId: workspaceId,
+        workspaceId,
+        recoveryProbeEligible: apifyRecovery.recoveryProbeEligible,
+      });
+    }
+    for (const order of recoveryProbeOrders) {
+      logEvent("info", "apify.recovery_probe_scheduled", {
+        correlationId: `${workspaceId}:${order.campaignId}:${order.planningWindow}`,
+        workspaceId,
+        campaignId: order.campaignId,
+        engineType: order.engineType,
+        desiredRawCount: order.desiredRawCount,
+      });
+    }
     const recoveryProbeRaw = recoveryProbeOrders.reduce((total, order) => total + order.desiredRawCount, 0);
     let orders = allocateEngineWork({
       workspaceId, campaigns: concreteCampaigns, capabilities, performances,
@@ -189,7 +222,16 @@ export async function runAutopilotCronTick(now: Date = new Date()): Promise<Auto
     const reservation = await enqueueDiscoveryOrdersWithinDailyRawCap(orders.map((order) => ({
       campaignId: order.campaignId,
       type: "run_engine_batch",
-      payload: { engineType: order.engineType, desiredRawCount: order.desiredRawCount, planningWindow: order.planningWindow, reason: order.reason, origin: order.origin },
+      payload: {
+        engineType: order.engineType,
+        desiredRawCount: order.desiredRawCount,
+        planningWindow: order.planningWindow,
+        reason: order.reason,
+        origin: order.origin,
+        ...(order.origin === "recovery_probe" ? {
+          recoveryCredentialFingerprint: createApifyCredentialFingerprint(mapsEnv.APIFY_API_TOKEN),
+        } : {}),
+      },
       idempotencyKey: order.idempotencyKey,
       desiredRawCount: order.desiredRawCount,
     })), now);
