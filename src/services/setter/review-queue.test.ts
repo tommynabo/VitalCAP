@@ -2,20 +2,23 @@ import { describe, expect, it, vi } from "vitest";
 import type { SetterReviewQueueDependencies, SetterQueueConversation, SetterQueueMessage, SetterQueueDraft } from "./review-queue";
 import { loadSetterReviewQueuePage, mergeSetterReviewQueuePages } from "./review-queue";
 
-function makeConversation(index: number): SetterQueueConversation {
+function makeConversation(index: number, state: SetterQueueConversation["state"] = "pending_review"): SetterQueueConversation {
   return {
     id: `conversation-${index}`,
     accountId: `account-${index}`,
     contactId: `contact-${index}`,
     campaignId: `campaign-${index % 2}`,
-    state: "pending_review",
+    state,
     latestIntent: null,
     updatedAt: new Date(Date.UTC(2026, 9, 8, 12, 0, 0) - index * 60_000).toISOString(),
   };
 }
 
-function createDependencies(total: number, withoutDraftAt?: number): SetterReviewQueueDependencies {
-  const conversations = Array.from({ length: total }, (_, index) => makeConversation(index));
+function createDependencies(total: number, withoutDraftAt?: number, pendingCount = total): SetterReviewQueueDependencies {
+  const conversations = Array.from({ length: total }, (_, index) => makeConversation(
+    index,
+    index < pendingCount ? "pending_review" : "approved_pending_send",
+  ));
   const messages: SetterQueueMessage[] = conversations.flatMap((conversation, index) => [
     {
       id: `old-inbound-${index}`,
@@ -39,15 +42,23 @@ function createDependencies(total: number, withoutDraftAt?: number): SetterRevie
     branch: "INTEREST",
     confidence: 0.9,
     reasonForHuman: null,
+    needsHuman: false,
     riskFlags: [],
   }]);
 
   return {
     listPendingConversations: vi.fn(async (limit, cursor) => conversations
-      .filter((conversation) => !cursor
-        || conversation.updatedAt < cursor.updatedAt
-        || (conversation.updatedAt === cursor.updatedAt && conversation.id < cursor.id))
-      .sort((left, right) => Date.parse(right.updatedAt) - Date.parse(left.updatedAt) || right.id.localeCompare(left.id))
+      .filter((conversation) => {
+        if (!cursor) return true;
+        const pending = conversation.state === "pending_review";
+        if (cursor.pendingFirst && !pending) return true;
+        if (pending !== cursor.pendingFirst) return false;
+        return conversation.updatedAt < cursor.updatedAt
+          || (conversation.updatedAt === cursor.updatedAt && conversation.id < cursor.id);
+      })
+      .sort((left, right) => Number(right.state === "pending_review") - Number(left.state === "pending_review")
+        || Date.parse(right.updatedAt) - Date.parse(left.updatedAt)
+        || right.id.localeCompare(left.id))
       .slice(0, limit)),
     listLatestInboundMessages: vi.fn(async (ids: string[]) => {
       const latestByConversation = new Map<string, SetterQueueMessage>();
@@ -62,6 +73,7 @@ function createDependencies(total: number, withoutDraftAt?: number): SetterRevie
     }),
     countMessages: vi.fn(async (ids: string[]) => Object.fromEntries(ids.map((id) => [id, 2]))),
     listDrafts: vi.fn(async (ids) => drafts.filter((draft) => ids.includes(draft.conversationMessageId))),
+    listFeedback: vi.fn(async () => []),
     listAccounts: vi.fn(async (ids: string[], contactIds: string[]) => ids.map((id) => ({
       account: { id, canonicalName: id },
       contacts: contactIds
@@ -83,6 +95,7 @@ describe("Setter review queue loading", () => {
     expect(page.conversations).toHaveLength(25);
     expect(page.pendingCount).toBe(31);
     expect(page.nextCursor?.id).toBe("conversation-24");
+    expect(page.nextCursor?.pendingFirst).toBe(true);
     expect(dependencies.countMessages).toHaveBeenCalledWith(page.conversations.map(({ id }) => id));
     expect(page.latestInboundMessages).toHaveLength(25);
     expect(page.messageCounts).toEqual(Object.fromEntries(page.conversations.map(({ id }) => [id, 2])));
@@ -118,6 +131,7 @@ describe("Setter review queue loading", () => {
 
     expect(firstPage.conversations.map(({ id }) => id)).toEqual(["conversation-1"]);
     expect(firstPage.nextCursor?.id).toBe("conversation-1");
+    expect(firstPage.nextCursor?.pendingFirst).toBe(true);
     expect(dependencies.countMessages).toHaveBeenCalledWith(["conversation-1"]);
 
     const selectedDraftId = firstPage.setterDrafts[0]?.id;
@@ -127,6 +141,17 @@ describe("Setter review queue loading", () => {
     expect(nextPage.conversations.map(({ id }) => id)).toEqual(["conversation-2", "conversation-3"]);
     expect(merged.setterDrafts.some(({ id }) => id === selectedDraftId)).toBe(true);
     expect(merged.conversations.map(({ id }) => id)).toContain("conversation-1");
+  });
+
+  it("keeps pending conversations ahead of processed items and continues paging in the processed group", async () => {
+    const dependencies = createDependencies(4, undefined, 1);
+    const firstPage = await loadSetterReviewQueuePage(dependencies, null, 2);
+
+    expect(firstPage.conversations.map(({ state }) => state)).toEqual(["pending_review", "approved_pending_send"]);
+    expect(firstPage.nextCursor?.pendingFirst).toBe(false);
+
+    const nextPage = await loadSetterReviewQueuePage(dependencies, firstPage.nextCursor, 2);
+    expect(nextPage.conversations.map(({ id }) => id)).toEqual(["conversation-2", "conversation-3"]);
   });
 
   it("returns an empty page without querying child datasets", async () => {

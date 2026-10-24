@@ -1,14 +1,15 @@
 import type { Account } from "@/domain/accounts/types";
 import type { Campaign } from "@/domain/campaigns/types";
 import type { Contact } from "@/domain/contacts/types";
-import type { Conversation, ConversationMessage, SetterDraft } from "@/domain/conversations/types";
+import type { Conversation, ConversationMessage, SetterDraft, SetterFeedback } from "@/domain/conversations/types";
 
 export const SETTER_REVIEW_QUEUE_LIMIT = 25;
 
-export type SetterQueueCursor = Pick<Conversation, "id" | "updatedAt">;
+export type SetterQueueCursor = Pick<Conversation, "id" | "updatedAt"> & { pendingFirst: boolean };
 export type SetterQueueConversation = Pick<Conversation, "id" | "accountId" | "contactId" | "campaignId" | "state" | "latestIntent" | "updatedAt">;
 export type SetterQueueMessage = Pick<ConversationMessage, "id" | "conversationId" | "direction" | "body" | "createdAt">;
-export type SetterQueueDraft = Pick<SetterDraft, "id" | "conversationMessageId" | "draft" | "confidence" | "riskFlags" | "branch" | "reasonForHuman">;
+export type SetterQueueDraft = Pick<SetterDraft, "id" | "conversationMessageId" | "draft" | "confidence" | "riskFlags" | "branch" | "reasonForHuman" | "needsHuman">;
+export type SetterQueueFeedback = Pick<SetterFeedback, "conversationMessageId" | "decision" | "correctedText" | "correctedBranch">;
 export type SetterQueueAccount = {
   account: Pick<Account, "id" | "canonicalName">;
   contacts: Array<Pick<Contact, "id" | "firstName" | "fullName">>;
@@ -20,6 +21,7 @@ export interface SetterReviewQueuePage {
   latestInboundMessages: SetterQueueMessage[];
   messageCounts: Record<string, number>;
   setterDrafts: SetterQueueDraft[];
+  reviewFeedback: SetterQueueFeedback[];
   accountBundles: SetterQueueAccount[];
   campaigns: SetterQueueCampaign[];
   pendingCount: number;
@@ -42,6 +44,7 @@ export function mergeSetterReviewQueuePages(
     latestInboundMessages: mergeBy(current.latestInboundMessages, next.latestInboundMessages, (item) => item.id),
     messageCounts: { ...current.messageCounts, ...next.messageCounts },
     setterDrafts: mergeBy(current.setterDrafts, next.setterDrafts, (item) => item.id),
+    reviewFeedback: mergeBy(current.reviewFeedback, next.reviewFeedback, (item) => item.conversationMessageId),
     accountBundles: mergeBy(current.accountBundles, next.accountBundles, (item) => item.account.id),
     campaigns: mergeBy(current.campaigns, next.campaigns, (item) => item.id),
     pendingCount: next.pendingCount,
@@ -55,6 +58,7 @@ export interface SetterReviewQueueDependencies {
   listLatestInboundMessages(conversationIds: string[]): Promise<SetterQueueMessage[]>;
   countMessages(conversationIds: string[]): Promise<Record<string, number>>;
   listDrafts(messageIds: string[]): Promise<SetterQueueDraft[]>;
+  listFeedback(messageIds: string[]): Promise<SetterQueueFeedback[]>;
   listAccounts(accountIds: string[], contactIds: string[]): Promise<SetterQueueAccount[]>;
   listCampaigns(campaignIds: string[]): Promise<SetterQueueCampaign[]>;
   countPendingConversations(): Promise<number>;
@@ -80,6 +84,7 @@ export async function loadSetterReviewQueuePage(
       latestInboundMessages: [],
       messageCounts: {},
       setterDrafts: [],
+      reviewFeedback: [],
       accountBundles: [],
       campaigns: [],
       pendingCount,
@@ -101,6 +106,9 @@ export async function loadSetterReviewQueuePage(
     return message ? [message.id] : [];
   });
   const drafts = inboundMessageIds.length > 0 ? await dependencies.listDrafts(inboundMessageIds) : [];
+    const reviewFeedback = drafts.length > 0
+      ? await dependencies.listFeedback(drafts.map((draft) => draft.conversationMessageId))
+      : [];
   const draftMessageIds = new Set(drafts.map((draft) => draft.conversationMessageId));
   const visibleConversations = pageConversations.filter((conversation) => {
     const latestInbound = latestInboundByConversation.get(conversation.id);
@@ -134,10 +142,13 @@ export async function loadSetterReviewQueuePage(
     latestInboundMessages: visibleLatestInboundMessages,
     messageCounts,
     setterDrafts: visibleDrafts,
+    reviewFeedback,
     accountBundles,
     campaigns,
     pendingCount,
     oldestPendingAt,
-    nextCursor: hasMore && lastConversation ? { id: lastConversation.id, updatedAt: lastConversation.updatedAt } : null,
+    nextCursor: hasMore && lastConversation
+      ? { id: lastConversation.id, updatedAt: lastConversation.updatedAt, pendingFirst: lastConversation.state === "pending_review" }
+      : null,
   };
 }

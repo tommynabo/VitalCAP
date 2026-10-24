@@ -1,8 +1,8 @@
-import { and, asc, count, desc, eq, inArray, lt, min, or } from "drizzle-orm";
+import { and, asc, count, desc, eq, inArray, lt, min, ne, or, sql } from "drizzle-orm";
 import { getDb } from "../db";
 import { conversations, conversationMessages, setterDrafts, setterFeedback, meetings } from "../schema/conversations";
 import type { Conversation, ConversationMessage, SetterDraft, SetterFeedback, Meeting } from "@/domain/conversations/types";
-import type { SetterQueueCursor, SetterQueueConversation, SetterQueueDraft, SetterQueueMessage } from "@/services/setter/review-queue";
+import type { SetterQueueCursor, SetterQueueConversation, SetterQueueDraft, SetterQueueFeedback, SetterQueueMessage } from "@/services/setter/review-queue";
 import type { ConversationHistoryCursor } from "@/services/setter/conversation-history";
 
 export function toConversation(row: typeof conversations.$inferSelect): Conversation {
@@ -117,13 +117,16 @@ export async function listPendingReviewConversations(
   const cursorDate = cursor ? new Date(cursor.updatedAt) : null;
   const conditions = [
     eq(conversations.workspaceId, workspaceId),
-    inArray(conversations.state, ["pending_review", "approved_pending_send", "sending", "send_accepted", "send_failed", "send_unknown", "sent"]),
+    inArray(conversations.state, ["pending_review", "approved_pending_send", "sending", "send_accepted", "send_failed", "send_unknown", "sent", "approved", "edited", "rejected"]),
   ];
   if (cursor && cursorDate) {
-    conditions.push(or(
+    const afterCursor = or(
       lt(conversations.updatedAt, cursorDate),
       and(eq(conversations.updatedAt, cursorDate), lt(conversations.id, cursor.id)),
-    )!);
+    )!;
+    conditions.push(cursor.pendingFirst
+      ? or(and(eq(conversations.state, "pending_review"), afterCursor), ne(conversations.state, "pending_review"))!
+      : and(ne(conversations.state, "pending_review"), afterCursor)!);
   }
   const rows = await db
     .select({
@@ -137,7 +140,7 @@ export async function listPendingReviewConversations(
     })
     .from(conversations)
     .where(and(...conditions))
-    .orderBy(desc(conversations.updatedAt), desc(conversations.id))
+    .orderBy(sql`CASE WHEN ${conversations.state} = 'pending_review' THEN 0 ELSE 1 END`, desc(conversations.updatedAt), desc(conversations.id))
     .limit(limit);
   return rows.map((row) => ({
     ...row,
@@ -247,12 +250,37 @@ export async function listSetterQueueDrafts(
       riskFlags: setterDrafts.riskFlags,
       branch: setterDrafts.branch,
       reasonForHuman: setterDrafts.reasonForHuman,
+      needsHuman: setterDrafts.needsHuman,
     })
     .from(setterDrafts)
     .innerJoin(conversationMessages, eq(setterDrafts.conversationMessageId, conversationMessages.id))
     .innerJoin(conversations, eq(conversationMessages.conversationId, conversations.id))
     .where(and(eq(conversations.workspaceId, workspaceId), inArray(conversationMessages.id, inboundMessageIds)));
   return rows.map((row) => ({ ...row, riskFlags: row.riskFlags as string[], branch: row.branch as SetterQueueDraft["branch"] }));
+}
+
+export async function listSetterQueueFeedback(
+  workspaceId: string,
+  messageIds: string[],
+): Promise<SetterQueueFeedback[]> {
+  if (messageIds.length === 0) return [];
+  const db = getDb();
+  const rows = await db
+    .select({
+      conversationMessageId: setterFeedback.conversationMessageId,
+      decision: setterFeedback.decision,
+      correctedText: setterFeedback.correctedText,
+      correctedBranch: setterFeedback.correctedBranch,
+    })
+    .from(setterFeedback)
+    .innerJoin(conversationMessages, eq(setterFeedback.conversationMessageId, conversationMessages.id))
+    .innerJoin(conversations, eq(conversationMessages.conversationId, conversations.id))
+    .where(and(eq(conversations.workspaceId, workspaceId), inArray(setterFeedback.conversationMessageId, messageIds)));
+  return rows.map((row) => ({
+    ...row,
+    decision: row.decision as SetterQueueFeedback["decision"],
+    correctedBranch: row.correctedBranch as SetterQueueFeedback["correctedBranch"],
+  }));
 }
 
 export async function listConversationMessages(workspaceId: string): Promise<ConversationMessage[]> {

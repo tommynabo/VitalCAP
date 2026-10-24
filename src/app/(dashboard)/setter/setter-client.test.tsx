@@ -13,6 +13,7 @@ describe("SetterClient empty state", () => {
         latestInboundMessages: [],
         messageCounts: {},
         setterDrafts: [],
+        reviewFeedback: [],
         accountBundles: [],
         campaigns: [],
         pendingCount: 0,
@@ -22,7 +23,7 @@ describe("SetterClient empty state", () => {
       renderedAt: "2026-10-08T12:00:00.000Z",
     }));
 
-    expect(markup).toContain("No hay conversaciones pendientes de revisión.");
+    expect(markup).toContain("No hay conversaciones en la cola.");
     expect(markup).toContain("Pendientes");
   });
 });

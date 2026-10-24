@@ -1,3 +1,4 @@
+  const cursor = { id: "conversation-25", updatedAt: "2026-10-08T12:00:00.000Z", pendingFirst: true };
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const getSetterReviewQueuePageForWorkspace = vi.fn();
@@ -32,7 +33,7 @@ describe("GET /api/setter/review-queue", () => {
     const response = await GET(new Request(`http://localhost/api/setter/review-queue?cursor=${encodeURIComponent(JSON.stringify(cursor))}`));
 
     expect(response.status).toBe(200);
-    expect(getSetterReviewQueuePageForWorkspace).toHaveBeenCalledWith(workspaceId, cursor);
+    expect(getSetterReviewQueuePageForWorkspace).toHaveBeenCalledWith(workspaceId, { ...cursor, pendingFirst: false });
   });
 
   it("rejects malformed cursors without querying queue data", async () => {

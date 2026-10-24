@@ -9,6 +9,7 @@ export const dynamic = "force-dynamic";
 const cursorSchema = z.object({
   id: z.string().min(1).max(100),
   updatedAt: z.string().datetime(),
+  pendingFirst: z.boolean().default(false),
 }).strict();
 
 export async function GET(request: Request) {

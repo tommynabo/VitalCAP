@@ -13,6 +13,41 @@ import {
   type ConversationHistoryPage,
 } from "@/services/setter/conversation-history";
 
+type QueueFilter = "all" | "accepted" | "rejected" | "corrected" | "pending" | "sending" | "instantly_accepted";
+
+const QUEUE_FILTERS: Array<{ id: QueueFilter; label: string }> = [
+  { id: "all", label: "Todos" },
+  { id: "accepted", label: "Aceptadas" },
+  { id: "rejected", label: "Rechazadas" },
+  { id: "corrected", label: "Corregidas" },
+  { id: "pending", label: "Pendientes" },
+  { id: "sending", label: "Envío en curso" },
+  { id: "instantly_accepted", label: "Aceptadas por Instantly" },
+];
+
+function isInQueueFilter(
+  filter: QueueFilter,
+  state: string,
+  feedback: { decision: string; correctedText: string | null; correctedBranch: string | null } | undefined,
+): boolean {
+  if (filter === "all") return true;
+  if (filter === "pending") return state === "pending_review";
+  if (filter === "sending") return state === "approved_pending_send" || state === "sending";
+  if (filter === "instantly_accepted") return state === "send_accepted";
+  if (filter === "accepted") return feedback?.decision === "approve" || state === "approved";
+  if (filter === "rejected") return feedback?.decision === "reject" || state === "rejected";
+  return feedback?.decision === "edit_and_send"
+    || feedback?.correctedText !== null && feedback?.correctedText !== undefined
+    || feedback?.correctedBranch !== null && feedback?.correctedBranch !== undefined
+    || state === "edited";
+}
+
+function intentLabel(intent: string): string {
+  if (intent === "HUMAN_REQUIRED") return "TO BE HUMAN";
+  if (intent === "NOT_INTERESTED") return "NOT INTERESTED";
+  return intent.replaceAll("_", " ").toLowerCase();
+}
+
 function elapsedLabel(timestamp: string | null, now: number): string {
   if (!timestamp) return "—";
   const minutes = Math.max(0, Math.floor((now - Date.parse(timestamp)) / 60_000));
@@ -38,6 +73,7 @@ export function SetterClient({
   const [editingDraftId, setEditingDraftId] = useState<string | null>(null);
   const [deliveryNotice, setDeliveryNotice] = useState<string | null>(null);
   const [loadingMore, setLoadingMore] = useState(false);
+  const [queueFilter, setQueueFilter] = useState<QueueFilter>("all");
   const [historyByConversationId, setHistoryByConversationId] = useState<Record<string, ConversationHistoryPage>>({});
   const [historyLoadingIds, setHistoryLoadingIds] = useState<string[]>([]);
   const [historyErrors, setHistoryErrors] = useState<Record<string, string>>({});
@@ -55,6 +91,7 @@ export function SetterClient({
   const accountBundleById = new Map(accountBundles.map((bundle) => [bundle.account.id, bundle]));
   const campaignById = new Map(campaigns.map((campaign) => [campaign.id, campaign]));
   const draftByMessageId = new Map(setterDrafts.map((draft) => [draft.conversationMessageId, draft]));
+  const feedbackByMessageId = new Map(queuePage.reviewFeedback.map((feedback) => [feedback.conversationMessageId, feedback]));
   const latestInboundByConversationId = new Map(latestInboundMessages.map((message) => [message.conversationId, message]));
   const queueItems = conversations.flatMap((conversation) => {
     const incoming = latestInboundByConversationId.get(conversation.id);
@@ -62,8 +99,16 @@ export function SetterClient({
     return incoming && draft ? [{ conversation, message: incoming, draft }] : [];
   });
   const now = Date.parse(renderedAt);
-  const pendingItems = queueItems
-    .sort((left, right) => Date.parse(left.message.createdAt) - Date.parse(right.message.createdAt));
+  const orderedItems = queueItems.sort((left, right) =>
+    Number(right.conversation.state === "pending_review") - Number(left.conversation.state === "pending_review")
+      || Date.parse(right.message.createdAt) - Date.parse(left.message.createdAt));
+  const filteredItems = orderedItems.filter(({ message, conversation }) =>
+    isInQueueFilter(queueFilter, conversation.state, feedbackByMessageId.get(message.id)));
+  const filterCounts = new Map(QUEUE_FILTERS.map(({ id }) => [
+    id,
+    id === "all" ? orderedItems.length : orderedItems.filter(({ message, conversation }) =>
+      isInQueueFilter(id, conversation.state, feedbackByMessageId.get(message.id))).length,
+  ]));
 
   async function fetchHistoryPage(conversationId: string, cursor: ConversationHistoryPage["nextCursor"] = null) {
     const query = cursor ? `?cursor=${encodeURIComponent(JSON.stringify(cursor))}` : "";
@@ -158,7 +203,7 @@ export function SetterClient({
                 : decision === "reject" ? "Rechazo registrado" : null;
       setDeliveryNotice(notice);
       setEditingDraftId(null);
-      const nextDraft = pendingItems.find(({ draft: pendingDraft, conversation }) => pendingDraft.id !== draft.id && conversation.state === "pending_review")?.draft;
+      const nextDraft = orderedItems.find(({ draft: pendingDraft, conversation }) => pendingDraft.id !== draft.id && conversation.state === "pending_review")?.draft;
       if (nextDraft) {
         setExpandedDraftId(nextDraft.id);
       } else if (queuePage.nextCursor) {
@@ -192,19 +237,37 @@ export function SetterClient({
       <section className="space-y-3" aria-labelledby="setter-review-heading">
         <div className="flex flex-wrap items-baseline justify-between gap-3">
           <h2 id="setter-review-heading" className="text-base font-semibold text-text">Cola de conversaciones</h2>
-          <span className="text-sm text-text-muted">{queuePage.pendingCount} pendientes · {pendingItems.length} visibles</span>
+          <span className="text-sm text-text-muted">{queuePage.pendingCount} pendientes · {orderedItems.length} visibles</span>
         </div>
         {actionError && <p role="alert" className="text-sm text-danger">{actionError}</p>}
         {deliveryNotice && <p role="status" className="text-sm text-text-muted">{deliveryNotice}</p>}
-        {pendingItems.length === 0 ? (
-          <p className="border-y border-border py-5 text-sm text-text-muted">No hay conversaciones pendientes de revisión.</p>
+        <div className="flex flex-wrap gap-2" role="group" aria-label="Filtrar conversaciones">
+          {QUEUE_FILTERS.map(({ id, label }) => (
+            <button
+              key={id}
+              type="button"
+              aria-pressed={queueFilter === id}
+              onClick={() => setQueueFilter(id)}
+              className={`min-h-10 rounded-md border px-3 py-2 text-sm font-medium transition ${
+                queueFilter === id ? "border-primary bg-primary-soft text-primary" : "border-border bg-surface text-text-muted hover:bg-surface-muted"
+              }`}
+            >
+              {label} <span className="ml-1 tabular-nums">{filterCounts.get(id)}</span>
+            </button>
+          ))}
+        </div>
+        {filteredItems.length === 0 ? (
+          <p className="border-y border-border py-5 text-sm text-text-muted">
+            {orderedItems.length === 0 ? "No hay conversaciones en la cola." : "No hay conversaciones para este filtro."}
+          </p>
         ) : (
           <div className="space-y-2">
-            {pendingItems.map(({ draft, message, conversation }) => {
+            {filteredItems.map(({ draft, message, conversation }) => {
               const bundle = accountBundleById.get(conversation.accountId);
               const contact = bundle?.contacts.find((item) => item.id === conversation.contactId);
               const leadName = contact?.fullName ?? contact?.firstName ?? bundle?.account.canonicalName ?? "Contacto sin identificar";
               const expanded = expandedDraftId === draft.id;
+              const feedback = feedbackByMessageId.get(message.id);
 
               return (
                 <article className="overflow-hidden rounded-md border border-border bg-surface" key={draft.id}>
@@ -218,14 +281,18 @@ export function SetterClient({
                     <span className="min-w-0 flex-1 truncate text-sm font-medium text-text">{leadName}</span>
                     <span className="max-w-48 truncate text-xs text-text-muted">{campaignById.get(conversation.campaignId)?.name ?? "Campaña"}</span>
                     <time className="text-xs text-text-muted" dateTime={message.createdAt}>{new Date(message.createdAt).toLocaleString("es-ES", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" })}</time>
-                    {conversation.state === "pending_review" && draft.branch === "HUMAN_REQUIRED" ? <Badge variant="danger">Requiere atención humana</Badge> : null}
+                    {draft.branch === "HUMAN_REQUIRED" ? <Badge variant="danger">TO BE HUMAN · intervención humana</Badge> : null}
+                    {draft.branch !== "HUMAN_REQUIRED" && draft.needsHuman ? <Badge variant="warning">REQUIRED · revisión humana</Badge> : null}
+                    {feedback?.decision === "approve" || conversation.state === "approved" ? <Badge variant="success">Aceptada</Badge> : null}
+                    {feedback?.decision === "edit_and_send" || conversation.state === "edited" ? <Badge variant="primary">Corregida</Badge> : null}
+                    {feedback?.decision === "reject" || conversation.state === "rejected" ? <Badge variant="danger">Rechazada</Badge> : null}
                     {conversation.state === "pending_review" ? <Badge variant="warning">Pendiente</Badge>
+                      : conversation.state === "approved_pending_send" || conversation.state === "sending" ? <Badge variant="warning">Envío en curso</Badge>
                         : conversation.state === "send_accepted" ? <Badge variant="warning">Respuesta aceptada por Instantly</Badge>
-                        : conversation.state === "sending" || conversation.state === "approved_pending_send" ? <Badge variant="warning">Envío en curso</Badge>
                           : conversation.state === "send_failed" ? <Badge variant="danger">Error al enviar</Badge>
                             : conversation.state === "send_unknown" ? <Badge variant="danger">Estado de envío pendiente de reconciliación</Badge>
                               : conversation.state === "sent" ? <Badge variant="success">Enviado</Badge> : null}
-                    {conversation.latestIntent && <Badge variant="neutral">{conversation.latestIntent}</Badge>}
+                    {conversation.latestIntent && <Badge variant={conversation.latestIntent === "NOT_INTERESTED" ? "danger" : conversation.latestIntent === "HUMAN_REQUIRED" ? "primary" : "neutral"}>{intentLabel(conversation.latestIntent)}</Badge>}
                     {expanded ? <ChevronDown size={16} aria-hidden="true" /> : <ChevronRight size={16} aria-hidden="true" />}
                   </button>
 
