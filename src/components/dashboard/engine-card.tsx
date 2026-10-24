@@ -94,7 +94,7 @@ export function EngineCard({ engine, timeZone = "Europe/Madrid" }: { engine: Eng
           </div>
         </dl>
         <p className="mt-3 text-xs text-text-muted">Yield {Math.round(engine.currentYield * 100)}%</p>
-        {engine.lastError ? <p className="mt-3 break-words border-t border-border pt-3 text-xs text-danger">Last error: {engine.lastError}</p> : null}
+        {engine.lastError ? <p className="mt-3 break-words border-t border-border pt-3 text-xs text-danger">Last pipeline / enrichment error: {engine.lastError}</p> : null}
         {engine.nextPlannedAction ? (
           <p className="mt-4 border-t border-border pt-3 text-xs text-text-muted">{engine.nextPlannedAction}</p>
         ) : null}

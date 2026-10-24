@@ -65,10 +65,25 @@ describe("global daily raw request cap SQL", () => {
     expect(query.sql).toContain("jsonb_set(allocated.payload, '{desiredRawCount}'");
     expect(query.sql).toContain("ON CONFLICT DO NOTHING");
     expect(query.sql).toContain("WHERE allocated.reserved_raw_count > 0");
+    expect(query.sql).toContain("input.payload->>'origin' = 'recovery_probe'");
+    expect(query.sql).toContain("existing.status IN ('pending', 'processing')");
     expect(query.params).toContain(1523);
     expect(query.params.some((parameter) => typeof parameter === "string"
       && parameter.includes('"origin":"recovery_probe"')
       && parameter.includes('"priority":0'))).toBe(true);
+  });
+
+  it("checks completed and dead-letter recovery jobs by their exact recovery identity", () => {
+    const query = dialect.sqlToQuery(buildEnqueueDiscoveryOrdersWithinDailyRawCapQuery([{
+      campaignId: "campaign-recovery",
+      type: "run_engine_batch",
+      payload: { engineType: "maps_fast", desiredRawCount: 10, origin: "recovery_probe" },
+      idempotencyKey: "apify-recovery-probe:workspace:campaign:credential:failure-epoch",
+      desiredRawCount: 10,
+    }], 1523, now));
+
+    expect(query.sql).toContain("existing.idempotency_key = input.idempotency_key");
+    expect(query.sql).toMatch(/input\.payload->>'origin' = 'recovery_probe'[\s\S]*OR existing\.status IN \('pending', 'processing'\)/);
   });
 
   it("uses one transaction-scoped global advisory lock before reading and reserving capacity", async () => {

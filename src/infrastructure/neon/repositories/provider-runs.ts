@@ -2,10 +2,11 @@ import { and, asc, desc, eq, gte, inArray, sql } from "drizzle-orm";
 import { getDayBounds } from "@/lib/time/day-bounds";
 import { getDb } from "../db";
 import { buildDailyRawRequestCommitmentCtes, executeUnderGlobalDailyRawCapLock } from "./daily-raw-request-cap";
+import { discoveryJobs } from "../schema/discovery";
 import { providerRuns } from "../schema/providers";
 import type { ProviderUsageStats } from "@/domain/providers/types";
 import { ProviderBudgetExceededError, ProviderFailureError, ProviderSafetyError } from "@/domain/providers/errors";
-import { createApifyConfigurationFingerprint, createApifyCredentialFingerprint, evaluateApifyRecovery, hasCurrentCredentialRecoveryProbeInFlight, type ApifyRecoveryRun } from "@/services/discovery/provider-health";
+import { createApifyConfigurationFingerprint, createApifyCredentialFingerprint, evaluateApifyRecovery, hasCurrentCredentialRecoveryProbeInFlight, resolveApifyRecoveryCredentialFingerprint, type ApifyRecoveryRun } from "@/services/discovery/provider-health";
 import { getCoreEnv, getMapsEnv } from "@/lib/config/env";
 
 export interface RecordProviderRunInput {
@@ -357,7 +358,8 @@ export async function getApifyRecoverySnapshot(workspaceId: string, now = new Da
       costUsd: providerRuns.costUsd,
       error: providerRuns.error,
       metadata: providerRuns.metadata,
-    }).from(providerRuns).where(and(
+      recoveryJobPayload: discoveryJobs.payload,
+    }).from(providerRuns).leftJoin(discoveryJobs, sql`${providerRuns.metadata}->>'discoveryJobId' = ${discoveryJobs.id}::text`).where(and(
       eq(providerRuns.workspaceId, workspaceId),
       eq(providerRuns.provider, "apify"),
       gte(providerRuns.startedAt, since),
@@ -377,7 +379,8 @@ export async function getApifyRecoverySnapshot(workspaceId: string, now = new Da
       startedAt: providerRuns.startedAt,
       finishedAt: providerRuns.finishedAt,
       metadata: providerRuns.metadata,
-    }).from(providerRuns).where(and(
+      recoveryJobPayload: discoveryJobs.payload,
+    }).from(providerRuns).leftJoin(discoveryJobs, sql`${providerRuns.metadata}->>'discoveryJobId' = ${discoveryJobs.id}::text`).where(and(
       eq(providerRuns.workspaceId, workspaceId),
       eq(providerRuns.provider, "apify"),
       inArray(providerRuns.status, ["succeeded", "ingested", "completed"]),
@@ -386,6 +389,10 @@ export async function getApifyRecoverySnapshot(workspaceId: string, now = new Da
   const runs: ApifyRecoveryRun[] = rows.map((row) => {
     const metadata = (row.metadata ?? {}) as Record<string, unknown>;
     const failureKind = metadata.failureKind;
+    const credentialFingerprint = resolveApifyRecoveryCredentialFingerprint(
+      metadata,
+      row.recoveryJobPayload as Record<string, unknown> | null,
+    );
     return {
       status: row.status,
       startedAt: row.startedAt,
@@ -393,7 +400,7 @@ export async function getApifyRecoverySnapshot(workspaceId: string, now = new Da
       itemsReturned: row.itemsReturned,
       costUsd: row.costUsd,
       recoveryProbe: metadata.recoveryProbe === true,
-      ...(typeof metadata.credentialFingerprint === "string" ? { credentialFingerprint: metadata.credentialFingerprint } : {}),
+      ...(credentialFingerprint ? { credentialFingerprint } : {}),
       ...(typeof metadata.configurationFingerprint === "string" ? { configurationFingerprint: metadata.configurationFingerprint } : {}),
       ...(failureKind === "transient" || failureKind === "billing" || failureKind === "authentication" || failureKind === "configuration" || failureKind === "safety" || failureKind === "actor_resource_limit"
         ? { failureKind }
@@ -421,9 +428,13 @@ export async function getApifyRecoverySnapshot(workspaceId: string, now = new Da
     eq(providerRuns.workspaceId, workspaceId),
     eq(providerRuns.status, "manual_reconciliation_required"),
   )).limit(1);
-  const latestSuccessMetadata = (successRows[0]?.metadata ?? {}) as Record<string, unknown>;
-  const latestSuccessCredentialFingerprint = typeof latestSuccessMetadata.credentialFingerprint === "string"
-    ? latestSuccessMetadata.credentialFingerprint
+  const latestSuccess = successRows[0];
+  const latestSuccessMetadata = (latestSuccess?.metadata ?? {}) as Record<string, unknown>;
+  const latestSuccessCredentialFingerprint = latestSuccess
+    ? resolveApifyRecoveryCredentialFingerprint(
+      latestSuccessMetadata,
+      latestSuccess.recoveryJobPayload as Record<string, unknown> | null,
+    ) ?? null
     : null;
   const recoverySnapshot = evaluateApifyRecovery(
     runs,

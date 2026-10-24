@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { aggregateProviderHealthSnapshots, buildProviderHealthSnapshot, createApifyConfigurationFingerprint, createApifyCredentialFingerprint, evaluateApifyRecovery, evaluateProviderHealth, getApifyAllocationHealth, hasCurrentCredentialRecoveryProbeInFlight, hasUnavailableRequiredDiscoveryProvider, isCurrentApifyRecoveryCredential, isProviderAvailableForDiscovery, resolveApifyDiscoveryWorkMode } from "./provider-health";
+import { aggregateProviderHealthSnapshots, buildProviderHealthSnapshot, createApifyConfigurationFingerprint, createApifyCredentialFingerprint, engineProviderHealthForType, evaluateApifyRecovery, evaluateProviderHealth, getApifyAllocationHealth, hasCurrentCredentialRecoveryProbeInFlight, hasUnavailableRequiredDiscoveryProvider, isCurrentApifyRecoveryCredential, isProviderAvailableForDiscovery, resolveApifyDiscoveryWorkMode, resolveApifyRecoveryCredentialFingerprint } from "./provider-health";
 
 describe("provider health cold start", () => {
   it("reports zero historical calls as untested", () => {
@@ -637,5 +637,85 @@ describe("shared provider health snapshots", () => {
       recentErrors: 3,
       recentErrorRate: 3 / 33,
     });
+  });
+});
+
+describe("Apify recovery terminal state regressions", () => {
+  const currentCredential = createApifyCredentialFingerprint("current-production-credential")!;
+  const previousCredential = createApifyCredentialFingerprint("previous-production-credential")!;
+  const successAt = "2026-10-24T13:32:00.000Z";
+
+  it("resolves a legacy successful recovery run from its linked recovery job payload only", () => {
+    expect(resolveApifyRecoveryCredentialFingerprint(
+      { recoveryProbe: true, discoveryJobId: "job-1" },
+      { origin: "recovery_probe", recoveryCredentialFingerprint: currentCredential },
+    )).toBe(currentCredential);
+    expect(resolveApifyRecoveryCredentialFingerprint(
+      { recoveryProbe: false },
+      { origin: "recovery_probe", recoveryCredentialFingerprint: currentCredential },
+    )).toBeUndefined();
+    expect(resolveApifyRecoveryCredentialFingerprint(
+      { recoveryProbe: true },
+      { origin: "normal", recoveryCredentialFingerprint: currentCredential },
+    )).toBeUndefined();
+  });
+
+  it("prefers provider-run identity over the linked job payload", () => {
+    expect(resolveApifyRecoveryCredentialFingerprint(
+      { recoveryProbe: true, credentialFingerprint: previousCredential },
+      { origin: "recovery_probe", recoveryCredentialFingerprint: currentCredential },
+    )).toBe(previousCredential);
+  });
+
+  it("closes recovery after current-credential probe success despite 24-hour historical failures", () => {
+    const latestFailure = {
+      status: "failed",
+      startedAt: "2026-10-24T11:59:00.000Z",
+      finishedAt: "2026-10-24T12:00:00.000Z",
+      itemsReturned: 0,
+      costUsd: 0,
+      failureKind: "billing" as const,
+      credentialFingerprint: previousCredential,
+    };
+    const historicalFailures = Array.from({ length: 24 }, (_, index) => ({
+      ...latestFailure,
+      startedAt: new Date(Date.parse("2026-10-24T10:00:00.000Z") + index * 60_000).toISOString(),
+      finishedAt: new Date(Date.parse("2026-10-24T10:00:30.000Z") + index * 60_000).toISOString(),
+    }));
+    const successfulProbe = {
+      status: "ingested",
+      startedAt: successAt,
+      finishedAt: successAt,
+      itemsReturned: 1,
+      costUsd: 0.05,
+      recoveryProbe: true,
+      credentialFingerprint: currentCredential,
+    };
+    const snapshot = evaluateApifyRecovery(
+      [...historicalFailures, latestFailure, successfulProbe],
+      latestFailure,
+      successAt,
+      false,
+      false,
+      new Date("2026-10-24T13:35:00.000Z"),
+      currentCredential,
+      null,
+      resolveApifyRecoveryCredentialFingerprint(
+        { recoveryProbe: true },
+        { origin: "recovery_probe", recoveryCredentialFingerprint: currentCredential },
+      ) ?? null,
+    );
+
+    expect(snapshot.recoveryProbeEligible).toBe(false);
+    expect(snapshot.nextRecoveryAttemptAt).toBeNull();
+    expect(snapshot.usage).toMatchObject({ calls: 1, errors: 0 });
+    expect(getApifyAllocationHealth(snapshot)).toBe("healthy");
+  });
+
+  it("keeps Maps Fast healthy while exhausted Serper blocks Maps Deep and SERP engines", () => {
+    expect(engineProviderHealthForType("maps_fast", "healthy", "paused")).toBe("healthy");
+    expect(engineProviderHealthForType("maps_deep", "healthy", "paused")).toBe("paused");
+    expect(engineProviderHealthForType("google_serp", "healthy", "paused")).toBe("paused");
+    expect(engineProviderHealthForType("linkedin_owner", "healthy", "paused")).toBe("paused");
   });
 });

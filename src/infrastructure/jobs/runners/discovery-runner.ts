@@ -175,6 +175,32 @@ async function runPreProviderStage<T>(
   }
 }
 
+export function mergeApifyProviderRunMetadata(
+  reservation: Record<string, unknown>,
+  provider: Record<string, unknown>,
+  runtime: Record<string, unknown>,
+): Record<string, unknown> {
+  const metadata = { ...reservation, ...provider, ...runtime };
+  for (const field of ["credentialFingerprint", "configurationFingerprint"] as const) {
+    if (typeof reservation[field] === "string") metadata[field] = reservation[field];
+  }
+  return metadata;
+}
+
+export function isDefinitiveApifyStartupFailure(failureKind: string | null | undefined): boolean {
+  return failureKind === "authentication" || failureKind === "billing" || failureKind === "configuration";
+}
+
+export function getApifyStartupCostPatch(failureKind: string | null | undefined): { costUsd: 0 } | Record<string, never> {
+  return isDefinitiveApifyStartupFailure(failureKind) ? { costUsd: 0 } : {};
+}
+
+export function getApifyDiscoveryBatchCap(recoveryProbe: boolean, providerHealth: string): number {
+  return recoveryProbe || providerHealth === "untested"
+    ? 10
+    : MAX_SEEDS_PER_JOB * MAX_RAW_PER_SEED;
+}
+
 interface DiscoveryHandoffCounters {
   providerReservationsCreated: number;
   providerReservationsSkipped: number;
@@ -317,7 +343,7 @@ async function executeDiscoveryJob(
   // success establishes health, a job can use the full five-seed planning
   // window (5 × 100 raw), still subject to the per-workspace daily raw and
   // spend guards in reserveApifyProviderRun.
-  const bootstrapCap = recoveryProbe || providerHealth === "untested" ? 10 : MAX_SEEDS_PER_JOB * MAX_RAW_PER_SEED;
+  const bootstrapCap = getApifyDiscoveryBatchCap(recoveryProbe, providerHealth);
   const desiredRawCount = Math.min(bootstrapCap, Math.max(0, Math.floor(job.payload.desiredRawCount)));
   if (desiredRawCount <= 0) return 0;
   const maxSeeds = Math.min(MAX_SEEDS_PER_JOB, Math.max(1, Math.ceil(desiredRawCount / 10)));
@@ -402,6 +428,7 @@ async function executeDiscoveryJob(
     }
     let seedRunId: string | null = null;
     let reservationId: string | null = null;
+    let reservationMetadata: Record<string, unknown> = {};
     if (engine.usesAsyncProvider) {
       logEvent("info", "discovery.provider.reserve.provider_run_attempt", {
         ...reservationFields,
@@ -466,6 +493,7 @@ async function executeDiscoveryJob(
         continue;
       }
       reservationId = reservation.providerRun.id;
+      reservationMetadata = (reservation.providerRun.metadata ?? {}) as Record<string, unknown>;
       seedRunId = await insertSearchSeedRun({
         seedId: seed.id,
         startedAt: startedAt.toISOString(),
@@ -475,7 +503,7 @@ async function executeDiscoveryJob(
         readyCount: 0,
         error: null,
       });
-      await updateProviderRun(reservationId, { metadata: {
+      await updateProviderRun(reservationId, { metadata: mergeApifyProviderRunMetadata(reservationMetadata, {}, {
         engineType: job.payload.engineType,
         seedId: seed.id,
         seedRunId,
@@ -489,7 +517,7 @@ async function executeDiscoveryJob(
           ? { credentialFingerprint: createApifyCredentialFingerprint(mapsEnv.APIFY_API_TOKEN) }
           : {}),
         ...(recoveryProbe && apifyConfigurationFingerprint ? { configurationFingerprint: apifyConfigurationFingerprint } : {}),
-      } });
+      }) });
     }
 
     let result;
@@ -522,8 +550,9 @@ async function executeDiscoveryJob(
         await updateProviderRun(reservationId, {
           status: "failed",
           finishedAt: new Date(),
+          ...getApifyStartupCostPatch(failureKind),
           error: `Provider startup failed: ${message}`,
-          metadata: {
+          metadata: mergeApifyProviderRunMetadata(reservationMetadata, {}, {
             engineType: job.payload.engineType,
             seedId: seed.id,
             seedRunId,
@@ -537,7 +566,7 @@ async function executeDiscoveryJob(
             ...(failureClass ? { failureClass } : {}),
             ...(credentialFingerprint ? { credentialFingerprint } : {}),
             ...(configurationFingerprint ? { configurationFingerprint } : {}),
-          },
+          }),
         });
       }
       if (seedRunId) await updateSearchSeedRun(seedRunId, { finishedAt: new Date().toISOString(), error: `Provider startup failed: ${message}` });
@@ -553,7 +582,21 @@ async function executeDiscoveryJob(
         externalDatasetId: result.providerRun.externalDatasetId,
         status: result.providerRun.status,
         costUsd: result.providerRun.costUsd,
-        metadata: { ...result.providerRun.metadata, engineType: job.payload.engineType, seedId: seed.id, seedRunId, discoveryJobId: job.id, query: seed.query, geography: seed.geography, recoveryProbe },
+        metadata: mergeApifyProviderRunMetadata(
+          reservationMetadata,
+          result.providerRun.metadata,
+          {
+            engineType: job.payload.engineType,
+            seedId: seed.id,
+            seedRunId,
+            discoveryJobId: job.id,
+            query: seed.query,
+            normalizedQuery,
+            geography: seed.geography,
+            planningWindow,
+            recoveryProbe,
+          },
+        ),
       });
       counters.providerRunsStarted += 1;
       logEvent("info", "discovery.provider.started", {

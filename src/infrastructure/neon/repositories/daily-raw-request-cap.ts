@@ -135,7 +135,10 @@ export function buildEnqueueDiscoveryOrdersWithinDailyRawCapQuery(
         AND NOT EXISTS (
           SELECT 1 FROM discovery_jobs existing
           WHERE existing.idempotency_key = input.idempotency_key
-            AND existing.status IN ('pending', 'processing')
+            AND (
+              input.payload->>'origin' = 'recovery_probe'
+              OR existing.status IN ('pending', 'processing')
+            )
         )
     ),
     allocated_orders AS (

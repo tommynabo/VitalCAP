@@ -39,6 +39,19 @@ export function createApifyConfigurationFingerprint(configuration: {
   ])).digest("hex");
 }
 
+export function resolveApifyRecoveryCredentialFingerprint(
+  metadata: Record<string, unknown>,
+  recoveryJobPayload?: Record<string, unknown> | null,
+): string | undefined {
+  if (typeof metadata.credentialFingerprint === "string" && metadata.credentialFingerprint.length > 0) {
+    return metadata.credentialFingerprint;
+  }
+  if (metadata.recoveryProbe !== true || recoveryJobPayload?.origin !== "recovery_probe") return undefined;
+  return typeof recoveryJobPayload.recoveryCredentialFingerprint === "string"
+    ? recoveryJobPayload.recoveryCredentialFingerprint
+    : undefined;
+}
+
 export interface ApifyRecoveryRun {
   status: string;
   startedAt: Date | string;

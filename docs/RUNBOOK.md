@@ -66,21 +66,24 @@ permanent).
 
 ## 4. Rotate provider keys
 
-**Mechanism:** every provider credential is a plain env var name in `.env.example`
-(`APIFY_API_TOKEN`, with SERP, email verification, email delivery, LLM, and SMS providers explicitly
-disabled) — never hardcoded in source.
+**Mechanism:** provider credentials are read from the deployed process environment, never hardcoded
+or stored in the database. Apify recovery compares a SHA-256 fingerprint; it never stores the raw
+`APIFY_API_TOKEN`.
 
 **Steps:**
 1. Generate a new key with the provider.
-2. Update the corresponding env var in Vercel's project environment variables (not in any committed
-   file).
-3. Redeploy (or use Vercel's "redeploy without build cache" if the runtime picks up env vars without a
-   full rebuild — verify per Vercel's current env-var-refresh behavior at deploy time).
-4. Revoke the old key at the provider only **after** confirming the new key works (check
-   `/admin/diagnostics`'s provider health panel shows `connected`/`healthy` for that provider following
-   deploy).
-5. No application code needs to change — every provider adapter reads its key from `process.env` at
-   call time, never at module load/build time, per the mock-adapter pattern already established.
+2. Set `APIFY_API_TOKEN` in the Vercel **Production** environment. Do not put the production key in a
+   local `.env` file or committed file.
+3. Redeploy Production. The new deployment reads `process.env.APIFY_API_TOKEN` through `getMapsEnv()`;
+   changing the Vercel variable and redeploying is sufficient to establish the new credential
+   fingerprint.
+4. Autopilot schedules one bounded, credential-scoped recovery probe. A successful provider run is
+   linked to its discovery job and durably associated with that fingerprint. Recovery then closes
+   immediately and normal Maps Fast discovery resumes, subject to the planning window, remaining raw
+   demand, seed availability, daily raw cap, and daily Apify spend cap.
+5. No database edit, reset endpoint, local `.env`, or manual campaign reactivation is required. Revoke
+   the old key only after the new run is confirmed healthy. Review Serper separately: exhausted Serper
+   capacity disables Serper-dependent engines, but does not disable Maps Fast through Apify.
 
 ## 5. Disable a provider
 
