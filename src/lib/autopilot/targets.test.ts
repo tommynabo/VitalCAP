@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   engineDeficit,
+  autopilotTargetMetricLabel,
   globalDeficit,
   globalProgressPct,
   sumReady,
@@ -17,6 +18,13 @@ const engines: EngineTargetState[] = [
 ];
 
 describe("autopilot target math", () => {
+  it("labels each target metric truthfully", () => {
+    expect(autopilotTargetMetricLabel("instantly_imported")).toBe("Instantly imports");
+    expect(autopilotTargetMetricLabel("qualified")).toBe("Qualified prospects");
+    expect(autopilotTargetMetricLabel("analyzed_qualified")).toBe("Analyzed qualified");
+    expect(autopilotTargetMetricLabel("outreach_ready")).toBe("Outreach ready");
+  });
+
   it("sums soft targets to 250 for the default 5x50 configuration", () => {
     expect(sumSoftTargets(engines)).toBe(250);
   });

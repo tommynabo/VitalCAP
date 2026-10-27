@@ -9,7 +9,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
-import { globalProgressPct, sumSoftTargets } from "@/lib/autopilot/targets";
+import { autopilotTargetMetricLabel, globalProgressPct, sumSoftTargets } from "@/lib/autopilot/targets";
 import type { DeadLetterSample, InstantlyPipelineDiagnostics, ProviderRowStatus, QueueHealthSnapshot } from "@/lib/data/repository";
 import { getEffectiveAutopilotState, type AutopilotSettings, type GlobalAutopilotState, type RebalanceDecision } from "@/domain/autopilot/types";
 
@@ -55,7 +55,8 @@ export function AutopilotClient({
     : globalProgressPct(state.dailyTarget, state.engines);
   const [targetInput, setTargetInput] = useState(String(settings.globalDailyTarget));
   const [targetMetric, setTargetMetric] = useState(settings.targetMetric);
-  const targetLabel = settings.targetMetric === "instantly_imported" ? "Instantly añadidos" : "qualified prospects";
+  const targetLabel = autopilotTargetMetricLabel(settings.targetMetric);
+  const progressLabel = settings.targetMetric === "instantly_imported" ? "Imported to Instantly" : targetLabel;
 
   async function control(action: Record<string, unknown>) {
     setPendingAction(String(action.action));
@@ -115,10 +116,10 @@ export function AutopilotClient({
         <CardContent className="flex flex-wrap items-end gap-3">
           <label className="text-sm text-text-muted">Target/day<input className="mt-1 block w-28 rounded border border-border bg-surface px-2 py-1 text-text" type="number" min="1" max="250" value={targetInput} onChange={(event) => setTargetInput(event.target.value)} /></label>
           <label className="text-sm text-text-muted">Target metric<select className="mt-1 block rounded border border-border bg-surface px-2 py-1 text-text" value={targetMetric} onChange={(event) => setTargetMetric(event.target.value as AutopilotSettings["targetMetric"])}>
-            <option value="qualified">Qualified</option>
+            <option value="qualified">Qualified prospects</option>
             <option value="analyzed_qualified">Analyzed qualified</option>
             <option value="outreach_ready">Outreach ready</option>
-            <option value="instantly_imported">Instantly added</option>
+            <option value="instantly_imported">Instantly imports</option>
           </select></label>
           <Button size="sm" disabled={pendingAction !== null} onClick={() => void control({ action: "target_change", globalDailyTarget: Number(targetInput), targetMetric })}>Save target</Button>
           <span className="text-xs text-text-muted">Recommended 250 · timezone {settings.timezone}</span>
@@ -127,9 +128,10 @@ export function AutopilotClient({
       </Card>
 
       <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-6">
-            <KpiStat label={settings.targetMetric === "instantly_imported" ? "Instantly añadidos hoy" : "Qualified today"} value={`${pacing?.targetAchievedToday ?? state.targetAchievedToday ?? state.readyToday}/${state.dailyTarget}`} emphasize />
+          <KpiStat label={progressLabel} value={`${pacing?.targetAchievedToday ?? state.targetAchievedToday ?? state.readyToday}/${state.dailyTarget}`} emphasize />
           <KpiStat label="Qualified today" value={String(pacing?.qualifiedToday ?? state.readyToday)} />
-        <KpiStat label="Progress" value={`${progressPct}%`} />
+        <KpiStat label="Valid emails today" value={pacing ? String(pacing.validEmailToday) : "Unavailable"} />
+        <KpiStat label="Progress" value={`${progressPct}% ${targetLabel}`} />
         <KpiStat label="Soft target total" value={String(softTargetTotal)} />
         <KpiStat label="Sent today" value={String(state.sentToday)} />
         <KpiStat label="Raw requests" value={pacing ? String(pacing.rawRequestedToday) : "Unavailable"} />
@@ -163,11 +165,11 @@ export function AutopilotClient({
               {pacing.targetMetric === "instantly_imported" && <div className="grid grid-cols-2 gap-3 border-y border-border py-3 sm:grid-cols-3 lg:grid-cols-6">
                 <KpiStat label="Discovered" value={String(pacing.discoveredToday)} />
                 <KpiStat label="With email" value={String(pacing.withEmailToday)} />
-                <KpiStat label="MV valid" value={String(pacing.validEmailToday)} />
+                <KpiStat label="Valid emails today" value={String(pacing.validEmailToday)} />
                 <KpiStat label="Eligible" value={String(pacing.eligibleToday)} />
                 <KpiStat label="Qualified" value={String(pacing.qualifiedToday)} />
                 <KpiStat label="Verification pending" value={String(pacing.verificationInFlight)} />
-                <KpiStat label="Instantly added today" value={String(pacing.instantlyImportedToday)} />
+                <KpiStat label="Imported to Instantly today" value={String(pacing.instantlyImportedToday)} />
               </div>}
               <p className="text-xs text-text-muted">{pacing.explanation}</p>
               <div className="flex flex-wrap items-center gap-2 text-xs text-text-muted">

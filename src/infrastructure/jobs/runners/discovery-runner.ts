@@ -19,6 +19,7 @@ import {
   listSearchSeedsForCampaignEngine,
   refreshSearchSeedQualification,
   getRemainingDiscoveryTarget,
+  getSeedEconomicPerformance,
   updateSearchSeedRun,
 } from "@/infrastructure/neon/repositories/discovery";
 import { getApifyRecoverySnapshot, getApifyReservationFailureDetails, getRecentProviderUsage, reserveApifyProviderRun, updateProviderRun } from "@/infrastructure/neon/repositories/provider-runs";
@@ -33,6 +34,7 @@ import { resolvePlanningWindow } from "@/services/autopilot/target-planner";
 import { getMapsEnv } from "@/lib/config/env";
 import { logEvent } from "@/lib/observability/structured-logger";
 import { getApifyFailureClass, getApifyFailureKind } from "@/infrastructure/providers/maps/apify-client";
+import { planSeedBatches, scoreSeedEconomicPerformance } from "@/services/discovery/seed-economics";
 
 const DISCOVERY_JOB_TYPE = "run_engine_batch";
 const MAX_SEEDS_PER_JOB = 5;
@@ -368,10 +370,54 @@ async function executeDiscoveryJob(
     plannedSeedCount: seeds.length,
   });
   const requestedSeedSpecified = Boolean(job.payload.seedQuery && job.payload.seedGeography);
+  const candidatePool = provider === "apify" ? persistedSeeds : seeds;
   const requestedSeed = job.payload.seedQuery && job.payload.seedGeography
-    ? seeds.find((seed) => seed.query === job.payload.seedQuery && seed.geography === job.payload.seedGeography)
+    ? candidatePool.find((seed) => seed.query === job.payload.seedQuery && seed.geography === job.payload.seedGeography)
     : undefined;
-  const boundedSeeds = requestedSeed ? [requestedSeed] : seeds.slice(0, maxSeeds);
+  const seedCandidates = requestedSeed ? [requestedSeed] : candidatePool;
+  const seedEconomics = provider === "apify"
+    ? await getSeedEconomicPerformance(campaign.id, job.payload.engineType, new Date(), campaign.timeZone)
+    : new Map();
+  const economicBatches = provider === "apify"
+    ? planSeedBatches({ seeds: seedCandidates, performanceBySeed: seedEconomics, rawNeeded: desiredRawCount, maxSeeds, now: new Date() })
+    : [];
+  const boundedSeeds = provider === "apify"
+    ? economicBatches.map((batch) => batch.seed)
+    : seedCandidates.slice(0, maxSeeds);
+  const economicBatchBySeed = new Map(economicBatches.map((batch) => [batch.seed.id, batch]));
+  const coolingSeedCount = seedCandidates.reduce((count, seed) => {
+    const policy = scoreSeedEconomicPerformance(seed, seedEconomics.get(seed.id), new Date());
+    return count + (policy.eligible ? 0 : 1);
+  }, 0);
+  if (coolingSeedCount > 0) {
+    logEvent("info", "discovery.seed_low_novelty_cooldown", {
+      correlationId: job.id,
+      campaignId: campaign.id,
+      engineType: job.payload.engineType,
+      cooledSeedCount: coolingSeedCount,
+    });
+  }
+  for (const batch of economicBatches) {
+    const performance = seedEconomics.get(batch.seed.id);
+    const fields = {
+      correlationId: job.id,
+      campaignId: campaign.id,
+      seedId: batch.seed.id,
+      engineType: job.payload.engineType,
+      sampleSize: performance?.sampleSize ?? 0,
+      noveltyRate: performance?.noveltyRate ?? null,
+      qualifiedYield: performance?.qualifiedYield ?? null,
+      validEmailYield: performance?.validEmailYield ?? null,
+      importYield: performance?.confirmedImportYield ?? null,
+      costPerNewRaw: performance?.costPerNewRaw ?? null,
+      costPerImport: performance?.costPerConfirmedImport ?? null,
+      batchSize: batch.requestedItems,
+      tier: batch.policy.tier,
+    };
+    logEvent("info", "discovery.seed_economic_score", fields);
+    logEvent("info", "discovery.seed_novelty_tier", fields);
+    logEvent("info", "discovery.seed_adaptive_batch", fields);
+  }
   logEvent("info", "discovery.seeds.bounded", {
     correlationId: job.id,
     discoveryJobId: job.id,
@@ -395,7 +441,10 @@ async function executeDiscoveryJob(
 
   let totalRawCandidates = 0;
   for (const [seedIndex, seed] of boundedSeeds.entries()) {
-    const requestedItems = Math.min(MAX_RAW_PER_SEED, Math.max(1, Math.ceil(remainingRaw / (boundedSeeds.length - seedIndex))));
+    const requestedItems = provider === "apify"
+      ? economicBatchBySeed.get(seed.id)?.requestedItems ?? 0
+      : Math.min(MAX_RAW_PER_SEED, Math.max(1, Math.ceil(remainingRaw / (boundedSeeds.length - seedIndex))));
+    if (requestedItems <= 0) continue;
     const startedAt = new Date();
     const reservationFields = {
       correlationId: job.id,

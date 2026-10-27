@@ -52,6 +52,33 @@ export interface EngineWorkAllocationInput extends Omit<MapsFastAllocationInput,
  */
 export const MAX_RAW_PER_PLANNING_WINDOW = 500;
 export const MAX_APIFY_RECOVERY_PROBE_RAW = 10;
+export const MIN_IMPORTS_FOR_COST_WEIGHT = 5;
+const COST_WEIGHT_FLOOR = 0.75;
+const COST_WEIGHT_CEILING = 1.25;
+
+function median(values: readonly number[]): number | null {
+  if (values.length === 0) return null;
+  const sorted = [...values].sort((left, right) => left - right);
+  const middle = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 0
+    ? ((sorted[middle - 1] ?? 0) + (sorted[middle] ?? 0)) / 2
+    : sorted[middle] ?? null;
+}
+
+function confirmedImportCostWeight(
+  performance: EnginePlanningPerformance | undefined,
+  medianCostPerImport: number | null,
+): number {
+  const costPerImport = performance?.costPerConfirmedImportUsd;
+  if (
+    (performance?.confirmedImportCount ?? 0) < MIN_IMPORTS_FOR_COST_WEIGHT
+    || costPerImport === null || costPerImport === undefined || costPerImport <= 0
+    || medianCostPerImport === null || medianCostPerImport <= 0
+  ) return 1;
+
+  const relativeWeight = Math.sqrt(medianCostPerImport / costPerImport);
+  return Math.max(COST_WEIGHT_FLOOR, Math.min(COST_WEIGHT_CEILING, relativeWeight));
+}
 
 export function planningWindowKey(now: Date, timeZone: string, windowMinutes = 15): string {
   const parts = new Intl.DateTimeFormat("en-CA", {
@@ -132,13 +159,22 @@ export function allocateEngineWork(input: EngineWorkAllocationInput): DiscoveryO
   const performanceByCampaign = new Map((input.performances ?? []).map((performance) => [performance.campaignId, performance]));
   const eligible = input.campaigns.filter((campaign) => campaign.status === "active" && campaign.autopilotEnabled && campaign.engineType !== "hybrid_fill" && campaign.dailySoftTarget > 0 && available.has(campaign.engineType));
   if (input.rawNeeded <= 0 || eligible.length === 0) return [];
+  const medianCostPerImport = median(eligible
+    .map((campaign) => performanceByCampaign.get(campaign.id))
+    .filter((performance): performance is EnginePlanningPerformance => performance !== undefined
+      && (performance.confirmedImportCount ?? 0) >= MIN_IMPORTS_FOR_COST_WEIGHT
+      && performance.costPerConfirmedImportUsd !== null
+      && performance.costPerConfirmedImportUsd !== undefined
+      && performance.costPerConfirmedImportUsd > 0)
+    .map((performance) => performance.costPerConfirmedImportUsd!));
 
   const weighted = eligible.map((campaign) => {
     const performance = performanceByCampaign.get(campaign.id);
     const yieldWeight = Math.max(0, Math.min(1, performance?.yield ?? SAFE_ENGINE_YIELD_PRIOR));
     const queuePenalty = Math.min(0.75, (performance?.queueDepth ?? 0) / 1_000);
     const exhaustionPenalty = Math.min(0.75, performance?.seedExhaustion ?? 0);
-    return { campaign, weight: campaign.dailySoftTarget * yieldWeight * (1 - queuePenalty) * (1 - exhaustionPenalty) };
+    const costWeight = confirmedImportCostWeight(performance, medianCostPerImport);
+    return { campaign, weight: campaign.dailySoftTarget * yieldWeight * (1 - queuePenalty) * (1 - exhaustionPenalty) * costWeight };
   });
   let totalWeight = weighted.reduce((sum, item) => sum + item.weight, 0);
   if (totalWeight <= 0) {

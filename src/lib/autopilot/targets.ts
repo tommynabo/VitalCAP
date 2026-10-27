@@ -1,4 +1,4 @@
-import type { EngineTargetState } from "@/domain/autopilot/types";
+import type { AutopilotTargetMetric, EngineTargetState } from "@/domain/autopilot/types";
 
 /**
  * Pure target-model math (Prompt 0 §0.4). Deliberately does not decide
@@ -16,6 +16,16 @@ export const sumReady = sumTargetAchieved;
 
 export function sumSoftTargets(engines: readonly EngineTargetState[]): number {
   return engines.reduce((total, engine) => total + engine.softTarget, 0);
+}
+
+export function autopilotTargetMetricLabel(metric: AutopilotTargetMetric | undefined): string {
+  switch (metric) {
+    case "instantly_imported": return "Instantly imports";
+    case "analyzed_qualified": return "Analyzed qualified";
+    case "outreach_ready": return "Outreach ready";
+    case "qualified":
+    default: return "Qualified prospects";
+  }
 }
 
 export function globalDeficit(dailyTarget: number, engines: readonly EngineTargetState[]): number {

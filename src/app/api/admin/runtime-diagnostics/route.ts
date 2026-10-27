@@ -5,13 +5,17 @@ import { listCampaigns } from "@/infrastructure/neon/repositories/campaigns";
 import { autopilotSettings } from "@/infrastructure/neon/schema/autopilot";
 import { getWorkspaceRole } from "@/infrastructure/neon/repositories/workspace";
 import { getApifyRecoverySnapshot } from "@/infrastructure/neon/repositories/provider-runs";
+import { getApifyDailyEconomicTotals, getSeedEconomicPerformance, listSearchSeedsForCampaignEngine } from "@/infrastructure/neon/repositories/discovery";
 import { getSystemHealthDiagnostics } from "@/infrastructure/neon/repositories/health-diagnostics";
 import { getRecoveryProbeDiscoveryJobs, getWatchdogWorkspaceSignals } from "@/infrastructure/neon/repositories/watchdog-signals";
+import { getAutopilotPacingState } from "@/infrastructure/neon/repositories/autopilot";
 import { getCurrentWorkspaceId, requireCurrentUser, UnauthorizedError } from "@/lib/auth/workspace";
 import { getMapsEnv, getSerperEnv } from "@/lib/config/env";
 import { resolveNeonVar } from "@/lib/config/env-utils";
 import { buildProviderHealthSnapshot } from "@/services/discovery/provider-health";
 import { getWatchdogPausePredicates } from "@/services/autopilot/watchdog-pause-policy";
+import { scoreSeedEconomicPerformance } from "@/services/discovery/seed-economics";
+import type { SeedEconomicPerformance } from "@/services/discovery/seed-economics";
 import { sanitizeRecoveryJobError } from "./sanitize-recovery-error";
 
 export const dynamic = "force-dynamic";
@@ -75,6 +79,46 @@ function formatDiagnosticDate(value: Date | string | null): string | null {
   return Number.isNaN(date.getTime()) ? null : date.toISOString();
 }
 
+function aggregateSeedEconomics(rows: readonly SeedEconomicPerformance[]) {
+  const total = (selector: (row: SeedEconomicPerformance) => number) => rows.reduce((sum, row) => sum + selector(row), 0);
+  const providerCostUsd = total((row) => row.providerCostUsd);
+  const newRaw = total((row) => row.newRaw);
+  const duplicates = total((row) => row.duplicates);
+  const attributedRows = rows.filter((row) => row.outcomeAttributionComplete);
+  const attributedTotal = (selector: (row: SeedEconomicPerformance) => number | null) =>
+    attributedRows.reduce((sum, row) => sum + (selector(row) ?? 0), 0);
+  const outcomeTotal = (selector: (row: SeedEconomicPerformance) => number | null) =>
+    rows.length > 0 && attributedRows.length === rows.length ? attributedTotal(selector) : null;
+  const qualified = outcomeTotal((row) => row.qualifiedFromSeed);
+  const website = outcomeTotal((row) => row.websiteFromSeed);
+  const emailFound = outcomeTotal((row) => row.emailFoundFromSeed);
+  const validEmail = outcomeTotal((row) => row.validEmailFromSeed);
+  const imports = outcomeTotal((row) => row.confirmedInstantlyImportsFromSeed);
+  return {
+    outcomeAttributionCompleteSeeds: attributedRows.length,
+    outcomeAttributionUnknownSeeds: rows.length - attributedRows.length,
+    recentRuns: total((row) => row.recentRuns),
+    sampleSize: total((row) => row.sampleSize),
+    itemsReturned: total((row) => row.itemsReturned),
+    newRaw,
+    duplicates,
+    noveltyRate: total((row) => row.itemsReturned) > 0 ? newRaw / total((row) => row.itemsReturned) : null,
+    providerCostUsd,
+    costPerNewRaw: newRaw > 0 ? providerCostUsd / newRaw : null,
+    qualified,
+    qualifiedYield: qualified !== null && newRaw > 0 ? qualified / newRaw : null,
+    website,
+    websiteRate: website !== null && newRaw > 0 ? website / newRaw : null,
+    emailFound,
+    emailFoundRate: emailFound !== null && newRaw > 0 ? emailFound / newRaw : null,
+    validEmail,
+    validEmailRate: validEmail !== null && newRaw > 0 ? validEmail / newRaw : null,
+    instantlyImported: imports,
+    instantlyImportRate: imports !== null && newRaw > 0 ? imports / newRaw : null,
+    costPerConfirmedImport: imports !== null && imports > 0 ? providerCostUsd / imports : null,
+  };
+}
+
 export async function GET() {
   try {
     const user = await requireCurrentUser();
@@ -97,6 +141,8 @@ export async function GET() {
         systemPausedAt: autopilotSettings.systemPausedAt,
         emergencyStopped: autopilotSettings.emergencyStopped,
         target: autopilotSettings.globalDailyTarget,
+        targetMetric: autopilotSettings.targetMetric,
+        timezone: autopilotSettings.timezone,
       }).from(autopilotSettings).where(eq(autopilotSettings.workspaceId, workspaceId)).limit(1),
       getApifyRecoverySnapshot(workspaceId),
       getWatchdogWorkspaceSignals(workspaceId),
@@ -109,6 +155,49 @@ export async function GET() {
       }),
     ]);
     const watchdogSignals = watchdogRows[0] ?? null;
+    const timeZone = settings?.timezone ?? "Europe/Madrid";
+    const mapsCampaigns = campaignRows.filter((campaign) => campaign.engineType === "maps_fast" || campaign.engineType === "maps_deep");
+    const [apifyDailyEconomics, pacing, seedEconomicsByCampaign] = await Promise.all([
+      getApifyDailyEconomicTotals(workspaceId, timeZone, diagnosticsNow),
+      getAutopilotPacingState(workspaceId, diagnosticsNow),
+      Promise.all(mapsCampaigns.map(async (campaign) => {
+        const [seeds, economics] = await Promise.all([
+          listSearchSeedsForCampaignEngine(campaign.id, campaign.engineType),
+          getSeedEconomicPerformance(campaign.id, campaign.engineType, diagnosticsNow, campaign.timeZone),
+        ]);
+        return {
+          campaignId: campaign.id,
+          engineType: campaign.engineType,
+          seeds: seeds.map((seed) => ({
+          seed,
+          performance: economics.get(seed.id),
+          policy: scoreSeedEconomicPerformance(seed, economics.get(seed.id), diagnosticsNow),
+          })),
+        };
+      })),
+    ]);
+    const seedEconomics = seedEconomicsByCampaign.flatMap((group) => group.seeds.map((item) => ({ ...item, campaignId: group.campaignId, engineType: group.engineType })));
+    const campaignEconomics = seedEconomicsByCampaign.map((group) => ({
+      campaignId: group.campaignId,
+      engineType: group.engineType,
+      ...aggregateSeedEconomics(group.seeds.flatMap((item) => item.performance ? [item.performance] : [])),
+    }));
+    const engineEconomics = [...new Set(campaignEconomics.map((row) => row.engineType))].map((engineType) => ({
+      engineType,
+      ...aggregateSeedEconomics(seedEconomicsByCampaign
+        .filter((group) => group.engineType === engineType)
+        .flatMap((group) => group.seeds.flatMap((item) => item.performance ? [item.performance] : []))),
+    }));
+    const lowNoveltyCostTodayUsd = seedEconomics.reduce((total, item) =>
+      total + (item.performance && item.performance.noveltyRate !== null && item.performance.noveltyRate < 0.1
+        ? item.performance.providerCostTodayUsd
+        : 0), 0);
+    const duplicateResultRate = apifyDailyEconomics.accountedResultsReturned > 0
+      ? apifyDailyEconomics.duplicates / apifyDailyEconomics.accountedResultsReturned
+      : null;
+    const costPerConfirmedImport = pacing.instantlyImportedToday > 0
+      ? apifyDailyEconomics.spendUsd / pacing.instantlyImportedToday
+      : null;
     const apifyHealth = buildProviderHealthSnapshot({
       provider: "apify",
       configured: mapsEnv.MAPS_PROVIDER === "apify" && Boolean(mapsEnv.APIFY_API_TOKEN),
@@ -192,7 +281,49 @@ export async function GET() {
         systemPausedAt: formatDiagnosticDate(settings.systemPausedAt),
         emergencyStopped: settings.emergencyStopped,
         target: settings.target,
+        targetMetric: settings.targetMetric,
       } : null,
+      discoveryEconomics: {
+        apifySpendTodayUsd: apifyDailyEconomics.spendUsd,
+        apifyRunsToday: apifyDailyEconomics.runs,
+        apifyResultsToday: apifyDailyEconomics.resultsReturned,
+        newRawToday: apifyDailyEconomics.newRaw,
+        duplicateExistingRawToday: apifyDailyEconomics.duplicates,
+        duplicateResultRate,
+        costPerNewRaw: apifyDailyEconomics.newRaw > 0 ? apifyDailyEconomics.spendUsd / apifyDailyEconomics.newRaw : null,
+        qualifiedToday: pacing.qualifiedToday,
+        validEmailToday: pacing.validEmailToday,
+        instantlyImportedToday: pacing.instantlyImportedToday,
+        costPerConfirmedImport,
+        lowNoveltyCostTodayUsd,
+        highNoveltySeedsAvailable: seedEconomics.filter((item) => item.performance?.noveltyRate !== null
+          && item.performance?.noveltyRate !== undefined
+          && (item.performance.recentRuns >= 3 || item.performance.sampleSize >= 50)
+          && item.performance.noveltyRate >= 0.5 && item.policy.eligible).length,
+        lowNoveltySeedsCooling: seedEconomics.filter((item) => item.performance?.zeroNoveltyRunStreak !== undefined
+          && item.performance.zeroNoveltyRunStreak >= 2 && !item.policy.eligible).length,
+        byCampaign: campaignEconomics,
+        byEngine: engineEconomics,
+        bySeed: seedEconomics.flatMap((item) => item.performance ? [{
+          seedId: item.seed.id,
+          campaignId: item.campaignId,
+          engineType: item.engineType,
+          sampleSize: item.performance.sampleSize,
+          recentRuns: item.performance.recentRuns,
+          noveltyRate: item.performance.noveltyRate,
+          providerCostUsd: item.performance.providerCostUsd,
+          costPerNewRaw: item.performance.costPerNewRaw,
+          outcomeAttributionComplete: item.performance.outcomeAttributionComplete,
+          qualifiedYield: item.performance.qualifiedYield,
+          websiteRate: item.performance.websiteRate,
+          emailFoundRate: item.performance.emailFoundRate,
+          validEmailRate: item.performance.validEmailRate,
+          instantlyImportRate: item.performance.instantlyImportRate,
+          costPerConfirmedImport: item.performance.costPerConfirmedImport,
+          tier: item.policy.tier,
+          eligible: item.policy.eligible,
+        }] : []),
+      },
       watchdog: watchdogSignals ? {
         oldDueDiscoveryCount: watchdogSignals.oldDueDiscovery,
         oldProcessingCount: watchdogSignals.oldProcessing,

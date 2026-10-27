@@ -9,7 +9,7 @@ import { getCampaignQueueDepth } from "@/infrastructure/neon/repositories/job-qu
 import { enqueueDiscoveryOrdersWithinDailyRawCap } from "@/infrastructure/neon/repositories/daily-raw-request-cap";
 import { bootstrapSearchSeeds, listSearchSeedsForCampaignEngine } from "@/infrastructure/neon/repositories/discovery";
 import { getApifyRecoverySnapshot, getRecentProviderUsage, getTodaySpendUsd } from "@/infrastructure/neon/repositories/provider-runs";
-import { allocateEngineWork, MAX_APIFY_RECOVERY_PROBE_RAW, MAX_RAW_PER_PLANNING_WINDOW, planApifyRecoveryProbe, rerouteEngineOrders, type EnginePlanningPerformance } from "@/services/autopilot/target-planner";
+import { allocateEngineWork, MAX_APIFY_RECOVERY_PROBE_RAW, MAX_RAW_PER_PLANNING_WINDOW, planApifyRecoveryProbe, planningWindowKey, rerouteEngineOrders, type EnginePlanningPerformance } from "@/services/autopilot/target-planner";
 import { getAutopilotEnginePerformance } from "@/infrastructure/neon/repositories/autopilot-engine-performance";
 import { decideHybridFill } from "@/services/discovery/hybrid-fill-decision";
 import { buildEngineCapabilities } from "@/services/autopilot/engine-capability";
@@ -178,6 +178,21 @@ export async function runAutopilotCronTick(now: Date = new Date()): Promise<Auto
       workspaceId, campaigns: concreteCampaigns, capabilities, performances,
       rawNeeded: planningRawLimit - recoveryProbeRaw, reason: pacing.explanation, now, timeZone: settings.timezone, origin: "normal",
     });
+    for (const performance of performances) {
+      const order = orders.find((item) => item.campaignId === performance.campaignId);
+      logEvent("info", "autopilot.cost_efficiency", {
+        correlationId: `${workspaceId}:${performance.campaignId}:${planningWindowKey(now, settings.timezone)}`,
+        workspaceId,
+        campaignId: performance.campaignId,
+        engineType: concreteCampaigns.find((campaign) => campaign.id === performance.campaignId)?.engineType ?? null,
+        sampleSize: performance.rawCount ?? 0,
+        importYield: performance.importRawYield ?? null,
+        costPerImport: performance.costPerConfirmedImportUsd ?? null,
+        costUsd: performance.estimatedProviderCostUsd ?? null,
+        batchSize: order?.desiredRawCount ?? 0,
+        yieldTier: performance.yieldTier ?? "neutral_prior",
+      });
+    }
 
     // Hybrid Fill is a policy: it redirects to an alternative campaign and
     // keeps that engine's real source/metrics, avoiding duplicate accounts.

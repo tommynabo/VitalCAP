@@ -5,7 +5,7 @@ import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
 import { FunnelChart, MiniBarChart, MixBar } from "@/components/ui/charts";
-import { globalProgressPct } from "@/lib/autopilot/targets";
+import { autopilotTargetMetricLabel } from "@/lib/autopilot/targets";
 import {
   getGlobalAutopilotStateData,
   getAccountBundles,
@@ -34,7 +34,10 @@ export default async function DashboardPage() {
       getOutreachQueueItems(),
       getWeeklyTrendData(),
     ]);
-  const progressPct = globalProgressPct(state.dailyTarget, state.engines);
+  const targetMetric = state.targetMetric ?? state.pacing?.targetMetric ?? "qualified";
+  const targetLabel = autopilotTargetMetricLabel(targetMetric);
+  const targetAchieved = state.targetAchievedToday ?? state.pacing?.targetAchievedToday ?? state.readyToday;
+  const progressPct = state.dailyTarget > 0 ? Math.min(100, Math.round((targetAchieved / state.dailyTarget) * 100)) : 0;
 
   const totalContactPoints = seedAccountBundles.reduce((sum, b) => sum + b.contactPoints.length, 0);
   const verifiedContactPoints = seedAccountBundles.reduce(
@@ -76,9 +79,11 @@ export default async function DashboardPage() {
         </p>
       </div>
 
-      <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-5">
+      <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-7">
         <KpiStat label="Daily target" value={String(state.dailyTarget)} />
-        <KpiStat label="Qualified today" value={String(state.targetAchievedToday ?? state.readyToday)} emphasize />
+        <KpiStat label="Qualified today" value={state.pacing ? String(state.pacing.qualifiedToday) : "Unavailable"} emphasize />
+        <KpiStat label="Valid emails today" value={state.pacing ? String(state.pacing.validEmailToday) : "Unavailable"} />
+        <KpiStat label="Imported to Instantly" value={state.pacing ? String(state.pacing.instantlyImportedToday) : "Unavailable"} />
         <KpiStat label="Sent today" value={String(state.sentToday)} />
         <KpiStat label="Replies" value={String(state.repliesToday)} />
         <KpiStat label="Meetings" value={String(state.meetingsToday)} />
@@ -91,11 +96,11 @@ export default async function DashboardPage() {
           </CardHeader>
           <CardContent>
             <p className="text-3xl font-semibold text-text">
-              {state.targetAchievedToday ?? state.readyToday} <span className="text-base font-normal text-text-muted">/ {state.dailyTarget}</span>
+              {targetAchieved} <span className="text-base font-normal text-text-muted">/ {state.dailyTarget}</span>
             </p>
             <Progress value={progressPct} className="mt-3" />
             <p className="mt-3 text-xs text-text-muted">
-              Qualified target progress · System health:{" "}
+              {targetLabel} target progress · System health:{" "}
               <span className="font-medium text-text">{state.systemHealth}</span>
             </p>
           </CardContent>

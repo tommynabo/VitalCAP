@@ -6,6 +6,7 @@ import type { EngineType } from "@/domain/campaigns/types";
 import type { CandidateProcessingMetrics, RawCandidate, SearchSeed, SearchSeedRun } from "@/domain/discovery/types";
 import { getDayBounds } from "@/lib/time/day-bounds";
 import { recomputeSeedMetrics, recordSeedRun } from "@/services/discovery/geography-planner";
+import { calculateSeedNoveltyRate, type SeedEconomicPerformance } from "@/services/discovery/seed-economics";
 
 function toSearchSeed(row: typeof searchSeeds.$inferSelect): SearchSeed {
   return {
@@ -58,6 +59,261 @@ export async function listSearchSeedsForCampaignEngine(campaignId: string, engin
     .from(searchSeeds)
     .where(and(eq(searchSeeds.campaignId, campaignId), eq(searchSeeds.engineType, engineType)));
   return rows.map(toSearchSeed);
+}
+
+export function buildSeedEconomicPerformanceQuery(campaignId: string, engineType: EngineType, since: Date, todayStart: Date, now: Date) {
+  return sql`
+    WITH recent_runs AS (
+      SELECT run.id, run.started_at, run.campaign_id,
+        COALESCE(run.seed_id, NULLIF(run.metadata->>'seedId', '')::uuid) AS seed_id,
+        run.items_returned, run.cost_usd,
+        NULLIF(run.metadata #>> '{ingestionAccounting,INSERTED_NEW_RAW}', '')::int AS new_raw,
+        NULLIF(run.metadata #>> '{ingestionAccounting,DUPLICATE_EXISTING_RAW}', '')::int AS duplicates,
+        (NULLIF(run.metadata #>> '{ingestionAccounting,INSERTED_NEW_RAW}', '') IS NOT NULL
+          AND NULLIF(run.metadata #>> '{ingestionAccounting,DUPLICATE_EXISTING_RAW}', '') IS NOT NULL) AS has_accounting
+      FROM provider_runs run
+      WHERE run.campaign_id = ${campaignId}::uuid
+        AND run.provider = 'apify'
+        AND run.status IN ('ingested', 'completed')
+        AND run.started_at >= ${since.toISOString()}::timestamptz
+        AND run.started_at < ${now.toISOString()}::timestamptz
+        AND COALESCE(run.metadata->>'recoveryProbe', 'false') <> 'true'
+        AND COALESCE(run.seed_id, NULLIF(run.metadata->>'seedId', '')::uuid) IS NOT NULL
+    ), ordered_runs AS (
+      SELECT recent_runs.*,
+        SUM(CASE WHEN NOT has_accounting OR items_returned <= 0 OR new_raw > 0 THEN 1 ELSE 0 END)
+          OVER (PARTITION BY seed_id ORDER BY started_at DESC, id DESC) AS zero_streak_boundary
+      FROM recent_runs
+    ), run_rollup AS (
+      SELECT seed_id,
+        COUNT(*) FILTER (WHERE has_accounting)::int AS recent_runs,
+        COALESCE(SUM(items_returned) FILTER (WHERE has_accounting), 0)::int AS items_returned,
+        COALESCE(SUM(new_raw) FILTER (WHERE has_accounting), 0)::int AS new_raw,
+        COALESCE(SUM(duplicates) FILTER (WHERE has_accounting), 0)::int AS duplicates,
+        COALESCE(SUM(cost_usd) FILTER (WHERE has_accounting), 0)::float AS provider_cost_usd,
+        COALESCE(SUM(cost_usd) FILTER (WHERE has_accounting AND started_at >= ${todayStart.toISOString()}::timestamptz), 0)::float AS provider_cost_today_usd,
+        COALESCE(SUM(items_returned) FILTER (WHERE started_at >= ${todayStart.toISOString()}::timestamptz), 0)::int AS items_returned_today,
+        COALESCE(SUM(new_raw) FILTER (WHERE has_accounting AND started_at >= ${todayStart.toISOString()}::timestamptz), 0)::int AS new_raw_today,
+        COALESCE(SUM(duplicates) FILTER (WHERE has_accounting AND started_at >= ${todayStart.toISOString()}::timestamptz), 0)::int AS duplicates_today,
+        COUNT(*) FILTER (WHERE has_accounting AND items_returned > 0 AND new_raw = 0 AND zero_streak_boundary = 0)::int AS zero_novelty_run_streak,
+        MAX(started_at) FILTER (WHERE has_accounting) AS last_run_at
+      FROM ordered_runs
+      GROUP BY seed_id
+    ), raw_mappings AS (
+      SELECT DISTINCT run.seed_id, raw.id AS raw_id, raw.campaign_id, raw.account_id
+      FROM recent_runs run
+      JOIN raw_candidates raw ON raw.provider_run_id = run.id
+      WHERE run.has_accounting
+    ), seed_accounts AS (
+      SELECT DISTINCT seed_id, campaign_id, account_id
+      FROM raw_mappings
+      WHERE account_id IS NOT NULL
+    ), account_seed_counts AS (
+      SELECT campaign_id, account_id, COUNT(DISTINCT seed_id)::int AS seed_count
+      FROM seed_accounts
+      GROUP BY campaign_id, account_id
+    ), attributable_accounts AS (
+      SELECT source.seed_id, source.campaign_id, source.account_id
+      FROM seed_accounts source
+      JOIN account_seed_counts counts
+        ON counts.campaign_id = source.campaign_id AND counts.account_id = source.account_id
+      WHERE counts.seed_count = 1
+    ), outcome_coverage AS (
+      SELECT mapping.seed_id,
+        COUNT(DISTINCT mapping.raw_id)::int AS total_raw,
+        COUNT(DISTINCT mapping.raw_id) FILTER (WHERE attributed.account_id IS NOT NULL)::int AS attributable_raw
+      FROM raw_mappings mapping
+      LEFT JOIN attributable_accounts attributed
+        ON attributed.seed_id = mapping.seed_id
+          AND attributed.campaign_id = mapping.campaign_id
+          AND attributed.account_id = mapping.account_id
+      GROUP BY mapping.seed_id
+    ), outcome_rollup AS (
+      SELECT source.seed_id,
+        COUNT(DISTINCT source.account_id) FILTER (WHERE EXISTS (
+          SELECT 1 FROM campaign_memberships membership
+          WHERE membership.campaign_id = source.campaign_id
+            AND membership.account_id = source.account_id
+            AND membership.qualified_at >= ${since.toISOString()}::timestamptz
+            AND membership.qualified_at < ${now.toISOString()}::timestamptz
+        ))::int AS qualified_from_seed,
+        COUNT(DISTINCT source.account_id) FILTER (WHERE EXISTS (
+          SELECT 1 FROM accounts account_record
+          WHERE account_record.id = source.account_id
+            AND NULLIF(TRIM(account_record.website_url), '') IS NOT NULL
+        ))::int AS website_from_seed,
+        COUNT(DISTINCT source.account_id) FILTER (WHERE EXISTS (
+          SELECT 1 FROM contact_points contact_point
+          WHERE contact_point.account_id = source.account_id
+            AND contact_point.type = 'email'
+            AND NULLIF(TRIM(contact_point.normalized_value), '') IS NOT NULL
+        ))::int AS email_found_from_seed,
+        COUNT(DISTINCT source.account_id) FILTER (WHERE EXISTS (
+          SELECT 1 FROM contact_points contact_point
+          WHERE contact_point.account_id = source.account_id
+            AND contact_point.type = 'email'
+            AND contact_point.verification_status = 'valid'
+            AND contact_point.verification_provider = 'millionverifier'
+        ))::int AS valid_email_from_seed,
+        COUNT(DISTINCT source.account_id) FILTER (WHERE EXISTS (
+          SELECT 1 FROM instantly_lead_imports imported
+          WHERE imported.account_id = source.account_id
+            AND imported.source_campaign_id = source.campaign_id
+            AND imported.status = 'instantly_added'
+            AND imported.provider_lead_id IS NOT NULL
+            AND imported.uploaded_at IS NOT NULL
+            AND imported.uploaded_at >= ${since.toISOString()}::timestamptz
+            AND imported.uploaded_at < ${now.toISOString()}::timestamptz
+        ))::int AS confirmed_imports_from_seed
+      FROM attributable_accounts source
+      GROUP BY source.seed_id
+    )
+    SELECT seed.id AS seed_id, seed.next_eligible_at,
+      COALESCE(rollup.recent_runs, 0)::int AS recent_runs,
+      COALESCE(rollup.items_returned, 0)::int AS items_returned,
+      COALESCE(rollup.new_raw, 0)::int AS new_raw,
+      COALESCE(rollup.duplicates, 0)::int AS duplicates,
+      COALESCE(rollup.provider_cost_usd, 0)::float AS provider_cost_usd,
+      COALESCE(rollup.provider_cost_today_usd, 0)::float AS provider_cost_today_usd,
+      COALESCE(coverage.total_raw, 0) > 0
+        AND coverage.total_raw = coverage.attributable_raw AS outcome_attribution_complete,
+      COALESCE(rollup.items_returned_today, 0)::int AS items_returned_today,
+      COALESCE(rollup.new_raw_today, 0)::int AS new_raw_today,
+      COALESCE(rollup.duplicates_today, 0)::int AS duplicates_today,
+      COALESCE(rollup.zero_novelty_run_streak, 0)::int AS zero_novelty_run_streak,
+      rollup.last_run_at,
+      CASE WHEN coverage.total_raw > 0 AND coverage.total_raw = coverage.attributable_raw
+        THEN COALESCE(outcomes.qualified_from_seed, 0)::int ELSE NULL END AS qualified_from_seed,
+      CASE WHEN coverage.total_raw > 0 AND coverage.total_raw = coverage.attributable_raw
+        THEN COALESCE(outcomes.website_from_seed, 0)::int ELSE NULL END AS website_from_seed,
+      CASE WHEN coverage.total_raw > 0 AND coverage.total_raw = coverage.attributable_raw
+        THEN COALESCE(outcomes.email_found_from_seed, 0)::int ELSE NULL END AS email_found_from_seed,
+      CASE WHEN coverage.total_raw > 0 AND coverage.total_raw = coverage.attributable_raw
+        THEN COALESCE(outcomes.valid_email_from_seed, 0)::int ELSE NULL END AS valid_email_from_seed,
+      CASE WHEN coverage.total_raw > 0 AND coverage.total_raw = coverage.attributable_raw
+        THEN COALESCE(outcomes.confirmed_imports_from_seed, 0)::int ELSE NULL END AS confirmed_imports_from_seed
+    FROM search_seeds seed
+    LEFT JOIN run_rollup rollup ON rollup.seed_id = seed.id
+    LEFT JOIN outcome_coverage coverage ON coverage.seed_id = seed.id
+    LEFT JOIN outcome_rollup outcomes ON outcomes.seed_id = seed.id
+    WHERE seed.campaign_id = ${campaignId}::uuid
+      AND seed.engine_type = ${engineType}
+  `;
+}
+
+function economicCount(value: unknown): number {
+  const parsed = Number(value ?? 0);
+  return Number.isFinite(parsed) ? Math.max(0, parsed) : 0;
+}
+
+function economicNullableCount(value: unknown): number | null {
+  return value === null || value === undefined ? null : economicCount(value);
+}
+
+export async function getSeedEconomicPerformance(
+  campaignId: string,
+  engineType: EngineType,
+  now = new Date(),
+  timeZone = "Europe/Madrid",
+): Promise<Map<string, SeedEconomicPerformance>> {
+  if (engineType !== "maps_fast" && engineType !== "maps_deep") return new Map();
+  const since = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+  const todayStart = getDayBounds(timeZone, now).start;
+  const result = await getDb().execute(buildSeedEconomicPerformanceQuery(campaignId, engineType, since, todayStart, now));
+  const performanceBySeed = new Map<string, SeedEconomicPerformance>();
+  for (const row of result.rows as Array<Record<string, unknown>>) {
+    const seedId = String(row.seed_id);
+    const recentRuns = economicCount(row.recent_runs);
+    const itemsReturned = economicCount(row.items_returned);
+    const newRaw = economicCount(row.new_raw);
+    const providerCostUsd = economicCount(row.provider_cost_usd);
+    const qualifiedFromSeed = economicNullableCount(row.qualified_from_seed);
+    const websiteFromSeed = economicNullableCount(row.website_from_seed);
+    const emailFoundFromSeed = economicNullableCount(row.email_found_from_seed);
+    const validEmailFromSeed = economicNullableCount(row.valid_email_from_seed);
+    const confirmedInstantlyImportsFromSeed = economicNullableCount(row.confirmed_imports_from_seed);
+    const lastRunAt = row.last_run_at ? new Date(String(row.last_run_at)).toISOString() : null;
+    performanceBySeed.set(seedId, {
+      seedId,
+      recentRuns,
+      itemsReturned,
+      newRaw,
+      duplicates: economicCount(row.duplicates),
+      noveltyRate: calculateSeedNoveltyRate(newRaw, itemsReturned),
+      providerCostUsd,
+      providerCostTodayUsd: economicCount(row.provider_cost_today_usd),
+      outcomeAttributionComplete: row.outcome_attribution_complete === true,
+      itemsReturnedToday: economicCount(row.items_returned_today),
+      newRawToday: economicCount(row.new_raw_today),
+      duplicatesToday: economicCount(row.duplicates_today),
+      costPerNewRaw: newRaw > 0 ? providerCostUsd / newRaw : null,
+      qualifiedFromSeed,
+      websiteFromSeed,
+      emailFoundFromSeed,
+      validEmailFromSeed,
+      confirmedInstantlyImportsFromSeed,
+      qualifiedYield: newRaw > 0 && qualifiedFromSeed !== null ? qualifiedFromSeed / newRaw : null,
+      websiteRate: newRaw > 0 && websiteFromSeed !== null ? websiteFromSeed / newRaw : null,
+      emailFoundRate: newRaw > 0 && emailFoundFromSeed !== null ? emailFoundFromSeed / newRaw : null,
+      validEmailYield: newRaw > 0 && validEmailFromSeed !== null ? validEmailFromSeed / newRaw : null,
+      validEmailRate: newRaw > 0 && validEmailFromSeed !== null ? validEmailFromSeed / newRaw : null,
+      confirmedImportYield: newRaw > 0 && confirmedInstantlyImportsFromSeed !== null ? confirmedInstantlyImportsFromSeed / newRaw : null,
+      instantlyImportRate: newRaw > 0 && confirmedInstantlyImportsFromSeed !== null ? confirmedInstantlyImportsFromSeed / newRaw : null,
+      costPerConfirmedImport: confirmedInstantlyImportsFromSeed !== null && confirmedInstantlyImportsFromSeed > 0 ? providerCostUsd / confirmedInstantlyImportsFromSeed : null,
+      sampleSize: itemsReturned,
+      zeroNoveltyRunStreak: economicCount(row.zero_novelty_run_streak),
+      lastRunAt,
+      nextEligibleAt: row.next_eligible_at ? new Date(String(row.next_eligible_at)).toISOString() : null,
+    });
+  }
+  return performanceBySeed;
+}
+
+export interface ApifyDailyEconomicTotals {
+  runs: number;
+  spendUsd: number;
+  resultsReturned: number;
+  accountedResultsReturned: number;
+  newRaw: number;
+  duplicates: number;
+}
+
+export function buildApifyDailyEconomicTotalsQuery(workspaceId: string, since: Date, now: Date) {
+  return sql`
+    SELECT COUNT(*)::int AS runs,
+      COALESCE(SUM(cost_usd), 0)::float AS spend_usd,
+      COALESCE(SUM(items_returned), 0)::int AS results_returned,
+      COALESCE(SUM(items_returned) FILTER (WHERE
+        NULLIF(metadata #>> '{ingestionAccounting,INSERTED_NEW_RAW}', '') IS NOT NULL
+        AND NULLIF(metadata #>> '{ingestionAccounting,DUPLICATE_EXISTING_RAW}', '') IS NOT NULL
+      ), 0)::int AS accounted_results_returned,
+      COALESCE(SUM(NULLIF(metadata #>> '{ingestionAccounting,INSERTED_NEW_RAW}', '')::int), 0)::int AS new_raw,
+      COALESCE(SUM(NULLIF(metadata #>> '{ingestionAccounting,DUPLICATE_EXISTING_RAW}', '')::int), 0)::int AS duplicates
+    FROM provider_runs
+    WHERE workspace_id = ${workspaceId}::uuid
+      AND provider = 'apify'
+      AND status <> 'budget_blocked'
+      AND started_at >= ${since.toISOString()}::timestamptz
+      AND started_at < ${now.toISOString()}::timestamptz
+  `;
+}
+
+export async function getApifyDailyEconomicTotals(
+  workspaceId: string,
+  timeZone: string,
+  now = new Date(),
+): Promise<ApifyDailyEconomicTotals> {
+  const { start } = getDayBounds(timeZone, now);
+  const result = await getDb().execute(buildApifyDailyEconomicTotalsQuery(workspaceId, start, now));
+  const row = result.rows[0] as Record<string, unknown> | undefined;
+  return {
+    runs: economicCount(row?.runs),
+    spendUsd: economicCount(row?.spend_usd),
+    resultsReturned: economicCount(row?.results_returned),
+    accountedResultsReturned: economicCount(row?.accounted_results_returned),
+    newRaw: economicCount(row?.new_raw),
+    duplicates: economicCount(row?.duplicates),
+  };
 }
 
 /**

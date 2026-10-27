@@ -95,6 +95,37 @@ describe("target planner", () => {
     expect(orders.find((order) => order.campaignId === "high")?.desiredRawCount).toBeGreaterThan(orders.find((order) => order.campaignId === "low")?.desiredRawCount ?? 0);
   });
 
+  it("weights confirmed-import cost only after the minimum import sample", () => {
+    const campaigns = [campaign("cheaper", 100), campaign("costlier", 100, { engineType: "google_serp" })];
+    const capabilities = ["maps_fast", "google_serp"].map((engineType) => ({
+      engineType: engineType as Campaign["engineType"], available: true, providerConfigured: true,
+      providerHealthy: true, providerUntested: false, costAllowed: true, campaignCount: 1,
+      reasonUnavailable: null, reason: null,
+    }));
+    const input = {
+      workspaceId: "workspace-1", campaigns, capabilities, rawNeeded: 100, reason: "behind pace",
+      now: new Date("2025-01-01T13:00:00Z"), timeZone: "Europe/Madrid",
+    };
+    const confirmedCostOrders = allocateEngineWork({
+      ...input,
+      performances: [
+        { campaignId: "cheaper", yield: 0.1, confirmedImportCount: 5, costPerConfirmedImportUsd: 0.1, queueDepth: 0, seedExhaustion: 0 },
+        { campaignId: "costlier", yield: 0.1, confirmedImportCount: 5, costPerConfirmedImportUsd: 0.2, queueDepth: 0, seedExhaustion: 0 },
+      ],
+    });
+    const smallSampleOrders = allocateEngineWork({
+      ...input,
+      performances: [
+        { campaignId: "cheaper", yield: 0.1, confirmedImportCount: 4, costPerConfirmedImportUsd: 0.1, queueDepth: 0, seedExhaustion: 0 },
+        { campaignId: "costlier", yield: 0.1, confirmedImportCount: 4, costPerConfirmedImportUsd: 0.2, queueDepth: 0, seedExhaustion: 0 },
+      ],
+    });
+
+    expect(confirmedCostOrders.find((order) => order.campaignId === "cheaper")?.desiredRawCount)
+      .toBeGreaterThan(confirmedCostOrders.find((order) => order.campaignId === "costlier")?.desiredRawCount ?? 0);
+    expect(smallSampleOrders.map((order) => order.desiredRawCount)).toEqual([50, 50]);
+  });
+
   it("allocates the one global deficit across configured healthy engines by observed yield", () => {
     const orders = allocateEngineWork({
       workspaceId: "workspace-1",
