@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { and, asc, desc, eq, gte, inArray, sql } from "drizzle-orm";
 import { getDayBounds } from "@/lib/time/day-bounds";
 import { getDb } from "../db";
@@ -7,7 +8,7 @@ import { providerRuns } from "../schema/providers";
 import type { ProviderUsageStats } from "@/domain/providers/types";
 import { ProviderBudgetExceededError, ProviderFailureError, ProviderSafetyError } from "@/domain/providers/errors";
 import { createApifyConfigurationFingerprint, createApifyCredentialFingerprint, evaluateApifyRecovery, hasCurrentCredentialRecoveryProbeInFlight, resolveApifyRecoveryCredentialFingerprint, type ApifyRecoveryRun } from "@/services/discovery/provider-health";
-import { getCoreEnv, getMapsEnv } from "@/lib/config/env";
+import { getCoreEnv, getMapsEnv, getSerperEnv } from "@/lib/config/env";
 import { SERPER_ESTIMATED_COST_PER_QUERY_USD } from "@/infrastructure/providers/serp/serper-provider";
 
 export interface RecordProviderRunInput {
@@ -49,6 +50,45 @@ export interface SerperRecoveryState {
   nextRecoveryAttemptAt: Date | null;
   lastFailureAt: Date | null;
   recoveredAt: Date | null;
+}
+
+export interface SerperRecoveryEvent {
+  status: string;
+  purpose: string | null;
+  startedAt: Date;
+  finishedAt: Date | null;
+  credentialFingerprint: string | null;
+}
+
+export function resolveSerperRecoveryState(input: {
+  latest: SerperRecoveryEvent | undefined;
+  currentCredentialFingerprint: string | null;
+  now: Date;
+}): SerperRecoveryState {
+  const { latest, currentCredentialFingerprint, now } = input;
+  if (!latest || (latest.purpose === "recovery_probe" && latest.status === "completed")) {
+    return {
+      allocationPaused: false,
+      recoveryProbeEligible: false,
+      nextRecoveryAttemptAt: null,
+      lastFailureAt: null,
+      recoveredAt: latest?.finishedAt ?? latest?.startedAt ?? null,
+    };
+  }
+
+  const lastFailureAt = latest.finishedAt ?? latest.startedAt;
+  const credentialChanged = currentCredentialFingerprint !== null
+    && (latest.credentialFingerprint === null || latest.credentialFingerprint !== currentCredentialFingerprint);
+  const nextRecoveryAttemptAt = credentialChanged
+    ? now
+    : new Date(lastFailureAt.getTime() + 60 * 60 * 1000);
+  return {
+    allocationPaused: true,
+    recoveryProbeEligible: now >= nextRecoveryAttemptAt,
+    nextRecoveryAttemptAt,
+    lastFailureAt,
+    recoveredAt: null,
+  };
 }
 
 export interface SerperPurposeUsageDiagnostics {
@@ -794,34 +834,23 @@ export async function getSerperSpendByPurpose(purpose: string, now = new Date(),
 
 export async function getSerperRecoveryState(now = new Date()): Promise<SerperRecoveryState> {
   const db = getDb();
-  const rows = await db.select({ status: providerRuns.status, purpose: sql<string | null>`${providerRuns.metadata}->>'purpose'`, startedAt: providerRuns.startedAt, finishedAt: providerRuns.finishedAt })
+  const apiKey = getSerperEnv().SERPER_API_KEY;
+  const currentCredentialFingerprint = apiKey ? createHash("sha256").update(apiKey).digest("hex") : null;
+  const rows = await db.select({
+    status: providerRuns.status,
+    purpose: sql<string | null>`${providerRuns.metadata}->>'purpose'`,
+    startedAt: providerRuns.startedAt,
+    finishedAt: providerRuns.finishedAt,
+    credentialFingerprint: sql<string | null>`${providerRuns.metadata}->>'credentialFingerprint'`,
+  })
     .from(providerRuns)
     .where(and(
       eq(providerRuns.provider, "serper"),
-      sql`(${providerRuns.metadata}->>'failureKind' = 'billing' OR (${providerRuns.metadata}->>'purpose' = 'recovery_probe' AND ${providerRuns.status} <> 'budget_blocked'))`,
+      sql`(${providerRuns.metadata}->>'failureKind' IN ('billing', 'authentication') OR (${providerRuns.metadata}->>'purpose' = 'recovery_probe' AND ${providerRuns.status} <> 'budget_blocked'))`,
     ))
     .orderBy(desc(providerRuns.startedAt))
     .limit(1);
-  const latest = rows[0];
-  if (!latest || (latest.purpose === "recovery_probe" && latest.status === "completed")) {
-    return {
-      allocationPaused: false,
-      recoveryProbeEligible: false,
-      nextRecoveryAttemptAt: null,
-      lastFailureAt: null,
-      recoveredAt: latest?.finishedAt ?? latest?.startedAt ?? null,
-    };
-  }
-
-  const lastFailureAt = latest.finishedAt ?? latest.startedAt;
-  const nextRecoveryAttemptAt = new Date(lastFailureAt.getTime() + 60 * 60 * 1000);
-  return {
-    allocationPaused: true,
-    recoveryProbeEligible: now >= nextRecoveryAttemptAt,
-    nextRecoveryAttemptAt,
-    lastFailureAt,
-    recoveredAt: null,
-  };
+  return resolveSerperRecoveryState({ latest: rows[0], currentCredentialFingerprint, now });
 }
 
 export async function getGlobalSerperSpendToday(now = new Date(), excludeRequestKey?: string): Promise<number> {

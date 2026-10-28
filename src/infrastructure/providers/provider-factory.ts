@@ -93,12 +93,13 @@ export function createSerpDiscoveryProvider(workspaceId: string, engineType: Eng
   if (env.SERP_PROVIDER === "disabled") throw new ProviderDisabledError("SERP_PROVIDER");
   if (env.SERP_PROVIDER === "mock") return new MockSerpDiscoveryProvider();
 
-  if (!env.SERPER_API_KEY) {
+  const apiKey = env.SERPER_API_KEY;
+  if (!apiKey) {
     throw new Error("SERP_PROVIDER=serper requires SERPER_API_KEY to be set.");
   }
 
   const provider = new SerperDiscoveryProvider({
-    apiKey: env.SERPER_API_KEY,
+    apiKey,
     country: env.SERPER_COUNTRY,
     language: env.SERPER_LANGUAGE,
   });
@@ -126,7 +127,8 @@ export function createSerpDiscoveryProvider(workspaceId: string, engineType: Eng
     const planningWindow = recoveryProbe
       ? `recovery:${Math.floor(now.getTime() / (60 * 60 * 1000))}`
       : dayStart.toISOString();
-    const requestQuery = recoveryProbe ? "serper-recovery-probe" : normalizedQuery;
+    const credentialFingerprint = createHash("sha256").update(apiKey).digest("hex");
+    const requestQuery = recoveryProbe ? `serper-recovery-probe:${credentialFingerprint}` : normalizedQuery;
     const requestKey = createProviderRequestKey({
       workspaceId: recoveryProbe ? "serper-account" : workspaceId,
       campaignId: recoveryProbe ? "serper-recovery" : campaignId,
@@ -144,6 +146,7 @@ export function createSerpDiscoveryProvider(workspaceId: string, engineType: Eng
       engineType,
       purpose,
       queryFingerprint,
+      credentialFingerprint,
       country: env.SERPER_COUNTRY ?? "es",
       language: env.SERPER_LANGUAGE ?? "es",
       maxResults,

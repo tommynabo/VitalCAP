@@ -1,8 +1,56 @@
 import { PgDialect } from "drizzle-orm/pg-core";
 import { describe, expect, it } from "vitest";
-import { buildApifyPollingDuePredicate, buildReserveApifyProviderRunQuery, buildReserveSerperProviderRunQuery, getApifyReservationFailureDetails, getSafePostgresErrorCode } from "./provider-runs";
+import { buildApifyPollingDuePredicate, buildReserveApifyProviderRunQuery, buildReserveSerperProviderRunQuery, getApifyReservationFailureDetails, getSafePostgresErrorCode, resolveSerperRecoveryState } from "./provider-runs";
 
 const dialect = new PgDialect();
+
+describe("Serper credential-aware recovery state", () => {
+  const failedAt = new Date("2026-10-28T10:00:00.000Z");
+  const probeAt = new Date("2026-10-28T10:30:00.000Z");
+
+  it("keeps the same credential in cooldown and enables the probe after 60 minutes", () => {
+    const latest = { status: "failed", purpose: "google_serp_discovery", startedAt: failedAt, finishedAt: failedAt, credentialFingerprint: "fingerprint-a" };
+
+    expect(resolveSerperRecoveryState({ latest, currentCredentialFingerprint: "fingerprint-a", now: probeAt })).toMatchObject({
+      allocationPaused: true,
+      recoveryProbeEligible: false,
+      nextRecoveryAttemptAt: new Date("2026-10-28T11:00:00.000Z"),
+    });
+    expect(resolveSerperRecoveryState({ latest, currentCredentialFingerprint: "fingerprint-a", now: new Date("2026-10-28T11:00:00.000Z") }).recoveryProbeEligible).toBe(true);
+  });
+
+  it("makes a changed credential immediately probe-eligible without unpausing allocation", () => {
+    expect(resolveSerperRecoveryState({
+      latest: { status: "failed", purpose: "google_serp_discovery", startedAt: failedAt, finishedAt: failedAt, credentialFingerprint: "fingerprint-a" },
+      currentCredentialFingerprint: "fingerprint-b",
+      now: probeAt,
+    })).toMatchObject({ allocationPaused: true, recoveryProbeEligible: true, nextRecoveryAttemptAt: probeAt });
+  });
+
+  it("allows a one-time immediate probe for legacy failures without a fingerprint", () => {
+    expect(resolveSerperRecoveryState({
+      latest: { status: "failed", purpose: "google_serp_discovery", startedAt: failedAt, finishedAt: failedAt, credentialFingerprint: null },
+      currentCredentialFingerprint: "fingerprint-b",
+      now: probeAt,
+    })).toMatchObject({ allocationPaused: true, recoveryProbeEligible: true, nextRecoveryAttemptAt: probeAt });
+  });
+
+  it("closes recovery after a completed probe for the current credential", () => {
+    expect(resolveSerperRecoveryState({
+      latest: { status: "completed", purpose: "recovery_probe", startedAt: probeAt, finishedAt: probeAt, credentialFingerprint: "fingerprint-b" },
+      currentCredentialFingerprint: "fingerprint-b",
+      now: probeAt,
+    })).toMatchObject({ allocationPaused: false, recoveryProbeEligible: false, nextRecoveryAttemptAt: null, recoveredAt: probeAt });
+  });
+
+  it("restarts the 60-minute cooldown after a failed probe on the current credential", () => {
+    expect(resolveSerperRecoveryState({
+      latest: { status: "failed", purpose: "recovery_probe", startedAt: probeAt, finishedAt: probeAt, credentialFingerprint: "fingerprint-b" },
+      currentCredentialFingerprint: "fingerprint-b",
+      now: new Date("2026-10-28T11:00:00.000Z"),
+    })).toMatchObject({ allocationPaused: true, recoveryProbeEligible: false, nextRecoveryAttemptAt: new Date("2026-10-28T11:30:00.000Z") });
+  });
+});
 
 describe("Apify provider run reservation SQL", () => {
   it("retains raw, spend, manual reconciliation, and idempotency guards for recovery probes", () => {

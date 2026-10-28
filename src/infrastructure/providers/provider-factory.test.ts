@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const { mockRecordProviderRun, mockReserveSerperProviderRun, mockUpdateProviderRun, mockGetProviderRunByRequestKey, mockSearch, mockGetTodaySpendUsd, mockGetGlobalSerperSpendToday, mockGetSerperRecoveryState, mockGetSerperSpendByPurpose } = vi.hoisted(() => ({
+const { mockRecordProviderRun, mockReserveSerperProviderRun, mockUpdateProviderRun, mockGetProviderRunByRequestKey, mockSearch, mockGetTodaySpendUsd, mockGetGlobalSerperSpendToday, mockGetSerperRecoveryState, mockGetSerperSpendByPurpose, mockGetSerperApiKey } = vi.hoisted(() => ({
   mockRecordProviderRun: vi.fn(),
   mockReserveSerperProviderRun: vi.fn(),
   mockUpdateProviderRun: vi.fn(),
@@ -10,10 +10,11 @@ const { mockRecordProviderRun, mockReserveSerperProviderRun, mockUpdateProviderR
   mockGetGlobalSerperSpendToday: vi.fn(),
   mockGetSerperRecoveryState: vi.fn(),
   mockGetSerperSpendByPurpose: vi.fn(),
+  mockGetSerperApiKey: vi.fn(() => "test-key"),
 }));
 
 vi.mock("@/lib/config/env", () => ({
-  getSerperEnv: () => ({ SERP_PROVIDER: "serper", SERPER_API_KEY: "test-key", SERPER_DAILY_COST_LIMIT_USD: 0.5, SERPER_COUNTRY: "es", SERPER_LANGUAGE: "es" }),
+  getSerperEnv: () => ({ SERP_PROVIDER: "serper", SERPER_API_KEY: mockGetSerperApiKey(), SERPER_DAILY_COST_LIMIT_USD: 0.5, SERPER_COUNTRY: "es", SERPER_LANGUAGE: "es" }),
 }));
 vi.mock("@/infrastructure/neon/repositories/provider-runs", () => ({
   getTodaySpendUsd: mockGetTodaySpendUsd,
@@ -42,6 +43,7 @@ import { createSerpDiscoveryProvider } from "./provider-factory";
 describe("Serper provider run recording", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockGetSerperApiKey.mockReturnValue("test-key");
     mockSearch.mockReset();
     mockGetTodaySpendUsd.mockResolvedValue(0);
     mockGetGlobalSerperSpendToday.mockResolvedValue(0);
@@ -143,6 +145,29 @@ describe("Serper provider run recording", () => {
     }));
   });
 
+  it("keeps existing account spend charged when a rotated key needs recovery", async () => {
+    mockGetSerperApiKey.mockReturnValue("rotated-test-key");
+    mockGetSerperRecoveryState.mockResolvedValue({
+      allocationPaused: true,
+      recoveryProbeEligible: true,
+      nextRecoveryAttemptAt: new Date(Date.now() - 1),
+      lastFailureAt: new Date(Date.now() - 60 * 60 * 1000),
+      recoveredAt: null,
+    });
+    mockGetGlobalSerperSpendToday.mockResolvedValue(0.5);
+    const provider = createSerpDiscoveryProvider("workspace-1", "google_serp", "campaign-1");
+
+    await expect(provider.search({ query: "safe rotated-key probe", maxResults: 10 }))
+      .rejects.toMatchObject({ name: "ProviderBudgetExceededError" });
+
+    expect(mockSearch).not.toHaveBeenCalled();
+    expect(mockUpdateProviderRun).toHaveBeenCalledWith("run-1", expect.objectContaining({
+      status: "budget_blocked",
+      costUsd: 0,
+      metadata: expect.objectContaining({ purpose: "recovery_probe", recoveryProbe: true }),
+    }));
+  });
+
   it.each([
     ["linkedin_owner", "linkedin_owner_discovery", 0.024],
     ["maps_deep", "maps_deep_enrichment", 0.049],
@@ -223,6 +248,40 @@ describe("Serper provider run recording", () => {
     }));
   });
 
+  it("uses one idempotent recovery reservation per credential and preserves the daily cap", async () => {
+    mockGetSerperRecoveryState.mockResolvedValue({
+      allocationPaused: true,
+      recoveryProbeEligible: true,
+      nextRecoveryAttemptAt: new Date(Date.now() - 1),
+      lastFailureAt: new Date(Date.now() - 60 * 60 * 1000),
+      recoveredAt: null,
+    });
+    mockGetProviderRunByRequestKey
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce({ id: "run-a", status: "completed", metadata: { purpose: "recovery_probe" } })
+      .mockResolvedValueOnce(null);
+    mockSearch.mockResolvedValue({ results: [], usage: { calls: 1, items: 0, errors: 0, totalLatencyMs: 1, costUsd: 0.001, quotaRemaining: null } });
+
+    await createSerpDiscoveryProvider("workspace-1", "google_serp", "campaign-1").search({ query: "safe probe", maxResults: 10 });
+    await createSerpDiscoveryProvider("workspace-1", "google_serp", "campaign-1").search({ query: "safe probe", maxResults: 10 });
+    mockGetSerperApiKey.mockReturnValue("rotated-test-key");
+    await createSerpDiscoveryProvider("workspace-1", "google_serp", "campaign-1").search({ query: "safe probe", maxResults: 10 });
+
+    const firstRequestKey = mockReserveSerperProviderRun.mock.calls[0]?.[0].requestKey;
+    const rotatedRequestKey = mockReserveSerperProviderRun.mock.calls[1]?.[0].requestKey;
+    expect(mockGetProviderRunByRequestKey.mock.calls[0]?.[0]).toBe(mockGetProviderRunByRequestKey.mock.calls[1]?.[0]);
+    expect(rotatedRequestKey).not.toBe(firstRequestKey);
+    expect(mockReserveSerperProviderRun).toHaveBeenCalledTimes(2);
+    expect(mockSearch).toHaveBeenCalledTimes(2);
+    expect(mockReserveSerperProviderRun).toHaveBeenNthCalledWith(2, expect.objectContaining({
+      costUsd: 0.001,
+      dailyCostLimitUsd: 0.5,
+      itemsRequested: 1,
+      metadata: expect.objectContaining({ purpose: "recovery_probe", recoveryProbe: true }),
+    }));
+    expect(mockSearch).toHaveBeenNthCalledWith(2, expect.objectContaining({ maxResults: 1, maxRetries: 0 }));
+  });
+
   it("creates a new recovery request epoch after a cap-blocked probe reaches the next cooldown", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-10-19T12:01:00.000Z"));
@@ -282,8 +341,9 @@ describe("Serper provider run recording", () => {
     expect(mockUpdateProviderRun).toHaveBeenCalledWith("run-1", expect.objectContaining({
       status: "failed",
       costUsd: 0,
-      metadata: expect.objectContaining({ purpose: "recovery_probe", recoveryProbe: true, failureKind: "billing", httpAttempts: 1 }),
+      metadata: expect.objectContaining({ purpose: "recovery_probe", recoveryProbe: true, failureKind: "billing", httpAttempts: 1, credentialFingerprint: expect.stringMatching(/^[a-f0-9]{64}$/) }),
     }));
+    expect(JSON.stringify(mockUpdateProviderRun.mock.calls[0]?.[1].metadata)).not.toContain("test-key");
     await expect(provider.search({ query: "existing safe seed", maxResults: 10 })).rejects.toMatchObject({ name: "ProviderBudgetExceededError" });
     expect(mockSearch).toHaveBeenCalledTimes(1);
     expect(mockReserveSerperProviderRun).toHaveBeenCalledTimes(1);
