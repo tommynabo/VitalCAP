@@ -9,12 +9,12 @@ import {
   getDeliveryEnv,
 } from "@/lib/config/env";
 import { getAuthEnv } from "@/lib/config/auth-env";
-import { getApifyRecoverySnapshot } from "@/infrastructure/neon/repositories/provider-runs";
+import { getApifyRecoverySnapshot, getRecentProviderUsage, getSerperRecoveryState } from "@/infrastructure/neon/repositories/provider-runs";
 import { getActiveAutopilotDiscoveryEngineTypes, getHealthWorkspaceIds } from "@/infrastructure/neon/repositories/diagnostics";
 import { getSystemHealthDiagnostics, type SystemHealthDiagnostics } from "@/infrastructure/neon/repositories/health-diagnostics";
 import type { EngineType } from "@/domain/campaigns/types";
 import type { ProviderHealthSnapshot } from "@/services/discovery/provider-health";
-import { aggregateProviderHealthSnapshots, buildProviderHealthSnapshot, hasUnavailableRequiredDiscoveryProvider } from "@/services/discovery/provider-health";
+import { aggregateProviderHealthSnapshots, buildProviderHealthSnapshot, evaluateProviderHealth, hasUnavailableRequiredDiscoveryProvider } from "@/services/discovery/provider-health";
 
 export const dynamic = "force-dynamic";
 
@@ -145,14 +145,16 @@ export async function GET() {
         serpProviderAvailable = false;
       } else {
         const snapshots: WorkspaceHealthSnapshot[] = await Promise.all(operationalWorkspaces.map(async ({ engineTypes, workspaceId }) => {
-          const [systemDiagnostics, apifyRecovery] = await Promise.all([
+          const now = new Date();
+          const [systemDiagnostics, apifyRecovery, serperRecovery] = await Promise.all([
             getSystemHealthDiagnostics({
               workspaceId,
-              now: new Date(),
+              now,
               mapsDailyBudgetUsd: mapsEnv?.APIFY_DAILY_COST_LIMIT_USD ?? 0,
               serperDailyBudgetUsd: serpEnv?.SERPER_DAILY_COST_LIMIT_USD ?? 0,
             }),
             mapsProvider === "apify" ? getApifyRecoverySnapshot(workspaceId) : Promise.resolve(null),
+            serpConfigured ? getSerperRecoveryState(now) : Promise.resolve(null),
           ]);
           const mapsUsage = {
             calls: systemDiagnostics.providers.apify.recentTerminalCalls,
@@ -170,6 +172,13 @@ export async function GET() {
             costUsd: 0,
             quotaRemaining: null,
           };
+          const serperAllocationHealth = !serperRecovery
+            ? undefined
+            : serperRecovery.recoveryProbeEligible
+              ? "untested"
+              : serperRecovery.allocationPaused
+                ? "paused"
+                : evaluateProviderHealth(await getRecentProviderUsage(workspaceId, "serper", 24, serperRecovery.recoveredAt));
           return {
             engineTypes,
             diagnostics: systemDiagnostics,
@@ -185,6 +194,7 @@ export async function GET() {
               configured: serpConfigured,
               budgetAllowed: systemDiagnostics.providers.serper.budgetAllowed,
               usage: serperUsage,
+              ...(serperAllocationHealth ? { allocationHealthOverride: serperAllocationHealth } : {}),
             }),
           };
         }));

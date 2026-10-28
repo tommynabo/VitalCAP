@@ -1,13 +1,15 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-const { mockGetHealthWorkspaceIds, mockGetApifyRecoverySnapshot, mockGetActiveAutopilotDiscoveryEngineTypes, mockGetSystemHealthDiagnostics } = vi.hoisted(() => ({
+const { mockGetHealthWorkspaceIds, mockGetApifyRecoverySnapshot, mockGetSerperRecoveryState, mockGetRecentProviderUsage, mockGetActiveAutopilotDiscoveryEngineTypes, mockGetSystemHealthDiagnostics } = vi.hoisted(() => ({
   mockGetHealthWorkspaceIds: vi.fn(),
   mockGetApifyRecoverySnapshot: vi.fn(),
+  mockGetSerperRecoveryState: vi.fn(),
+  mockGetRecentProviderUsage: vi.fn(),
   mockGetActiveAutopilotDiscoveryEngineTypes: vi.fn(),
   mockGetSystemHealthDiagnostics: vi.fn(),
 }));
 
-vi.mock("@/infrastructure/neon/repositories/provider-runs", () => ({ getApifyRecoverySnapshot: mockGetApifyRecoverySnapshot }));
+vi.mock("@/infrastructure/neon/repositories/provider-runs", () => ({ getApifyRecoverySnapshot: mockGetApifyRecoverySnapshot, getSerperRecoveryState: mockGetSerperRecoveryState, getRecentProviderUsage: mockGetRecentProviderUsage }));
 vi.mock("@/infrastructure/neon/repositories/diagnostics", () => ({ getHealthWorkspaceIds: mockGetHealthWorkspaceIds, getActiveAutopilotDiscoveryEngineTypes: mockGetActiveAutopilotDiscoveryEngineTypes }));
 vi.mock("@/infrastructure/neon/repositories/health-diagnostics", () => ({ getSystemHealthDiagnostics: mockGetSystemHealthDiagnostics }));
 
@@ -19,6 +21,13 @@ const environmentNames = ["APP_ENV", "VERCEL_ENV", "DEV_SEED_MODE", "DATABASE_UR
 
 const emptyUsage = { calls: 0, items: 0, errors: 0, totalLatencyMs: 0, costUsd: 0, quotaRemaining: null };
 const healthyUsage = { ...emptyUsage, calls: 4, items: 8 };
+const healthySerperRecovery = {
+  allocationPaused: false,
+  recoveryProbeEligible: false,
+  nextRecoveryAttemptAt: null,
+  lastFailureAt: null,
+  recoveredAt: null,
+};
 type RecoveryFixture = {
   usage: typeof emptyUsage;
   recoveryProbeEligible: boolean;
@@ -114,10 +123,14 @@ describe("GET /api/health", () => {
   beforeEach(() => {
     mockGetHealthWorkspaceIds.mockReset();
     mockGetApifyRecoverySnapshot.mockReset();
+    mockGetSerperRecoveryState.mockReset();
+    mockGetRecentProviderUsage.mockReset();
     mockGetActiveAutopilotDiscoveryEngineTypes.mockReset();
     mockGetSystemHealthDiagnostics.mockReset();
     mockGetHealthWorkspaceIds.mockResolvedValue([]);
     mockGetApifyRecoverySnapshot.mockResolvedValue(healthyRecovery);
+    mockGetSerperRecoveryState.mockResolvedValue(healthySerperRecovery);
+    mockGetRecentProviderUsage.mockResolvedValue(healthyUsage);
     mockGetActiveAutopilotDiscoveryEngineTypes.mockResolvedValue([]);
     mockGetSystemHealthDiagnostics.mockResolvedValue(diagnostics());
   });
@@ -146,7 +159,7 @@ describe("GET /api/health", () => {
       databaseConfigured: false,
       auth: { configured: false },
       maps: { provider: "mock", configured: true },
-      serp: { provider: "disabled", configured: false, health: "missing_configuration", status: "missing_configuration" },
+      serp: { provider: "disabled", configured: false, health: "missing_configuration", status: "missing_configuration", providerAvailable: false },
       intelligence: { provider: "disabled", configured: true },
       verification: { provider: "disabled" },
       delivery: { mode: "dry_run", provider: "disabled" }
@@ -397,6 +410,87 @@ describe("GET /api/health", () => {
 
     expect(body.status).toBe("degraded");
     expect(body.maps).toMatchObject({ allocationHealth: "paused", providerAvailable: false, lastFailureClass: "billing" });
+  });
+
+  it("keeps historical Serper reliability while allowing allocation after successful recovery", async () => {
+    configureHealthEnvironment();
+    const recoveredAt = new Date("2026-10-28T10:50:15.000Z");
+    mockGetSerperRecoveryState.mockResolvedValue({ ...healthySerperRecovery, recoveredAt });
+    mockGetRecentProviderUsage.mockResolvedValue({ ...healthyUsage, calls: 5, errors: 0 });
+    configureWorkspaces({
+      active: {
+        engineTypes: ["maps_fast", "google_serp"],
+        diagnostics: diagnostics({
+          providers: {
+            serper: {
+              recentTerminalCalls: 10,
+              recentErrors: 8,
+              lastSuccessAt: "2026-10-28T10:55:17.000Z",
+              lastFailureAt: "2026-10-28T10:25:16.000Z",
+              lastFailureClass: "billing",
+              budgetAllowed: true,
+            },
+          },
+        }),
+        serperUsage: { ...healthyUsage, calls: 10, errors: 8 },
+      },
+    });
+
+    const body = await (await GET()).json();
+
+    expect(mockGetSerperRecoveryState).toHaveBeenCalledWith(expect.any(Date));
+    expect(mockGetRecentProviderUsage).toHaveBeenCalledWith("active", "serper", 24, recoveredAt);
+    expect(body.serp).toMatchObject({
+      reliabilityHealth: "paused",
+      allocationHealth: "healthy",
+      providerAvailable: true,
+      recentTerminalCalls: 10,
+      recentErrors: 8,
+      recentErrorRate: 0.8,
+      lastFailureClass: "billing",
+    });
+  });
+
+  it("keeps Serper unavailable during an active billing cooldown", async () => {
+    configureHealthEnvironment();
+    mockGetSerperRecoveryState.mockResolvedValue({
+      ...healthySerperRecovery,
+      allocationPaused: true,
+      nextRecoveryAttemptAt: new Date("2026-10-28T12:00:00.000Z"),
+    });
+    configureWorkspaces({ active: { engineTypes: ["google_serp"] } });
+
+    const body = await (await GET()).json();
+
+    expect(body.serp).toMatchObject({ allocationHealth: "paused", providerAvailable: false });
+    expect(mockGetRecentProviderUsage).not.toHaveBeenCalled();
+  });
+
+  it("allows Serper recovery probes while reporting allocation as untested", async () => {
+    configureHealthEnvironment();
+    mockGetSerperRecoveryState.mockResolvedValue({
+      ...healthySerperRecovery,
+      allocationPaused: true,
+      recoveryProbeEligible: true,
+    });
+    configureWorkspaces({ active: { engineTypes: ["google_serp"] } });
+
+    const body = await (await GET()).json();
+
+    expect(body.serp).toMatchObject({ allocationHealth: "untested", providerAvailable: true });
+    expect(mockGetRecentProviderUsage).not.toHaveBeenCalled();
+  });
+
+  it("keeps Serper unavailable when its key is missing", async () => {
+    configureHealthEnvironment();
+    delete process.env.SERPER_API_KEY;
+    resetServerEnvCacheForTests();
+    configureWorkspaces({ active: { engineTypes: ["google_serp"] } });
+
+    const body = await (await GET()).json();
+
+    expect(body.serp).toMatchObject({ configured: false, allocationHealth: "missing_configuration", providerAvailable: false });
+    expect(mockGetSerperRecoveryState).not.toHaveBeenCalled();
   });
 
   it("degrades production when the required Apify budget is exhausted", async () => {
