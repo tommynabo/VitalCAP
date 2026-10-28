@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { Account, AccountStatus } from "@/domain/accounts/types";
-import { ProviderBudgetExceededError } from "@/domain/providers/errors";
+import { ProviderBudgetExceededError, ProviderFailureError, ProviderTransientError } from "@/domain/providers/errors";
 import { getEffectiveAutopilotState } from "@/domain/autopilot/types";
 import type { CampaignMembershipStage } from "@/domain/campaigns/types";
 import type { CandidateProcessingMetrics } from "@/domain/discovery/types";
@@ -301,6 +301,19 @@ async function executeProcessingJob(
   if (!campaign) throw new Error(`Campaign not found: ${job.campaignId}`);
 
   const payload = raw.rawPayload as unknown as CandidateRawPayload;
+  let existingProcessingMetrics = raw.processingMetrics;
+  if (raw.engineType === "maps_fast" && raw.processingMetrics?.websiteRecoveryStatus === "started") {
+    existingProcessingMetrics = {
+      ...raw.processingMetrics,
+      websiteRecoveryStatus: "transient_failure",
+      websiteRecoveryFailed: 1,
+    };
+    await runProcessingWriteStage(diagnostics, "RESET_INTERRUPTED_WEBSITE_RECOVERY", () =>
+      updateRawCandidateProcessingMetrics(raw.id, {
+        websiteRecoveryStatus: "transient_failure",
+        websiteRecoveryFailed: 1,
+      }));
+  }
   const incoming = deriveIncomingIdentitySignals(payload);
   const existingAccounts = await findCandidateAccountMatches(campaign.workspaceId, incoming);
   if (!hasLinkedInEmployerAccount(payload, existingAccounts)) {
@@ -329,7 +342,7 @@ async function executeProcessingJob(
     verificationCacheStore: createInMemoryVerificationCacheStore(),
     now: new Date(),
     deferVerification: true,
-    existingProcessingMetrics: raw.processingMetrics,
+    existingProcessingMetrics,
     ...(raw.engineType === "maps_fast" && payload.kind === "maps" && !job.payload.skipMapsFastWebsiteRecovery ? {
       recoverMapsFastWebsite: async (place) => {
         const query = buildMapsFastWebsiteRecoveryQuery(place);
@@ -338,10 +351,12 @@ async function executeProcessingJob(
         let attemptClaimed = false;
         try {
           const settings = await runProcessingCronStage(diagnostics, "PROCESS_SETTINGS", () => getAutopilotSettings(campaign.workspaceId));
-          if (getEffectiveAutopilotState(settings) !== "running") return { status: "blocked" as const };
+          if (getEffectiveAutopilotState(settings) !== "running") throw new ProviderDisabledError("serper");
 
           const provider = createSerpDiscoveryProvider(campaign.workspaceId, "maps_fast", campaign.id);
-          if (provider.providerName !== "serper") return { status: "blocked" as const };
+          if (provider.providerName !== "serper") {
+            throw new ProviderDisabledError("serper");
+          }
 
           attemptClaimed = await claimMapsFastWebsiteRecovery(raw.id);
           if (!attemptClaimed) return { status: "blocked" as const };
@@ -354,11 +369,11 @@ async function executeProcessingJob(
               websiteRecoverySource: "serper",
               websiteRecoveryAttempted: 1,
               websiteRecoverySucceeded: 0,
-              websiteRecoveryFailed: 1,
+              websiteRecoveryFailed: 0,
               websiteRecoveryProvider: "serper",
-              websiteRecoveryStatus: "failed",
+              websiteRecoveryStatus: "terminal_no_match",
             });
-            return { status: "no_match" as const };
+            return { status: "terminal_no_match" as const };
           }
 
           await updateRawCandidateProcessingMetrics(raw.id, {
@@ -390,19 +405,35 @@ async function executeProcessingJob(
                 websiteRecoveryStatus: "budget_blocked",
               });
             }
-            return { status: "blocked" as const };
+            throw error;
           }
-          if (!attemptClaimed || error instanceof ProviderDisabledError) return { status: "blocked" as const };
+          if (!attemptClaimed && (error instanceof ProviderDisabledError || error instanceof ProviderFailureError)) {
+            const providerBlocked = error instanceof ProviderDisabledError
+              || ["billing", "authentication", "configuration"].includes(error.kind);
+            await updateRawCandidateProcessingMetrics(raw.id, {
+              websiteRecoveryAttempted: 0,
+              websiteRecoverySucceeded: 0,
+              websiteRecoveryFailed: 0,
+              websiteRecoveryStatus: providerBlocked ? "provider_blocked" : "transient_failure",
+              websiteRecoveryProvider: "serper",
+            });
+            throw new ProviderTransientError("Maps Fast website recovery provider is temporarily unavailable.");
+          }
+          if (!attemptClaimed) throw error;
+          const providerBlocked = error instanceof ProviderDisabledError
+            || (error instanceof ProviderFailureError && ["billing", "authentication", "configuration"].includes(error.kind));
           await updateRawCandidateProcessingMetrics(raw.id, {
             websiteOrigin: "none",
-            websiteRecoverySource: "serper",
-            websiteRecoveryAttempted: 1,
+            websiteRecoverySource: attemptClaimed ? "serper" : null,
+            websiteRecoveryAttempted: attemptClaimed ? 1 : 0,
             websiteRecoverySucceeded: 0,
-            websiteRecoveryFailed: 1,
+            websiteRecoveryFailed: attemptClaimed ? 1 : 0,
             websiteRecoveryProvider: "serper",
-            websiteRecoveryStatus: "failed",
+            websiteRecoveryStatus: providerBlocked ? "provider_blocked" : "transient_failure",
           });
-          return { status: "failed" as const };
+          if (providerBlocked) throw new ProviderTransientError("Maps Fast website recovery provider is temporarily unavailable.");
+          if (error instanceof ProviderFailureError) throw error;
+          throw new ProviderTransientError("Maps Fast website recovery request failed.");
         }
       },
     } : {}),
@@ -998,7 +1029,29 @@ export async function runProcessingCronTick(
           await runWithDeadlineSignal(cleanupDeadline.signal, async () => {
             if (!jobCompletedPersisted) {
               if (jobError instanceof ProviderBudgetExceededError) {
-                await deferProcessingJob({ jobId: job.id, workerId, nextAttemptAt: jobError.retryAt, reason: jobError.message });
+                if (job.attemptCount >= job.maxAttempts) {
+                  await failProcessingJob({ workerId, job, error: jobError, now });
+                } else {
+                  await deferProcessingJob({
+                    jobId: job.id,
+                    workerId,
+                    nextAttemptAt: jobError.retryAt,
+                    reason: jobError.message,
+                    consumeAttempt: true,
+                  });
+                }
+              } else if (jobError instanceof ProviderFailureError && jobError.retryAt) {
+                if (job.attemptCount >= job.maxAttempts) {
+                  await failProcessingJob({ workerId, job, error: jobError, now });
+                } else {
+                  await deferProcessingJob({
+                    jobId: job.id,
+                    workerId,
+                    nextAttemptAt: jobError.retryAt,
+                    reason: jobError.message,
+                    consumeAttempt: true,
+                  });
+                }
               } else {
                 const failureTime = jobError instanceof DeadlineExceededError ? new Date() : now;
                 await failProcessingJob({

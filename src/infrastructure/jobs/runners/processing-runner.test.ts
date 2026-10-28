@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { ProviderBudgetExceededError } from "@/domain/providers/errors";
+import { ProviderBudgetExceededError, ProviderFailureError, ProviderTransientError } from "@/domain/providers/errors";
 import type { MapsPlaceResult } from "@/domain/providers/types";
 import type { ProcessedCandidateResult, ProcessingContext } from "@/services/discovery/candidate-processor";
 import {
@@ -709,7 +709,7 @@ describe("runProcessingCronTick", () => {
     expect(mocks.completeProcessingJob).not.toHaveBeenCalled();
   });
 
-  it("does not construct a Serper provider while Autopilot is paused", async () => {
+  it("does not query Serper while paused and preserves recovery through bounded job retry", async () => {
     prepareMapsFastRecoveryJob();
     mocks.getAutopilotSettings.mockResolvedValue({ enabled: true, systemPaused: true, emergencyStopped: false, timezone: "Europe/Madrid" });
 
@@ -717,10 +717,20 @@ describe("runProcessingCronTick", () => {
 
     expect(mocks.createSerpDiscoveryProvider).not.toHaveBeenCalled();
     expect(mocks.claimMapsFastWebsiteRecovery).not.toHaveBeenCalled();
+    expect(mocks.updateRawCandidateProcessingMetrics).toHaveBeenCalledWith("raw-candidate-id", expect.objectContaining({
+      websiteRecoveryStatus: "provider_blocked",
+      websiteRecoveryAttempted: 0,
+    }));
+    expect(mocks.deferProcessingJob).toHaveBeenCalledWith(expect.objectContaining({
+      jobId: "maps-fast-recovery",
+      nextAttemptAt: expect.any(Date),
+      consumeAttempt: true,
+    }));
     expect(mocks.failProcessingJob).not.toHaveBeenCalled();
+    expect(mocks.completeProcessingJob).not.toHaveBeenCalled();
   });
 
-  it("does not claim or search when Serper is unavailable", async () => {
+  it("retries through bounded job backoff when Serper is unavailable", async () => {
     prepareMapsFastRecoveryJob();
     mocks.createSerpDiscoveryProvider.mockReturnValue({ providerName: "mock", search: vi.fn() });
 
@@ -729,10 +739,20 @@ describe("runProcessingCronTick", () => {
     expect(mocks.processRawCandidate).toHaveBeenCalledOnce();
     expect(mocks.createSerpDiscoveryProvider).toHaveBeenCalledWith("workspace-id", "maps_fast", "campaign-id");
     expect(mocks.claimMapsFastWebsiteRecovery).not.toHaveBeenCalled();
+    expect(mocks.updateRawCandidateProcessingMetrics).toHaveBeenCalledWith("raw-candidate-id", expect.objectContaining({
+      websiteRecoveryStatus: "provider_blocked",
+      websiteRecoveryAttempted: 0,
+    }));
+    expect(mocks.deferProcessingJob).toHaveBeenCalledWith(expect.objectContaining({
+      jobId: "maps-fast-recovery",
+      nextAttemptAt: expect.any(Date),
+      consumeAttempt: true,
+    }));
     expect(mocks.failProcessingJob).not.toHaveBeenCalled();
+    expect(mocks.completeProcessingJob).not.toHaveBeenCalled();
   });
 
-  it("treats a Serper budget block as a safe no-website outcome", async () => {
+  it("defers a Serper budget block without consuming the processing attempt", async () => {
     prepareMapsFastRecoveryJob();
     const search = vi.fn().mockRejectedValue(new ProviderBudgetExceededError("Serper daily budget exhausted", new Date("2026-10-20T00:00:00Z")));
     mocks.createSerpDiscoveryProvider.mockReturnValue({ providerName: "serper", search });
@@ -744,8 +764,36 @@ describe("runProcessingCronTick", () => {
       websiteRecoveryAttempted: 0,
       websiteRecoveryStatus: "budget_blocked",
     }));
+    expect(mocks.deferProcessingJob).toHaveBeenCalledWith(expect.objectContaining({
+      jobId: "maps-fast-recovery",
+      nextAttemptAt: new Date("2026-10-20T00:00:00Z"),
+      consumeAttempt: true,
+    }));
     expect(mocks.failProcessingJob).not.toHaveBeenCalled();
-    expect(mocks.completeProcessingJob).toHaveBeenCalledOnce();
+    expect(mocks.completeProcessingJob).not.toHaveBeenCalled();
+  });
+
+  it("dead-letters repeated budget deferrals at the existing processing attempt limit", async () => {
+    prepareMapsFastRecoveryJob();
+    mocks.claimProcessingJobs.mockReset()
+      .mockResolvedValueOnce([{
+        ...makeJob("maps-fast-recovery"),
+        attemptCount: 5,
+        maxAttempts: 5,
+        type: "process_raw_candidate",
+        payload: { rawCandidateId: "raw-candidate-id" },
+      }])
+      .mockResolvedValueOnce([]);
+    const search = vi.fn().mockRejectedValue(new ProviderBudgetExceededError("Serper daily budget exhausted", new Date("2026-10-21T00:00:00Z")));
+    mocks.createSerpDiscoveryProvider.mockReturnValue({ providerName: "serper", search });
+
+    await runProcessingCronTick(1, new Date("2026-10-20T12:00:00Z"));
+
+    expect(mocks.deferProcessingJob).not.toHaveBeenCalled();
+    expect(mocks.failProcessingJob).toHaveBeenCalledWith(expect.objectContaining({
+      job: expect.objectContaining({ attemptCount: 5, maxAttempts: 5 }),
+      error: expect.any(ProviderBudgetExceededError),
+    }));
   });
 
   it("does not repeat a paid lookup when the persisted atomic claim is already held", async () => {
@@ -783,6 +831,92 @@ describe("runProcessingCronTick", () => {
       rawSnapshot: expect.objectContaining({ kind: "maps_fast_website_recovery", provider: "serper" }),
     }));
     expect(mocks.getWebsiteEnrichmentStatus).toHaveBeenCalledWith("account-id", "farmacia-ejemplo.es");
+  });
+
+  it("finalizes a successful Serper no-match as terminal and does not retry it", async () => {
+    prepareMapsFastRecoveryJob();
+    mocks.createSerpDiscoveryProvider.mockReturnValue({ providerName: "serper", search: vi.fn().mockResolvedValue({
+      results: [],
+      usage: { calls: 1, items: 0, errors: 0, totalLatencyMs: 10, costUsd: 0.001, quotaRemaining: null },
+    }) });
+
+    await runProcessingCronTick(1);
+
+    expect(mocks.updateRawCandidateProcessingMetrics).toHaveBeenCalledWith("raw-candidate-id", expect.objectContaining({
+      websiteRecoveryStatus: "terminal_no_match",
+      websiteRecoveryAttempted: 1,
+      websiteRecoveryFailed: 0,
+    }));
+    expect(mocks.failProcessingJob).not.toHaveBeenCalled();
+    expect(mocks.completeProcessingJob).toHaveBeenCalledOnce();
+  });
+
+  it("keeps transient Serper failure retryable through bounded processing-job backoff", async () => {
+    prepareMapsFastRecoveryJob();
+    const transientError = new ProviderTransientError("temporary Serper outage", new Date("2026-10-20T08:00:00Z"));
+    mocks.createSerpDiscoveryProvider.mockReturnValue({ providerName: "serper", search: vi.fn().mockRejectedValue(transientError) });
+
+    await runProcessingCronTick(1, new Date("2026-10-20T08:00:00Z"));
+
+    expect(mocks.updateRawCandidateProcessingMetrics).toHaveBeenCalledWith("raw-candidate-id", expect.objectContaining({
+      websiteRecoveryStatus: "transient_failure",
+      websiteRecoveryAttempted: 1,
+      websiteRecoveryFailed: 1,
+    }));
+    expect(mocks.deferProcessingJob).toHaveBeenCalledWith(expect.objectContaining({
+      jobId: "maps-fast-recovery",
+      nextAttemptAt: transientError.retryAt,
+      consumeAttempt: true,
+    }));
+    expect(mocks.failProcessingJob).not.toHaveBeenCalled();
+    expect(mocks.completeProcessingJob).not.toHaveBeenCalled();
+  });
+
+  it("reclaims recovery after a prior processing attempt was interrupted in started state", async () => {
+    prepareMapsFastRecoveryJob();
+    mocks.getRawCandidateById.mockResolvedValue({
+      id: "raw-candidate-id",
+      campaignId: "campaign-id",
+      engineType: "maps_fast",
+      rawPayload: { kind: "maps", place: mapsFastRecoveryPlace },
+      processingMetrics: { websiteRecoveryStatus: "started", websiteRecoveryAttempted: 1 },
+      accountId: null,
+      searchSeedRunId: null,
+    });
+    const search = vi.fn().mockResolvedValue({
+      results: [],
+      usage: { calls: 1, items: 0, errors: 0, totalLatencyMs: 10, costUsd: 0.001, quotaRemaining: null },
+    });
+    mocks.createSerpDiscoveryProvider.mockReturnValue({ providerName: "serper", search });
+
+    await runProcessingCronTick(1);
+
+    expect(mocks.updateRawCandidateProcessingMetrics).toHaveBeenCalledWith("raw-candidate-id", expect.objectContaining({
+      websiteRecoveryStatus: "transient_failure",
+      websiteRecoveryFailed: 1,
+    }));
+    expect(mocks.claimMapsFastWebsiteRecovery).toHaveBeenCalledOnce();
+    expect(search).toHaveBeenCalledOnce();
+  });
+
+  it("classifies billing and provider availability failures as blocked, not terminal identity failures", async () => {
+    prepareMapsFastRecoveryJob();
+    const blockedError = new ProviderFailureError("temporary provider availability", "billing", null);
+    mocks.createSerpDiscoveryProvider.mockReturnValue({ providerName: "serper", search: vi.fn().mockRejectedValue(blockedError) });
+
+    await runProcessingCronTick(1);
+
+    expect(mocks.updateRawCandidateProcessingMetrics).toHaveBeenCalledWith("raw-candidate-id", expect.objectContaining({
+      websiteRecoveryStatus: "provider_blocked",
+      websiteRecoveryAttempted: 1,
+    }));
+    expect(mocks.deferProcessingJob).toHaveBeenCalledWith(expect.objectContaining({
+      jobId: "maps-fast-recovery",
+      nextAttemptAt: expect.any(Date),
+      consumeAttempt: true,
+    }));
+    expect(mocks.failProcessingJob).not.toHaveBeenCalled();
+    expect(mocks.completeProcessingJob).not.toHaveBeenCalled();
   });
 
   it("persists recovered deep-fetch attribution separately from the candidate homepage fetch", async () => {

@@ -121,6 +121,31 @@ export async function runAutopilotCronTick(now: Date = new Date()): Promise<Auto
     const pacing = await getAutopilotPacingState(workspaceId, now);
     pacingStates.push(pacing);
     campaignsTicked += campaigns.length;
+    logEvent("info", "contactability.funnel_snapshot", {
+      correlationId: `autopilot:${workspaceId}`,
+      workspaceId,
+      windowDays: 30,
+      qualifiedAccounts: pacing.qualifiedAccounts,
+      qualifiedWithDomain: pacing.qualifiedWithDomain,
+      qualifiedWithoutValidEmail: pacing.qualifiedWithoutValidEmail,
+      qualifiedDomainWithoutValidEmail: pacing.qualifiedDomainWithoutValidEmail,
+      qualifiedRecoveryEligibleWithoutValidEmail: pacing.qualifiedRecoveryEligibleWithoutValidEmail,
+      qualifiedTerminalNoMatchWithoutValidEmail: pacing.qualifiedTerminalNoMatchWithoutValidEmail,
+      validEmailAccounts: pacing.validEmailAccounts,
+      eligibleImportBacklog: pacing.eligibleImportBacklog,
+      confirmedImportsToday: pacing.confirmedImportsToday,
+      contactabilityHistoricalSample: pacing.contactabilityHistoricalSample,
+      contactabilityImportYield: pacing.contactabilityImportYield,
+      expectedImportsFromContactabilityBacklog: pacing.expectedImportsFromContactabilityBacklog,
+      processingPending: pacing.processingInFlight,
+      verificationPending: pacing.verificationInFlight,
+    });
+    logEvent("info", "maps_fast.website_recovery_outcomes", {
+      correlationId: `autopilot:${workspaceId}`,
+      workspaceId,
+      windowDays: 30,
+      ...pacing.recoveryOutcomes,
+    });
     // The target and budget are workspace-wide, never multiplied by engines.
     if (pacing.remainingTarget <= 0) continue;
 

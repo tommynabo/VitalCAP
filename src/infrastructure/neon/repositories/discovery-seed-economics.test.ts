@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { PgDialect } from "drizzle-orm/pg-core";
-import { buildApifyDailyEconomicTotalsQuery, buildSeedEconomicPerformanceQuery } from "./discovery";
+import { buildApifyDailyEconomicTotalsQuery, buildClaimMapsFastWebsiteRecoveryQuery, buildSeedEconomicPerformanceQuery } from "./discovery";
 
 describe("seed economic performance query", () => {
   it("uses provider accounting and actual returned/cost values, excluding recovery probes", () => {
@@ -45,5 +45,18 @@ describe("seed economic performance query", () => {
     expect(query.params).toContain(workspaceId);
     expect(query.params).toContain(since.toISOString());
     expect(query.params).toContain(now.toISOString());
+  });
+
+  it("keeps successful and terminal recovery closed while allowing retryable statuses to be claimed", () => {
+    const query = new PgDialect().sqlToQuery(buildClaimMapsFastWebsiteRecoveryQuery("raw-candidate-1"));
+
+    expect(query.sql).toContain("SET processing_metrics = COALESCE(processing_metrics, '{}'::jsonb)");
+    expect(query.sql).toContain("NOT IN ('started', 'succeeded', 'terminal_no_match', 'failed')");
+    expect(query.sql).toContain("engine_type = 'maps_fast'");
+    expect(query.sql).toContain("RETURNING id");
+    expect(query.params).toContain("raw-candidate-1");
+    for (const retryable of ["transient_failure", "provider_blocked", "budget_blocked"]) {
+      expect(query.sql).not.toContain(`'${retryable}'`);
+    }
   });
 });

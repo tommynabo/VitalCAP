@@ -39,6 +39,32 @@ export interface AutopilotPacingState {
   qualifiedToday: number;
   instantlyImportedToday: number;
   eligibleImportBacklog: number;
+  qualifiedContactabilityBacklog: number;
+  qualifiedAccounts: number;
+  qualifiedWithDomain: number;
+  qualifiedWithoutValidEmail: number;
+  qualifiedDomainWithoutValidEmail: number;
+  qualifiedRecoveryEligibleWithoutValidEmail: number;
+  qualifiedTerminalNoMatchWithoutValidEmail: number;
+  validEmailAccounts: number;
+  confirmedImportsToday: number;
+  recoveryOutcomes: {
+    attempted: number;
+    succeeded: number;
+    terminalNoMatch: number;
+    transientFailure: number;
+    providerBlocked: number;
+    budgetBlocked: number;
+    fetchSucceeded: number;
+    fetchFailed: number;
+    emailAccountsCreated: number;
+    validEmailAccounts: number;
+    confirmedImportedAccounts: number;
+  };
+  contactabilityHistoricalSample: number;
+  contactabilityImportYield: number;
+  expectedImportsFromContactabilityBacklog: number;
+  contactabilityBackpressureMultiplier: number;
   verificationInFlight: number;
   expectedImportsFromBacklog: number;
   rawRequestedToday: number;
@@ -146,6 +172,19 @@ export interface PacingComputationInput {
   qualifiedToday?: number;
   instantlyImportedToday?: number;
   eligibleImportBacklog?: number;
+  qualifiedContactabilityBacklog?: number;
+  qualifiedAccounts?: number;
+  qualifiedWithDomain?: number;
+  qualifiedWithoutValidEmail?: number;
+  qualifiedDomainWithoutValidEmail?: number;
+  qualifiedRecoveryEligibleWithoutValidEmail?: number;
+  qualifiedTerminalNoMatchWithoutValidEmail?: number;
+  validEmailAccounts?: number;
+  confirmedImportsToday?: number;
+  recoveryOutcomes?: AutopilotPacingState["recoveryOutcomes"];
+  contactabilityHistoricalSample?: number;
+  contactabilityImportYield?: number;
+  expectedImportsFromContactabilityBacklog?: number;
   verificationInFlight?: number;
   rawRequestedToday: number;
   rawReturnedToday: number;
@@ -179,10 +218,22 @@ export function computeAutopilotPacing(input: PacingComputationInput): Autopilot
   const expectedAchievedByNow = input.dailyTarget * elapsedOperatingFraction;
   const remainingTarget = Math.max(0, input.dailyTarget - input.targetAchievedToday);
   const backlogCreditCap = Math.floor(Math.min(remainingTarget, expectedAchievedByNow * 0.1));
+  const qualifiedContactabilityBacklog = Math.max(0, input.qualifiedContactabilityBacklog ?? 0);
+  const contactabilityHistoricalSample = Math.max(0, input.contactabilityHistoricalSample ?? 0);
+  const contactabilityImportYield = contactabilityHistoricalSample >= 20
+    ? Math.max(0, Math.min(0.3, input.contactabilityImportYield ?? 0))
+    : 0;
+  const observedContactabilityImports = Math.floor(qualifiedContactabilityBacklog * contactabilityImportYield);
+  const expectedImportsFromContactabilityBacklog = Math.min(
+    observedContactabilityImports,
+    Math.max(0, input.expectedImportsFromContactabilityBacklog ?? observedContactabilityImports),
+  );
   const expectedImportsFromBacklog = Math.min(
-    Math.max(0, input.expectedImportsFromBacklog ?? 0),
+    Math.max(0, input.expectedImportsFromBacklog ?? 0) + expectedImportsFromContactabilityBacklog,
     backlogCreditCap,
   );
+  const contactabilityDemandDiscount = Math.min(0.15, expectedImportsFromContactabilityBacklog / Math.max(1, input.dailyTarget));
+  const contactabilityBackpressureMultiplier = 1 - contactabilityDemandDiscount;
   const expectedProgressFromInFlight = targetMetric === "instantly_imported"
     ? expectedImportsFromBacklog
     : input.expectedQualifiedFromInFlight;
@@ -204,11 +255,15 @@ export function computeAutopilotPacing(input: PacingComputationInput): Autopilot
   // turns this into bounded, idempotent planning-window orders. A fixed 100
   // here made a 250-qualified/day target mathematically unreachable at
   // ordinary yield rates.
-  const estimatedRawDemand = targetMetric === "instantly_imported"
+  const unadjustedEstimatedRawDemand = targetMetric === "instantly_imported"
     ? Math.ceil(Math.max(0, remainingTarget - expectedProgressFromInFlight) / boundedYield)
     : targetNeededToPlan > 0 ? Math.ceil(targetNeededToPlan / boundedYield) : 0;
-  const rawNeededToPlan = targetNeededToPlan > 0
-    ? Math.min(rawRemainingToday, Math.ceil(targetNeededToPlan / boundedYield))
+  const estimatedRawDemand = unadjustedEstimatedRawDemand > 0
+    ? Math.max(1, Math.floor(unadjustedEstimatedRawDemand * contactabilityBackpressureMultiplier))
+    : 0;
+  const unadjustedRawNeededToPlan = targetNeededToPlan > 0 ? Math.ceil(targetNeededToPlan / boundedYield) : 0;
+  const rawNeededToPlan = unadjustedRawNeededToPlan > 0
+    ? Math.min(rawRemainingToday, Math.max(1, Math.floor(unadjustedRawNeededToPlan * contactabilityBackpressureMultiplier)))
     : 0;
   const capacityConstrained = estimatedRawDemand > rawRemainingToday;
   
@@ -255,6 +310,32 @@ export function computeAutopilotPacing(input: PacingComputationInput): Autopilot
     qualifiedToday: input.qualifiedToday ?? input.targetAchievedToday,
     instantlyImportedToday: input.instantlyImportedToday ?? 0,
     eligibleImportBacklog: input.eligibleImportBacklog ?? 0,
+    qualifiedContactabilityBacklog,
+    qualifiedAccounts: input.qualifiedAccounts ?? 0,
+    qualifiedWithDomain: input.qualifiedWithDomain ?? 0,
+    qualifiedWithoutValidEmail: input.qualifiedWithoutValidEmail ?? 0,
+    qualifiedDomainWithoutValidEmail: input.qualifiedDomainWithoutValidEmail ?? 0,
+    qualifiedRecoveryEligibleWithoutValidEmail: input.qualifiedRecoveryEligibleWithoutValidEmail ?? 0,
+    qualifiedTerminalNoMatchWithoutValidEmail: input.qualifiedTerminalNoMatchWithoutValidEmail ?? 0,
+    validEmailAccounts: input.validEmailAccounts ?? 0,
+    confirmedImportsToday: input.confirmedImportsToday ?? 0,
+    recoveryOutcomes: input.recoveryOutcomes ?? {
+      attempted: 0,
+      succeeded: 0,
+      terminalNoMatch: 0,
+      transientFailure: 0,
+      providerBlocked: 0,
+      budgetBlocked: 0,
+      fetchSucceeded: 0,
+      fetchFailed: 0,
+      emailAccountsCreated: 0,
+      validEmailAccounts: 0,
+      confirmedImportedAccounts: 0,
+    },
+    contactabilityHistoricalSample,
+    contactabilityImportYield,
+    expectedImportsFromContactabilityBacklog,
+    contactabilityBackpressureMultiplier,
     verificationInFlight: input.verificationInFlight ?? 0,
     expectedImportsFromBacklog,
     rawRequestedToday: input.rawRequestedToday,

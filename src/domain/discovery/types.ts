@@ -29,7 +29,7 @@ export interface CandidateProcessingMetrics {
   websiteRecoverySucceeded?: number;
   websiteRecoveryFailed?: number;
   websiteRecoveryProvider?: "serper" | null;
-  websiteRecoveryStatus?: "not_attempted" | "not_needed" | "not_applicable" | "started" | "succeeded" | "failed" | "budget_blocked" | "blocked";
+  websiteRecoveryStatus?: "not_attempted" | "not_needed" | "not_applicable" | "started" | "succeeded" | "terminal_no_match" | "transient_failure" | "provider_blocked" | "failed" | "budget_blocked" | "blocked";
   websiteRecoveryDomain?: string | null;
   websiteRecoveryUrl?: string | null;
   websiteRecoveryEvidence?: SerpResult | null;

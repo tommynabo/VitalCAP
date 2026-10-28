@@ -3,6 +3,7 @@ import type { BusinessType } from "@/domain/accounts/types";
 import type { RoleType, VerificationStatus } from "@/domain/contacts/types";
 import type { CandidateProcessingMetrics } from "@/domain/discovery/types";
 import type { MapsPlaceResult, SerpResult, WebsiteFetcher, EmailVerificationProvider } from "@/domain/providers/types";
+import { ProviderBudgetExceededError, ProviderFailureError } from "@/domain/providers/errors";
 import { normalizeAddress, normalizeBusinessName, normalizeDomain, normalizePhoneES } from "@/lib/normalization";
 import { evaluateSpainEligibility, type SpainEligibilityVerdict } from "@/lib/geography/spain-eligibility";
 import { evaluateAccountDedup, type AccountIdentitySignals } from "@/services/deduplication/account-dedup";
@@ -383,6 +384,7 @@ export async function processRawCandidate(
     : undefined;
   const recoveryAlreadyFinalized = processingMetrics.websiteRecoveryStatus === "started"
     || processingMetrics.websiteRecoveryStatus === "succeeded"
+    || processingMetrics.websiteRecoveryStatus === "terminal_no_match"
     || processingMetrics.websiteRecoveryStatus === "failed";
   if (
     engineType === "maps_fast"
@@ -410,14 +412,22 @@ export async function processRawCandidate(
         processingMetrics.recoveredWebsiteDomain = recovery.website.domain;
         processingMetrics.recoveredWebsiteUrl = recovery.website.websiteUrl;
         processingMetrics.websiteRecoveryEvidence = null;
-      } else if (recovery.status === "failed" || recovery.status === "no_match") {
+      } else if (recovery.status === "terminal_no_match") {
         processingMetrics.websiteRecoveryAttempted = 1;
         processingMetrics.websiteRecoverySucceeded = 0;
-        processingMetrics.websiteRecoveryFailed = 1;
+        processingMetrics.websiteRecoveryFailed = 0;
         processingMetrics.websiteEmailAttributionComplete = true;
         processingMetrics.websiteRecoverySource = "serper";
         processingMetrics.websiteRecoveryProvider = "serper";
-        processingMetrics.websiteRecoveryStatus = "failed";
+        processingMetrics.websiteRecoveryStatus = "terminal_no_match";
+      } else if (recovery.status === "provider_blocked" || recovery.status === "budget_blocked") {
+        processingMetrics.websiteRecoveryAttempted = 0;
+        processingMetrics.websiteRecoverySucceeded = 0;
+        processingMetrics.websiteRecoveryFailed = 0;
+        processingMetrics.websiteEmailAttributionComplete = true;
+        processingMetrics.websiteRecoverySource = null;
+        processingMetrics.websiteRecoveryProvider = "serper";
+        processingMetrics.websiteRecoveryStatus = recovery.status;
       } else {
         processingMetrics.websiteRecoveryAttempted = 0;
         processingMetrics.websiteRecoverySucceeded = 0;
@@ -427,15 +437,17 @@ export async function processRawCandidate(
         processingMetrics.websiteRecoveryProvider = null;
         processingMetrics.websiteRecoveryStatus = "blocked";
       }
-    } catch {
+    } catch (error) {
       if (context.signal?.aborted) throw context.signal.reason;
+      if (error instanceof ProviderFailureError || error instanceof ProviderBudgetExceededError) throw error;
       processingMetrics.websiteRecoveryAttempted = 1;
       processingMetrics.websiteRecoverySucceeded = 0;
       processingMetrics.websiteRecoveryFailed = 1;
       processingMetrics.websiteEmailAttributionComplete = true;
       processingMetrics.websiteRecoverySource = "serper";
       processingMetrics.websiteRecoveryProvider = "serper";
-      processingMetrics.websiteRecoveryStatus = "failed";
+      processingMetrics.websiteRecoveryStatus = "transient_failure";
+      throw error;
     }
   }
   if (payload.kind === "maps" && payload.crawledPages) {

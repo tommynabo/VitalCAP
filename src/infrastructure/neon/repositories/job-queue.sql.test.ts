@@ -142,6 +142,21 @@ describe("job queue SQL builders", () => {
     expect(query.sql).not.toContain("dead_letter");
   });
 
+  it("can defer a provider-budget processing retry without refunding its bounded attempt", () => {
+    const query = dialect.sqlToQuery(buildDeferJobQuery("processing_jobs", {
+      jobId: "job-1",
+      workerId: "worker-1",
+      nextAttemptAt: new Date("2026-10-21T00:00:00.000Z"),
+      reason: "Serper daily budget exhausted",
+      consumeAttempt: true,
+    }, new Date("2026-10-20T12:00:00.000Z")));
+
+    expect(query.sql).toContain("attempt_count = CASE WHEN");
+    expect(query.params).toContain(true);
+    expect(query.sql).toContain("GREATEST(attempt_count - 1, 0)");
+    expect(query.sql).toContain("next_attempt_at =");
+  });
+
   it.each(["discovery_jobs", "processing_jobs"] as const)("writes %s dead letters using the current schema", (table) => {
     const query = dialect.sqlToQuery(buildDeadLetterExpiredJobsQuery(table, 300, "Max attempts exceeded"));
 

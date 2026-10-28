@@ -611,16 +611,23 @@ export async function getRawCandidateById(id: string): Promise<RawCandidate | nu
   return row ? toRawCandidate(row) : null;
 }
 
+export function buildClaimMapsFastWebsiteRecoveryQuery(rawCandidateId: string) {
+  return sql`
+    UPDATE raw_candidates
+    SET processing_metrics = COALESCE(processing_metrics, '{}'::jsonb)
+      || '{"websiteRecoveryStatus":"started","websiteRecoveryProvider":"serper"}'::jsonb
+    WHERE id = ${rawCandidateId}::uuid
+      AND engine_type = 'maps_fast'
+      AND COALESCE(processing_metrics->>'websiteRecoveryStatus', '')
+        NOT IN ('started', 'succeeded', 'terminal_no_match', 'failed')
+    RETURNING id
+  `;
+}
+
 export async function claimMapsFastWebsiteRecovery(rawCandidateId: string): Promise<boolean> {
   const db = getDb();
-  const claimed = await db.update(rawCandidates).set({
-    processingMetrics: sql`COALESCE(${rawCandidates.processingMetrics}, '{}'::jsonb) || '{"websiteRecoveryStatus":"started","websiteRecoveryProvider":"serper"}'::jsonb`,
-  }).where(and(
-    eq(rawCandidates.id, rawCandidateId),
-    eq(rawCandidates.engineType, "maps_fast"),
-    sql`COALESCE(${rawCandidates.processingMetrics}->>'websiteRecoveryStatus', '') NOT IN ('started', 'succeeded', 'failed')`,
-  )).returning({ id: rawCandidates.id });
-  return claimed.length > 0;
+  const claimed = await db.execute(buildClaimMapsFastWebsiteRecoveryQuery(rawCandidateId));
+  return claimed.rows.length > 0;
 }
 
 export async function updateRawCandidateProcessingMetrics(

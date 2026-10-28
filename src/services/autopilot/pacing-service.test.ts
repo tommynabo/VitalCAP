@@ -165,6 +165,64 @@ describe("computeAutopilotPacing", () => {
     expect(result.rawNeededToPlan).toBeGreaterThan(0);
   });
 
+  it("uses resolved contactability yield only after 20 samples and keeps combined credit capped", () => {
+    const result = computeAutopilotPacing({
+      ...base,
+      targetMetric: "instantly_imported",
+      targetAchievedToday: 0,
+      qualifiedContactabilityBacklog: 1_000,
+      contactabilityHistoricalSample: 20,
+      contactabilityImportYield: 0.8,
+      expectedImportsFromContactabilityBacklog: 800,
+      expectedImportsFromBacklog: 25,
+      availableDiscoveryCapacity: true,
+      now: new Date("2025-06-15T12:00:00Z"),
+    });
+
+    expect(result.contactabilityImportYield).toBe(0.3);
+    expect(result.expectedImportsFromContactabilityBacklog).toBe(300);
+    expect(result.expectedImportsFromBacklog).toBeLessThanOrEqual(result.expectedAchievedByNow * 0.1);
+    expect(result.status).toBe("behind_pace");
+    expect(result.rawNeededToPlan).toBeGreaterThan(0);
+    expect(result.contactabilityBackpressureMultiplier).toBe(0.85);
+  });
+
+  it("does not credit a sub-20 historical sample and restores normal demand when backlog dries", () => {
+    const noContactability = computeAutopilotPacing({
+      ...base,
+      targetMetric: "instantly_imported",
+      targetAchievedToday: 0,
+      now: new Date("2025-06-15T12:00:00Z"),
+    });
+    const insufficientSample = computeAutopilotPacing({
+      ...base,
+      targetMetric: "instantly_imported",
+      targetAchievedToday: 0,
+      qualifiedContactabilityBacklog: 1_000,
+      contactabilityHistoricalSample: 19,
+      contactabilityImportYield: 0.3,
+      expectedImportsFromContactabilityBacklog: 300,
+      now: new Date("2025-06-15T12:00:00Z"),
+    });
+    const backlogDrained = computeAutopilotPacing({
+      ...base,
+      targetMetric: "instantly_imported",
+      targetAchievedToday: 0,
+      qualifiedContactabilityBacklog: 0,
+      contactabilityHistoricalSample: 30,
+      contactabilityImportYield: 0.3,
+      expectedImportsFromContactabilityBacklog: 0,
+      now: new Date("2025-06-15T12:00:00Z"),
+    });
+
+    expect(insufficientSample.expectedImportsFromContactabilityBacklog).toBe(0);
+    expect(insufficientSample.contactabilityBackpressureMultiplier).toBe(1);
+    expect(insufficientSample.rawNeededToPlan).toBe(noContactability.rawNeededToPlan);
+    expect(backlogDrained.expectedImportsFromContactabilityBacklog).toBe(0);
+    expect(backlogDrained.contactabilityBackpressureMultiplier).toBe(1);
+    expect(backlogDrained.rawNeededToPlan).toBe(noContactability.rawNeededToPlan);
+  });
+
   it("bounds tiny import yield and never exceeds the daily raw-request cap", () => {
     const result = computeAutopilotPacing({
       ...base,

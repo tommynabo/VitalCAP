@@ -204,6 +204,47 @@ describe("runAutopilotCronTick", () => {
     ]), now);
   });
 
+  it("logs workspace-level contactability and recovery aggregates without prospect identifiers", async () => {
+    const now = new Date("2025-06-15T12:00:00Z");
+    mocks.getAutopilotPacingState.mockResolvedValue(computeAutopilotPacing({
+      workspaceId: "workspace-1", timeZone: "Europe/Madrid", targetMetric: "instantly_imported",
+      dailyTarget: 250, targetAchievedToday: 0, qualifiedContactabilityBacklog: 12,
+      contactabilityHistoricalSample: 20, contactabilityImportYield: 0.2,
+      expectedImportsFromContactabilityBacklog: 2, eligibleImportBacklog: 3,
+      expectedImportsFromBacklog: 3, rawRequestedToday: 0, rawReturnedToday: 0,
+      processingInFlight: 4, providerRunsInFlight: 0, expectedQualifiedFromInFlight: 0,
+      apifySpendToday: 0, apifyDailyBudgetRemaining: 5, providerHealth: "healthy",
+      availableDiscoveryCapacity: true, estimatedYield: 0.2, yieldSampleSize: 30, now,
+      operatingStartHour: 7, operatingEndHour: 22,
+    }));
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    try {
+      await runAutopilotCronTick(now);
+      const events = log.mock.calls.map(([line]) => JSON.parse(String(line)) as { message: string; fields: Record<string, unknown> });
+      const funnel = events.find((event) => event.message === "contactability.funnel_snapshot");
+      const recovery = events.find((event) => event.message === "maps_fast.website_recovery_outcomes");
+
+      expect(funnel?.fields).toMatchObject({
+        qualifiedAccounts: 0,
+        contactabilityHistoricalSample: 20,
+        contactabilityImportYield: 0.2,
+        expectedImportsFromContactabilityBacklog: 2,
+        processingPending: 4,
+      });
+      expect(recovery?.fields).toMatchObject({
+        attempted: 0,
+        succeeded: 0,
+        terminalNoMatch: 0,
+        transientFailure: 0,
+        budgetBlocked: 0,
+      });
+      expect(JSON.stringify([funnel, recovery])).not.toMatch(/@|\+?\d{8,}|https?:\/\//);
+    } finally {
+      log.mockRestore();
+    }
+  });
+
   it("does not schedule new work when the global cap has no remaining capacity", async () => {
     const now = new Date("2025-06-15T12:00:00Z");
     mocks.getAutopilotPacingState.mockResolvedValue(computeAutopilotPacing({

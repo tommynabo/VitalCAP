@@ -34,8 +34,8 @@ export interface RecoveredBusinessWebsite {
 }
 
 export type MapsFastWebsiteRecoveryOutcome =
-  | { status: "blocked" }
-  | { status: "failed" | "no_match" }
+  | { status: "blocked" | "provider_blocked" | "budget_blocked" }
+  | { status: "terminal_no_match" }
   | { status: "recovered"; website: RecoveredBusinessWebsite };
 
 export function buildMapsFastWebsiteRecoveryQuery(place: MapsPlaceResult): string | null {

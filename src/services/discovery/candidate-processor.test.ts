@@ -276,7 +276,7 @@ describe("processRawCandidate — maps candidates", () => {
   });
 
   it("keeps a no-result recovery on the ordinary no-email path", async () => {
-    const recoverMapsFastWebsite = vi.fn().mockResolvedValue({ status: "no_match" });
+    const recoverMapsFastWebsite = vi.fn().mockResolvedValue({ status: "terminal_no_match" });
     const fetchPage = vi.fn();
     const result = await processRawCandidate(
       mapsPayload({ phone: null }),
@@ -289,10 +289,37 @@ describe("processRawCandidate — maps candidates", () => {
     expect(result.processingMetrics).toMatchObject({
       websiteRecoveryAttempted: 1,
       websiteRecoverySucceeded: 0,
-      websiteRecoveryFailed: 1,
-      websiteRecoveryStatus: "failed",
+      websiteRecoveryFailed: 0,
+      websiteRecoveryStatus: "terminal_no_match",
       websiteOrigin: "none",
     });
+  });
+
+  it("does not retry a persisted terminal no-match", async () => {
+    const recoverMapsFastWebsite = vi.fn();
+    const result = await processRawCandidate(
+      mapsPayload({ phone: null }),
+      "maps_fast",
+      baseContext({
+        existingProcessingMetrics: {
+          homepageFetchAttempted: 0,
+          homepageFetchSucceeded: 0,
+          homepageFetchFailed: 0,
+          emailRejectedFormat: 0,
+          emailDuplicate: 0,
+          websiteOrigin: "none",
+          websiteRecoveryAttempted: 1,
+          websiteRecoverySucceeded: 0,
+          websiteRecoveryFailed: 0,
+          websiteRecoveryStatus: "terminal_no_match",
+        },
+        recoverMapsFastWebsite,
+        websiteFetcher: { fetchPage: vi.fn() },
+      }),
+    );
+
+    expect(recoverMapsFastWebsite).not.toHaveBeenCalled();
+    expect(result.processingMetrics.websiteRecoveryStatus).toBe("terminal_no_match");
   });
 
   it("does not recover a duplicate whose matched account already has a domain", async () => {

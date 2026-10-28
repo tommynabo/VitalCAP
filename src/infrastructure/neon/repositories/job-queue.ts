@@ -607,6 +607,7 @@ interface DeferJobInput {
   workerId: string;
   nextAttemptAt: Date;
   reason: string;
+  consumeAttempt?: boolean;
 }
 
 export function buildDeferJobQuery(table: QueueTable, input: DeferJobInput, now: Date) {
@@ -618,7 +619,7 @@ export function buildDeferJobQuery(table: QueueTable, input: DeferJobInput, now:
         SET status = 'pending',
             locked_at = NULL,
             locked_by = NULL,
-            attempt_count = GREATEST(attempt_count - 1, 0),
+          attempt_count = CASE WHEN ${input.consumeAttempt ?? false} THEN attempt_count ELSE GREATEST(attempt_count - 1, 0) END,
             next_attempt_at = ${nextAttemptAt}::timestamptz,
             last_error = ${input.reason},
             updated_at = ${nowIso}::timestamptz
@@ -630,7 +631,7 @@ export function buildDeferJobQuery(table: QueueTable, input: DeferJobInput, now:
         SET status = 'pending',
             locked_at = NULL,
             locked_by = NULL,
-            attempt_count = GREATEST(attempt_count - 1, 0),
+          attempt_count = CASE WHEN ${input.consumeAttempt ?? false} THEN attempt_count ELSE GREATEST(attempt_count - 1, 0) END,
             next_attempt_at = ${nextAttemptAt}::timestamptz,
             last_error = ${input.reason},
             updated_at = ${nowIso}::timestamptz
