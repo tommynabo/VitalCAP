@@ -8,6 +8,7 @@ const mocks = vi.hoisted(() => ({
   insertRebalanceDecision: vi.fn(),
   enqueueDiscoveryOrdersWithinDailyRawCap: vi.fn(),
   getCampaignQueueDepth: vi.fn(),
+  getWatchdogWorkspaceSignals: vi.fn(),
   bootstrapSearchSeeds: vi.fn(),
   listSearchSeedsForCampaignEngine: vi.fn(),
   getRecentProviderUsage: vi.fn(),
@@ -39,6 +40,9 @@ vi.mock("@/infrastructure/neon/repositories/autopilot", () => ({
 }));
 vi.mock("@/infrastructure/neon/repositories/job-queue", () => ({
   getCampaignQueueDepth: mocks.getCampaignQueueDepth,
+}));
+vi.mock("@/infrastructure/neon/repositories/watchdog-signals", () => ({
+  getWatchdogWorkspaceSignals: mocks.getWatchdogWorkspaceSignals,
 }));
 vi.mock("@/infrastructure/neon/repositories/daily-raw-request-cap", () => ({
   enqueueDiscoveryOrdersWithinDailyRawCap: mocks.enqueueDiscoveryOrdersWithinDailyRawCap,
@@ -98,6 +102,26 @@ describe("runAutopilotCronTick", () => {
       timezone: "Europe/Madrid",
     });
     mocks.getCampaignQueueDepth.mockResolvedValue(0);
+    mocks.getWatchdogWorkspaceSignals.mockResolvedValue([{
+      workspaceId: "workspace-1",
+      oldDueDiscovery: 0,
+      deferredDiscovery: 0,
+      oldProcessing: 0,
+      staleDiscoveryLocks: 0,
+      staleProcessingLocks: 0,
+      manualReconciliations: 0,
+      processingPending: 0,
+      processingCompletedRecent: 0,
+      processingFailedRecent: 0,
+      processingTimedOutRecent: 0,
+      processingEnqueuedRecent: 0,
+      systemPaused: false,
+      systemPauseReason: null,
+      systemPausedAt: null,
+      oldestDueDiscoveryAgeMinutes: null,
+      oldestProcessingAgeMinutes: null,
+      recoveryProbeDiscoveryCount: 0,
+    }]);
     mocks.enqueueDiscoveryOrdersWithinDailyRawCap.mockImplementation(async (orders) => ({
       snapshot: { cap: 1523, committedRawRequests: 0, providerReservedRawRequests: 0, queuedRawRequests: 0, remainingRawRequests: 1523, overshootRawRequests: 0, blockedReason: null },
       orders: orders.map((order: { idempotencyKey: string; desiredRawCount: number }, index: number) => ({
@@ -222,6 +246,60 @@ describe("runAutopilotCronTick", () => {
 
     expect(result.ordersScheduled).toBe(3);
     expect(result.ordersScheduled).toBeLessThanOrEqual(3);
+  });
+
+  it("scales discovery work down for a large but draining processing queue", async () => {
+    const now = new Date("2025-06-15T12:00:00Z");
+    const pacing = computeAutopilotPacing({
+      workspaceId: "workspace-1", timeZone: "Europe/Madrid", targetMetric: "instantly_imported",
+      dailyTarget: 250, targetAchievedToday: 0, instantlyImportedToday: 0, eligibleImportBacklog: 0,
+      expectedImportsFromBacklog: 0, rawRequestedToday: 0, rawReturnedToday: 0, processingInFlight: 0,
+      providerRunsInFlight: 0, expectedQualifiedFromInFlight: 0, apifySpendToday: 0,
+      apifyDailyBudgetRemaining: 9, providerHealth: "healthy", availableDiscoveryCapacity: true,
+      estimatedYield: 0.5, yieldSampleSize: 30, now, operatingStartHour: 7, operatingEndHour: 22,
+    });
+    mocks.getAutopilotPacingState.mockResolvedValue(pacing);
+    mocks.getWatchdogWorkspaceSignals.mockResolvedValue([{
+      workspaceId: "workspace-1", oldDueDiscovery: 0, deferredDiscovery: 0, oldProcessing: 170,
+      staleDiscoveryLocks: 0, staleProcessingLocks: 0, manualReconciliations: 0,
+      processingPending: 170, processingCompletedRecent: 40, processingFailedRecent: 0,
+      processingTimedOutRecent: 0, processingEnqueuedRecent: 0, systemPaused: false,
+      systemPauseReason: null, systemPausedAt: null, oldestDueDiscoveryAgeMinutes: null,
+      oldestProcessingAgeMinutes: 45, recoveryProbeDiscoveryCount: 0,
+    }]);
+
+    const result = await runAutopilotCronTick(now);
+    const scheduledOrders = mocks.enqueueDiscoveryOrdersWithinDailyRawCap.mock.calls[0]?.[0] ?? [];
+    const scheduledRaw = scheduledOrders.reduce((sum: number, order: { payload: { desiredRawCount: number } }) => sum + order.payload.desiredRawCount, 0);
+
+    expect(result.ordersScheduled).toBeGreaterThan(0);
+    expect(scheduledRaw).toBeLessThan(pacing.rawNeededToPlan);
+  });
+
+  it("does not generate discovery orders while processing health is stalled", async () => {
+    mocks.getWatchdogWorkspaceSignals.mockResolvedValue([{
+      workspaceId: "workspace-1", oldDueDiscovery: 0, deferredDiscovery: 0, oldProcessing: 170,
+      staleDiscoveryLocks: 0, staleProcessingLocks: 1, manualReconciliations: 0,
+      processingPending: 170, processingCompletedRecent: 0, processingFailedRecent: 0,
+      processingTimedOutRecent: 0, processingEnqueuedRecent: 0, systemPaused: false,
+      systemPauseReason: null, systemPausedAt: null, oldestDueDiscoveryAgeMinutes: null,
+      oldestProcessingAgeMinutes: 45, recoveryProbeDiscoveryCount: 0,
+    }]);
+    mocks.getAutopilotPacingState.mockResolvedValue(computeAutopilotPacing({
+      workspaceId: "workspace-1", timeZone: "Europe/Madrid", targetMetric: "instantly_imported",
+      dailyTarget: 250, targetAchievedToday: 0, instantlyImportedToday: 0, eligibleImportBacklog: 0,
+      expectedImportsFromBacklog: 0, rawRequestedToday: 0, rawReturnedToday: 0, processingInFlight: 0,
+      providerRunsInFlight: 0, expectedQualifiedFromInFlight: 0, apifySpendToday: 0,
+      apifyDailyBudgetRemaining: 9, providerHealth: "healthy", availableDiscoveryCapacity: true,
+      estimatedYield: 0.5, yieldSampleSize: 30, now: new Date("2025-06-15T12:00:00Z"),
+      operatingStartHour: 7, operatingEndHour: 22,
+    }));
+
+    const result = await runAutopilotCronTick(new Date("2025-06-15T12:00:00Z"));
+    const scheduledOrders = mocks.enqueueDiscoveryOrdersWithinDailyRawCap.mock.calls[0]?.[0] ?? [];
+
+    expect(result.ordersScheduled).toBe(0);
+    expect(scheduledOrders).toEqual([]);
   });
 
   it("refreshes a watchdog-owned pause and schedules one bounded probe even when provider-paused pacing has zero normal demand", async () => {

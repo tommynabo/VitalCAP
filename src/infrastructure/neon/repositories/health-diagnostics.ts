@@ -1,5 +1,11 @@
 import { sql } from "drizzle-orm";
 import { PROVIDER_DEFERRED_JOB_ERROR_PREFIX } from "@/domain/discovery/types";
+import {
+  getAdaptiveProcessingMaxJobs,
+  getDiscoveryBackpressureMultiplier,
+  getProcessingHealthState,
+  isWatchdogQueuePauseResumeEligible,
+} from "@/services/autopilot/watchdog-pause-policy";
 import { getDb } from "../db";
 
 export interface ProviderHealthDiagnostics {
@@ -25,6 +31,21 @@ export interface SystemHealthDiagnostics {
     processingProcessing: number;
     processingStaleLocks: number;
     manualProviderReconciliations: number;
+  };
+  processing: {
+    pending: number;
+    oldPending: number;
+    oldestAgeMinutes: number | null;
+    completedRecent: number;
+    failedRecent: number;
+    timedOutRecent: number;
+    enqueuedRecent: number;
+    drainRatePerHour: number;
+    adaptiveMaxJobs: number;
+    discoveryBackpressureMultiplier: number;
+    healthState: "healthy" | "healthy_draining" | "stalled";
+    watchdogPauseRequired: boolean;
+    watchdogAutoResumeEligible: boolean;
   };
 }
 
@@ -150,6 +171,33 @@ export async function getSystemHealthDiagnostics(input: {
           WHERE job.status = 'pending' AND campaign.workspace_id = ${input.workspaceId}::uuid
             AND (job.next_attempt_at IS NULL OR job.next_attempt_at <= ${input.now.toISOString()}::timestamptz))::int AS processing_pending,
         (SELECT COUNT(*) FROM processing_jobs job JOIN campaigns campaign ON campaign.id = job.campaign_id
+          WHERE job.status = 'pending' AND campaign.workspace_id = ${input.workspaceId}::uuid
+            AND (job.next_attempt_at IS NULL OR job.next_attempt_at <= ${input.now.toISOString()}::timestamptz)
+            AND job.created_at < ${new Date(input.now.getTime() - 30 * 60_000).toISOString()}::timestamptz)::int AS processing_old_pending,
+        (SELECT EXTRACT(EPOCH FROM (${input.now.toISOString()}::timestamptz - MIN(job.created_at))) / 60
+          FROM processing_jobs job JOIN campaigns campaign ON campaign.id = job.campaign_id
+          WHERE job.status = 'pending' AND campaign.workspace_id = ${input.workspaceId}::uuid
+            AND (job.next_attempt_at IS NULL OR job.next_attempt_at <= ${input.now.toISOString()}::timestamptz)) AS processing_oldest_age_minutes,
+        (SELECT COUNT(*) FROM processing_jobs job JOIN campaigns campaign ON campaign.id = job.campaign_id
+          WHERE job.status = 'completed' AND campaign.workspace_id = ${input.workspaceId}::uuid
+            AND job.updated_at >= ${new Date(input.now.getTime() - 30 * 60_000).toISOString()}::timestamptz)::int AS processing_completed_recent,
+        (SELECT COUNT(*) FROM processing_jobs job JOIN campaigns campaign ON campaign.id = job.campaign_id
+          WHERE job.status IN ('pending', 'dead_letter') AND campaign.workspace_id = ${input.workspaceId}::uuid
+            AND job.updated_at >= ${new Date(input.now.getTime() - 30 * 60_000).toISOString()}::timestamptz
+            AND job.last_error IS NOT NULL AND job.last_error NOT ILIKE '%budget%'
+            AND job.last_error NOT ILIKE '%raw request cap%')::int AS processing_failed_recent,
+        (SELECT COUNT(*) FROM processing_jobs job JOIN campaigns campaign ON campaign.id = job.campaign_id
+          WHERE job.status IN ('pending', 'dead_letter') AND campaign.workspace_id = ${input.workspaceId}::uuid
+            AND job.updated_at >= ${new Date(input.now.getTime() - 30 * 60_000).toISOString()}::timestamptz
+            AND (job.last_error ILIKE '%PROCESSING_JOB_TIMEOUT%'
+              OR job.last_error ILIKE '%Processing job exceeded%'
+              OR job.last_error ILIKE '%Processing cron work exceeded%')
+            AND job.last_error NOT ILIKE '%budget%'
+            AND job.last_error NOT ILIKE '%raw request cap%')::int AS processing_timed_out_recent,
+        (SELECT COUNT(*) FROM processing_jobs job JOIN campaigns campaign ON campaign.id = job.campaign_id
+          WHERE campaign.workspace_id = ${input.workspaceId}::uuid
+            AND job.created_at >= ${new Date(input.now.getTime() - 30 * 60_000).toISOString()}::timestamptz)::int AS processing_enqueued_recent,
+        (SELECT COUNT(*) FROM processing_jobs job JOIN campaigns campaign ON campaign.id = job.campaign_id
           WHERE job.status = 'processing' AND campaign.workspace_id = ${input.workspaceId}::uuid)::int AS processing_processing,
         (SELECT COUNT(*) FROM processing_jobs job JOIN campaigns campaign ON campaign.id = job.campaign_id
           WHERE job.status = 'processing' AND campaign.workspace_id = ${input.workspaceId}::uuid
@@ -209,6 +257,23 @@ export async function getSystemHealthDiagnostics(input: {
           ? "queue_health"
           : "other";
   const queue = queueResult.rows[0] as Record<string, unknown> | undefined;
+  const processingSignals = {
+    oldDueDiscovery: count(queue?.due_pending_discovery),
+    deferredDiscovery: count(queue?.deferred_discovery),
+    oldProcessing: count(queue?.processing_old_pending),
+    staleDiscoveryLocks: count(queue?.discovery_stale_locks),
+    staleProcessingLocks: count(queue?.processing_stale_locks),
+    manualReconciliations: count(queue?.manual_provider_reconciliations),
+    processingPending: count(queue?.processing_pending),
+    processingCompletedRecent: count(queue?.processing_completed_recent),
+    processingFailedRecent: count(queue?.processing_failed_recent),
+    processingTimedOutRecent: count(queue?.processing_timed_out_recent),
+    processingEnqueuedRecent: count(queue?.processing_enqueued_recent),
+  };
+  const processingHealthState = getProcessingHealthState(processingSignals);
+  const watchdogAutoResumeEligible = autopilot?.only_pause_reason === "queue_health"
+    && count(autopilot?.system_paused_count) > 0
+    && isWatchdogQueuePauseResumeEligible(processingSignals);
   return {
     providers,
     autopilotEffectiveState,
@@ -223,6 +288,25 @@ export async function getSystemHealthDiagnostics(input: {
       processingProcessing: count(queue?.processing_processing),
       processingStaleLocks: count(queue?.processing_stale_locks),
       manualProviderReconciliations: count(queue?.manual_provider_reconciliations),
+    },
+    processing: {
+      pending: processingSignals.processingPending ?? 0,
+      oldPending: processingSignals.oldProcessing,
+      oldestAgeMinutes: queue?.processing_oldest_age_minutes !== null
+        && queue?.processing_oldest_age_minutes !== undefined
+        && Number.isFinite(Number(queue.processing_oldest_age_minutes))
+        ? Number(queue?.processing_oldest_age_minutes)
+        : null,
+      completedRecent: processingSignals.processingCompletedRecent ?? 0,
+      failedRecent: processingSignals.processingFailedRecent ?? 0,
+      timedOutRecent: processingSignals.processingTimedOutRecent ?? 0,
+      enqueuedRecent: processingSignals.processingEnqueuedRecent ?? 0,
+      drainRatePerHour: (processingSignals.processingCompletedRecent ?? 0) * 2,
+      adaptiveMaxJobs: getAdaptiveProcessingMaxJobs(processingSignals),
+      discoveryBackpressureMultiplier: getDiscoveryBackpressureMultiplier(processingSignals),
+      healthState: processingHealthState,
+      watchdogPauseRequired: processingHealthState === "stalled",
+      watchdogAutoResumeEligible,
     },
   };
 }

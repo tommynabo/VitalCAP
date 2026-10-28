@@ -1,6 +1,7 @@
 import { PgDialect } from "drizzle-orm/pg-core";
 import { describe, expect, it } from "vitest";
 import { buildRecoveryProbeDiscoveryJobsQuery } from "./watchdog-signals";
+import { buildWatchdogWorkspaceSignalsQuery } from "./watchdog-signals";
 
 const dialect = new PgDialect();
 
@@ -25,5 +26,22 @@ describe("recovery probe discovery job diagnostics SQL", () => {
     expect(selectClause).not.toContain("dj.payload AS payload");
     expect(query.sql).not.toMatch(/\b(INSERT|UPDATE|DELETE)\b/i);
     expect(query.params).toContain("workspace-1");
+  });
+});
+
+describe("watchdog processing-health signal SQL", () => {
+  it("derives pending, drain, failure, timeout, and arrival signals from durable job rows", () => {
+    const query = dialect.sqlToQuery(buildWatchdogWorkspaceSignalsQuery("workspace-1"));
+
+    expect(query.sql).toContain("AS processing_pending");
+    expect(query.sql).toContain("AS processing_completed_recent");
+    expect(query.sql).toContain("AS processing_failed_recent");
+    expect(query.sql).toContain("AS processing_timed_out_recent");
+    expect(query.sql).toContain("AS processing_enqueued_recent");
+    expect(query.sql).toContain("pj.status = 'completed'");
+    expect(query.sql).toContain("PROCESSING_JOB_TIMEOUT");
+    expect(query.sql).toContain("pj.last_error NOT ILIKE '%budget%'");
+    expect(query.sql).toContain("AS oldest_processing_age_minutes");
+    expect(query.sql).not.toMatch(/\b(INSERT|UPDATE|DELETE)\b/i);
   });
 });

@@ -16,6 +16,16 @@ function buildDiscoveryClaimQuery(batchSize = 1) {
   }, claimTime));
 }
 
+function buildProcessingClaimQuery() {
+  return dialect.sqlToQuery(buildClaimJobsQuery("processing_jobs", {
+    workerId: "worker-1",
+    batchSize: 1,
+    campaignId: "campaign-1",
+    requireAutopilot: true,
+    leaseMs: 5 * 60 * 1000,
+  }, claimTime));
+}
+
 describe("job queue SQL builders", () => {
   it("persists only the allowlisted processing failure metadata on dead-letter payloads", () => {
     const query = dialect.sqlToQuery(buildRecoveryFailureMetadataSql({
@@ -88,11 +98,23 @@ describe("job queue SQL builders", () => {
     expect(query.sql).toContain("c.autopilot_enabled = true");
     expect(query.sql).toContain("aps.enabled = true");
     expect(query.sql).toContain("aps.emergency_stopped = false");
-    expect(query.sql).toContain("aps.system_paused = false OR aps.system_pause_reason = 'Queue health deteriorated (watchdog)'");
+    expect(query.sql).toContain("aps.system_paused = false");
+    expect(query.sql).not.toContain("aps.system_pause_reason");
     expect(query.sql).toContain("j.campaign_id =");
     expect(query.sql).toContain("j.status IN ('pending', 'processing')");
     expect(query.sql).toContain("j.locked_at + (");
     expect(query.sql).toContain("FOR UPDATE OF j SKIP LOCKED");
+  });
+
+  it("pauses discovery claims but keeps processing claims eligible during a watchdog pause", () => {
+    const discoverySql = buildDiscoveryClaimQuery().sql;
+    const processingSql = buildProcessingClaimQuery().sql;
+
+    expect(discoverySql).toContain("aps.system_paused = false");
+    expect(discoverySql).not.toContain("aps.system_pause_reason");
+    expect(processingSql).not.toContain("aps.system_paused");
+    expect(processingSql).toContain("aps.emergency_stopped = false");
+    expect(processingSql).toMatch(/j\.next_attempt_at IS NULL OR j\.next_attempt_at <= \$\d+::timestamptz/);
   });
 
   it("limits a single-job discovery claim to at most one row", () => {

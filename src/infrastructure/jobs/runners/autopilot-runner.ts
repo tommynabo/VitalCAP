@@ -6,6 +6,7 @@ import { listAutopilotEnabledCampaigns } from "@/infrastructure/neon/repositorie
 import { listWorkspaceIds } from "@/infrastructure/neon/repositories/workspace";
 import { getAutopilotSettings, getAutopilotPacingState, insertRebalanceDecision } from "@/infrastructure/neon/repositories/autopilot";
 import { getCampaignQueueDepth } from "@/infrastructure/neon/repositories/job-queue";
+import { getWatchdogWorkspaceSignals } from "@/infrastructure/neon/repositories/watchdog-signals";
 import { enqueueDiscoveryOrdersWithinDailyRawCap } from "@/infrastructure/neon/repositories/daily-raw-request-cap";
 import { bootstrapSearchSeeds, listSearchSeedsForCampaignEngine } from "@/infrastructure/neon/repositories/discovery";
 import { getApifyRecoverySnapshot, getGlobalSerperSpendToday, getRecentProviderUsage, getSerperRecoveryState, getTodaySpendUsd } from "@/infrastructure/neon/repositories/provider-runs";
@@ -20,6 +21,7 @@ import { SERPER_ESTIMATED_COST_PER_QUERY_USD } from "@/infrastructure/providers/
 import type { SearchSeed } from "@/domain/discovery/types";
 import { refreshWatchdogPauseForWorkspace } from "./watchdog-runner";
 import { logEvent } from "@/lib/observability/structured-logger";
+import { getDiscoveryBackpressureMultiplier, getProcessingHealthState } from "@/services/autopilot/watchdog-pause-policy";
 
 export interface AutopilotRunnerResult {
   campaignsTicked: number;
@@ -80,6 +82,34 @@ export async function runAutopilotCronTick(now: Date = new Date()): Promise<Auto
       else emergencyStoppedWorkspaces += 1;
       continue;
     }
+
+    let processingSignals;
+    let processingSignalAvailable = true;
+    try {
+      processingSignals = (await getWatchdogWorkspaceSignals(workspaceId))[0];
+      processingSignalAvailable = Boolean(processingSignals);
+    } catch {
+      processingSignalAvailable = false;
+    }
+    const processingHealthState = processingSignalAvailable
+      ? getProcessingHealthState(processingSignals!)
+      : "stalled";
+    const discoveryBackpressureMultiplier = processingSignalAvailable
+      ? getDiscoveryBackpressureMultiplier(processingSignals!)
+      : 0;
+    logEvent("info", "autopilot.processing_backpressure", {
+      correlationId: workspaceId,
+      workspaceId,
+      processingPending: processingSignals?.processingPending ?? 0,
+      processingOldPending: processingSignals?.oldProcessing ?? 0,
+      processingCompletedLast30M: processingSignals?.processingCompletedRecent ?? 0,
+      processingFailuresLast30M: processingSignals?.processingFailedRecent ?? 0,
+      processingTimedOutLast30M: processingSignals?.processingTimedOutRecent ?? 0,
+      processingDrainRatePerHour: (processingSignals?.processingCompletedRecent ?? 0) * 2,
+      processingHealthState,
+      discoveryBackpressureMultiplier,
+      watchdogPauseRequired: processingHealthState === "stalled",
+    });
 
     const campaigns = await listAutopilotEnabledCampaigns(workspaceId);
     if (!campaigns.length) continue;
@@ -144,10 +174,11 @@ export async function runAutopilotCronTick(now: Date = new Date()): Promise<Auto
     const recoveryRawNeed = apifyRecovery.recoveryProbeEligible
       ? Math.min(MAX_APIFY_RECOVERY_PROBE_RAW, pacing.rawRequestsRemaining)
       : 0;
-    const planningRawLimit = Math.min(
+    const unscaledPlanningRawLimit = Math.min(
       MAX_RAW_PER_PLANNING_WINDOW,
       Math.max(Math.ceil(pacing.rawNeededToPlan), recoveryRawNeed),
     );
+    const planningRawLimit = Math.floor(unscaledPlanningRawLimit * discoveryBackpressureMultiplier);
     const recoveryProbeOrders = planApifyRecoveryProbe({
       workspaceId,
       campaigns: concreteCampaigns,
@@ -203,7 +234,7 @@ export async function runAutopilotCronTick(now: Date = new Date()): Promise<Auto
     // keeps that engine's real source/metrics, avoiding duplicate accounts.
     const hybridDecisions = decideHybridFill({
       enabled: campaigns.some((campaign) => campaign.engineType === "hybrid_fill"),
-      rawDeficit: pacing.rawNeededToPlan,
+      rawDeficit: Math.floor(pacing.rawNeededToPlan * discoveryBackpressureMultiplier),
       candidates: concreteCampaigns.map((campaign) => {
         const capability = capabilities.find((item) => item.engineType === campaign.engineType);
         const measured = performances.find((item) => item.campaignId === campaign.id);
@@ -225,7 +256,7 @@ export async function runAutopilotCronTick(now: Date = new Date()): Promise<Auto
         const previousRebalance = new Map(orders.map((order) => [order.campaignId, order.rebalanceAmount ?? 0]));
         orders = rerouteEngineOrders({
           workspaceId, campaigns: concreteCampaigns, capabilities, performances, orders,
-          rawNeeded: pacing.rawNeededToPlan,
+          rawNeeded: Math.floor(pacing.rawNeededToPlan * discoveryBackpressureMultiplier),
           reason: decision.reason,
           now, timeZone: settings.timezone,
           fromCampaignIds: [decision.sourceCampaignId],

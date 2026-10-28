@@ -5,6 +5,7 @@ const mocks = vi.hoisted(() => ({
   unauthorizedCronResponse: vi.fn(),
   runCronRoute: vi.fn(),
   runProcessingCronTick: vi.fn(),
+  getWatchdogWorkspaceSignals: vi.fn(),
 }));
 
 vi.mock("../_lib/cron-http", () => ({
@@ -17,6 +18,9 @@ vi.mock("@/infrastructure/jobs/runners/processing-runner", () => ({
   PROCESSING_CRON_TIME_BUDGET_MS: 240_000,
   PROCESSING_MAX_JOBS_PER_TICK: 8,
   runProcessingCronTick: mocks.runProcessingCronTick,
+}));
+vi.mock("@/infrastructure/neon/repositories/watchdog-signals", () => ({
+  getWatchdogWorkspaceSignals: mocks.getWatchdogWorkspaceSignals,
 }));
 
 import type { NextRequest } from "next/server";
@@ -34,6 +38,19 @@ describe("processing cron route", () => {
       cleanupFailures: 0,
       durationMs: 100_000,
     });
+    mocks.getWatchdogWorkspaceSignals.mockResolvedValue([{
+      oldDueDiscovery: 0,
+      deferredDiscovery: 0,
+      oldProcessing: 0,
+      staleDiscoveryLocks: 0,
+      staleProcessingLocks: 0,
+      manualReconciliations: 0,
+      processingPending: 0,
+      processingCompletedRecent: 0,
+      processingFailedRecent: 0,
+      processingTimedOutRecent: 0,
+      processingEnqueuedRecent: 0,
+    }]);
     mocks.runCronRoute.mockImplementation(async (_route: string, work: () => Promise<unknown>) => {
       await work();
       return new Response(null, { status: 200 });
@@ -51,6 +68,27 @@ describe("processing cron route", () => {
     expect(response.status).toBe(200);
     expect(mocks.runCronRoute).toHaveBeenCalledWith("process", expect.any(Function));
     expect(mocks.runProcessingCronTick).toHaveBeenCalledWith(8, expect.any(Date), expect.objectContaining({ timeBudgetMs: 240_000, correlationId: expect.any(String) }));
+  });
+
+  it("raises processing capacity to the hard cap only for a large healthy draining queue", async () => {
+    mocks.getWatchdogWorkspaceSignals.mockResolvedValue([{
+      oldDueDiscovery: 0,
+      deferredDiscovery: 0,
+      oldProcessing: 170,
+      staleDiscoveryLocks: 0,
+      staleProcessingLocks: 0,
+      manualReconciliations: 0,
+      processingPending: 170,
+      processingCompletedRecent: 40,
+      processingFailedRecent: 0,
+      processingTimedOutRecent: 0,
+      processingEnqueuedRecent: 0,
+    }]);
+
+    const response = await GET({} as unknown as NextRequest);
+
+    expect(response.status).toBe(200);
+    expect(mocks.runProcessingCronTick).toHaveBeenCalledWith(16, expect.any(Date), expect.objectContaining({ timeBudgetMs: 240_000 }));
   });
 
   it("returns a generic failure when the processing work throws", async () => {

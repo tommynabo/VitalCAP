@@ -15,6 +15,11 @@ import { getSystemHealthDiagnostics, type SystemHealthDiagnostics } from "@/infr
 import type { EngineType } from "@/domain/campaigns/types";
 import type { ProviderHealthSnapshot } from "@/services/discovery/provider-health";
 import { aggregateProviderHealthSnapshots, buildProviderHealthSnapshot, evaluateProviderHealth, hasUnavailableRequiredDiscoveryProvider } from "@/services/discovery/provider-health";
+import {
+  getAdaptiveProcessingMaxJobs,
+  getDiscoveryBackpressureMultiplier,
+  getProcessingHealthState,
+} from "@/services/autopilot/watchdog-pause-policy";
 
 export const dynamic = "force-dynamic";
 
@@ -60,6 +65,25 @@ function aggregateSystemDiagnostics(items: SystemHealthDiagnostics[]): SystemHea
   const pauseReasons = new Set(items.map((item) => item.systemPauseReason).filter((reason) => reason !== null));
   const queueTotal = (key: keyof SystemHealthDiagnostics["queue"]) =>
     items.reduce((sum, item) => sum + item.queue[key], 0);
+  const processingTotal = (key: "pending" | "oldPending" | "completedRecent" | "failedRecent" | "timedOutRecent" | "enqueuedRecent") =>
+    items.reduce((sum, item) => sum + item.processing[key], 0);
+  const processingSignals = {
+    oldDueDiscovery: queueTotal("duePendingDiscovery"),
+    deferredDiscovery: queueTotal("deferredDiscovery"),
+    oldProcessing: processingTotal("oldPending"),
+    staleDiscoveryLocks: queueTotal("discoveryStaleLocks"),
+    staleProcessingLocks: queueTotal("processingStaleLocks"),
+    manualReconciliations: queueTotal("manualProviderReconciliations"),
+    processingPending: processingTotal("pending"),
+    processingCompletedRecent: processingTotal("completedRecent"),
+    processingFailedRecent: processingTotal("failedRecent"),
+    processingTimedOutRecent: processingTotal("timedOutRecent"),
+    processingEnqueuedRecent: processingTotal("enqueuedRecent"),
+  };
+  const processingHealthState = getProcessingHealthState(processingSignals);
+  const queuePausedWorkspaces = items.filter((item) =>
+    item.systemPaused && item.systemPauseReason === "queue_health",
+  );
 
   return {
     providers: { apify: aggregateProvider("apify"), serper: aggregateProvider("serper") },
@@ -75,6 +99,25 @@ function aggregateSystemDiagnostics(items: SystemHealthDiagnostics[]): SystemHea
       processingProcessing: queueTotal("processingProcessing"),
       processingStaleLocks: queueTotal("processingStaleLocks"),
       manualProviderReconciliations: queueTotal("manualProviderReconciliations"),
+    },
+    processing: {
+      pending: processingSignals.processingPending ?? 0,
+      oldPending: processingSignals.oldProcessing,
+      oldestAgeMinutes: items.reduce<number | null>((maxAge, item) =>
+        item.processing.oldestAgeMinutes === null
+          ? maxAge
+          : Math.max(maxAge ?? 0, item.processing.oldestAgeMinutes), null),
+      completedRecent: processingSignals.processingCompletedRecent ?? 0,
+      failedRecent: processingSignals.processingFailedRecent ?? 0,
+      timedOutRecent: processingSignals.processingTimedOutRecent ?? 0,
+      enqueuedRecent: processingSignals.processingEnqueuedRecent ?? 0,
+      drainRatePerHour: (processingSignals.processingCompletedRecent ?? 0) * 2,
+      adaptiveMaxJobs: getAdaptiveProcessingMaxJobs(processingSignals),
+      discoveryBackpressureMultiplier: getDiscoveryBackpressureMultiplier(processingSignals),
+      healthState: processingHealthState,
+      watchdogPauseRequired: processingHealthState === "stalled",
+      watchdogAutoResumeEligible: queuePausedWorkspaces.length > 0
+        && queuePausedWorkspaces.every((item) => item.processing.watchdogAutoResumeEligible),
     },
   };
 }
@@ -302,6 +345,21 @@ export async function GET() {
       processingProcessing: 0,
       processingStaleLocks: 0,
       manualProviderReconciliations: 0,
+    },
+    processing: diagnostics?.processing ?? {
+      pending: 0,
+      oldPending: 0,
+      oldestAgeMinutes: null,
+      completedRecent: 0,
+      failedRecent: 0,
+      timedOutRecent: 0,
+      enqueuedRecent: 0,
+      drainRatePerHour: 0,
+      adaptiveMaxJobs: 8,
+      discoveryBackpressureMultiplier: 1,
+      healthState: "healthy",
+      watchdogPauseRequired: false,
+      watchdogAutoResumeEligible: false,
     },
     intelligence: {
       provider: intelEnv?.LLM_PROVIDER || process.env.LLM_PROVIDER || "disabled",

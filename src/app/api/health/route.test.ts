@@ -66,12 +66,28 @@ function diagnostics(overrides: Record<string, unknown> = {}) {
     systemPaused: false,
     systemPauseReason: null,
     queue: emptyQueue,
+    processing: {
+      pending: 0,
+      oldPending: 0,
+      oldestAgeMinutes: null,
+      completedRecent: 0,
+      failedRecent: 0,
+      timedOutRecent: 0,
+      enqueuedRecent: 0,
+      drainRatePerHour: 0,
+      adaptiveMaxJobs: 8,
+      discoveryBackpressureMultiplier: 1,
+      healthState: "healthy",
+      watchdogPauseRequired: false,
+      watchdogAutoResumeEligible: false,
+    },
   };
   return {
     ...defaults,
     ...overrides,
     providers: { ...defaults.providers, ...(overrides.providers as object ?? {}) },
     queue: { ...defaults.queue, ...(overrides.queue as object ?? {}) },
+    processing: { ...defaults.processing, ...(overrides.processing as object ?? {}) },
   };
 }
 
@@ -327,7 +343,26 @@ describe("GET /api/health", () => {
       running: { engineTypes: ["maps_fast"] },
       paused: {
         engineTypes: ["google_serp"],
-        diagnostics: diagnostics({ autopilotEffectiveState: "system_paused", systemPaused: true, systemPauseReason: "queue_health" }),
+        diagnostics: diagnostics({
+          autopilotEffectiveState: "system_paused",
+          systemPaused: true,
+          systemPauseReason: "queue_health",
+          processing: {
+            pending: 90,
+            oldPending: 2,
+            oldestAgeMinutes: 45,
+            completedRecent: 12,
+            failedRecent: 0,
+            timedOutRecent: 0,
+            enqueuedRecent: 10,
+            drainRatePerHour: 24,
+            adaptiveMaxJobs: 8,
+            discoveryBackpressureMultiplier: 0.75,
+            healthState: "healthy_draining",
+            watchdogPauseRequired: false,
+            watchdogAutoResumeEligible: true,
+          },
+        }),
       },
     });
 
@@ -338,6 +373,7 @@ describe("GET /api/health", () => {
       autopilotEffectiveState: "system_paused",
       systemPaused: true,
       pausedOperationalWorkspaceCount: 1,
+      processing: { pending: 90, oldPending: 2, oldestAgeMinutes: 45, completedRecent: 12, watchdogAutoResumeEligible: true },
     });
   });
 
@@ -545,11 +581,17 @@ describe("GET /api/health", () => {
     configureWorkspaces({
       "workspace-a": {
         engineTypes: ["maps_fast"],
-        diagnostics: diagnostics({ queue: { duePendingDiscovery: 2, deferredDiscovery: 3, discoveryProcessing: 4, discoveryStaleLocks: 1, processingPending: 5, processingProcessing: 6, processingStaleLocks: 2, manualProviderReconciliations: 3 } }),
+        diagnostics: diagnostics({
+          queue: { duePendingDiscovery: 2, deferredDiscovery: 3, discoveryProcessing: 4, discoveryStaleLocks: 1, processingPending: 5, processingProcessing: 6, processingStaleLocks: 2, manualProviderReconciliations: 3 },
+          processing: { pending: 5, oldPending: 2, oldestAgeMinutes: 40, completedRecent: 4, failedRecent: 0, timedOutRecent: 0, enqueuedRecent: 5 },
+        }),
       },
       "workspace-b": {
         engineTypes: ["maps_fast"],
-        diagnostics: diagnostics({ queue: { duePendingDiscovery: 7, deferredDiscovery: 8, discoveryProcessing: 9, discoveryStaleLocks: 4, processingPending: 10, processingProcessing: 11, processingStaleLocks: 5, manualProviderReconciliations: 6 } }),
+        diagnostics: diagnostics({
+          queue: { duePendingDiscovery: 7, deferredDiscovery: 8, discoveryProcessing: 9, discoveryStaleLocks: 4, processingPending: 10, processingProcessing: 11, processingStaleLocks: 5, manualProviderReconciliations: 6 },
+          processing: { pending: 10, oldPending: 5, oldestAgeMinutes: 55, completedRecent: 6, failedRecent: 1, timedOutRecent: 0, enqueuedRecent: 8 },
+        }),
       },
     });
 
@@ -566,5 +608,15 @@ describe("GET /api/health", () => {
       manualProviderReconciliations: 9,
     });
     expect(body.status).toBe("degraded");
+    expect(body.processing).toMatchObject({
+      pending: 15,
+      oldPending: 7,
+      oldestAgeMinutes: 55,
+      completedRecent: 10,
+      failedRecent: 1,
+      drainRatePerHour: 20,
+      adaptiveMaxJobs: 8,
+      healthState: "stalled",
+    });
   });
 });

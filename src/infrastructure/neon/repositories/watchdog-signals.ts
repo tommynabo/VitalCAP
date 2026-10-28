@@ -131,6 +131,21 @@ export function buildWatchdogWorkspaceSignalsQuery(workspaceId?: string) {
     AND (pj.next_attempt_at IS NULL OR pj.next_attempt_at <= NOW())
     AND pj.created_at < NOW() - INTERVAL '30 minutes'
   `;
+  const recentProcessingFailure = sql`
+    pj.updated_at >= NOW() - INTERVAL '30 minutes'
+    AND pj.status IN ('pending', 'dead_letter')
+    AND pj.last_error IS NOT NULL
+    AND pj.last_error NOT ILIKE '%budget%'
+    AND pj.last_error NOT ILIKE '%raw request cap%'
+  `;
+  const recentProcessingTimeout = sql`
+    ${recentProcessingFailure}
+    AND (
+      pj.last_error ILIKE '%PROCESSING_JOB_TIMEOUT%'
+      OR pj.last_error ILIKE '%Processing job exceeded%'
+      OR pj.last_error ILIKE '%Processing cron work exceeded%'
+    )
+  `;
   const staleLockMinutes = STALE_JOB_LOCK_THRESHOLD_MS / 60_000;
   const staleDiscoveryLock = sql`
     dj.status = 'processing'
@@ -159,8 +174,15 @@ export function buildWatchdogWorkspaceSignalsQuery(workspaceId?: string) {
     ),
     processing_health AS (
       SELECT c.workspace_id,
+        COUNT(*) FILTER (WHERE pj.status = 'pending'
+          AND (pj.next_attempt_at IS NULL OR pj.next_attempt_at <= NOW()))::int AS processing_pending,
         COUNT(*) FILTER (WHERE ${oldProcessing})::int AS old_processing,
         MIN(pj.created_at) FILTER (WHERE ${oldProcessing}) AS oldest_processing_at,
+        COUNT(*) FILTER (WHERE pj.status = 'completed'
+          AND pj.updated_at >= NOW() - INTERVAL '30 minutes')::int AS processing_completed_recent,
+        COUNT(*) FILTER (WHERE ${recentProcessingFailure})::int AS processing_failed_recent,
+        COUNT(*) FILTER (WHERE ${recentProcessingTimeout})::int AS processing_timed_out_recent,
+        COUNT(*) FILTER (WHERE pj.created_at >= NOW() - INTERVAL '30 minutes')::int AS processing_enqueued_recent,
         COUNT(*) FILTER (WHERE ${staleProcessingLock})::int AS stale_processing_locks
       FROM processing_jobs pj
       JOIN campaigns c ON c.id = pj.campaign_id
@@ -176,6 +198,11 @@ export function buildWatchdogWorkspaceSignalsQuery(workspaceId?: string) {
         COALESCE(dh.stale_discovery_locks, 0)::int AS stale_discovery_locks,
         COALESCE(ph.old_processing, 0)::int AS old_processing,
         ph.oldest_processing_at,
+        COALESCE(ph.processing_pending, 0)::int AS processing_pending,
+        COALESCE(ph.processing_completed_recent, 0)::int AS processing_completed_recent,
+        COALESCE(ph.processing_failed_recent, 0)::int AS processing_failed_recent,
+        COALESCE(ph.processing_timed_out_recent, 0)::int AS processing_timed_out_recent,
+        COALESCE(ph.processing_enqueued_recent, 0)::int AS processing_enqueued_recent,
         COALESCE(ph.stale_processing_locks, 0)::int AS stale_processing_locks,
         (SELECT COUNT(*) FROM provider_runs pr
           WHERE pr.workspace_id = w.id AND pr.status = 'manual_reconciliation_required')::int AS provider_reconciliations
@@ -216,6 +243,11 @@ export async function getWatchdogWorkspaceSignals(workspaceId?: string): Promise
     oldDueDiscovery: toCount(row.old_due_discovery),
     deferredDiscovery: toCount(row.deferred_discovery),
     oldProcessing: toCount(row.old_processing),
+    processingPending: toCount(row.processing_pending),
+    processingCompletedRecent: toCount(row.processing_completed_recent),
+    processingFailedRecent: toCount(row.processing_failed_recent),
+    processingTimedOutRecent: toCount(row.processing_timed_out_recent),
+    processingEnqueuedRecent: toCount(row.processing_enqueued_recent),
     staleDiscoveryLocks: toCount(row.stale_discovery_locks),
     staleProcessingLocks: toCount(row.stale_processing_locks),
     manualReconciliations: toCount(row.provider_reconciliations),
