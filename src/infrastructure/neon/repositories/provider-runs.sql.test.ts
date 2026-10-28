@@ -43,6 +43,7 @@ describe("Apify provider run reservation SQL", () => {
       seedId: "00000000-0000-0000-0000-000000000003",
       itemsRequested: 10,
       costUsd: 0.01,
+      dailyCostLimitUsd: 0.5,
       metadata: { engineType: "google_serp", discoveryJobId: "00000000-0000-0000-0000-000000000004" },
     }, 1523, new Date("2026-10-19T12:00:00.000Z")));
 
@@ -50,8 +51,11 @@ describe("Apify provider run reservation SQL", () => {
     expect(query.sql).toContain("provider_requests_by_discovery_job run");
     expect(query.sql).toContain("WHERE run.discovery_job_id = job.id::text");
     expect(query.sql).not.toContain("concurrent_apify_run_count");
+    expect(query.sql).toContain("cost_safety.spent_today +");
+    expect(query.sql).toContain("provider = 'serper'");
     expect(query.sql).toContain("ON CONFLICT (request_key) WHERE request_key IS NOT NULL DO NOTHING");
     expect(query.params).toContain(1523);
+    expect(query.params).toContain(0.5);
     expect(query.params).toContain("00000000-0000-0000-0000-000000000004");
   });
 

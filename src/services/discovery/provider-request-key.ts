@@ -7,6 +7,10 @@ export interface ProviderRequestIdentity {
   provider: string;
   query: string;
   planningWindow: string;
+  purpose?: string;
+  country?: string;
+  language?: string;
+  maxResults?: number;
 }
 
 export function normalizeProviderQuery(query: string): string {
@@ -31,6 +35,10 @@ export function createProviderRequestKey(identity: ProviderRequestIdentity): str
     identity.provider,
     normalizeProviderQuery(identity.query),
     identity.planningWindow,
+    identity.purpose ?? null,
+    identity.country ?? null,
+    identity.language ?? null,
+    identity.maxResults ?? null,
   ];
   const digest = createHash("sha256").update(JSON.stringify(normalizedIdentity)).digest("hex");
   return `${identity.provider}:${digest}`;

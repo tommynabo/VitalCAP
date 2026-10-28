@@ -2,12 +2,13 @@ import { and, asc, desc, eq, gte, inArray, sql } from "drizzle-orm";
 import { getDayBounds } from "@/lib/time/day-bounds";
 import { getDb } from "../db";
 import { buildDailyRawRequestCommitmentCtes, executeUnderGlobalDailyRawCapLock } from "./daily-raw-request-cap";
-import { discoveryJobs } from "../schema/discovery";
+import { discoveryJobs, rawCandidates } from "../schema/discovery";
 import { providerRuns } from "../schema/providers";
 import type { ProviderUsageStats } from "@/domain/providers/types";
 import { ProviderBudgetExceededError, ProviderFailureError, ProviderSafetyError } from "@/domain/providers/errors";
 import { createApifyConfigurationFingerprint, createApifyCredentialFingerprint, evaluateApifyRecovery, hasCurrentCredentialRecoveryProbeInFlight, resolveApifyRecoveryCredentialFingerprint, type ApifyRecoveryRun } from "@/services/discovery/provider-health";
 import { getCoreEnv, getMapsEnv } from "@/lib/config/env";
+import { SERPER_ESTIMATED_COST_PER_QUERY_USD } from "@/infrastructure/providers/serp/serper-provider";
 
 export interface RecordProviderRunInput {
   workspaceId: string;
@@ -37,8 +38,53 @@ export interface ReserveSerperProviderRunInput {
   seedId?: string | null;
   itemsRequested: number;
   costUsd: number;
+  dailyCostLimitUsd: number;
   metadata: Record<string, unknown>;
   timeZone?: string;
+}
+
+export interface SerperRecoveryState {
+  allocationPaused: boolean;
+  recoveryProbeEligible: boolean;
+  nextRecoveryAttemptAt: Date | null;
+  lastFailureAt: Date | null;
+  recoveredAt: Date | null;
+}
+
+export interface SerperPurposeUsageDiagnostics {
+  queriesToday: number;
+  successfulQueriesToday: number;
+  estimatedBillableAttemptsToday: number;
+  spendTodayUsd: number;
+  providerResultsToday: number;
+  queriesRolling30Days: number;
+  successfulQueriesRolling30Days: number;
+  rolling30DaySpendUsd: number;
+}
+
+export interface SerperCostDiagnostics {
+  dailyCapUsd: number;
+  spendTodayUsd: number;
+  budgetRemainingUsd: number;
+  projected15DayMaxSpendUsd: number;
+  projected30DayMaxSpendUsd: number;
+  rolling30DaySpendUsd: number;
+  rollingAverageDailySpendUsd: number;
+  projectedBalanceLifetimeDays: number | null;
+  operatorProvidedBalanceUsd: number | null;
+  estimatedBillableAttemptsToday: number;
+  estimatedMaxDailyAttempts: number;
+  purposes: Record<string, SerperPurposeUsageDiagnostics>;
+  mapsFastRecovery: {
+    attempts: number;
+    succeeded: number;
+    recoveredWithEmail: number;
+    recoveredValidEmails: number | null;
+    recoveredImports: number | null;
+    costPerRecoveredWebsiteUsd: number | null;
+    costPerValidEmailUsd: number | null;
+    costPerConfirmedImportUsd: number | null;
+  };
 }
 
 export async function reserveSerperProviderRun(input: ReserveSerperProviderRunInput): Promise<{ providerRun: typeof providerRuns.$inferSelect; created: boolean }> {
@@ -48,6 +94,7 @@ export async function reserveSerperProviderRun(input: ReserveSerperProviderRunIn
   const [row] = await executeUnderGlobalDailyRawCapLock(buildReserveSerperProviderRunQuery(input, maxRequests, now)) as Array<{
     inserted_row: unknown;
     safety_row: { committed_raw_requests: number; additional_raw_requests: number } | null;
+    serper_spent_today: number;
     existing_row: unknown;
   }>;
   if (row?.inserted_row || row?.existing_row) {
@@ -60,11 +107,16 @@ export async function reserveSerperProviderRun(input: ReserveSerperProviderRunIn
     const retryAt = getDayBounds(input.timeZone ?? "Europe/Madrid", now).end;
     throw new ProviderBudgetExceededError("Provider reservation is blocked by the daily raw request cap.", retryAt, "raw_request_cap");
   }
+  if (row && Number(row.serper_spent_today) + input.costUsd > input.dailyCostLimitUsd) {
+    const retryAt = getDayBounds(input.timeZone ?? "Europe/Madrid", now).end;
+    throw new ProviderBudgetExceededError("Serper reservation is blocked by the daily cost limit.", retryAt);
+  }
   throw new Error(`Unable to reserve Serper provider run ${input.requestKey}.`);
 }
 
 export function buildReserveSerperProviderRunQuery(input: ReserveSerperProviderRunInput, maxRequests: number, now: Date) {
   const discoveryJobId = typeof input.metadata.discoveryJobId === "string" ? input.metadata.discoveryJobId : "";
+  const { start, end } = getDayBounds("UTC", now);
   return sql`
     WITH ${buildDailyRawRequestCommitmentCtes(now)},
     raw_safety AS (
@@ -88,6 +140,13 @@ export function buildReserveSerperProviderRunQuery(input: ReserveSerperProviderR
         GREATEST(${input.itemsRequested} - job_unrepresented_raw_requests, 0)::int AS additional_raw_requests
       FROM raw_safety
     ),
+    cost_safety AS (
+      SELECT COALESCE(SUM(cost_usd), 0)::numeric AS spent_today
+      FROM provider_runs
+      WHERE provider = 'serper'
+        AND started_at >= ${start}
+        AND started_at < ${end}
+    ),
     inserted AS (
       INSERT INTO provider_runs (
         workspace_id, campaign_id, provider, operation, request_key, seed_id, status,
@@ -96,14 +155,16 @@ export function buildReserveSerperProviderRunQuery(input: ReserveSerperProviderR
       SELECT ${input.workspaceId}::uuid, ${input.campaignId}::uuid, 'serper', 'search',
         ${input.requestKey}, ${input.seedId ?? null}::uuid, 'starting', ${input.itemsRequested},
         0, ${input.costUsd}, ${JSON.stringify(input.metadata)}::jsonb
-      FROM safety
+      FROM safety, cost_safety
       WHERE safety.committed_raw_requests + safety.additional_raw_requests <= ${maxRequests}
+        AND cost_safety.spent_today + ${input.costUsd} <= ${input.dailyCostLimitUsd}
       ON CONFLICT (request_key) WHERE request_key IS NOT NULL DO NOTHING
       RETURNING *
     )
     SELECT
       (SELECT row_to_json(inserted.*) FROM inserted) AS inserted_row,
       (SELECT row_to_json(safety.*) FROM safety) AS safety_row,
+      (SELECT spent_today FROM cost_safety) AS serper_spent_today,
       (SELECT row_to_json(existing.*) FROM provider_runs existing WHERE existing.request_key = ${input.requestKey}) AS existing_row
   `;
 }
@@ -716,10 +777,199 @@ export async function getTodaySpendUsd(workspaceId: string, provider: string, ti
   return row?.total ?? 0;
 }
 
-/** Real `provider_runs` rows from the last `sinceHours`, folded into `evaluateProviderHealth`'s `ProviderUsageStats` shape (Gate E autopilot cron — feeds real per-engine provider health into `runAutopilotTick`, replacing the previously-hardcoded `"unknown"`). */
-export async function getRecentProviderUsage(workspaceId: string, provider: string, sinceHours = 24): Promise<ProviderUsageStats> {
+export async function getSerperSpendByPurpose(purpose: string, now = new Date(), excludeRequestKey?: string): Promise<number> {
   const db = getDb();
-  const since = new Date(Date.now() - sinceHours * 60 * 60 * 1000);
+  const { start, end } = getDayBounds("UTC", now);
+  const [row] = await db.select({ total: sql<number>`COALESCE(SUM(${providerRuns.costUsd}), 0)` })
+    .from(providerRuns)
+    .where(and(
+      eq(providerRuns.provider, "serper"),
+      gte(providerRuns.startedAt, start),
+      sql`${providerRuns.startedAt} < ${end}`,
+      sql`${providerRuns.metadata}->>'purpose' = ${purpose}`,
+      ...(excludeRequestKey ? [sql`${providerRuns.requestKey} IS DISTINCT FROM ${excludeRequestKey}`] : []),
+    ));
+  return row?.total ?? 0;
+}
+
+export async function getSerperRecoveryState(now = new Date()): Promise<SerperRecoveryState> {
+  const db = getDb();
+  const rows = await db.select({ status: providerRuns.status, purpose: sql<string | null>`${providerRuns.metadata}->>'purpose'`, startedAt: providerRuns.startedAt, finishedAt: providerRuns.finishedAt })
+    .from(providerRuns)
+    .where(and(
+      eq(providerRuns.provider, "serper"),
+      sql`(${providerRuns.metadata}->>'failureKind' = 'billing' OR (${providerRuns.metadata}->>'purpose' = 'recovery_probe' AND ${providerRuns.status} <> 'budget_blocked'))`,
+    ))
+    .orderBy(desc(providerRuns.startedAt))
+    .limit(1);
+  const latest = rows[0];
+  if (!latest || (latest.purpose === "recovery_probe" && latest.status === "completed")) {
+    return {
+      allocationPaused: false,
+      recoveryProbeEligible: false,
+      nextRecoveryAttemptAt: null,
+      lastFailureAt: null,
+      recoveredAt: latest?.finishedAt ?? latest?.startedAt ?? null,
+    };
+  }
+
+  const lastFailureAt = latest.finishedAt ?? latest.startedAt;
+  const nextRecoveryAttemptAt = new Date(lastFailureAt.getTime() + 60 * 60 * 1000);
+  return {
+    allocationPaused: true,
+    recoveryProbeEligible: now >= nextRecoveryAttemptAt,
+    nextRecoveryAttemptAt,
+    lastFailureAt,
+    recoveredAt: null,
+  };
+}
+
+export async function getGlobalSerperSpendToday(now = new Date(), excludeRequestKey?: string): Promise<number> {
+  const db = getDb();
+  const { start, end } = getDayBounds("UTC", now);
+  const [row] = await db.select({ total: sql<number>`COALESCE(SUM(${providerRuns.costUsd}), 0)` })
+    .from(providerRuns)
+    .where(and(
+      eq(providerRuns.provider, "serper"),
+      gte(providerRuns.startedAt, start),
+      sql`${providerRuns.startedAt} < ${end}`,
+      ...(excludeRequestKey ? [sql`${providerRuns.requestKey} IS DISTINCT FROM ${excludeRequestKey}`] : []),
+    ));
+  return row?.total ?? 0;
+}
+
+export async function getSerperCostDiagnostics(input: {
+  dailyCapUsd: number;
+  operatorProvidedBalanceUsd?: number;
+  now?: Date;
+}): Promise<SerperCostDiagnostics> {
+  const db = getDb();
+  const now = input.now ?? new Date();
+  const today = getDayBounds("UTC", now);
+  const rollingStart = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+  const rows = await db.select({
+    status: providerRuns.status,
+    startedAt: providerRuns.startedAt,
+    costUsd: providerRuns.costUsd,
+    itemsReturned: providerRuns.itemsReturned,
+    metadata: providerRuns.metadata,
+  }).from(providerRuns).where(and(
+    eq(providerRuns.provider, "serper"),
+    gte(providerRuns.startedAt, rollingStart),
+  ));
+  const recoveryCandidates = await db.select({ processingMetrics: rawCandidates.processingMetrics })
+    .from(rawCandidates)
+    .where(and(
+      eq(rawCandidates.engineType, "maps_fast"),
+      gte(rawCandidates.discoveredAt, rollingStart),
+      sql`${rawCandidates.processingMetrics}->>'websiteRecoveryProvider' = 'serper'`,
+    ));
+
+  const purposeNames = [
+    "google_serp_discovery",
+    "linkedin_owner_discovery",
+    "maps_fast_website_recovery",
+    "maps_deep_enrichment",
+    "recovery_probe",
+  ];
+  const purposes = Object.fromEntries(purposeNames.map((purpose) => [purpose, {
+    queriesToday: 0,
+    successfulQueriesToday: 0,
+    estimatedBillableAttemptsToday: 0,
+    spendTodayUsd: 0,
+    providerResultsToday: 0,
+    queriesRolling30Days: 0,
+    successfulQueriesRolling30Days: 0,
+    rolling30DaySpendUsd: 0,
+  }])) as Record<string, SerperPurposeUsageDiagnostics>;
+  let spendTodayUsd = 0;
+  let rolling30DaySpendUsd = 0;
+  let estimatedBillableAttemptsToday = 0;
+  let recoveryAttempts = 0;
+  let recoveredWebsites = 0;
+  let recoveredWithEmail = 0;
+  let recoveredValidEmails = 0;
+  let recoveredImports = 0;
+  let validEmailAttributionComplete = true;
+  let importAttributionComplete = true;
+
+  for (const candidate of recoveryCandidates) {
+    const metrics = candidate.processingMetrics as Record<string, unknown> | null;
+    if (!metrics || metrics.websiteRecoveryProvider !== "serper") continue;
+    recoveryAttempts += Number(metrics.websiteRecoveryAttempted ?? 0);
+    if (Number(metrics.websiteRecoverySucceeded ?? 0) <= 0) continue;
+    recoveredWebsites += 1;
+    if (metrics.websiteEmailAttributionComplete === true && Number(metrics.websiteEmailsFound ?? 0) > 0) recoveredWithEmail += 1;
+    if (typeof metrics.websiteValidEmails === "number") recoveredValidEmails += metrics.websiteValidEmails;
+    else validEmailAttributionComplete = false;
+    if (typeof metrics.websiteImported === "number") recoveredImports += metrics.websiteImported;
+    else importAttributionComplete = false;
+  }
+
+  for (const row of rows) {
+    const costUsd = Number(row.costUsd ?? 0);
+    const startedAt = row.startedAt instanceof Date ? row.startedAt : new Date(row.startedAt);
+    const metadata = row.metadata as Record<string, unknown>;
+    const purpose = typeof metadata.purpose === "string" ? metadata.purpose : "unknown";
+    const calls = Number(metadata.httpAttempts ?? (costUsd > 0 ? Math.ceil(costUsd / SERPER_ESTIMATED_COST_PER_QUERY_USD) : 0));
+    rolling30DaySpendUsd += costUsd;
+    if (purpose in purposes) {
+      const usage = purposes[purpose]!;
+      usage.rolling30DaySpendUsd += costUsd;
+      if (row.status !== "budget_blocked") usage.queriesRolling30Days += 1;
+      if (row.status === "completed") usage.successfulQueriesRolling30Days += 1;
+    }
+    if (startedAt < today.start || startedAt >= today.end) continue;
+
+    spendTodayUsd += costUsd;
+    estimatedBillableAttemptsToday += Number.isFinite(calls) ? calls : 0;
+    if (purpose in purposes) {
+      const usage = purposes[purpose]!;
+      if (row.status !== "budget_blocked") usage.queriesToday += 1;
+      if (row.status === "completed") usage.successfulQueriesToday += 1;
+      usage.estimatedBillableAttemptsToday += Number.isFinite(calls) ? calls : 0;
+      usage.spendTodayUsd += costUsd;
+      usage.providerResultsToday += row.itemsReturned;
+    }
+  }
+
+  const rollingAverageDailySpendUsd = rolling30DaySpendUsd / 30;
+  const operatorProvidedBalanceUsd = input.operatorProvidedBalanceUsd ?? null;
+  const projectedDailySpendUsd = rollingAverageDailySpendUsd > 0 ? rollingAverageDailySpendUsd : input.dailyCapUsd;
+  const mapsRecoveryCostUsd = purposes.maps_fast_website_recovery!.rolling30DaySpendUsd;
+  return {
+    dailyCapUsd: input.dailyCapUsd,
+    spendTodayUsd,
+    budgetRemainingUsd: Math.max(0, input.dailyCapUsd - spendTodayUsd),
+    projected15DayMaxSpendUsd: input.dailyCapUsd * 15,
+    projected30DayMaxSpendUsd: input.dailyCapUsd * 30,
+    rolling30DaySpendUsd,
+    rollingAverageDailySpendUsd,
+    projectedBalanceLifetimeDays: operatorProvidedBalanceUsd === null || projectedDailySpendUsd <= 0
+      ? null
+      : operatorProvidedBalanceUsd / projectedDailySpendUsd,
+    operatorProvidedBalanceUsd,
+    estimatedBillableAttemptsToday,
+    estimatedMaxDailyAttempts: Math.floor(input.dailyCapUsd / SERPER_ESTIMATED_COST_PER_QUERY_USD),
+    purposes,
+    mapsFastRecovery: {
+      attempts: recoveryAttempts,
+      succeeded: recoveredWebsites,
+      recoveredWithEmail,
+      recoveredValidEmails: validEmailAttributionComplete ? recoveredValidEmails : null,
+      recoveredImports: importAttributionComplete ? recoveredImports : null,
+      costPerRecoveredWebsiteUsd: recoveredWebsites > 0 ? mapsRecoveryCostUsd / recoveredWebsites : null,
+      costPerValidEmailUsd: validEmailAttributionComplete && recoveredValidEmails > 0 ? mapsRecoveryCostUsd / recoveredValidEmails : null,
+      costPerConfirmedImportUsd: importAttributionComplete && recoveredImports > 0 ? mapsRecoveryCostUsd / recoveredImports : null,
+    },
+  };
+}
+
+/** Real `provider_runs` rows from the last `sinceHours`, folded into `evaluateProviderHealth`'s `ProviderUsageStats` shape (Gate E autopilot cron — feeds real per-engine provider health into `runAutopilotTick`, replacing the previously-hardcoded `"unknown"`). */
+export async function getRecentProviderUsage(workspaceId: string, provider: string, sinceHours = 24, after?: Date | null): Promise<ProviderUsageStats> {
+  const db = getDb();
+  const rollingSince = new Date(Date.now() - sinceHours * 60 * 60 * 1000);
+  const since = after && after > rollingSince ? after : rollingSince;
   const rows = await db
     .select({ status: providerRuns.status, itemsReturned: providerRuns.itemsReturned, costUsd: providerRuns.costUsd })
     .from(providerRuns)

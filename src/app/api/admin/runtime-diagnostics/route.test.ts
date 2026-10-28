@@ -2,6 +2,9 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const {
   getApifyRecoverySnapshot,
+  getSerperRecoveryState,
+  getSerperCostDiagnostics,
+  getRecentProviderUsage,
   getApifyDailyEconomicTotals,
   getCurrentWorkspaceId,
   getDb,
@@ -16,6 +19,9 @@ const {
   requireCurrentUser,
 } = vi.hoisted(() => ({
   getApifyRecoverySnapshot: vi.fn(),
+  getSerperRecoveryState: vi.fn(),
+  getSerperCostDiagnostics: vi.fn(),
+  getRecentProviderUsage: vi.fn(),
   getApifyDailyEconomicTotals: vi.fn(),
   getCurrentWorkspaceId: vi.fn(),
   getDb: vi.fn(),
@@ -37,7 +43,7 @@ vi.mock("@/infrastructure/neon/schema/autopilot", () => ({
   autopilotSettings: { enabled: {}, systemPaused: {}, systemPauseReason: {}, systemPausedAt: {}, emergencyStopped: {}, globalDailyTarget: {}, targetMetric: {}, timezone: {} },
 }));
 vi.mock("@/infrastructure/neon/repositories/workspace", () => ({ getWorkspaceRole }));
-vi.mock("@/infrastructure/neon/repositories/provider-runs", () => ({ getApifyRecoverySnapshot }));
+vi.mock("@/infrastructure/neon/repositories/provider-runs", () => ({ getApifyRecoverySnapshot, getSerperRecoveryState, getSerperCostDiagnostics, getRecentProviderUsage }));
 vi.mock("@/infrastructure/neon/repositories/discovery", () => ({ getApifyDailyEconomicTotals, getSeedEconomicPerformance, listSearchSeedsForCampaignEngine }));
 vi.mock("@/infrastructure/neon/repositories/autopilot", () => ({ getAutopilotPacingState }));
 vi.mock("@/infrastructure/neon/repositories/health-diagnostics", () => ({ getSystemHealthDiagnostics }));
@@ -79,6 +85,32 @@ describe("GET /api/admin/runtime-diagnostics recovery errors", () => {
       credentialChangedSinceLatestFailure: true,
       usage: { calls: 0, errors: 0, items: 0, costUsd: 0, totalLatencyMs: 0, quotaRemaining: null },
     });
+    getSerperRecoveryState.mockResolvedValue({ allocationPaused: false, recoveryProbeEligible: false, nextRecoveryAttemptAt: null, lastFailureAt: null, recoveredAt: null });
+    getSerperCostDiagnostics.mockResolvedValue({
+      dailyCapUsd: 0.5,
+      spendTodayUsd: 0,
+      budgetRemainingUsd: 0.5,
+      projected15DayMaxSpendUsd: 7.5,
+      projected30DayMaxSpendUsd: 15,
+      rolling30DaySpendUsd: 0,
+      rollingAverageDailySpendUsd: 0,
+      projectedBalanceLifetimeDays: null,
+      operatorProvidedBalanceUsd: null,
+      estimatedBillableAttemptsToday: 0,
+      estimatedMaxDailyAttempts: 500,
+      mapsFastRecovery: {
+        attempts: 0,
+        succeeded: 0,
+        recoveredWithEmail: 0,
+        recoveredValidEmails: null,
+        recoveredImports: null,
+        costPerRecoveredWebsiteUsd: null,
+        costPerValidEmailUsd: null,
+        costPerConfirmedImportUsd: null,
+      },
+      purposes: Object.fromEntries(["google_serp_discovery", "linkedin_owner_discovery", "maps_fast_website_recovery", "maps_deep_enrichment", "recovery_probe"].map((purpose) => [purpose, { queriesToday: 0, successfulQueriesToday: 0, estimatedBillableAttemptsToday: 0, spendTodayUsd: 0, providerResultsToday: 0, queriesRolling30Days: 0, successfulQueriesRolling30Days: 0, rolling30DaySpendUsd: 0 }])),
+    });
+    getRecentProviderUsage.mockResolvedValue({ calls: 12, errors: 0, items: 0, costUsd: 0, totalLatencyMs: 0, quotaRemaining: null });
     getSystemHealthDiagnostics.mockResolvedValue({
       providers: {
         apify: { recentTerminalCalls: 10, recentErrors: 3, lastSuccessAt: null, lastFailureAt: null, lastFailureClass: null, budgetAllowed: true },

@@ -20,6 +20,10 @@ describe("createProviderRequestKey", () => {
     const key = createProviderRequestKey(baseIdentity);
     expect(createProviderRequestKey({ ...baseIdentity, campaignId: "campaign-2" })).not.toBe(key);
     expect(createProviderRequestKey({ ...baseIdentity, engineType: "linkedin_owner" })).not.toBe(key);
+    expect(createProviderRequestKey({ ...baseIdentity, purpose: "google_serp_discovery" })).not.toBe(key);
+    expect(createProviderRequestKey({ ...baseIdentity, country: "pt" })).not.toBe(key);
+    expect(createProviderRequestKey({ ...baseIdentity, language: "pt" })).not.toBe(key);
+    expect(createProviderRequestKey({ ...baseIdentity, maxResults: 1 })).not.toBe(key);
     expect(createProviderRequestKey({ ...baseIdentity, planningWindow: "2026-10-03T11:15" })).not.toBe(key);
   });
 

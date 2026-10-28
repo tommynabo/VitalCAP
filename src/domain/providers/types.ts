@@ -77,6 +77,7 @@ export interface SerpResult {
 export interface SerpSearchInput {
   query: string;
   maxResults: number;
+  maxRetries?: number;
   seedId?: string;
   planningWindow?: string;
   signal?: AbortSignal;

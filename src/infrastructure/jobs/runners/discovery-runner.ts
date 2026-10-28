@@ -22,7 +22,7 @@ import {
   getSeedEconomicPerformance,
   updateSearchSeedRun,
 } from "@/infrastructure/neon/repositories/discovery";
-import { getApifyRecoverySnapshot, getApifyReservationFailureDetails, getRecentProviderUsage, reserveApifyProviderRun, updateProviderRun } from "@/infrastructure/neon/repositories/provider-runs";
+import { getApifyRecoverySnapshot, getApifyReservationFailureDetails, getRecentProviderUsage, getSerperRecoveryState, reserveApifyProviderRun, updateProviderRun } from "@/infrastructure/neon/repositories/provider-runs";
 import { getAutopilotSettings } from "@/infrastructure/neon/repositories/autopilot";
 import { getEffectiveAutopilotState } from "@/domain/autopilot/types";
 import { buildMapsSeedCatalog, buildSerpSeedCatalog, LINKEDIN_OWNER_ROLE_QUERIES, ICP_CATEGORY_TERMS } from "@/services/discovery/spain-search-catalog";
@@ -141,6 +141,7 @@ type PreProviderStage =
   | "load_maps_env"
   | "create_configuration_fingerprint"
   | "load_apify_recovery_snapshot"
+  | "load_serper_recovery_state"
   | "resolve_apify_allocation_health"
   | "resolve_recovery_work_mode";
 
@@ -261,9 +262,16 @@ async function executeDiscoveryJob(
   const apifyRecovery = provider === "apify"
     ? await runPreProviderStage(job, "load_apify_recovery_snapshot", () => getApifyRecoverySnapshot(campaign.workspaceId))
     : null;
+  const serperRecovery = provider === "serper"
+    ? await runPreProviderStage(job, "load_serper_recovery_state", () => getSerperRecoveryState())
+    : null;
   const providerHealth = apifyRecovery
     ? await runPreProviderStage(job, "resolve_apify_allocation_health", () => getApifyAllocationHealth(apifyRecovery))
-    : evaluateProviderHealth(await getRecentProviderUsage(campaign.workspaceId, provider));
+    : serperRecovery?.recoveryProbeEligible
+      ? "untested"
+      : serperRecovery?.allocationPaused
+        ? "paused"
+        : evaluateProviderHealth(await getRecentProviderUsage(campaign.workspaceId, provider, 24, serperRecovery?.recoveredAt));
   const requestedRecoveryProbe = job.payload.origin === "recovery_probe";
   const recoveryWorkMode = await runPreProviderStage(job, "resolve_recovery_work_mode", () => provider === "apify" && apifyRecovery
     ? resolveApifyDiscoveryWorkMode({

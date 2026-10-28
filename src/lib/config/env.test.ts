@@ -44,6 +44,10 @@ describe("getCoreEnv", () => {
       process.env.SERPER_DAILY_COST_LIMIT_USD = "0";
       resetServerEnvCacheForTests();
       expect(getSerperEnv().SERPER_DAILY_COST_LIMIT_USD).toBe(0);
+
+      process.env.SERPER_DAILY_COST_LIMIT_USD = "0.51";
+      resetServerEnvCacheForTests();
+      expect(() => getSerperEnv()).toThrow();
     } finally {
       if (original === undefined) delete process.env.SERPER_DAILY_COST_LIMIT_USD;
       else process.env.SERPER_DAILY_COST_LIMIT_USD = original;

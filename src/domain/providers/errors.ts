@@ -1,4 +1,4 @@
-export type ProviderFailureKind = "transient" | "billing" | "authentication" | "configuration" | "safety";
+export type ProviderFailureKind = "transient" | "billing" | "authentication" | "configuration" | "rate_limit" | "timeout" | "unknown" | "safety";
 
 export const PROVIDER_RETRY_DELAYS_MS = {
   transient: 2 * 60 * 1000,

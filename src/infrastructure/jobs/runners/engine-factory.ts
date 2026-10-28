@@ -39,7 +39,7 @@ export function createDiscoveryEngine(workspaceId: string, engineType: EngineTyp
     case "hybrid_fill":
       return new HybridFillEngine({
         maps_fast: new MapsFastEngine(createMapsDiscoveryProvider(workspaceId, "maps_fast")),
-        google_serp: new GoogleSerpEngine(createSerpDiscoveryProvider(workspaceId, engineType, campaignId, discoveryJobId)),
+        google_serp: new GoogleSerpEngine(createSerpDiscoveryProvider(workspaceId, "google_serp", campaignId, discoveryJobId)),
       });
     default: {
       const exhaustive: never = engineType;

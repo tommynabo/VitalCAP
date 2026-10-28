@@ -8,7 +8,7 @@ import { getAutopilotSettings, getAutopilotPacingState, insertRebalanceDecision 
 import { getCampaignQueueDepth } from "@/infrastructure/neon/repositories/job-queue";
 import { enqueueDiscoveryOrdersWithinDailyRawCap } from "@/infrastructure/neon/repositories/daily-raw-request-cap";
 import { bootstrapSearchSeeds, listSearchSeedsForCampaignEngine } from "@/infrastructure/neon/repositories/discovery";
-import { getApifyRecoverySnapshot, getRecentProviderUsage, getTodaySpendUsd } from "@/infrastructure/neon/repositories/provider-runs";
+import { getApifyRecoverySnapshot, getGlobalSerperSpendToday, getRecentProviderUsage, getSerperRecoveryState, getTodaySpendUsd } from "@/infrastructure/neon/repositories/provider-runs";
 import { allocateEngineWork, MAX_APIFY_RECOVERY_PROBE_RAW, MAX_RAW_PER_PLANNING_WINDOW, planApifyRecoveryProbe, planningWindowKey, rerouteEngineOrders, type EnginePlanningPerformance } from "@/services/autopilot/target-planner";
 import { getAutopilotEnginePerformance } from "@/infrastructure/neon/repositories/autopilot-engine-performance";
 import { decideHybridFill } from "@/services/discovery/hybrid-fill-decision";
@@ -96,11 +96,16 @@ export async function runAutopilotCronTick(now: Date = new Date()): Promise<Auto
 
     const mapsEnv = getMapsEnv();
     const serperEnv = getSerperEnv();
-    const serperSpendToday = await getTodaySpendUsd(workspaceId, "serper", settings.timezone, now);
+    const serperSpendToday = await getGlobalSerperSpendToday(now);
     const serperBudgetRemaining = Math.max(0, serperEnv.SERPER_DAILY_COST_LIMIT_USD - serperSpendToday);
     const apifyRecovery = await getApifyRecoverySnapshot(workspaceId, now);
     const mapsHealth = getApifyAllocationHealth(apifyRecovery);
-    const serpHealth = evaluateProviderHealth(await getRecentProviderUsage(workspaceId, "serper"));
+    const serperRecovery = await getSerperRecoveryState(now);
+    const serpHealth = serperRecovery.recoveryProbeEligible
+      ? "untested"
+      : serperRecovery.allocationPaused
+        ? "paused"
+        : evaluateProviderHealth(await getRecentProviderUsage(workspaceId, "serper", 24, serperRecovery.recoveredAt));
     const healths = engineHealths(mapsHealth, serpHealth);
     const allTypes: EngineType[] = ["maps_fast", "maps_deep", "google_serp", "linkedin_owner", "hybrid_fill"];
     const capabilities = buildEngineCapabilities({

@@ -12,7 +12,7 @@ import type { EngineType } from "@/domain/campaigns/types";
 import type { AutopilotSettings, EngineTargetState, GlobalAutopilotState, ProviderHealthStatus, RebalanceDecision } from "@/domain/autopilot/types";
 import { getDayBounds } from "@/lib/time/day-bounds";
 import { getAutopilotPacingMetrics } from "./autopilot-pacing";
-import { getApifyRecoverySnapshot, getRecentProviderUsage, getTodaySpendUsd } from "./provider-runs";
+import { getApifyRecoverySnapshot, getGlobalSerperSpendToday, getRecentProviderUsage, getSerperRecoveryState, getTodaySpendUsd } from "./provider-runs";
 import { getDeliveryEnv, getMapsEnv, getSerperEnv } from "@/lib/config/env";
 import {
   ENGINE_TYPES,
@@ -144,8 +144,13 @@ async function getEngineProviderHealth(workspaceId: string, engineType: EngineTy
   const maps = mapsSnapshot.allocationHealth === "missing_configuration"
     ? "paused"
     : mapsSnapshot.allocationHealth;
+  const serperRecovery = await getSerperRecoveryState();
   const serp = serpEnv.SERP_PROVIDER === "serper" && Boolean(serpEnv.SERPER_API_KEY)
-    ? evaluateProviderHealth(await getRecentProviderUsage(workspaceId, "serper"))
+    ? serperRecovery.recoveryProbeEligible
+      ? "untested"
+      : serperRecovery.allocationPaused
+        ? "paused"
+        : evaluateProviderHealth(await getRecentProviderUsage(workspaceId, "serper", 24, serperRecovery.recoveredAt))
     : "paused";
   return engineProviderHealthForType(engineType, maps, serp);
 }
@@ -156,7 +161,12 @@ export async function getAutopilotPacingState(workspaceId: string, now = new Dat
   const metrics = await getAutopilotPacingMetrics(workspaceId, settings.timezone, now, instantlyCampaignId);
   const apifyRecovery = await getApifyRecoverySnapshot(workspaceId, now);
   const providerHealth = getApifyAllocationHealth(apifyRecovery);
-  const serpHealth = evaluateProviderHealth(await getRecentProviderUsage(workspaceId, "serper"));
+  const serperRecovery = await getSerperRecoveryState(now);
+  const serpHealth = serperRecovery.recoveryProbeEligible
+    ? "untested"
+    : serperRecovery.allocationPaused
+      ? "paused"
+      : evaluateProviderHealth(await getRecentProviderUsage(workspaceId, "serper", 24, serperRecovery.recoveredAt));
   const importTarget = settings.targetMetric === "instantly_imported";
   const estimatedYield = importTarget
     ? metrics.historicalImportSourceCount >= 10
@@ -168,7 +178,7 @@ export async function getAutopilotPacingState(workspaceId: string, now = new Dat
   const env = getMapsEnv();
   const effectiveBudget = Math.min(env.APIFY_DAILY_COST_LIMIT_USD, settings.maxDailyApifySpendUsd ?? Number.POSITIVE_INFINITY);
   const serpEnv = getSerperEnv();
-  const serperSpendToday = await getTodaySpendUsd(workspaceId, "serper", settings.timezone, now);
+  const serperSpendToday = await getGlobalSerperSpendToday(now);
   const apifyAvailable = isProviderAvailableForDiscovery(
     env.MAPS_PROVIDER === "apify" && Boolean(env.APIFY_API_TOKEN),
     providerHealth,

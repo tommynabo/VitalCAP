@@ -150,6 +150,31 @@ describe("target planner", () => {
     expect(orders.map((order) => order.engineType)).toEqual(expect.arrayContaining(["maps_fast", "google_serp", "linkedin_owner"]));
   });
 
+  it("keeps LinkedIn available as small exploration while prioritizing Google SERP", () => {
+    const orders = allocateEngineWork({
+      workspaceId: "workspace-1",
+      campaigns: [campaign("serp", 100, { engineType: "google_serp" }), campaign("owner", 100, { engineType: "linkedin_owner" })],
+      capabilities: ["google_serp", "linkedin_owner"].map((engineType) => ({
+        engineType: engineType as Campaign["engineType"], available: true, providerConfigured: true,
+        providerHealthy: true, providerUntested: false, costAllowed: true, campaignCount: 1,
+        reasonUnavailable: null, reason: null,
+      })),
+      performances: [
+        { campaignId: "serp", yield: 0.1, queueDepth: 0, seedExhaustion: 0 },
+        { campaignId: "owner", yield: 0.1, confirmedImportCount: 0, queueDepth: 0, seedExhaustion: 0 },
+      ],
+      rawNeeded: 100,
+      reason: "behind pace",
+      now: new Date("2025-01-01T13:00:00Z"),
+      timeZone: "Europe/Madrid",
+    });
+
+    const google = orders.find((order) => order.engineType === "google_serp")?.desiredRawCount ?? 0;
+    const linkedin = orders.find((order) => order.engineType === "linkedin_owner")?.desiredRawCount ?? 0;
+    expect(google).toBeGreaterThan(linkedin);
+    expect(linkedin).toBeGreaterThan(0);
+  });
+
   it("does not multiply the global target or schedule paused, draft, or unavailable engines", () => {
     const orders = allocateEngineWork({
       workspaceId: "workspace-1",

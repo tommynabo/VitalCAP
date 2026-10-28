@@ -12,6 +12,8 @@ const mocks = vi.hoisted(() => ({
   listSearchSeedsForCampaignEngine: vi.fn(),
   getRecentProviderUsage: vi.fn(),
   getTodaySpendUsd: vi.fn(),
+  getGlobalSerperSpendToday: vi.fn(),
+  getSerperRecoveryState: vi.fn(),
   getApifyRecoverySnapshot: vi.fn(),
   getAutopilotEnginePerformance: vi.fn(),
   buildEngineCapabilities: vi.fn(),
@@ -49,6 +51,8 @@ vi.mock("@/infrastructure/neon/repositories/provider-runs", () => ({
   getApifyRecoverySnapshot: mocks.getApifyRecoverySnapshot,
   getRecentProviderUsage: mocks.getRecentProviderUsage,
   getTodaySpendUsd: mocks.getTodaySpendUsd,
+  getGlobalSerperSpendToday: mocks.getGlobalSerperSpendToday,
+  getSerperRecoveryState: mocks.getSerperRecoveryState,
 }));
 vi.mock("@/infrastructure/neon/repositories/autopilot-engine-performance", () => ({
   getAutopilotEnginePerformance: mocks.getAutopilotEnginePerformance,
@@ -106,6 +110,8 @@ describe("runAutopilotCronTick", () => {
     mocks.listSearchSeedsForCampaignEngine.mockResolvedValue([]);
     mocks.getRecentProviderUsage.mockResolvedValue([]);
     mocks.getTodaySpendUsd.mockResolvedValue(0);
+    mocks.getGlobalSerperSpendToday.mockResolvedValue(0);
+    mocks.getSerperRecoveryState.mockResolvedValue({ allocationPaused: false, recoveryProbeEligible: false, nextRecoveryAttemptAt: null, lastFailureAt: null, recoveredAt: null });
     mocks.getApifyRecoverySnapshot.mockResolvedValue({ recoveryProbeEligible: false, nextRecoveryAttemptAt: null });
     mocks.getAutopilotEnginePerformance.mockResolvedValue(new Map());
     mocks.buildEngineCapabilities.mockReturnValue([{

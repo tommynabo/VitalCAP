@@ -174,7 +174,11 @@ export function allocateEngineWork(input: EngineWorkAllocationInput): DiscoveryO
     const queuePenalty = Math.min(0.75, (performance?.queueDepth ?? 0) / 1_000);
     const exhaustionPenalty = Math.min(0.75, performance?.seedExhaustion ?? 0);
     const costWeight = confirmedImportCostWeight(performance, medianCostPerImport);
-    return { campaign, weight: campaign.dailySoftTarget * yieldWeight * (1 - queuePenalty) * (1 - exhaustionPenalty) * costWeight };
+    const explorationWeight = campaign.engineType === "linkedin_owner"
+      && (performance?.confirmedImportCount ?? 0) < MIN_IMPORTS_FOR_COST_WEIGHT
+      ? 0.1
+      : 1;
+    return { campaign, weight: campaign.dailySoftTarget * yieldWeight * (1 - queuePenalty) * (1 - exhaustionPenalty) * costWeight * explorationWeight };
   });
   let totalWeight = weighted.reduce((sum, item) => sum + item.weight, 0);
   if (totalWeight <= 0) {
@@ -191,11 +195,20 @@ export function allocateEngineWork(input: EngineWorkAllocationInput): DiscoveryO
   totalWeight = allocationWeights.reduce((sum, item) => sum + item.weight, 0);
 
   const window = planningWindowKey(input.now, input.timeZone);
-  let remaining = Math.min(MAX_RAW_PER_PLANNING_WINDOW, Math.ceil(input.rawNeeded));
-  return allocationWeights.flatMap((item, index) => {
-    const share = index === allocationWeights.length - 1 ? remaining : Math.min(remaining, Math.floor((Math.min(MAX_RAW_PER_PLANNING_WINDOW, input.rawNeeded) * item.weight) / totalWeight));
+  const rawLimit = Math.min(MAX_RAW_PER_PLANNING_WINDOW, Math.ceil(input.rawNeeded));
+  const shares = allocationWeights.map((item, index) => {
+    const exact = rawLimit * item.weight / totalWeight;
+    return { item, index, share: Math.floor(exact), fraction: exact - Math.floor(exact) };
+  });
+  let remainder = rawLimit - shares.reduce((sum, item) => sum + item.share, 0);
+  const remainderOrder = [...shares].sort((left, right) => right.fraction - left.fraction || right.index - left.index);
+  for (const item of remainderOrder) {
+    if (remainder <= 0) break;
+    item.share += 1;
+    remainder -= 1;
+  }
+  return shares.flatMap(({ item, share }) => {
     if (share <= 0) return [];
-    remaining -= share;
     return [{
       workspaceId: input.workspaceId,
       campaignId: item.campaign.id,

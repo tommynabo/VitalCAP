@@ -4,7 +4,7 @@ import { getDb } from "@/infrastructure/neon/db";
 import { listCampaigns } from "@/infrastructure/neon/repositories/campaigns";
 import { autopilotSettings } from "@/infrastructure/neon/schema/autopilot";
 import { getWorkspaceRole } from "@/infrastructure/neon/repositories/workspace";
-import { getApifyRecoverySnapshot } from "@/infrastructure/neon/repositories/provider-runs";
+import { getApifyRecoverySnapshot, getRecentProviderUsage, getSerperCostDiagnostics, getSerperRecoveryState } from "@/infrastructure/neon/repositories/provider-runs";
 import { getApifyDailyEconomicTotals, getSeedEconomicPerformance, listSearchSeedsForCampaignEngine } from "@/infrastructure/neon/repositories/discovery";
 import { getSystemHealthDiagnostics } from "@/infrastructure/neon/repositories/health-diagnostics";
 import { getRecoveryProbeDiscoveryJobs, getWatchdogWorkspaceSignals } from "@/infrastructure/neon/repositories/watchdog-signals";
@@ -12,11 +12,12 @@ import { getAutopilotPacingState } from "@/infrastructure/neon/repositories/auto
 import { getCurrentWorkspaceId, requireCurrentUser, UnauthorizedError } from "@/lib/auth/workspace";
 import { getMapsEnv, getSerperEnv } from "@/lib/config/env";
 import { resolveNeonVar } from "@/lib/config/env-utils";
-import { buildProviderHealthSnapshot } from "@/services/discovery/provider-health";
+import { buildProviderHealthSnapshot, evaluateProviderHealth } from "@/services/discovery/provider-health";
 import { getWatchdogPausePredicates } from "@/services/autopilot/watchdog-pause-policy";
 import { scoreSeedEconomicPerformance } from "@/services/discovery/seed-economics";
 import type { SeedEconomicPerformance } from "@/services/discovery/seed-economics";
 import { sanitizeRecoveryJobError } from "./sanitize-recovery-error";
+import { SERPER_LINKEDIN_DAILY_EXPLORATION_LIMIT_USD } from "@/infrastructure/providers/serp/serper-provider";
 
 export const dynamic = "force-dynamic";
 
@@ -132,7 +133,7 @@ export async function GET() {
     const mapsEnv = getMapsEnv();
     const serperEnv = getSerperEnv();
     const diagnosticsNow = new Date();
-    const [campaignRows, [settings], apifyRecovery, watchdogRows, discoveryRecoveryJobs, systemDiagnostics] = await Promise.all([
+    const [campaignRows, [settings], apifyRecovery, watchdogRows, discoveryRecoveryJobs, systemDiagnostics, serperRecovery, serperCostDiagnostics] = await Promise.all([
       listCampaigns(workspaceId),
       db.select({
         enabled: autopilotSettings.enabled,
@@ -153,14 +154,23 @@ export async function GET() {
         mapsDailyBudgetUsd: mapsEnv.APIFY_DAILY_COST_LIMIT_USD,
         serperDailyBudgetUsd: serperEnv.SERPER_DAILY_COST_LIMIT_USD,
       }),
+      getSerperRecoveryState(diagnosticsNow),
+      getSerperCostDiagnostics({
+        dailyCapUsd: serperEnv.SERPER_DAILY_COST_LIMIT_USD,
+        operatorProvidedBalanceUsd: serperEnv.SERPER_OPERATOR_BALANCE_USD,
+        now: diagnosticsNow,
+      }),
     ]);
     const watchdogSignals = watchdogRows[0] ?? null;
     const timeZone = settings?.timezone ?? "Europe/Madrid";
-    const mapsCampaigns = campaignRows.filter((campaign) => campaign.engineType === "maps_fast" || campaign.engineType === "maps_deep");
+    const economicCampaigns = campaignRows.filter((campaign) => campaign.engineType === "maps_fast"
+      || campaign.engineType === "maps_deep"
+      || campaign.engineType === "google_serp"
+      || campaign.engineType === "linkedin_owner");
     const [apifyDailyEconomics, pacing, seedEconomicsByCampaign] = await Promise.all([
       getApifyDailyEconomicTotals(workspaceId, timeZone, diagnosticsNow),
       getAutopilotPacingState(workspaceId, diagnosticsNow),
-      Promise.all(mapsCampaigns.map(async (campaign) => {
+      Promise.all(economicCampaigns.map(async (campaign) => {
         const [seeds, economics] = await Promise.all([
           listSearchSeedsForCampaignEngine(campaign.id, campaign.engineType),
           getSeedEconomicPerformance(campaign.id, campaign.engineType, diagnosticsNow, campaign.timeZone),
@@ -188,6 +198,9 @@ export async function GET() {
         .filter((group) => group.engineType === engineType)
         .flatMap((group) => group.seeds.flatMap((item) => item.performance ? [item.performance] : []))),
     }));
+    const googleSerpEconomics = engineEconomics.find((row) => row.engineType === "google_serp");
+    const linkedinEconomics = engineEconomics.find((row) => row.engineType === "linkedin_owner");
+    const mapsDeepEconomics = engineEconomics.find((row) => row.engineType === "maps_deep");
     const lowNoveltyCostTodayUsd = seedEconomics.reduce((total, item) =>
       total + (item.performance && item.performance.noveltyRate !== null && item.performance.noveltyRate < 0.1
         ? item.performance.providerCostTodayUsd
@@ -212,10 +225,17 @@ export async function GET() {
       },
       recovery: apifyRecovery,
     });
+    const serperAllocationUsage = await getRecentProviderUsage(workspaceId, "serper", 24, serperRecovery.recoveredAt);
+    const serperAllocationHealth = serperRecovery.recoveryProbeEligible
+      ? "untested"
+      : serperRecovery.allocationPaused
+        ? "paused"
+        : evaluateProviderHealth(serperAllocationUsage);
     const serperHealth = buildProviderHealthSnapshot({
       provider: "serper",
       configured: serperEnv.SERP_PROVIDER === "serper" && Boolean(serperEnv.SERPER_API_KEY),
-      budgetAllowed: systemDiagnostics.providers.serper.budgetAllowed,
+      budgetAllowed: serperCostDiagnostics.budgetRemainingUsd >= 0.001,
+      allocationHealthOverride: serperAllocationHealth,
       usage: {
         calls: systemDiagnostics.providers.serper.recentTerminalCalls,
         errors: systemDiagnostics.providers.serper.recentErrors,
@@ -263,6 +283,58 @@ export async function GET() {
         latestSuccessAt: formatDiagnosticDate(apifyRecovery.latestSuccessAt),
       },
       serper: {
+        SERPER_PROVIDER_AVAILABLE: serperHealth.providerAvailable,
+        SERPER_DAILY_CAP_USD: serperCostDiagnostics.dailyCapUsd,
+        SERPER_SPEND_TODAY: serperCostDiagnostics.spendTodayUsd,
+        SERPER_BUDGET_REMAINING: serperCostDiagnostics.budgetRemainingUsd,
+        SERPER_PROJECTED_30D_SPEND: serperCostDiagnostics.rolling30DaySpendUsd,
+        SERPER_PROJECTED_BALANCE_LIFETIME_DAYS: serperCostDiagnostics.projectedBalanceLifetimeDays,
+        SERPER_OPERATOR_PROVIDED_BALANCE_USD: serperCostDiagnostics.operatorProvidedBalanceUsd,
+        SERPER_PROJECTED_15D_MAX_SPEND: serperCostDiagnostics.projected15DayMaxSpendUsd,
+        SERPER_PROJECTED_30D_MAX_SPEND: serperCostDiagnostics.projected30DayMaxSpendUsd,
+        SERPER_ESTIMATED_BILLABLE_ATTEMPTS_TODAY: serperCostDiagnostics.estimatedBillableAttemptsToday,
+        SERPER_ESTIMATED_MAX_DAILY_ATTEMPTS: serperCostDiagnostics.estimatedMaxDailyAttempts,
+        SERPER_ALLOCATION_HEALTH: serperHealth.allocationHealth,
+        SERPER_RELIABILITY_HEALTH: serperHealth.reliabilityHealth,
+        SERPER_RECOVERY_PROBE_ELIGIBLE: serperRecovery.recoveryProbeEligible,
+        SERPER_RECOVERY_PROBE_ATTEMPTED: (serperCostDiagnostics.purposes.recovery_probe?.queriesToday ?? 0) > 0,
+        SERPER_RECOVERY_PROBE_SUCCEEDED: serperRecovery.recoveredAt !== null,
+        SERPER_NEXT_RECOVERY_AT: formatDiagnosticDate(serperRecovery.nextRecoveryAttemptAt),
+        GOOGLE_SERP_AVAILABLE: serperHealth.providerAvailable,
+        MAPS_FAST_WEBSITE_RECOVERY_AVAILABLE: serperHealth.providerAvailable,
+        MAPS_DEEP_SERPER_COMPONENT_AVAILABLE: serperHealth.providerAvailable,
+        LINKEDIN_OWNER_AVAILABLE: serperHealth.providerAvailable,
+        LINKEDIN_OWNER_ECONOMIC_PRIORITY: "exploration",
+        LINKEDIN_OWNER_DAILY_SPEND_LIMIT_USD: Math.min(serperCostDiagnostics.dailyCapUsd * 0.05, SERPER_LINKEDIN_DAILY_EXPLORATION_LIMIT_USD),
+        SERPER_GOOGLE_SERP_QUERIES: serperCostDiagnostics.purposes.google_serp_discovery?.queriesToday ?? 0,
+        SERPER_GOOGLE_SERP_NEW_RAW: googleSerpEconomics?.newRaw ?? 0,
+        SERPER_GOOGLE_SERP_VALID_EMAILS: googleSerpEconomics?.validEmail ?? null,
+        SERPER_GOOGLE_SERP_IMPORTS: googleSerpEconomics?.instantlyImported ?? null,
+        SERPER_GOOGLE_SERP_COST_PER_VALID_EMAIL: googleSerpEconomics?.validEmail && googleSerpEconomics.validEmail > 0
+          ? googleSerpEconomics.providerCostUsd / googleSerpEconomics.validEmail
+          : null,
+        SERPER_GOOGLE_SERP_COST_PER_CONFIRMED_IMPORT: googleSerpEconomics?.costPerConfirmedImport ?? null,
+        SERPER_GOOGLE_SERP_COST_TODAY: serperCostDiagnostics.purposes.google_serp_discovery?.spendTodayUsd ?? 0,
+        SERPER_LINKEDIN_QUERIES: serperCostDiagnostics.purposes.linkedin_owner_discovery?.queriesToday ?? 0,
+        SERPER_LINKEDIN_IMPORTS: linkedinEconomics?.instantlyImported ?? null,
+        SERPER_LINKEDIN_COST_PER_CONFIRMED_IMPORT: linkedinEconomics?.costPerConfirmedImport ?? null,
+        SERPER_LINKEDIN_COST_TODAY: serperCostDiagnostics.purposes.linkedin_owner_discovery?.spendTodayUsd ?? 0,
+        SERPER_MAPS_RECOVERY_QUERIES: serperCostDiagnostics.purposes.maps_fast_website_recovery?.queriesToday ?? 0,
+        SERPER_MAPS_RECOVERY_COST_TODAY: serperCostDiagnostics.purposes.maps_fast_website_recovery?.spendTodayUsd ?? 0,
+        SERPER_MAPS_RECOVERY_ATTEMPTS_30D: serperCostDiagnostics.mapsFastRecovery.attempts,
+        SERPER_MAPS_RECOVERED_WEBSITES_30D: serperCostDiagnostics.mapsFastRecovery.succeeded,
+        SERPER_MAPS_RECOVERED_WITH_EMAIL_30D: serperCostDiagnostics.mapsFastRecovery.recoveredWithEmail,
+        SERPER_MAPS_RECOVERED_VALID_EMAILS_30D: serperCostDiagnostics.mapsFastRecovery.recoveredValidEmails,
+        SERPER_MAPS_RECOVERED_IMPORTS_30D: serperCostDiagnostics.mapsFastRecovery.recoveredImports,
+        SERPER_COST_PER_RECOVERED_WEBSITE_30D: serperCostDiagnostics.mapsFastRecovery.costPerRecoveredWebsiteUsd,
+        SERPER_COST_PER_VALID_EMAIL_30D: serperCostDiagnostics.mapsFastRecovery.costPerValidEmailUsd,
+        SERPER_COST_PER_CONFIRMED_IMPORT_30D: serperCostDiagnostics.mapsFastRecovery.costPerConfirmedImportUsd,
+        SERPER_MAPS_DEEP_QUERIES: serperCostDiagnostics.purposes.maps_deep_enrichment?.queriesToday ?? 0,
+        SERPER_MAPS_DEEP_IMPORTS: mapsDeepEconomics?.instantlyImported ?? null,
+        SERPER_MAPS_DEEP_COST_PER_CONFIRMED_IMPORT: mapsDeepEconomics?.costPerConfirmedImport ?? null,
+        SERPER_MAPS_DEEP_COST_TODAY: serperCostDiagnostics.purposes.maps_deep_enrichment?.spendTodayUsd ?? 0,
+        SERPER_RECOVERY_PROBE_QUERIES: serperCostDiagnostics.purposes.recovery_probe?.queriesToday ?? 0,
+        SERPER_RECOVERY_PROBE_COST_TODAY: serperCostDiagnostics.purposes.recovery_probe?.spendTodayUsd ?? 0,
         reliabilityHealth: serperHealth.reliabilityHealth,
         allocationHealth: serperHealth.allocationHealth,
         providerAvailable: serperHealth.providerAvailable,
@@ -273,6 +345,8 @@ export async function GET() {
         lastSuccessAt: systemDiagnostics.providers.serper.lastSuccessAt,
         lastFailureAt: systemDiagnostics.providers.serper.lastFailureAt,
         lastFailureClass: systemDiagnostics.providers.serper.lastFailureClass,
+        recoveryProbeEligible: serperRecovery.recoveryProbeEligible,
+        nextRecoveryAttemptAt: formatDiagnosticDate(serperRecovery.nextRecoveryAttemptAt),
       },
       autopilot: settings ? {
         enabled: settings.enabled,

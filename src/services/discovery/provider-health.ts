@@ -118,6 +118,7 @@ export function buildProviderHealthSnapshot(input: {
   budgetAllowed: boolean;
   usage: ProviderUsageStats;
   recovery?: ApifyRecoverySnapshot;
+  allocationHealthOverride?: ProviderHealthLabel;
 }): ProviderHealthSnapshot {
   const reliabilityHealth: ProviderHealthLabel = input.configured
     ? evaluateProviderHealth(input.usage)
@@ -126,9 +127,9 @@ export function buildProviderHealthSnapshot(input: {
     ? "missing_configuration"
     : !input.budgetAllowed
       ? "paused"
-      : input.provider === "apify"
+      : input.allocationHealthOverride ?? (input.provider === "apify"
         ? input.recovery ? getApifyAllocationHealth(input.recovery) : "unknown"
-        : reliabilityHealth;
+        : reliabilityHealth);
   const latestFailureAt = input.provider === "apify" ? input.recovery?.latestFailureAt ?? null : null;
   const latestSuccessAt = input.provider === "apify" ? input.recovery?.latestSuccessAt ?? null : null;
   const failureTime = latestFailureAt === null ? Number.NaN : new Date(latestFailureAt).getTime();

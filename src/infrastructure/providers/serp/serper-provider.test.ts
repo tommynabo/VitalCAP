@@ -38,10 +38,74 @@ describe("SerperDiscoveryProvider", () => {
 
   it("retries on transient failure then throws after exhausting retries", async () => {
     const fetchImpl = vi.fn().mockResolvedValue(new Response("boom", { status: 500 }));
-    const provider = new SerperDiscoveryProvider({ apiKey: "key", fetchImpl });
+    const provider = new SerperDiscoveryProvider({ apiKey: "key", fetchImpl, retryDelay: async () => undefined });
 
     await expect(provider.search({ query: "unique query", maxResults: 5 })).rejects.toThrow(/HTTP 500/);
-    expect(fetchImpl).toHaveBeenCalledTimes(3); // 1 initial + 2 retries
+    expect(fetchImpl).toHaveBeenCalledTimes(2); // 1 initial + 1 retry
+  });
+
+  it.each([401, 403])("does not retry HTTP %i authentication/configuration failures", async (status) => {
+    const fetchImpl = vi.fn().mockResolvedValue(new Response("denied", { status }));
+    const provider = new SerperDiscoveryProvider({ apiKey: "key", fetchImpl });
+
+    await expect(provider.search({ query: "safe probe", maxResults: 1 })).rejects.toMatchObject({
+      kind: status === 401 ? "authentication" : "configuration",
+      estimatedCostUsd: 0,
+    });
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it("classifies other HTTP 400 responses as configuration errors without retry", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(new Response('{"message":"Invalid request"}', { status: 400 }));
+    const provider = new SerperDiscoveryProvider({ apiKey: "key", fetchImpl });
+
+    await expect(provider.search({ query: "safe probe", maxResults: 1 })).rejects.toMatchObject({ kind: "configuration", estimatedCostUsd: 0 });
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it("respects a bounded 429 retry and accounts for both attempts on success", async () => {
+    const fetchImpl = vi.fn()
+      .mockResolvedValueOnce(new Response("slow down", { status: 429, headers: { "Retry-After": "900" } }))
+      .mockResolvedValueOnce(jsonResponse({ organic: [] }));
+    const provider = new SerperDiscoveryProvider({ apiKey: "key", fetchImpl, retryDelay: async (delayMs) => {
+      expect(delayMs).toBeLessThanOrEqual(30_000);
+    } });
+
+    const output = await provider.search({ query: "safe probe", maxResults: 1 });
+
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    expect(output.usage).toMatchObject({ calls: 2, costUsd: 0.002 });
+  });
+
+  it("charges each potentially billable HTTP attempt after a transient retry", async () => {
+    const fetchImpl = vi.fn()
+      .mockResolvedValueOnce(new Response("temporary failure", { status: 500 }))
+      .mockResolvedValueOnce(jsonResponse({ organic: [] }));
+    const provider = new SerperDiscoveryProvider({ apiKey: "key", fetchImpl, retryDelay: async () => undefined });
+
+    const output = await provider.search({ query: "safe probe", maxResults: 1 });
+
+    expect(output.usage).toMatchObject({ calls: 2, costUsd: 0.002 });
+  });
+
+  it("bounds a network timeout retry and counts both possible billable attempts", async () => {
+    const fetchImpl = vi.fn()
+      .mockRejectedValueOnce(new DOMException("request timed out", "AbortError"))
+      .mockResolvedValueOnce(jsonResponse({ organic: [] }));
+    const provider = new SerperDiscoveryProvider({ apiKey: "key", fetchImpl, retryDelay: async () => undefined });
+
+    const output = await provider.search({ query: "safe probe", maxResults: 1 });
+
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    expect(output.usage).toMatchObject({ calls: 2, costUsd: 0.002 });
+  });
+
+  it("classifies insufficient credits as billing and does not retry", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(new Response('{"message":"Not enough credits"}', { status: 400 }));
+    const provider = new SerperDiscoveryProvider({ apiKey: "key", fetchImpl });
+
+    await expect(provider.search({ query: "safe probe", maxResults: 1 })).rejects.toMatchObject({ kind: "billing" });
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
   });
 
   it("aborts the active request without retrying when the caller deadline expires", async () => {

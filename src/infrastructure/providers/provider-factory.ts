@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { EmailVerificationProvider, MapsDiscoveryProvider, SerpDiscoveryProvider } from "@/domain/providers/types";
 import type { EngineType } from "@/domain/campaigns/types";
 import { ProviderBudgetExceededError, ProviderConfigurationError } from "@/domain/providers/errors";
@@ -5,16 +6,25 @@ import { getMapsEnv, getSerperEnv, getVerificationEnv } from "@/lib/config/env";
 import { MockMapsDiscoveryProvider } from "./maps/mock-provider";
 import { ApifyMapsDiscoveryProvider } from "./maps/apify-provider";
 import { MockSerpDiscoveryProvider } from "./serp/mock-provider";
-import { SerperDiscoveryProvider, SERPER_ESTIMATED_COST_PER_QUERY_USD } from "./serp/serper-provider";
+import { MAX_TRANSIENT_RETRIES, SERPER_ESTIMATED_COST_PER_QUERY_USD, SERPER_LINKEDIN_DAILY_EXPLORATION_LIMIT_USD, SerperDiscoveryProvider } from "./serp/serper-provider";
 import { MockEmailVerificationProvider } from "./email-verification/mock-provider";
 import { MillionVerifierEmailVerificationProvider, MILLIONVERIFIER_ESTIMATED_COST_PER_EMAIL_USD } from "./email-verification/millionverifier-provider";
-import { getProviderRunByRequestKey, getTodaySpendUsd, recordProviderRun, reserveSerperProviderRun, updateProviderRun } from "@/infrastructure/neon/repositories/provider-runs";
+import { getGlobalSerperSpendToday, getProviderRunByRequestKey, getSerperRecoveryState, getSerperSpendByPurpose, getTodaySpendUsd, recordProviderRun, reserveSerperProviderRun, updateProviderRun } from "@/infrastructure/neon/repositories/provider-runs";
 import { getAutopilotSettings } from "@/infrastructure/neon/repositories/autopilot";
 import { getEffectiveAutopilotState } from "@/domain/autopilot/types";
 import { getDayBounds } from "@/lib/time/day-bounds";
 import { createProviderRequestKey, currentProviderPlanningWindow, nextProviderPlanningWindowAt, normalizeProviderQuery } from "@/services/discovery/provider-request-key";
 
 export type MapsEngineRole = "maps_fast" | "maps_deep" | "hybrid_fill";
+export type SerperPurpose = "google_serp_discovery" | "linkedin_owner_discovery" | "maps_fast_website_recovery" | "maps_deep_enrichment" | "recovery_probe";
+
+function purposeForEngine(engineType: EngineType): SerperPurpose {
+  if (engineType === "maps_fast") return "maps_fast_website_recovery";
+  if (engineType === "maps_deep") return "maps_deep_enrichment";
+  if (engineType === "google_serp") return "google_serp_discovery";
+  if (engineType === "linkedin_owner") return "linkedin_owner_discovery";
+  throw new ProviderConfigurationError("Serper purpose is not configured for this discovery engine.");
+}
 
 export class ProviderDisabledError extends Error {
   constructor(provider: string) {
@@ -96,9 +106,51 @@ export function createSerpDiscoveryProvider(workspaceId: string, engineType: Eng
   const originalSearch = provider.search.bind(provider);
   provider.search = async (input) => {
     const settings = await getAutopilotSettings(workspaceId);
-    const planningWindow = input.planningWindow ?? currentProviderPlanningWindow();
-    const normalizedQuery = normalizeProviderQuery(input.query);
-    const requestKey = createProviderRequestKey({ workspaceId, campaignId, engineType, provider: "serper", query: normalizedQuery, planningWindow });
+    const now = new Date();
+    const recoveryState = await getSerperRecoveryState(now);
+    if (recoveryState.allocationPaused && !recoveryState.recoveryProbeEligible) {
+      throw new ProviderBudgetExceededError(
+        "Serper allocation is paused during billing recovery cooldown.",
+        recoveryState.nextRecoveryAttemptAt ?? new Date(now.getTime() + 60 * 60 * 1000),
+      );
+    }
+
+    const recoveryProbe = recoveryState.allocationPaused && recoveryState.recoveryProbeEligible;
+    const purpose = recoveryProbe ? "recovery_probe" : purposeForEngine(engineType);
+    const query = input.query;
+    const normalizedQuery = normalizeProviderQuery(query);
+    const maxResults = recoveryProbe ? 1 : input.maxResults;
+    const maxRetries = recoveryProbe ? 0 : MAX_TRANSIENT_RETRIES;
+    const reserveCostUsd = (maxRetries + 1) * SERPER_ESTIMATED_COST_PER_QUERY_USD;
+    const { start: dayStart } = getDayBounds(settings.timezone, now);
+    const planningWindow = recoveryProbe
+      ? `recovery:${Math.floor(now.getTime() / (60 * 60 * 1000))}`
+      : dayStart.toISOString();
+    const requestQuery = recoveryProbe ? "serper-recovery-probe" : normalizedQuery;
+    const requestKey = createProviderRequestKey({
+      workspaceId: recoveryProbe ? "serper-account" : workspaceId,
+      campaignId: recoveryProbe ? "serper-recovery" : campaignId,
+      engineType: recoveryProbe ? "recovery_probe" : engineType,
+      provider: "serper",
+      query: requestQuery,
+      planningWindow,
+      purpose,
+      country: env.SERPER_COUNTRY ?? "es",
+      language: env.SERPER_LANGUAGE ?? "es",
+      maxResults,
+    });
+    const queryFingerprint = createHash("sha256").update(normalizedQuery).digest("hex");
+    const requestMetadata = {
+      engineType,
+      purpose,
+      queryFingerprint,
+      country: env.SERPER_COUNTRY ?? "es",
+      language: env.SERPER_LANGUAGE ?? "es",
+      maxResults,
+      planningWindow,
+      recoveryProbe,
+      ...(discoveryJobId ? { discoveryJobId } : {}),
+    };
     const existing = await getProviderRunByRequestKey(requestKey);
     if (existing) {
       if (existing.status === "budget_blocked") {
@@ -115,9 +167,10 @@ export function createSerpDiscoveryProvider(workspaceId: string, engineType: Eng
       campaignId,
       requestKey,
       seedId: input.seedId,
-      itemsRequested: input.maxResults,
-      costUsd: SERPER_ESTIMATED_COST_PER_QUERY_USD,
-      metadata: { engineType, query: input.query, normalizedQuery, planningWindow, ...(discoveryJobId ? { discoveryJobId } : {}) },
+      itemsRequested: maxResults,
+      costUsd: reserveCostUsd,
+      dailyCostLimitUsd: env.SERPER_DAILY_COST_LIMIT_USD,
+      metadata: requestMetadata,
       timeZone: settings.timezone,
     });
     if (!reservation.created) {
@@ -130,8 +183,8 @@ export function createSerpDiscoveryProvider(workspaceId: string, engineType: Eng
       return { results: [], usage: { calls: 0, items: 0, errors: 0, totalLatencyMs: 0, costUsd: 0, quotaRemaining: null }, providerRunId: reservation.providerRun.id };
     }
 
-    const spendToday = await getTodaySpendUsd(workspaceId, "serper", settings.timezone);
-    if (spendToday > env.SERPER_DAILY_COST_LIMIT_USD) {
+    const spendToday = await getGlobalSerperSpendToday(now, requestKey);
+    if (spendToday + reserveCostUsd > env.SERPER_DAILY_COST_LIMIT_USD) {
       const { end: retryAt } = getDayBounds(settings.timezone);
       const message = `Serper daily budget exhausted; retrying after ${retryAt.toISOString()}.`;
       await updateProviderRun(reservation.providerRun.id, {
@@ -139,22 +192,53 @@ export function createSerpDiscoveryProvider(workspaceId: string, engineType: Eng
         costUsd: 0,
         finishedAt: new Date(),
         error: message,
-        metadata: { engineType, query: input.query, normalizedQuery, planningWindow, retryAt: retryAt.toISOString(), budgetBlocked: true, ...(discoveryJobId ? { discoveryJobId } : {}) },
+        metadata: { ...requestMetadata, retryAt: retryAt.toISOString(), budgetBlocked: true },
       });
       throw new ProviderBudgetExceededError(message, retryAt);
     }
 
+    const purposeLimitUsd = purpose === "linkedin_owner_discovery"
+      ? Math.min(env.SERPER_DAILY_COST_LIMIT_USD * 0.05, SERPER_LINKEDIN_DAILY_EXPLORATION_LIMIT_USD)
+      : purpose === "maps_deep_enrichment"
+        ? env.SERPER_DAILY_COST_LIMIT_USD * 0.1
+        : Number.POSITIVE_INFINITY;
+    if (Number.isFinite(purposeLimitUsd)) {
+      const purposeSpend = await getSerperSpendByPurpose(purpose, now, requestKey);
+      if (purposeSpend + reserveCostUsd > purposeLimitUsd) {
+        const { end: retryAt } = getDayBounds(settings.timezone, now);
+        await updateProviderRun(reservation.providerRun.id, {
+          status: "budget_blocked",
+          costUsd: 0,
+          finishedAt: new Date(),
+          error: `Serper purpose allowance reached; retrying after ${retryAt.toISOString()}.`,
+          metadata: { ...requestMetadata, retryAt: retryAt.toISOString(), purposeBudgetBlocked: true },
+        });
+        throw new ProviderBudgetExceededError("Serper purpose allowance reached.", retryAt);
+      }
+    }
+
     let output;
     try {
-      output = await originalSearch(input);
+      output = await originalSearch({ ...input, query, maxResults, maxRetries });
     } catch (error) {
+      const errorKind = (error as { kind?: unknown })?.kind;
+      const failureKind = typeof errorKind === "string"
+        && ["billing", "authentication", "configuration", "transient", "rate_limit", "timeout", "unknown", "safety"].includes(errorKind)
+        ? errorKind
+        : "unknown";
+      const httpAttempts = typeof (error as { httpAttempts?: unknown })?.httpAttempts === "number" ? (error as { httpAttempts: number }).httpAttempts : 0;
+      const costUsd = typeof (error as { estimatedCostUsd?: unknown })?.estimatedCostUsd === "number"
+        ? (error as { estimatedCostUsd: number }).estimatedCostUsd
+        : ["billing", "authentication", "configuration"].includes(failureKind)
+          ? 0
+          : httpAttempts * SERPER_ESTIMATED_COST_PER_QUERY_USD;
       await updateProviderRun(reservation.providerRun.id, {
         status: "failed",
         itemsReturned: 0,
-        costUsd: 0,
+        costUsd,
         finishedAt: new Date(),
         error: error instanceof Error ? error.message : String(error),
-        metadata: { engineType, query: input.query, normalizedQuery, planningWindow, ...(discoveryJobId ? { discoveryJobId } : {}) },
+        metadata: { ...requestMetadata, failureKind, httpAttempts },
       });
       throw error;
     }
@@ -164,9 +248,9 @@ export function createSerpDiscoveryProvider(workspaceId: string, engineType: Eng
       itemsReturned: output.results.length,
       costUsd: output.usage.costUsd,
       finishedAt: new Date(),
-      metadata: { engineType, query: input.query, normalizedQuery, planningWindow, ...(discoveryJobId ? { discoveryJobId } : {}) },
+      metadata: { ...requestMetadata, httpAttempts: output.usage.calls },
     });
-    return { ...output, providerRunId: reservation.providerRun.id };
+    return { ...output, results: recoveryProbe ? [] : output.results, providerRunId: reservation.providerRun.id };
   };
   return provider;
 }
