@@ -14,6 +14,7 @@ import { getAutopilotSettings } from "@/infrastructure/neon/repositories/autopil
 import { getEffectiveAutopilotState } from "@/domain/autopilot/types";
 import { getDayBounds } from "@/lib/time/day-bounds";
 import { createProviderRequestKey, currentProviderPlanningWindow, nextProviderPlanningWindowAt, normalizeProviderQuery } from "@/services/discovery/provider-request-key";
+import { APIFY_DEFAULT_BATCH_COST_LIMIT_USD, APIFY_MAX_RESULTS_PER_SEARCH } from "@/services/discovery/apify-request-capacity";
 
 export type MapsEngineRole = "maps_fast" | "maps_deep" | "hybrid_fill";
 export type SerperPurpose = "google_serp_discovery" | "linkedin_owner_discovery" | "maps_fast_website_recovery" | "maps_deep_enrichment" | "recovery_probe";
@@ -64,7 +65,8 @@ export function createMapsDiscoveryProvider(workspaceId: string, role: MapsEngin
     apiToken: env.APIFY_API_TOKEN,
     actorId,
     dailyCostLimitUsd: env.APIFY_DAILY_COST_LIMIT_USD,
-    batchCostLimitUsd: env.APIFY_BATCH_COST_LIMIT_USD,
+    batchCostLimitUsd: Math.min(env.APIFY_BATCH_COST_LIMIT_USD, APIFY_DEFAULT_BATCH_COST_LIMIT_USD),
+    maxCrawledPlacesPerSearch: APIFY_MAX_RESULTS_PER_SEARCH,
     getTodaySpendUsd: async (excludeRequestKey) => {
       const settings = await getAutopilotSettings(workspaceId);
       return getTodaySpendUsd(workspaceId, "apify", settings.timezone, new Date(), excludeRequestKey);

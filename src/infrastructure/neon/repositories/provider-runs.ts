@@ -750,6 +750,7 @@ export async function updateProviderRun(
     externalRunId: string | null;
     actorId: string | null;
     externalDatasetId: string | null;
+    itemsRequested: number;
     itemsReturned: number;
     costUsd: number;
     finishedAt: Date | null;

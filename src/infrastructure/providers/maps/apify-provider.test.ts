@@ -86,6 +86,61 @@ describe("ApifyMapsDiscoveryProvider", () => {
     expect(startActorRun).toHaveBeenCalledWith(expect.any(String), expect.any(Object), { maxTotalChargeUsd: 0.09999999999999964 });
   });
 
+  it("uses the same hard-capped result count in actor input and async accounting", async () => {
+    const startActorRun = vi.fn().mockResolvedValue({ ...SUCCEEDED_RUN, status: "READY", defaultDatasetId: null });
+    const provider = new ApifyMapsDiscoveryProvider({
+      apiToken: "token",
+      actorId: "compass/crawler-google-places",
+      dailyCostLimitUsd: 10,
+      batchCostLimitUsd: 0.5,
+      getTodaySpendUsd: vi.fn().mockResolvedValue(0),
+      client: { runAndWait: vi.fn(), startActorRun, getDatasetItems: vi.fn() },
+    });
+
+    const result = await provider.startAsync({ query: "farmacia", geography: "Madrid", pageToken: null, maxResults: 250 });
+    expect(startActorRun.mock.calls[0]?.[1]).toMatchObject({ maxCrawledPlacesPerSearch: 100 });
+    expect(result.itemsRequested).toBe(100);
+  });
+
+  it("does not start an actor run when the batch budget cannot fund one result", async () => {
+    const startActorRun = vi.fn();
+    const provider = new ApifyMapsDiscoveryProvider({
+      apiToken: "token",
+      actorId: "compass/crawler-google-places",
+      dailyCostLimitUsd: 10,
+      batchCostLimitUsd: 0,
+      getTodaySpendUsd: vi.fn().mockResolvedValue(0),
+      client: { runAndWait: vi.fn(), startActorRun, getDatasetItems: vi.fn() },
+    });
+
+    await expect(provider.startAsync({ query: "farmacia", geography: "Madrid", pageToken: null }))
+      .rejects.toThrow(ApifyCostLimitExceededError);
+    expect(startActorRun).not.toHaveBeenCalled();
+  });
+
+  it("respects a lower configured result ceiling in actor input and run records", async () => {
+    const client: ApifyMapsClient = {
+      runAndWait: vi.fn().mockResolvedValue(SUCCEEDED_RUN),
+      getDatasetItems: vi.fn().mockResolvedValue([{ title: "Farmacia A", placeId: "p1" }]),
+    };
+    const recordRun = vi.fn().mockResolvedValue(undefined);
+    const provider = new ApifyMapsDiscoveryProvider({
+      apiToken: "token",
+      actorId: "compass/crawler-google-places",
+      dailyCostLimitUsd: 10,
+      batchCostLimitUsd: 0.5,
+      maxCrawledPlacesPerSearch: 20,
+      getTodaySpendUsd: vi.fn().mockResolvedValue(0),
+      recordRun,
+      client,
+    });
+
+    await provider.search({ query: "farmacia", geography: "Madrid", pageToken: null, maxResults: 80 });
+    expect(client.runAndWait).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({ maxCrawledPlacesPerSearch: 20 }), expect.any(Object));
+    expect(client.getDatasetItems).toHaveBeenCalledWith("ds1", { limit: 20 });
+    expect(recordRun).toHaveBeenCalledWith(expect.objectContaining({ itemsRequested: 20 }));
+  });
+
   it("does not count its own idempotent reservation twice during provider budget preflight", async () => {
     const getTodaySpendUsd = vi.fn().mockResolvedValue(0);
     const startActorRun = vi.fn().mockResolvedValue({ ...SUCCEEDED_RUN, status: "READY", defaultDatasetId: null });

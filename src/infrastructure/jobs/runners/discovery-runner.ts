@@ -35,6 +35,11 @@ import { getMapsEnv } from "@/lib/config/env";
 import { logEvent } from "@/lib/observability/structured-logger";
 import { getApifyFailureClass, getApifyFailureKind } from "@/infrastructure/providers/maps/apify-client";
 import { planSeedBatches, scoreSeedEconomicPerformance } from "@/services/discovery/seed-economics";
+import {
+  APIFY_DEFAULT_BATCH_COST_LIMIT_USD,
+  APIFY_MAX_RESULTS_PER_SEARCH,
+  resolveApifyMaxResults,
+} from "@/services/discovery/apify-request-capacity";
 
 const DISCOVERY_JOB_TYPE = "run_engine_batch";
 const MAX_SEEDS_PER_JOB = 5;
@@ -386,9 +391,37 @@ async function executeDiscoveryJob(
   const seedEconomics = provider === "apify"
     ? await getSeedEconomicPerformance(campaign.id, job.payload.engineType, new Date(), campaign.timeZone)
     : new Map();
-  const economicBatches = provider === "apify"
-    ? planSeedBatches({ seeds: seedCandidates, performanceBySeed: seedEconomics, rawNeeded: desiredRawCount, maxSeeds, now: new Date() })
-    : [];
+  const economicPlan = provider === "apify"
+    ? planSeedBatches({
+      seeds: seedCandidates,
+      performanceBySeed: seedEconomics,
+      rawNeeded: desiredRawCount,
+      maxSeeds,
+      now: new Date(),
+      configuredMaxResults: APIFY_MAX_RESULTS_PER_SEARCH,
+      batchCostLimitUsd: mapsEnv?.APIFY_BATCH_COST_LIMIT_USD ?? APIFY_DEFAULT_BATCH_COST_LIMIT_USD,
+    })
+    : null;
+  const economicBatches = economicPlan?.batches ?? [];
+  if (economicPlan) {
+    const plannedItems = economicPlan.coreRequestedItems + economicPlan.explorationRequestedItems;
+    const tierCounts = Object.fromEntries(["high", "good", "marginal", "low", "zero"].map((tier) => [
+      tier,
+      economicBatches.filter((batch) => batch.policy.tier === tier).length,
+    ]));
+    logEvent("info", "discovery.seed_plan_economics", {
+      correlationId: job.id,
+      discoveryJobId: job.id,
+      requestedTarget: desiredRawCount,
+      coreRequestedItems: economicPlan.coreRequestedItems,
+      explorationRequestedItems: economicPlan.explorationRequestedItems,
+      totalPlannedRequestedItems: plannedItems,
+      explorationRequestedShare: plannedItems > 0 ? economicPlan.explorationRequestedItems / plannedItems : 0,
+      ...Object.fromEntries(Object.entries(tierCounts).map(([tier, count]) => [`${tier}SeedsRun`, count])),
+      explorationSeedsRun: economicBatches.filter((batch) => batch.policy.exploration).length,
+      productiveSeedCapacityConstrained: economicPlan.productiveSeedCapacityConstrained,
+    });
+  }
   const boundedSeeds = provider === "apify"
     ? economicBatches.map((batch) => batch.seed)
     : seedCandidates.slice(0, maxSeeds);
@@ -449,9 +482,16 @@ async function executeDiscoveryJob(
 
   let totalRawCandidates = 0;
   for (const [seedIndex, seed] of boundedSeeds.entries()) {
-    const requestedItems = provider === "apify"
+    const plannedItems = provider === "apify"
       ? economicBatchBySeed.get(seed.id)?.requestedItems ?? 0
       : Math.min(MAX_RAW_PER_SEED, Math.max(1, Math.ceil(remainingRaw / (boundedSeeds.length - seedIndex))));
+    const requestedItems = provider === "apify"
+      ? resolveApifyMaxResults({
+        requestedItems: plannedItems,
+        configuredMaxResults: APIFY_MAX_RESULTS_PER_SEARCH,
+        batchCostLimitUsd: mapsEnv?.APIFY_BATCH_COST_LIMIT_USD ?? APIFY_DEFAULT_BATCH_COST_LIMIT_USD,
+      })
+      : plannedItems;
     if (requestedItems <= 0) continue;
     const startedAt = new Date();
     const reservationFields = {
@@ -504,6 +544,13 @@ async function executeDiscoveryJob(
           metadata: {
             engineType: job.payload.engineType,
             seedId: seed.id,
+            ...(provider === "apify" && economicBatchBySeed.get(seed.id) ? {
+              seedEconomicTier: economicBatchBySeed.get(seed.id)!.policy.tier,
+              seedEconomicExploration: economicBatchBySeed.get(seed.id)!.policy.exploration,
+              seedEconomicCoreRequestedItems: economicBatchBySeed.get(seed.id)!.policy.exploration ? 0 : requestedItems,
+              seedEconomicExplorationRequestedItems: economicBatchBySeed.get(seed.id)!.policy.exploration ? requestedItems : 0,
+              productiveSeedCapacityConstrained: economicPlan?.productiveSeedCapacityConstrained ?? false,
+            } : {}),
             discoveryJobId: job.id,
             query: seed.query,
             normalizedQuery,
@@ -638,6 +685,7 @@ async function executeDiscoveryJob(
         externalRunId: result.providerRun.externalRunId,
         externalDatasetId: result.providerRun.externalDatasetId,
         status: result.providerRun.status,
+        itemsRequested: result.providerRun.itemsRequested,
         costUsd: result.providerRun.costUsd,
         metadata: mergeApifyProviderRunMetadata(
           reservationMetadata,

@@ -271,6 +271,12 @@ export async function getSeedEconomicPerformance(
 
 export interface ApifyDailyEconomicTotals {
   runs: number;
+  itemsRequested: number;
+  coreRequestedItems: number;
+  explorationRequestedItems: number;
+  explorationSeedsRun: number;
+  productiveSeedCapacityConstrained: boolean;
+  seedTierCounts: Record<"high" | "good" | "marginal" | "low" | "zero" | "exploration", number>;
   spendUsd: number;
   resultsReturned: number;
   accountedResultsReturned: number;
@@ -281,6 +287,17 @@ export interface ApifyDailyEconomicTotals {
 export function buildApifyDailyEconomicTotalsQuery(workspaceId: string, since: Date, now: Date) {
   return sql`
     SELECT COUNT(*)::int AS runs,
+      COALESCE(SUM(items_requested), 0)::int AS items_requested,
+      COALESCE(SUM(NULLIF(metadata->>'seedEconomicCoreRequestedItems', '')::int), 0)::int AS core_requested_items,
+      COALESCE(SUM(NULLIF(metadata->>'seedEconomicExplorationRequestedItems', '')::int), 0)::int AS exploration_requested_items,
+      COUNT(*) FILTER (WHERE metadata->>'seedEconomicExploration' = 'true')::int AS exploration_seeds_run,
+      COALESCE(BOOL_OR(metadata->>'productiveSeedCapacityConstrained' = 'true'), false) AS productive_seed_capacity_constrained,
+      COUNT(*) FILTER (WHERE metadata->>'seedEconomicTier' = 'high')::int AS high_seed_runs,
+      COUNT(*) FILTER (WHERE metadata->>'seedEconomicTier' = 'good')::int AS good_seed_runs,
+      COUNT(*) FILTER (WHERE metadata->>'seedEconomicTier' = 'marginal')::int AS marginal_seed_runs,
+      COUNT(*) FILTER (WHERE metadata->>'seedEconomicTier' = 'low')::int AS low_seed_runs,
+      COUNT(*) FILTER (WHERE metadata->>'seedEconomicTier' = 'zero')::int AS zero_seed_runs,
+      COUNT(*) FILTER (WHERE metadata->>'seedEconomicTier' = 'exploration')::int AS exploration_tier_seed_runs,
       COALESCE(SUM(cost_usd), 0)::float AS spend_usd,
       COALESCE(SUM(items_returned), 0)::int AS results_returned,
       COALESCE(SUM(items_returned) FILTER (WHERE
@@ -308,6 +325,19 @@ export async function getApifyDailyEconomicTotals(
   const row = result.rows[0] as Record<string, unknown> | undefined;
   return {
     runs: economicCount(row?.runs),
+    itemsRequested: economicCount(row?.items_requested),
+    coreRequestedItems: economicCount(row?.core_requested_items),
+    explorationRequestedItems: economicCount(row?.exploration_requested_items),
+    explorationSeedsRun: economicCount(row?.exploration_seeds_run),
+    productiveSeedCapacityConstrained: row?.productive_seed_capacity_constrained === true,
+    seedTierCounts: {
+      high: economicCount(row?.high_seed_runs),
+      good: economicCount(row?.good_seed_runs),
+      marginal: economicCount(row?.marginal_seed_runs),
+      low: economicCount(row?.low_seed_runs),
+      zero: economicCount(row?.zero_seed_runs),
+      exploration: economicCount(row?.exploration_tier_seed_runs),
+    },
     spendUsd: economicCount(row?.spend_usd),
     resultsReturned: economicCount(row?.results_returned),
     accountedResultsReturned: economicCount(row?.accounted_results_returned),

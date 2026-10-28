@@ -127,7 +127,7 @@ describe("seed economics", () => {
       ["high-b", performance({ seedId: "high-b", noveltyRate: 0.6 })],
       ["low", performance({ seedId: "low", noveltyRate: 0.05 })],
     ]);
-    const batches = planSeedBatches({ seeds, performanceBySeed: performances, rawNeeded: 180, maxSeeds: 3, now });
+    const { batches } = planSeedBatches({ seeds, performanceBySeed: performances, rawNeeded: 180, maxSeeds: 3, now });
 
     expect(batches.map((batch) => batch.seed.id)).toEqual(["high-a", "high-b"]);
     expect(batches.reduce((sum, batch) => sum + batch.requestedItems, 0)).toBe(180);
@@ -140,9 +140,9 @@ describe("seed economics", () => {
       ["high-a", performance({ seedId: "high-a", noveltyRate: 0.7 })],
       ["high-b", performance({ seedId: "high-b", noveltyRate: 0.6 })],
     ]);
-    const batches = planSeedBatches({ seeds, performanceBySeed: performances, rawNeeded: 100, maxSeeds: 3, now });
+    const { batches } = planSeedBatches({ seeds, performanceBySeed: performances, rawNeeded: 100, maxSeeds: 3, now });
 
-    expect(batches.find((batch) => batch.seed.id === "new")?.requestedItems).toBeGreaterThanOrEqual(12);
+    expect(batches.find((batch) => batch.seed.id === "new")?.requestedItems).toBe(12);
     expect(batches.reduce((sum, batch) => sum + batch.requestedItems, 0)).toBe(100);
   });
 
@@ -153,7 +153,7 @@ describe("seed economics", () => {
       seed("barcelona", { geography: "Barcelona" }),
     ];
     const performances = new Map(seeds.map((item) => [item.id, performance({ seedId: item.id, noveltyRate: 0.6 })]));
-    const batches = planSeedBatches({ seeds, performanceBySeed: performances, rawNeeded: 150, maxSeeds: 2, now });
+    const { batches } = planSeedBatches({ seeds, performanceBySeed: performances, rawNeeded: 150, maxSeeds: 2, now });
 
     expect(batches.map((batch) => batch.seed.id)).toEqual(["madrid-a", "barcelona"]);
   });
@@ -168,9 +168,121 @@ describe("seed economics", () => {
       ["productive-madrid", performance({ seedId: "productive-madrid", noveltyRate: 0.6 })],
       ["productive-valencia", performance({ seedId: "productive-valencia", noveltyRate: 0.6 })],
     ]);
-    const batches = planSeedBatches({ seeds, performanceBySeed: performances, rawNeeded: 150, maxSeeds: 2, now });
+    const { batches } = planSeedBatches({ seeds, performanceBySeed: performances, rawNeeded: 150, maxSeeds: 2, now });
 
-    expect(batches.map((batch) => batch.seed.id)).toEqual(["productive-valencia", "exploration-madrid"]);
+    expect(batches.map((batch) => batch.seed.id)).toEqual(["productive-madrid", "productive-valencia"]);
+  });
+
+  it("keeps exploration candidates out of core and enforces the requested-item allowance", () => {
+    const seeds = [seed("new-a"), seed("new-b"), seed("good", { geography: "Good" })];
+    const result = planSeedBatches({
+      seeds,
+      performanceBySeed: new Map([["good", performance({ seedId: "good", noveltyRate: 0.3 })]]),
+      rawNeeded: 100,
+      maxSeeds: 3,
+      now,
+    });
+    const exploration = result.batches.filter((batch) => batch.policy.exploration);
+    const core = result.batches.filter((batch) => !batch.policy.exploration);
+
+    expect(core.map((batch) => batch.seed.id)).toEqual(["good"]);
+    expect(exploration.every((batch) => batch.requestedItems <= 20)).toBe(true);
+    expect(result.explorationRequestedItems).toBeLessThanOrEqual(100 * 0.12);
+    expect(result.explorationRequestedItems).toBe(12);
+  });
+
+  it("does not round exploration above 12% for small requested targets", () => {
+    const result = planSeedBatches({
+      seeds: [seed("new-a"), seed("new-b")],
+      performanceBySeed: new Map(),
+      rawNeeded: 8,
+      maxSeeds: 2,
+      now,
+    });
+
+    expect(result.explorationRequestedItems).toBe(0);
+    expect(result.explorationRequestedItems).toBeLessThanOrEqual(8 * 0.12);
+  });
+
+  it("does not let 206 low-sample seeds overwhelm productive seeds", () => {
+    const productive = Array.from({ length: 5 }, (_, index) => seed(`high-${index}`, { geography: `Productive ${index}` }));
+    const exploration = Array.from({ length: 206 }, (_, index) => seed(`explore-${index}`, { geography: `Explore ${index}` }));
+    const performances = new Map(productive.map((item) => [item.id, performance({ seedId: item.id, noveltyRate: 0.7 })]));
+    const result = planSeedBatches({ seeds: [...exploration, ...productive], performanceBySeed: performances, rawNeeded: 250, maxSeeds: 5, now });
+
+    expect(result.batches.filter((batch) => !batch.policy.exploration).length).toBe(3);
+    expect(result.batches.filter((batch) => batch.policy.exploration).length).toBe(2);
+    expect(result.explorationRequestedItems).toBeLessThanOrEqual(30);
+    expect(result.batches.slice(0, 3).every((batch) => batch.policy.tier === "high")).toBe(true);
+  });
+
+  it("never assigns zero-novelty seeds to core and reports constrained capacity", () => {
+    const zeroPerformance = performance({ noveltyRate: 0, zeroNoveltyRunStreak: 1 });
+    const result = planSeedBatches({
+      seeds: [seed("zero-a"), seed("zero-b")],
+      performanceBySeed: new Map([
+        ["zero-a", { ...zeroPerformance, seedId: "zero-a" }],
+        ["zero-b", { ...zeroPerformance, seedId: "zero-b" }],
+      ]),
+      rawNeeded: 100,
+      maxSeeds: 2,
+      now,
+    });
+
+    expect(result.batches.every((batch) => batch.policy.tier === "zero" && batch.policy.exploration)).toBe(true);
+    expect(result.coreRequestedItems).toBe(0);
+    expect(result.explorationRequestedItems).toBe(12);
+    expect(result.productiveSeedCapacityConstrained).toBe(true);
+  });
+
+  it("selects high and good economic tiers before exploration and retains the hard exploration ceiling", () => {
+    const seeds = [seed("new"), seed("good"), seed("high")];
+    const result = planSeedBatches({
+      seeds,
+      performanceBySeed: new Map([
+        ["good", performance({ seedId: "good", noveltyRate: 0.3 })],
+        ["high", performance({ seedId: "high", noveltyRate: 0.7 })],
+      ]),
+      rawNeeded: 1000,
+      maxSeeds: 3,
+      now,
+    });
+
+    expect(result.batches.map((batch) => batch.seed.id)).toEqual(["high", "good", "new"]);
+    expect(result.explorationRequestedItems).toBeLessThanOrEqual(120);
+    expect(result.productiveSeedCapacityConstrained).toBe(true);
+  });
+
+  it("uses geography spread inside the selected economic tier", () => {
+    const seeds = [
+      seed("high-madrid-a", { geography: "Madrid" }),
+      seed("high-madrid-b", { geography: "Madrid" }),
+      seed("high-barcelona", { geography: "Barcelona" }),
+    ];
+    const result = planSeedBatches({
+      seeds,
+      performanceBySeed: new Map(seeds.map((item) => [item.id, performance({ seedId: item.id, noveltyRate: 0.7 })])),
+      rawNeeded: 200,
+      maxSeeds: 2,
+      now,
+    });
+
+    expect(result.batches.map((batch) => batch.seed.id)).toEqual(["high-madrid-a", "high-barcelona"]);
+  });
+
+  it("caps planning at a configured lower provider maximum", () => {
+    const result = planSeedBatches({
+      seeds: [seed("high")],
+      performanceBySeed: new Map([["high", performance({ seedId: "high", noveltyRate: 0.7 })]]),
+      rawNeeded: 100,
+      maxSeeds: 1,
+      now,
+      configuredMaxResults: 20,
+      batchCostLimitUsd: 0.5,
+    });
+
+    expect(result.batches[0]?.requestedItems).toBe(20);
+    expect(result.productiveSeedCapacityConstrained).toBe(true);
   });
 
   it("uses confirmed-import cost only with a confident sample and limits its weight", () => {

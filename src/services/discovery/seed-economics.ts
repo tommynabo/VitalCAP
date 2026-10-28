@@ -1,4 +1,9 @@
 import type { SearchSeed } from "@/domain/discovery/types";
+import {
+  APIFY_DEFAULT_BATCH_COST_LIMIT_USD,
+  APIFY_MAX_RESULTS_PER_SEARCH,
+  resolveApifyMaxResults,
+} from "./apify-request-capacity";
 
 export const SEED_ECONOMICS_POLICY = {
   minimumRuns: 3,
@@ -6,7 +11,7 @@ export const SEED_ECONOMICS_POLICY = {
   zeroNoveltyRunsBeforeCooldown: 2,
   zeroNoveltyCooldownDays: 7,
   explorationFraction: 0.12,
-  explorationMaxResults: 40,
+  explorationMaxResults: 20,
   returningSeedMaxResults: 20,
   highNoveltyThreshold: 0.5,
   goodNoveltyThreshold: 0.25,
@@ -72,6 +77,13 @@ export interface SeedBatchPlan {
   seed: SearchSeed;
   requestedItems: number;
   policy: SeedEconomicPolicyResult;
+}
+
+export interface SeedBatchPlanningResult {
+  batches: SeedBatchPlan[];
+  coreRequestedItems: number;
+  explorationRequestedItems: number;
+  productiveSeedCapacityConstrained: boolean;
 }
 
 function clampRate(value: number | null | undefined): number | null {
@@ -187,7 +199,7 @@ export function scoreSeedEconomicPerformance(
     priorityScore,
     maxResults: Math.min(maxResults, SEED_ECONOMICS_POLICY.maxResultsPerSeed),
     eligible: true,
-    exploration: Boolean(coolingUntil),
+    exploration: tier === "zero" || Boolean(coolingUntil),
     cooldownUntil: coolingUntil?.toISOString() ?? null,
   };
 }
@@ -231,10 +243,14 @@ export function planSeedBatches(input: {
   rawNeeded: number;
   maxSeeds: number;
   now: Date;
-}): SeedBatchPlan[] {
+  configuredMaxResults?: number;
+  batchCostLimitUsd?: number;
+}): SeedBatchPlanningResult {
   const target = Math.max(0, Math.floor(input.rawNeeded));
   const seedLimit = Math.max(0, Math.floor(input.maxSeeds));
-  if (target === 0 || seedLimit === 0) return [];
+  if (target === 0 || seedLimit === 0) {
+    return { batches: [], coreRequestedItems: 0, explorationRequestedItems: 0, productiveSeedCapacityConstrained: target > 0 };
+  }
 
   const confidentCosts = [...input.performanceBySeed.values()]
     .filter((item) => (item.confirmedInstantlyImportsFromSeed ?? 0) >= SEED_ECONOMICS_POLICY.minConfirmedImportsForCostWeight)
@@ -250,64 +266,102 @@ export function planSeedBatches(input: {
     .filter(({ seed, policy }) => policy.eligible
       && (!seed.nextEligibleAt || new Date(seed.nextEligibleAt).getTime() <= input.now.getTime()))
     .sort((left, right) => right.policy.priorityScore - left.policy.priorityScore || left.index - right.index);
-  if (candidates.length === 0) return [];
+  if (candidates.length === 0) {
+    return { batches: [], coreRequestedItems: 0, explorationRequestedItems: 0, productiveSeedCapacityConstrained: true };
+  }
 
+  const coreCandidates = candidates.filter(({ policy }) => !policy.exploration && policy.tier !== "zero");
   const explorationCandidates = candidates.filter(({ policy }) => policy.exploration);
   const explorationTarget = explorationCandidates.length > 0
-    ? Math.ceil(target * SEED_ECONOMICS_POLICY.explorationFraction)
+    ? Math.floor(target * SEED_ECONOMICS_POLICY.explorationFraction)
     : 0;
-  const explorationSlots = Math.min(
+  const providerMaximum = input.configuredMaxResults ?? APIFY_MAX_RESULTS_PER_SEARCH;
+  const batchCostLimitUsd = input.batchCostLimitUsd ?? APIFY_DEFAULT_BATCH_COST_LIMIT_USD;
+  const maxExplorationCandidateCapacity = Math.max(0, ...explorationCandidates.map(({ policy }) =>
+    resolveApifyMaxResults({
+      requestedItems: policy.maxResults,
+      configuredMaxResults: providerMaximum,
+      batchCostLimitUsd,
+    }),
+  ));
+  const desiredExplorationSlots = Math.min(
     explorationCandidates.length,
-    seedLimit,
-    Math.ceil(explorationTarget / SEED_ECONOMICS_POLICY.explorationMaxResults),
+    maxExplorationCandidateCapacity > 0 ? Math.ceil(explorationTarget / maxExplorationCandidateCapacity) : 0,
   );
-  const selectedExploration = selectWithGeographySpread(explorationCandidates, explorationSlots);
-  const explorationIds = new Set(selectedExploration.map(({ seed }) => seed.id));
-  const explorationGeographies = new Set(selectedExploration.map(({ seed }) => seed.geography));
-  const selectedCore = selectWithGeographySpread(
-    candidates.filter(({ seed }) => !explorationIds.has(seed.id)),
-    seedLimit - selectedExploration.length,
-    explorationGeographies,
+  const selectedCore: typeof candidates = [];
+  const selectedCoreIds = new Set<string>();
+  const selectedGeographies = new Set<string>();
+  const coreTarget = target - explorationTarget;
+  let selectedCoreCapacity = 0;
+  for (const tier of ["high", "good", "marginal", "low"] as const) {
+    const tierCandidates = coreCandidates.filter(({ policy }) => policy.tier === tier);
+    const remainingCandidates = tierCandidates.filter(({ seed }) => !selectedCoreIds.has(seed.id));
+    while (selectedCore.length < seedLimit && selectedCoreCapacity < coreTarget && remainingCandidates.length > 0) {
+      const [candidate] = selectWithGeographySpread(remainingCandidates, 1, selectedGeographies);
+      if (!candidate) break;
+      selectedCore.push(candidate);
+      selectedCoreIds.add(candidate.seed.id);
+      selectedGeographies.add(candidate.seed.geography);
+      remainingCandidates.splice(remainingCandidates.findIndex(({ seed }) => seed.id === candidate.seed.id), 1);
+      selectedCoreCapacity += resolveApifyMaxResults({
+        requestedItems: candidate.policy.maxResults,
+        configuredMaxResults: providerMaximum,
+        batchCostLimitUsd,
+      });
+    }
+  }
+  const explorationSlots = Math.min(desiredExplorationSlots, seedLimit - selectedCore.length);
+  const selectedExploration = selectWithGeographySpread(
+    explorationCandidates,
+    explorationSlots,
+    selectedGeographies,
   );
   const selected = [...selectedCore, ...selectedExploration];
   const allocation = new Map<string, number>();
+  let coreRemaining = Math.max(0, target - (selectedExploration.length > 0 ? explorationTarget : 0));
+  for (const candidate of selectedCore) {
+    if (coreRemaining <= 0) break;
+    const maxResults = resolveApifyMaxResults({
+      requestedItems: candidate.policy.maxResults,
+      configuredMaxResults: providerMaximum,
+      batchCostLimitUsd,
+    });
+    const requestedItems = Math.min(maxResults, coreRemaining);
+    if (requestedItems > 0) {
+      allocation.set(candidate.seed.id, requestedItems);
+      coreRemaining -= requestedItems;
+    }
+  }
 
-  let remaining = target;
-  const reservedExploration = Math.min(
-    explorationTarget,
-    selectedExploration.reduce((sum, item) => sum + item.policy.maxResults, 0),
-  );
-  let explorationRemaining = reservedExploration;
+  let explorationRemaining = explorationTarget;
   for (const candidate of selectedExploration) {
-    const requestedItems = Math.min(candidate.policy.maxResults, explorationRemaining);
+    if (explorationRemaining <= 0) break;
+    const maxResults = resolveApifyMaxResults({
+      requestedItems: candidate.policy.maxResults,
+      configuredMaxResults: providerMaximum,
+      batchCostLimitUsd,
+    });
+    const requestedItems = Math.min(maxResults, explorationRemaining);
     if (requestedItems > 0) {
       allocation.set(candidate.seed.id, requestedItems);
       explorationRemaining -= requestedItems;
-      remaining -= requestedItems;
     }
   }
 
-  for (const candidate of selectedCore) {
-    if (remaining <= 0) break;
-    const requestedItems = Math.min(candidate.policy.maxResults, remaining);
-    if (requestedItems > 0) {
-      allocation.set(candidate.seed.id, requestedItems);
-      remaining -= requestedItems;
-    }
-  }
-
-  for (const candidate of selectedExploration) {
-    if (remaining <= 0) break;
-    const alreadyAllocated = allocation.get(candidate.seed.id) ?? 0;
-    const requestedItems = Math.min(candidate.policy.maxResults - alreadyAllocated, remaining);
-    if (requestedItems > 0) {
-      allocation.set(candidate.seed.id, alreadyAllocated + requestedItems);
-      remaining -= requestedItems;
-    }
-  }
-
-  return selected
+  const batches = selected
     .map(({ seed, policy }) => ({ seed, policy, requestedItems: allocation.get(seed.id) ?? 0 }))
     .filter((batch) => batch.requestedItems > 0)
     .sort((left, right) => right.policy.priorityScore - left.policy.priorityScore);
+  const coreRequestedItems = batches.filter((batch) => !batch.policy.exploration)
+    .reduce((sum, batch) => sum + batch.requestedItems, 0);
+  const explorationRequestedItems = batches.filter((batch) => batch.policy.exploration)
+    .reduce((sum, batch) => sum + batch.requestedItems, 0);
+  const totalRequestedItems = coreRequestedItems + explorationRequestedItems;
+
+  return {
+    batches,
+    coreRequestedItems,
+    explorationRequestedItems,
+    productiveSeedCapacityConstrained: totalRequestedItems < target,
+  };
 }

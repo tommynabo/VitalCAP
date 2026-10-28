@@ -34,6 +34,11 @@ describe("seed economic performance query", () => {
 
     expect(query.sql).toContain("SUM(cost_usd)");
     expect(query.sql).toContain("SUM(items_returned)");
+    expect(query.sql).toContain("SUM(items_requested)");
+    expect(query.sql).toContain("seedEconomicCoreRequestedItems");
+    expect(query.sql).toContain("seedEconomicExplorationRequestedItems");
+    expect(query.sql).toContain("seedEconomicTier");
+    expect(query.sql).toContain("productiveSeedCapacityConstrained");
     expect(query.sql).toContain("INSERTED_NEW_RAW");
     expect(query.sql).toContain("DUPLICATE_EXISTING_RAW");
     expect(query.sql).not.toContain("items_requested *");

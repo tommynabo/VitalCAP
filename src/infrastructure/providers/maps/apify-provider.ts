@@ -3,6 +3,7 @@ import { ProviderBudgetExceededError, ProviderConfigurationError } from "@/domai
 import { ApifyClient, type ApifyRun } from "./apify-client";
 import { buildCompassActorInput, COMPASS_ACTOR_ID, mapCompassItemToPlaceResult } from "./apify-actors/compass-adapter";
 import { allowsNewApifyRun } from "@/domain/autopilot/gates";
+import { APIFY_MAX_RESULTS_PER_SEARCH, resolveApifyMaxResults } from "@/services/discovery/apify-request-capacity";
 
 /** Narrowed to just the two methods this provider calls, so tests can inject a plain fake instead of a real `ApifyClient`. */
 export interface ApifyMapsClient {
@@ -95,7 +96,12 @@ export class ApifyMapsDiscoveryProvider implements MapsDiscoveryProvider {
     }
     const startActorRun = this.client.startActorRun;
     if (!startActorRun) throw new ProviderConfigurationError("Async Apify client support is not configured.");
-    const maxResults = Math.min(this.config.maxCrawledPlacesPerSearch ?? 20, Math.max(1, Math.floor(input.maxResults ?? this.config.maxCrawledPlacesPerSearch ?? 20)));
+    const maxResults = resolveApifyMaxResults({
+      requestedItems: input.maxResults ?? this.config.maxCrawledPlacesPerSearch ?? APIFY_MAX_RESULTS_PER_SEARCH,
+      configuredMaxResults: this.config.maxCrawledPlacesPerSearch ?? APIFY_MAX_RESULTS_PER_SEARCH,
+      batchCostLimitUsd: this.config.batchCostLimitUsd,
+    });
+    if (maxResults === 0) throw new ApifyCostLimitExceededError("Apify batch budget cannot fund one requested result.");
     const actorInput = buildCompassActorInput(input, maxResults);
     const run = await startActorRun.call(this.client, this.config.actorId, actorInput, { maxTotalChargeUsd });
     return {
@@ -117,7 +123,12 @@ export class ApifyMapsDiscoveryProvider implements MapsDiscoveryProvider {
     if (this.config.actorId !== COMPASS_ACTOR_ID) {
       throw new ProviderConfigurationError(`No verified input adapter exists for Apify actor ${this.config.actorId}.`);
     }
-    const maxResults = Math.min(this.config.maxCrawledPlacesPerSearch ?? 20, Math.max(1, Math.floor(input.maxResults ?? this.config.maxCrawledPlacesPerSearch ?? 20)));
+    const maxResults = resolveApifyMaxResults({
+      requestedItems: input.maxResults ?? this.config.maxCrawledPlacesPerSearch ?? APIFY_MAX_RESULTS_PER_SEARCH,
+      configuredMaxResults: this.config.maxCrawledPlacesPerSearch ?? APIFY_MAX_RESULTS_PER_SEARCH,
+      batchCostLimitUsd: this.config.batchCostLimitUsd,
+    });
+    if (maxResults === 0) throw new ApifyCostLimitExceededError("Apify batch budget cannot fund one requested result.");
     const actorInput = buildCompassActorInput(input, maxResults);
     let run;
     try {
@@ -130,7 +141,7 @@ export class ApifyMapsDiscoveryProvider implements MapsDiscoveryProvider {
         externalRunId: null,
         externalDatasetId: null,
         status: "failed",
-        itemsRequested: this.config.maxCrawledPlacesPerSearch ?? 20,
+        itemsRequested: maxResults,
         itemsReturned: 0,
         costUsd: 0,
         errorMessage: error instanceof Error ? error.message : String(error),
@@ -144,7 +155,7 @@ export class ApifyMapsDiscoveryProvider implements MapsDiscoveryProvider {
         externalRunId: run.id,
         externalDatasetId: run.defaultDatasetId,
         status: "failed",
-        itemsRequested: this.config.maxCrawledPlacesPerSearch ?? 20,
+        itemsRequested: maxResults,
         itemsReturned: 0,
         costUsd: run.usageTotalUsd ?? 0,
         errorMessage: `Apify run ended with status ${run.status}`,
@@ -156,7 +167,7 @@ export class ApifyMapsDiscoveryProvider implements MapsDiscoveryProvider {
     let items: Record<string, unknown>[];
     try {
       items = (await this.client.getDatasetItems(run.defaultDatasetId, {
-        limit: this.config.maxCrawledPlacesPerSearch ?? 20,
+        limit: maxResults,
       })) as Record<string, unknown>[];
     } catch (error) {
       await this.config.recordRun?.({
@@ -164,7 +175,7 @@ export class ApifyMapsDiscoveryProvider implements MapsDiscoveryProvider {
         externalRunId: run.id,
         externalDatasetId: run.defaultDatasetId,
         status: "failed",
-        itemsRequested: this.config.maxCrawledPlacesPerSearch ?? 20,
+        itemsRequested: maxResults,
         itemsReturned: 0,
         costUsd: run.usageTotalUsd ?? 0,
         errorMessage: error instanceof Error ? error.message : String(error),
@@ -179,7 +190,7 @@ export class ApifyMapsDiscoveryProvider implements MapsDiscoveryProvider {
       externalRunId: run.id,
       externalDatasetId: run.defaultDatasetId,
       status: "completed",
-      itemsRequested: this.config.maxCrawledPlacesPerSearch ?? 20,
+      itemsRequested: maxResults,
       itemsReturned: results.length,
       costUsd,
     });

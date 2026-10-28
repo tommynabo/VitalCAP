@@ -69,7 +69,20 @@ describe("GET /api/admin/runtime-diagnostics recovery errors", () => {
     requireCurrentUser.mockResolvedValue({ userId: "admin-1" });
     getWorkspaceRole.mockResolvedValue("admin");
     listCampaigns.mockResolvedValue([]);
-    getApifyDailyEconomicTotals.mockResolvedValue({ runs: 0, spendUsd: 0, resultsReturned: 0, accountedResultsReturned: 0, newRaw: 0, duplicates: 0 });
+    getApifyDailyEconomicTotals.mockResolvedValue({
+      runs: 0,
+      itemsRequested: 0,
+      coreRequestedItems: 0,
+      explorationRequestedItems: 0,
+      explorationSeedsRun: 0,
+      productiveSeedCapacityConstrained: false,
+      seedTierCounts: { high: 0, good: 0, marginal: 0, low: 0, zero: 0, exploration: 0 },
+      spendUsd: 0,
+      resultsReturned: 0,
+      accountedResultsReturned: 0,
+      newRaw: 0,
+      duplicates: 0,
+    });
     getAutopilotPacingState.mockResolvedValue({ instantlyImportedToday: 0, qualifiedToday: 0, validEmailToday: 0 });
     getSeedEconomicPerformance.mockResolvedValue(new Map());
     listSearchSeedsForCampaignEngine.mockResolvedValue([]);
@@ -184,6 +197,10 @@ describe("GET /api/admin/runtime-diagnostics recovery errors", () => {
     expect(body.autopilot).toMatchObject({ target: 250, targetMetric: "instantly_imported" });
     expect(body.discoveryEconomics).toMatchObject({
       apifySpendTodayUsd: 0,
+      apifyItemsRequestedToday: 0,
+      apifyCoreRequestedToday: 0,
+      apifyExplorationRequestedToday: 0,
+      apifyExplorationRequestedShareToday: 0,
       apifyResultsToday: 0,
       newRawToday: 0,
       qualifiedToday: 0,

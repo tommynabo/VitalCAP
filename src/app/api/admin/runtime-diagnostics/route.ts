@@ -360,6 +360,15 @@ export async function GET() {
       discoveryEconomics: {
         apifySpendTodayUsd: apifyDailyEconomics.spendUsd,
         apifyRunsToday: apifyDailyEconomics.runs,
+        apifyItemsRequestedToday: apifyDailyEconomics.itemsRequested,
+        apifyCoreRequestedToday: apifyDailyEconomics.coreRequestedItems,
+        apifyExplorationRequestedToday: apifyDailyEconomics.explorationRequestedItems,
+        apifyExplorationRequestedShareToday: apifyDailyEconomics.itemsRequested > 0
+          ? apifyDailyEconomics.explorationRequestedItems / apifyDailyEconomics.itemsRequested
+          : 0,
+        apifyExplorationSeedsRunToday: apifyDailyEconomics.explorationSeedsRun,
+        apifySeedTierCountsToday: apifyDailyEconomics.seedTierCounts,
+        apifyProductiveSeedCapacityConstrainedToday: apifyDailyEconomics.productiveSeedCapacityConstrained,
         apifyResultsToday: apifyDailyEconomics.resultsReturned,
         newRawToday: apifyDailyEconomics.newRaw,
         duplicateExistingRawToday: apifyDailyEconomics.duplicates,
