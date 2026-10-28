@@ -113,6 +113,25 @@ describe("seed economics", () => {
     expect(returned).toMatchObject({ eligible: true, exploration: true, maxResults: 20 });
   });
 
+  it("cools extremely low-novelty sources only after mature, fully attributed evidence with no imports", () => {
+    const matureWeakSource = performance({
+      noveltyRate: 0.02,
+      zeroNoveltyRunStreak: 0,
+      confirmedInstantlyImportsFromSeed: 0,
+      lastRunAt: "2026-10-27T09:00:00.000Z",
+    });
+    const cooled = scoreSeedEconomicPerformance(seed("weak"), matureWeakSource, now);
+    const oneRun = scoreSeedEconomicPerformance(seed("one-run"), performance({
+      recentRuns: 1,
+      noveltyRate: 0.02,
+      confirmedInstantlyImportsFromSeed: 0,
+      lastRunAt: "2026-10-27T09:00:00.000Z",
+    }), now);
+
+    expect(cooled).toMatchObject({ eligible: false, tier: "zero", maxResults: 0 });
+    expect(oneRun.eligible).toBe(true);
+  });
+
   it("gives high-novelty seeds more batch capacity than low-novelty seeds", () => {
     const high = scoreSeedEconomicPerformance(seed("high"), performance({ noveltyRate: 0.7 }), now);
     const low = scoreSeedEconomicPerformance(seed("low"), performance({ noveltyRate: 0.05 }), now);
@@ -310,6 +329,40 @@ describe("seed economics", () => {
     expect(expensiveScore).toBeLessThan(baselineScore);
     expect(noisyScore).toBeCloseTo(noisyNeutralScore);
     expect(expensiveScore).toBeGreaterThanOrEqual(baselineScore * 0.75);
+  });
+
+  it("ranks mature sources by cost per new raw without changing their tier", () => {
+    const expensive = scoreSeedEconomicPerformance(seed("expensive"), performance({
+      noveltyRate: 0.4,
+      costPerNewRaw: 0.04,
+    }), now, null, 0.01);
+    const efficient = scoreSeedEconomicPerformance(seed("efficient"), performance({
+      noveltyRate: 0.4,
+      costPerNewRaw: 0.005,
+    }), now, null, 0.01);
+
+    expect(expensive.tier).toBe(efficient.tier);
+    expect(expensive.priorityScore).toBeLessThan(efficient.priorityScore);
+    expect(expensive.priorityScore).toBeGreaterThanOrEqual(efficient.priorityScore * 0.6);
+  });
+
+  it("protects high/good sources and reduces exploration to 5% under mature economic pressure", () => {
+    const result = planSeedBatches({
+      seeds: [seed("high"), seed("marginal"), seed("new")],
+      performanceBySeed: new Map([
+        ["high", performance({ seedId: "high", noveltyRate: 0.7 })],
+        ["marginal", performance({ seedId: "marginal", noveltyRate: 0.15 })],
+      ]),
+      rawNeeded: 100,
+      maxSeeds: 3,
+      now,
+      economicPressure: true,
+    });
+
+    expect(result.batches.map((batch) => batch.seed.id)).toContain("high");
+    expect(result.batches.map((batch) => batch.seed.id)).not.toContain("marginal");
+    expect(result.explorationRequestedItems).toBe(5);
+    expect(result.explorationRequestedItems).toBeLessThanOrEqual(100 * 0.12);
   });
 
   it("projects the verified zero-novelty bucket at more than 15% savings with all useful raw retained", () => {

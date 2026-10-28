@@ -9,7 +9,7 @@ import { getCampaignQueueDepth } from "@/infrastructure/neon/repositories/job-qu
 import { getWatchdogWorkspaceSignals } from "@/infrastructure/neon/repositories/watchdog-signals";
 import { enqueueDiscoveryOrdersWithinDailyRawCap } from "@/infrastructure/neon/repositories/daily-raw-request-cap";
 import { bootstrapSearchSeeds, listSearchSeedsForCampaignEngine } from "@/infrastructure/neon/repositories/discovery";
-import { getApifyRecoverySnapshot, getGlobalSerperSpendToday, getRecentProviderUsage, getSerperRecoveryState, getTodaySpendUsd } from "@/infrastructure/neon/repositories/provider-runs";
+import { getApifyRecoverySnapshot, getGlobalSerperSpendToday, getLatestProviderEconomicPacingStates, getRecentProviderUsage, getSerperRecoveryState, getTodaySpendUsd, recordProviderRun } from "@/infrastructure/neon/repositories/provider-runs";
 import { allocateEngineWork, MAX_APIFY_RECOVERY_PROBE_RAW, MAX_RAW_PER_PLANNING_WINDOW, planApifyRecoveryProbe, planningWindowKey, rerouteEngineOrders, type EnginePlanningPerformance } from "@/services/autopilot/target-planner";
 import { getAutopilotEnginePerformance } from "@/infrastructure/neon/repositories/autopilot-engine-performance";
 import { decideHybridFill } from "@/services/discovery/hybrid-fill-decision";
@@ -22,6 +22,7 @@ import type { SearchSeed } from "@/domain/discovery/types";
 import { refreshWatchdogPauseForWorkspace } from "./watchdog-runner";
 import { logEvent } from "@/lib/observability/structured-logger";
 import { getDiscoveryBackpressureMultiplier, getProcessingHealthState } from "@/services/autopilot/watchdog-pause-policy";
+import { computeProviderBudgetPacing, projectEndOfDayImports } from "@/services/autopilot/economic-pacing";
 
 export interface AutopilotRunnerResult {
   campaignsTicked: number;
@@ -147,12 +148,79 @@ export async function runAutopilotCronTick(now: Date = new Date()): Promise<Auto
       ...pacing.recoveryOutcomes,
     });
     // The target and budget are workspace-wide, never multiplied by engines.
-    if (pacing.remainingTarget <= 0) continue;
+    if (pacing.remainingTarget <= 0) {
+      logEvent("info", "autopilot.target_reached_stop", {
+        correlationId: `autopilot:${workspaceId}`,
+        workspaceId,
+        targetMetric: pacing.targetMetric,
+        confirmedImportsToday: pacing.confirmedImportsToday,
+        remainingTarget: 0,
+        processingPending: pacing.processingInFlight,
+        verificationPending: pacing.verificationInFlight,
+      });
+      continue;
+    }
 
     const mapsEnv = getMapsEnv();
     const serperEnv = getSerperEnv();
     const serperSpendToday = await getGlobalSerperSpendToday(now);
     const serperBudgetRemaining = Math.max(0, serperEnv.SERPER_DAILY_COST_LIMIT_USD - serperSpendToday);
+    const apifyDailyCap = Math.min(mapsEnv.APIFY_DAILY_COST_LIMIT_USD, settings.maxDailyApifySpendUsd ?? Number.POSITIVE_INFINITY);
+    const latestEconomicPacing = await getLatestProviderEconomicPacingStates(workspaceId, settings.timezone, now);
+    const apifyEconomicPacing = computeProviderBudgetPacing({
+      spendTodayUsd: Math.max(0, apifyDailyCap - pacing.apifyDailyBudgetRemaining),
+      dailyCapUsd: apifyDailyCap,
+      elapsedOperatingFraction: pacing.elapsedOperatingFraction,
+      previousState: latestEconomicPacing.apify,
+    });
+    const serperEconomicPacing = computeProviderBudgetPacing({
+      spendTodayUsd: serperSpendToday,
+      dailyCapUsd: serperEnv.SERPER_DAILY_COST_LIMIT_USD,
+      elapsedOperatingFraction: pacing.elapsedOperatingFraction,
+      previousState: latestEconomicPacing.serper,
+    });
+    for (const [provider, current, previous] of [
+      ["apify", apifyEconomicPacing, latestEconomicPacing.apify],
+      ["serper", serperEconomicPacing, latestEconomicPacing.serper],
+    ] as const) {
+      if (current.state === previous) continue;
+      await recordProviderRun({
+        workspaceId,
+        provider,
+        operation: "economic_pacing_state",
+        status: "completed",
+        itemsRequested: 0,
+        itemsReturned: 0,
+        costUsd: 0,
+        metadata: {
+          economicPaceState: current.state,
+          spendTodayUsd: current.spendTodayUsd,
+          dailyCapUsd: current.dailyCapUsd,
+          expectedSpendByNowUsd: current.expectedSpendByNowUsd,
+          timePacePct: current.timePacePct,
+        },
+      });
+    }
+    logEvent("info", "autopilot.economic_provider_pacing", {
+      correlationId: `autopilot:${workspaceId}`,
+      workspaceId,
+      confirmedImportsToday: pacing.confirmedImportsToday,
+      targetImports: settings.globalDailyTarget,
+      remainingTarget: pacing.remainingTarget,
+      elapsedOperatingFraction: pacing.elapsedOperatingFraction,
+      apifySpendTodayUsd: apifyEconomicPacing.spendTodayUsd,
+      apifyDailyCapUsd: apifyEconomicPacing.dailyCapUsd,
+      apifyExpectedSpendByNowUsd: apifyEconomicPacing.expectedSpendByNowUsd,
+      apifyPaceState: apifyEconomicPacing.state,
+      apifyDiscoveryMultiplier: apifyEconomicPacing.discoveryMultiplier,
+      serperSpendTodayUsd: serperEconomicPacing.spendTodayUsd,
+      serperDailyCapUsd: serperEconomicPacing.dailyCapUsd,
+      serperExpectedSpendByNowUsd: serperEconomicPacing.expectedSpendByNowUsd,
+      serperPaceState: serperEconomicPacing.state,
+      serperDiscoveryMultiplier: serperEconomicPacing.discoveryMultiplier,
+      processingPending: pacing.processingInFlight,
+      verificationPending: pacing.verificationInFlight,
+    });
     const apifyRecovery = await getApifyRecoverySnapshot(workspaceId, now);
     const mapsHealth = getApifyAllocationHealth(apifyRecovery);
     const serperRecovery = await getSerperRecoveryState(now);
@@ -171,14 +239,49 @@ export async function runAutopilotCronTick(now: Date = new Date()): Promise<Auto
       mapsFastHealth: mapsHealth,
       providerHealth: healths,
       costAllowed: pacing.apifyDailyBudgetRemaining > 0 || serperBudgetRemaining >= SERPER_ESTIMATED_COST_PER_QUERY_USD,
-      mapsCostAllowed: pacing.apifyDailyBudgetRemaining > 0,
-      serperCostAllowed: serperBudgetRemaining >= SERPER_ESTIMATED_COST_PER_QUERY_USD,
+      mapsCostAllowed: pacing.apifyDailyBudgetRemaining > 0 && apifyEconomicPacing.discoveryMultiplier > 0,
+      serperCostAllowed: serperBudgetRemaining >= SERPER_ESTIMATED_COST_PER_QUERY_USD && serperEconomicPacing.discoveryMultiplier > 0,
       campaignCounts: Object.fromEntries(allTypes.map((engineType) => [engineType, campaigns.filter((campaign) => campaign.engineType === engineType).length])),
     });
 
     const concreteCampaigns = campaigns.filter((campaign) => campaign.engineType !== "hybrid_fill");
     const seedSets = await Promise.all(concreteCampaigns.map((campaign) => listSearchSeedsForCampaignEngine(campaign.id, campaign.engineType)));
     const enginePerformanceByCampaign = await getAutopilotEnginePerformance(workspaceId, getDeliveryEnv().INSTANTLY_CAMPAIGN_ID, now);
+    const recentImportSample = [...enginePerformanceByCampaign.values()]
+      .reduce((total, performance) => total + performance.confirmedImportCount, 0);
+    const recentRawSample = [...enginePerformanceByCampaign.values()]
+      .reduce((total, performance) => total + performance.rawCount, 0);
+    const attributedProviderCostUsd = [...enginePerformanceByCampaign.values()]
+      .reduce((total, performance) => total + (performance.estimatedProviderCostUsd ?? 0), 0);
+    const importProjection = projectEndOfDayImports({
+      confirmedImports: pacing.confirmedImportsToday,
+      dailyTarget: pacing.dailyTarget,
+      elapsedOperatingFraction: pacing.elapsedOperatingFraction,
+      recentImportsPerDay: recentImportSample / 7,
+      recentImportSample,
+      expectedImportsFromBacklog: pacing.expectedImportsFromBacklog,
+    });
+    logEvent("info", "autopilot.economic_acceptance_snapshot", {
+      correlationId: `autopilot:${workspaceId}`,
+      workspaceId,
+      targetMetric: pacing.targetMetric,
+      confirmedImportsToday: pacing.confirmedImportsToday,
+      targetImports: pacing.dailyTarget,
+      remainingTarget: pacing.remainingTarget,
+      targetProgressPct: pacing.dailyTarget > 0 ? Math.min(100, pacing.confirmedImportsToday / pacing.dailyTarget * 100) : 0,
+      rawSample7d: recentRawSample,
+      confirmedImportSample7d: recentImportSample,
+      rawToConfirmedImportYield7d: recentRawSample > 0 ? recentImportSample / recentRawSample : null,
+      attributedProviderCost7dUsd: attributedProviderCostUsd,
+      attributedProviderCostPerConfirmedImport7dUsd: recentImportSample > 0 ? attributedProviderCostUsd / recentImportSample : null,
+      projectedEndOfDayImportsLow: importProjection.low,
+      projectedEndOfDayImportsBase: importProjection.base,
+      projectedEndOfDayImportsHigh: importProjection.high,
+      processingPending: pacing.processingInFlight,
+      verificationPending: pacing.verificationInFlight,
+      qualifiedContactabilityBacklog: pacing.qualifiedContactabilityBacklog,
+      expectedImportsFromBacklog: pacing.expectedImportsFromBacklog,
+    });
     const performances: EnginePlanningPerformance[] = await Promise.all(concreteCampaigns.map(async (campaign, index) => {
       const measured = enginePerformanceByCampaign.get(campaign.id);
       return {
@@ -237,6 +340,12 @@ export async function runAutopilotCronTick(now: Date = new Date()): Promise<Auto
     const recoveryProbeRaw = recoveryProbeOrders.reduce((total, order) => total + order.desiredRawCount, 0);
     let orders = allocateEngineWork({
       workspaceId, campaigns: concreteCampaigns, capabilities, performances,
+      economicPressureByEngine: {
+        maps_fast: apifyEconomicPacing.state === "AHEAD_OF_BUDGET_PACE",
+        maps_deep: apifyEconomicPacing.state === "AHEAD_OF_BUDGET_PACE",
+        google_serp: serperEconomicPacing.state === "AHEAD_OF_BUDGET_PACE",
+        linkedin_owner: serperEconomicPacing.state === "AHEAD_OF_BUDGET_PACE",
+      },
       rawNeeded: planningRawLimit - recoveryProbeRaw, reason: pacing.explanation, now, timeZone: settings.timezone, origin: "normal",
     });
     for (const performance of performances) {
@@ -307,6 +416,9 @@ export async function runAutopilotCronTick(now: Date = new Date()): Promise<Auto
         ...(order.origin === "recovery_probe" ? {
           recoveryCredentialFingerprint: createApifyCredentialFingerprint(mapsEnv.APIFY_API_TOKEN),
         } : {}),
+        economicPaceState: order.engineType === "maps_fast" || order.engineType === "maps_deep"
+          ? apifyEconomicPacing.state
+          : serperEconomicPacing.state,
       },
       idempotencyKey: order.idempotencyKey,
       desiredRawCount: order.desiredRawCount,

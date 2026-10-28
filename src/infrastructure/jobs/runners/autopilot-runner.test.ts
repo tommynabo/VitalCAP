@@ -14,6 +14,8 @@ const mocks = vi.hoisted(() => ({
   getRecentProviderUsage: vi.fn(),
   getTodaySpendUsd: vi.fn(),
   getGlobalSerperSpendToday: vi.fn(),
+  getLatestProviderEconomicPacingStates: vi.fn(),
+  recordProviderRun: vi.fn(),
   getSerperRecoveryState: vi.fn(),
   getApifyRecoverySnapshot: vi.fn(),
   getAutopilotEnginePerformance: vi.fn(),
@@ -56,6 +58,8 @@ vi.mock("@/infrastructure/neon/repositories/provider-runs", () => ({
   getRecentProviderUsage: mocks.getRecentProviderUsage,
   getTodaySpendUsd: mocks.getTodaySpendUsd,
   getGlobalSerperSpendToday: mocks.getGlobalSerperSpendToday,
+  getLatestProviderEconomicPacingStates: mocks.getLatestProviderEconomicPacingStates,
+  recordProviderRun: mocks.recordProviderRun,
   getSerperRecoveryState: mocks.getSerperRecoveryState,
 }));
 vi.mock("@/infrastructure/neon/repositories/autopilot-engine-performance", () => ({
@@ -135,6 +139,7 @@ describe("runAutopilotCronTick", () => {
     mocks.getRecentProviderUsage.mockResolvedValue([]);
     mocks.getTodaySpendUsd.mockResolvedValue(0);
     mocks.getGlobalSerperSpendToday.mockResolvedValue(0);
+    mocks.getLatestProviderEconomicPacingStates.mockResolvedValue({});
     mocks.getSerperRecoveryState.mockResolvedValue({ allocationPaused: false, recoveryProbeEligible: false, nextRecoveryAttemptAt: null, lastFailureAt: null, recoveredAt: null });
     mocks.getApifyRecoverySnapshot.mockResolvedValue({ recoveryProbeEligible: false, nextRecoveryAttemptAt: null });
     mocks.getAutopilotEnginePerformance.mockResolvedValue(new Map());
@@ -154,7 +159,7 @@ describe("runAutopilotCronTick", () => {
     mocks.decideHybridFill.mockReturnValue([]);
     mocks.buildMapsSeedCatalog.mockReturnValue([]);
     mocks.getDeliveryEnv.mockReturnValue({ INSTANTLY_CAMPAIGN_ID: "instantly-campaign" });
-    mocks.getMapsEnv.mockReturnValue({ MAPS_PROVIDER: "apify", APIFY_API_TOKEN: "configured" });
+    mocks.getMapsEnv.mockReturnValue({ MAPS_PROVIDER: "apify", APIFY_API_TOKEN: "configured", APIFY_DAILY_COST_LIMIT_USD: 5 });
     mocks.getSerperEnv.mockReturnValue({
       SERP_PROVIDER: "serper",
       SERPER_API_KEY: "configured",
@@ -199,9 +204,43 @@ describe("runAutopilotCronTick", () => {
       expect.objectContaining({
         campaignId: "campaign-1",
         type: "run_engine_batch",
-        payload: expect.objectContaining({ engineType: "maps_fast" }),
+        payload: expect.objectContaining({ engineType: "maps_fast", economicPaceState: "UNDER_PACE" }),
       }),
     ]), now);
+    expect(mocks.recordProviderRun).toHaveBeenCalledWith(expect.objectContaining({
+      provider: "apify",
+      operation: "economic_pacing_state",
+      costUsd: 0,
+      metadata: expect.objectContaining({ economicPaceState: "UNDER_PACE" }),
+    }));
+  });
+
+  it("stops new discovery at the confirmed-import target while logging the stop", async () => {
+    const now = new Date("2025-06-15T12:00:00Z");
+    mocks.getAutopilotPacingState.mockResolvedValue(computeAutopilotPacing({
+      workspaceId: "workspace-1", timeZone: "Europe/Madrid", targetMetric: "instantly_imported",
+      dailyTarget: 250, targetAchievedToday: 250, instantlyImportedToday: 250,
+      confirmedImportsToday: 250,
+      rawRequestedToday: 0, rawReturnedToday: 0, processingInFlight: 4, providerRunsInFlight: 0,
+      expectedQualifiedFromInFlight: 0, apifySpendToday: 1, apifyDailyBudgetRemaining: 4,
+      providerHealth: "healthy", availableDiscoveryCapacity: true, estimatedYield: 0.2,
+      yieldSampleSize: 30, now, operatingStartHour: 7, operatingEndHour: 22,
+    }));
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    try {
+      await runAutopilotCronTick(now);
+
+      expect(mocks.enqueueDiscoveryOrdersWithinDailyRawCap).not.toHaveBeenCalled();
+      const events = log.mock.calls.map(([line]) => JSON.parse(String(line)) as { message: string; fields: Record<string, unknown> });
+      expect(events.find((event) => event.message === "autopilot.target_reached_stop")?.fields).toMatchObject({
+        confirmedImportsToday: 250,
+        remainingTarget: 0,
+        processingPending: 4,
+      });
+    } finally {
+      log.mockRestore();
+    }
   });
 
   it("logs workspace-level contactability and recovery aggregates without prospect identifiers", async () => {
@@ -224,6 +263,7 @@ describe("runAutopilotCronTick", () => {
       const events = log.mock.calls.map(([line]) => JSON.parse(String(line)) as { message: string; fields: Record<string, unknown> });
       const funnel = events.find((event) => event.message === "contactability.funnel_snapshot");
       const recovery = events.find((event) => event.message === "maps_fast.website_recovery_outcomes");
+      const economics = events.find((event) => event.message === "autopilot.economic_acceptance_snapshot");
 
       expect(funnel?.fields).toMatchObject({
         qualifiedAccounts: 0,
@@ -239,7 +279,14 @@ describe("runAutopilotCronTick", () => {
         transientFailure: 0,
         budgetBlocked: 0,
       });
-      expect(JSON.stringify([funnel, recovery])).not.toMatch(/@|\+?\d{8,}|https?:\/\//);
+      expect(economics?.fields).toMatchObject({
+        confirmedImportsToday: 0,
+        targetImports: 250,
+        projectedEndOfDayImportsLow: 0,
+        projectedEndOfDayImportsBase: 2,
+        projectedEndOfDayImportsHigh: 5,
+      });
+      expect(JSON.stringify([funnel, recovery, economics])).not.toMatch(/@|\+?\d{8,}|https?:\/\//);
     } finally {
       log.mockRestore();
     }

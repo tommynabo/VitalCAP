@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const { mockRecordProviderRun, mockReserveSerperProviderRun, mockUpdateProviderRun, mockGetProviderRunByRequestKey, mockSearch, mockGetTodaySpendUsd, mockGetGlobalSerperSpendToday, mockGetSerperRecoveryState, mockGetSerperSpendByPurpose, mockGetSerperApiKey } = vi.hoisted(() => ({
+const { mockRecordProviderRun, mockReserveSerperProviderRun, mockUpdateProviderRun, mockGetProviderRunByRequestKey, mockSearch, mockGetTodaySpendUsd, mockGetGlobalSerperSpendToday, mockGetLatestProviderEconomicPacingStates, mockGetSerperRecoveryState, mockGetSerperSpendByPurpose, mockGetSerperApiKey } = vi.hoisted(() => ({
   mockRecordProviderRun: vi.fn(),
   mockReserveSerperProviderRun: vi.fn(),
   mockUpdateProviderRun: vi.fn(),
@@ -8,6 +8,7 @@ const { mockRecordProviderRun, mockReserveSerperProviderRun, mockUpdateProviderR
   mockSearch: vi.fn(),
   mockGetTodaySpendUsd: vi.fn(),
   mockGetGlobalSerperSpendToday: vi.fn(),
+  mockGetLatestProviderEconomicPacingStates: vi.fn(),
   mockGetSerperRecoveryState: vi.fn(),
   mockGetSerperSpendByPurpose: vi.fn(),
   mockGetSerperApiKey: vi.fn(() => "test-key"),
@@ -19,6 +20,7 @@ vi.mock("@/lib/config/env", () => ({
 vi.mock("@/infrastructure/neon/repositories/provider-runs", () => ({
   getTodaySpendUsd: mockGetTodaySpendUsd,
   getGlobalSerperSpendToday: mockGetGlobalSerperSpendToday,
+  getLatestProviderEconomicPacingStates: mockGetLatestProviderEconomicPacingStates,
   getSerperRecoveryState: mockGetSerperRecoveryState,
   getSerperSpendByPurpose: mockGetSerperSpendByPurpose,
   getProviderRunByRequestKey: mockGetProviderRunByRequestKey,
@@ -47,6 +49,7 @@ describe("Serper provider run recording", () => {
     mockSearch.mockReset();
     mockGetTodaySpendUsd.mockResolvedValue(0);
     mockGetGlobalSerperSpendToday.mockResolvedValue(0);
+    mockGetLatestProviderEconomicPacingStates.mockResolvedValue({});
     mockGetSerperRecoveryState.mockResolvedValue({ allocationPaused: false, recoveryProbeEligible: false, nextRecoveryAttemptAt: null, lastFailureAt: null });
     mockGetSerperSpendByPurpose.mockResolvedValue(0);
     mockGetProviderRunByRequestKey.mockResolvedValue(null);
@@ -130,7 +133,7 @@ describe("Serper provider run recording", () => {
     expect(mockUpdateProviderRun).toHaveBeenCalledWith("run-1", expect.objectContaining({ status: "failed", itemsReturned: 0, costUsd: 0, error: "Serper rate limit" }));
   });
 
-  it("blocks calls after the Serper daily cost budget is exhausted", async () => {
+  it("blocks calls before the Serper daily cost budget is exhausted", async () => {
     mockGetGlobalSerperSpendToday.mockResolvedValue(0.501);
     const provider = createSerpDiscoveryProvider("workspace-1", "google_serp", "campaign-3");
 
@@ -138,11 +141,18 @@ describe("Serper provider run recording", () => {
       .rejects.toMatchObject({ name: "ProviderBudgetExceededError" });
 
     expect(mockSearch).not.toHaveBeenCalled();
-    expect(mockUpdateProviderRun).toHaveBeenCalledWith("run-1", expect.objectContaining({
-      status: "budget_blocked",
-      costUsd: 0,
-      metadata: expect.objectContaining({ engineType: "google_serp", purpose: "google_serp_discovery", budgetBlocked: true }),
-    }));
+    expect(mockReserveSerperProviderRun).not.toHaveBeenCalled();
+    expect(mockUpdateProviderRun).not.toHaveBeenCalled();
+  });
+
+  it("pauses normal Serper allocation near the daily cap before reserving a paid request", async () => {
+    mockGetGlobalSerperSpendToday.mockResolvedValue(0.46);
+    const provider = createSerpDiscoveryProvider("workspace-1", "google_serp", "campaign-1");
+
+    await expect(provider.search({ query: "farmacia Barcelona", maxResults: 5 }))
+      .rejects.toThrow("paused near the daily budget cap");
+    expect(mockReserveSerperProviderRun).not.toHaveBeenCalled();
+    expect(mockSearch).not.toHaveBeenCalled();
   });
 
   it("keeps existing account spend charged when a rotated key needs recovery", async () => {

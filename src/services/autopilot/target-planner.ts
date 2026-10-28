@@ -42,6 +42,7 @@ export interface EngineWorkAllocationInput extends Omit<MapsFastAllocationInput,
   campaigns: readonly Campaign[];
   capabilities: readonly EngineCapability[];
   performances?: readonly EnginePlanningPerformance[];
+  economicPressureByEngine?: Partial<Record<EngineType, boolean>>;
 }
 
 /**
@@ -174,11 +175,16 @@ export function allocateEngineWork(input: EngineWorkAllocationInput): DiscoveryO
     const queuePenalty = Math.min(0.75, (performance?.queueDepth ?? 0) / 1_000);
     const exhaustionPenalty = Math.min(0.75, performance?.seedExhaustion ?? 0);
     const costWeight = confirmedImportCostWeight(performance, medianCostPerImport);
+    const matureExpensiveEngine = (performance?.confirmedImportCount ?? 0) >= MIN_IMPORTS_FOR_COST_WEIGHT
+      && (performance?.costPerConfirmedImportUsd ?? 0) > (medianCostPerImport ?? Number.POSITIVE_INFINITY);
+    const economicPressureWeight = input.economicPressureByEngine?.[campaign.engineType] && matureExpensiveEngine
+      ? 0.75
+      : 1;
     const explorationWeight = campaign.engineType === "linkedin_owner"
       && (performance?.confirmedImportCount ?? 0) < MIN_IMPORTS_FOR_COST_WEIGHT
       ? 0.1
       : 1;
-    return { campaign, weight: campaign.dailySoftTarget * yieldWeight * (1 - queuePenalty) * (1 - exhaustionPenalty) * costWeight * explorationWeight };
+    return { campaign, weight: campaign.dailySoftTarget * yieldWeight * (1 - queuePenalty) * (1 - exhaustionPenalty) * costWeight * economicPressureWeight * explorationWeight };
   });
   let totalWeight = weighted.reduce((sum, item) => sum + item.weight, 0);
   if (totalWeight <= 0) {
@@ -246,6 +252,7 @@ export function rerouteEngineOrders(input: EngineWorkAllocationInput & {
       && (!alternativeCampaignIds || alternativeCampaignIds.has(campaign.id))),
     capabilities: input.capabilities,
     performances: input.performances,
+    economicPressureByEngine: input.economicPressureByEngine,
     rawNeeded: divertedRaw,
     reason: input.reason,
     now: input.now,

@@ -22,7 +22,7 @@ import {
   getSeedEconomicPerformance,
   updateSearchSeedRun,
 } from "@/infrastructure/neon/repositories/discovery";
-import { getApifyRecoverySnapshot, getApifyReservationFailureDetails, getRecentProviderUsage, getSerperRecoveryState, reserveApifyProviderRun, updateProviderRun } from "@/infrastructure/neon/repositories/provider-runs";
+import { getApifyRecoverySnapshot, getApifyReservationFailureDetails, getLatestProviderEconomicPacingStates, getRecentProviderUsage, getSerperRecoveryState, getTodaySpendUsd, recordProviderRun, reserveApifyProviderRun, updateProviderRun } from "@/infrastructure/neon/repositories/provider-runs";
 import { getAutopilotSettings } from "@/infrastructure/neon/repositories/autopilot";
 import { getEffectiveAutopilotState } from "@/domain/autopilot/types";
 import { buildMapsSeedCatalog, buildSerpSeedCatalog, LINKEDIN_OWNER_ROLE_QUERIES, ICP_CATEGORY_TERMS } from "@/services/discovery/spain-search-catalog";
@@ -34,7 +34,10 @@ import { resolvePlanningWindow } from "@/services/autopilot/target-planner";
 import { getMapsEnv } from "@/lib/config/env";
 import { logEvent } from "@/lib/observability/structured-logger";
 import { getApifyFailureClass, getApifyFailureKind } from "@/infrastructure/providers/maps/apify-client";
+import { getDayBounds } from "@/lib/time/day-bounds";
 import { planSeedBatches, scoreSeedEconomicPerformance } from "@/services/discovery/seed-economics";
+import type { EconomicPacingState } from "@/services/autopilot/economic-pacing";
+import { computeProviderBudgetPacing, getElapsedOperatingFraction } from "@/services/autopilot/economic-pacing";
 import {
   APIFY_DEFAULT_BATCH_COST_LIMIT_USD,
   APIFY_MAX_RESULTS_PER_SEARCH,
@@ -77,6 +80,7 @@ interface DiscoveryJobPayload {
   reason?: string;
   origin?: "normal" | "rebalance" | "hybrid_fill" | "recovery_probe";
   recoveryCredentialFingerprint?: string;
+  economicPaceState?: EconomicPacingState;
   seedQuery?: string;
   seedGeography?: string;
 }
@@ -258,6 +262,7 @@ async function executeDiscoveryJob(
   if (autopilotState !== "running") return 0;
 
   const provider = job.payload.engineType === "maps_fast" || job.payload.engineType === "maps_deep" ? "apify" : "serper";
+  let executionEconomicPaceState = job.payload.economicPaceState;
   const mapsEnv = provider === "apify"
     ? await runPreProviderStage(job, "load_maps_env", () => getMapsEnv())
     : null;
@@ -317,6 +322,60 @@ async function executeDiscoveryJob(
     });
     if (!retryAt) throw new ProviderConfigurationError("Apify is paused without an eligible recovery time.");
     throw new ProviderFailureError("Apify provider is in recovery cooldown.", "transient", retryAt);
+  }
+
+  if (provider === "apify" && mapsEnv && !recoveryProbe) {
+    const now = new Date();
+    const [spendToday, priorPacingStates] = await Promise.all([
+      getTodaySpendUsd(campaign.workspaceId, "apify", settings.timezone, now),
+      getLatestProviderEconomicPacingStates(campaign.workspaceId, settings.timezone, now),
+    ]);
+    const dailyCap = Math.min(mapsEnv.APIFY_DAILY_COST_LIMIT_USD, settings.maxDailyApifySpendUsd ?? Number.POSITIVE_INFINITY);
+    const economicPacing = computeProviderBudgetPacing({
+      spendTodayUsd: spendToday,
+      dailyCapUsd: dailyCap,
+      elapsedOperatingFraction: getElapsedOperatingFraction(
+        settings.timezone,
+        now,
+        settings.operatingStartHour ?? 7,
+        settings.operatingEndHour ?? 22,
+      ),
+      previousState: priorPacingStates.apify,
+    });
+    executionEconomicPaceState = economicPacing.state;
+    if (economicPacing.state === "NEAR_DAILY_CAP") {
+      if (priorPacingStates.apify !== economicPacing.state) {
+        await recordProviderRun({
+          workspaceId: campaign.workspaceId,
+          provider: "apify",
+          operation: "economic_pacing_state",
+          status: "completed",
+          itemsRequested: 0,
+          itemsReturned: 0,
+          costUsd: 0,
+          metadata: {
+            economicPaceState: economicPacing.state,
+            spendTodayUsd: economicPacing.spendTodayUsd,
+            dailyCapUsd: economicPacing.dailyCapUsd,
+            expectedSpendByNowUsd: economicPacing.expectedSpendByNowUsd,
+            timePacePct: economicPacing.timePacePct,
+          },
+        });
+      }
+      logEvent("info", "discovery.provider.deferred", {
+        correlationId: job.id,
+        discoveryJobId: job.id,
+        provider,
+        reason: "economic_near_daily_cap",
+        spendTodayUsd: economicPacing.spendTodayUsd,
+        dailyCapUsd: economicPacing.dailyCapUsd,
+        economicPaceState: economicPacing.state,
+      });
+      throw new ProviderBudgetExceededError(
+        "Apify allocation is paused near the daily budget cap.",
+        getDayBounds(settings.timezone, now).end,
+      );
+    }
   }
 
   const engine = createDiscoveryEngine(campaign.workspaceId, job.payload.engineType, campaign.id, job.id);
@@ -400,6 +459,8 @@ async function executeDiscoveryJob(
       now: new Date(),
       configuredMaxResults: APIFY_MAX_RESULTS_PER_SEARCH,
       batchCostLimitUsd: mapsEnv?.APIFY_BATCH_COST_LIMIT_USD ?? APIFY_DEFAULT_BATCH_COST_LIMIT_USD,
+      economicPressure: executionEconomicPaceState === "AHEAD_OF_BUDGET_PACE"
+        || executionEconomicPaceState === "NEAR_DAILY_CAP",
     })
     : null;
   const economicBatches = economicPlan?.batches ?? [];
@@ -417,6 +478,9 @@ async function executeDiscoveryJob(
       explorationRequestedItems: economicPlan.explorationRequestedItems,
       totalPlannedRequestedItems: plannedItems,
       explorationRequestedShare: plannedItems > 0 ? economicPlan.explorationRequestedItems / plannedItems : 0,
+      economicPressureActive: executionEconomicPaceState === "AHEAD_OF_BUDGET_PACE"
+        || executionEconomicPaceState === "NEAR_DAILY_CAP",
+      economicPaceState: executionEconomicPaceState ?? null,
       ...Object.fromEntries(Object.entries(tierCounts).map(([tier, count]) => [`${tier}SeedsRun`, count])),
       explorationSeedsRun: economicBatches.filter((batch) => batch.policy.exploration).length,
       productiveSeedCapacityConstrained: economicPlan.productiveSeedCapacityConstrained,
@@ -557,6 +621,7 @@ async function executeDiscoveryJob(
             geography: seed.geography,
             planningWindow,
             recoveryProbe,
+            ...(executionEconomicPaceState ? { economicPaceState: executionEconomicPaceState } : {}),
             ...(mapsEnv?.APIFY_API_TOKEN
               ? { credentialFingerprint: createApifyCredentialFingerprint(mapsEnv.APIFY_API_TOKEN) }
               : {}),

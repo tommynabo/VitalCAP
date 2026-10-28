@@ -126,6 +126,31 @@ describe("target planner", () => {
     expect(smallSampleOrders.map((order) => order.desiredRawCount)).toEqual([50, 50]);
   });
 
+  it("reduces only a mature expensive engine under provider pressure and preserves the global deficit", () => {
+    const campaigns = [campaign("efficient", 100), campaign("expensive", 100, { engineType: "google_serp" })];
+    const capabilities = ["maps_fast", "google_serp"].map((engineType) => ({
+      engineType: engineType as Campaign["engineType"], available: true, providerConfigured: true,
+      providerHealthy: true, providerUntested: false, costAllowed: true, campaignCount: 1,
+      reasonUnavailable: null, reason: null,
+    }));
+    const input = {
+      workspaceId: "workspace-1", campaigns, capabilities, rawNeeded: 100, reason: "ahead of budget pace",
+      performances: [
+        { campaignId: "efficient", yield: 0.1, confirmedImportCount: 10, costPerConfirmedImportUsd: 0.1, queueDepth: 0, seedExhaustion: 0 },
+        { campaignId: "expensive", yield: 0.1, confirmedImportCount: 10, costPerConfirmedImportUsd: 0.2, queueDepth: 0, seedExhaustion: 0 },
+      ],
+      now: new Date("2025-01-01T13:00:00Z"), timeZone: "Europe/Madrid",
+    };
+    const normal = allocateEngineWork(input);
+    const pressured = allocateEngineWork({ ...input, economicPressureByEngine: { google_serp: true } });
+
+    expect(pressured.find((order) => order.campaignId === "expensive")?.desiredRawCount)
+      .toBeLessThan(normal.find((order) => order.campaignId === "expensive")?.desiredRawCount ?? 0);
+    expect(pressured.find((order) => order.campaignId === "efficient")?.desiredRawCount)
+      .toBeGreaterThanOrEqual(normal.find((order) => order.campaignId === "efficient")?.desiredRawCount ?? 0);
+    expect(pressured.reduce((total, order) => total + order.desiredRawCount, 0)).toBe(100);
+  });
+
   it("allocates the one global deficit across configured healthy engines by observed yield", () => {
     const orders = allocateEngineWork({
       workspaceId: "workspace-1",

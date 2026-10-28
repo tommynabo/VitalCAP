@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { and, asc, desc, eq, gte, inArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gte, inArray, ne, sql } from "drizzle-orm";
 import { getDayBounds } from "@/lib/time/day-bounds";
 import { getDb } from "../db";
 import { buildDailyRawRequestCommitmentCtes, executeUnderGlobalDailyRawCapLock } from "./daily-raw-request-cap";
@@ -10,6 +10,7 @@ import { ProviderBudgetExceededError, ProviderFailureError, ProviderSafetyError 
 import { createApifyConfigurationFingerprint, createApifyCredentialFingerprint, evaluateApifyRecovery, hasCurrentCredentialRecoveryProbeInFlight, resolveApifyRecoveryCredentialFingerprint, type ApifyRecoveryRun } from "@/services/discovery/provider-health";
 import { getCoreEnv, getMapsEnv, getSerperEnv } from "@/lib/config/env";
 import { SERPER_ESTIMATED_COST_PER_QUERY_USD } from "@/infrastructure/providers/serp/serper-provider";
+import type { EconomicPacingState } from "@/services/autopilot/economic-pacing";
 
 export interface RecordProviderRunInput {
   workspaceId: string;
@@ -125,6 +126,41 @@ export interface SerperCostDiagnostics {
     costPerValidEmailUsd: number | null;
     costPerConfirmedImportUsd: number | null;
   };
+}
+
+export function buildLatestProviderEconomicPacingStatesQuery(workspaceId: string, timeZone: string, now: Date) {
+  const { start, end } = getDayBounds(timeZone, now);
+  return sql`
+    SELECT DISTINCT ON (provider)
+      provider,
+      metadata->>'economicPaceState' AS economic_pace_state
+    FROM provider_runs
+    WHERE workspace_id = ${workspaceId}::uuid
+      AND provider IN ('apify', 'serper')
+      AND metadata->>'economicPaceState' IN ('UNDER_PACE', 'ON_PACE', 'AHEAD_OF_BUDGET_PACE', 'NEAR_DAILY_CAP')
+      AND started_at >= ${start.toISOString()}::timestamptz
+      AND started_at < ${end.toISOString()}::timestamptz
+    ORDER BY provider, started_at DESC
+  `;
+}
+
+export async function getLatestProviderEconomicPacingStates(
+  workspaceId: string,
+  timeZone: string,
+  now: Date,
+): Promise<Partial<Record<"apify" | "serper", EconomicPacingState>>> {
+  const result = await getDb().execute(buildLatestProviderEconomicPacingStatesQuery(workspaceId, timeZone, now));
+  const states: Partial<Record<"apify" | "serper", EconomicPacingState>> = {};
+  for (const row of result.rows as Array<{ provider?: unknown; economic_pace_state?: unknown }>) {
+    const provider = row.provider;
+    const state = row.economic_pace_state;
+    if ((provider === "apify" || provider === "serper")
+      && typeof state === "string"
+      && ["UNDER_PACE", "ON_PACE", "AHEAD_OF_BUDGET_PACE", "NEAR_DAILY_CAP"].includes(state)) {
+      states[provider] = state as EconomicPacingState;
+    }
+  }
+  return states;
 }
 
 export async function reserveSerperProviderRun(input: ReserveSerperProviderRunInput): Promise<{ providerRun: typeof providerRuns.$inferSelect; created: boolean }> {
@@ -463,6 +499,7 @@ export async function getApifyRecoverySnapshot(workspaceId: string, now = new Da
     }).from(providerRuns).leftJoin(discoveryJobs, sql`${providerRuns.metadata}->>'discoveryJobId' = ${discoveryJobs.id}::text`).where(and(
       eq(providerRuns.workspaceId, workspaceId),
       eq(providerRuns.provider, "apify"),
+      ne(providerRuns.operation, "economic_pacing_state"),
       gte(providerRuns.startedAt, since),
     )),
     db.select({
@@ -474,6 +511,7 @@ export async function getApifyRecoverySnapshot(workspaceId: string, now = new Da
     }).from(providerRuns).where(and(
       eq(providerRuns.workspaceId, workspaceId),
       eq(providerRuns.provider, "apify"),
+      ne(providerRuns.operation, "economic_pacing_state"),
       inArray(providerRuns.status, ["failed", "aborted", "timed_out"]),
     )).orderBy(desc(sql`COALESCE(${providerRuns.finishedAt}, ${providerRuns.startedAt})`)).limit(1),
     db.select({
@@ -484,6 +522,7 @@ export async function getApifyRecoverySnapshot(workspaceId: string, now = new Da
     }).from(providerRuns).leftJoin(discoveryJobs, sql`${providerRuns.metadata}->>'discoveryJobId' = ${discoveryJobs.id}::text`).where(and(
       eq(providerRuns.workspaceId, workspaceId),
       eq(providerRuns.provider, "apify"),
+      ne(providerRuns.operation, "economic_pacing_state"),
       inArray(providerRuns.status, ["succeeded", "ingested", "completed"]),
     )).orderBy(desc(sql`COALESCE(${providerRuns.finishedAt}, ${providerRuns.startedAt})`)).limit(1),
   ]);
@@ -1003,7 +1042,12 @@ export async function getRecentProviderUsage(workspaceId: string, provider: stri
   const rows = await db
     .select({ status: providerRuns.status, itemsReturned: providerRuns.itemsReturned, costUsd: providerRuns.costUsd })
     .from(providerRuns)
-    .where(and(eq(providerRuns.workspaceId, workspaceId), eq(providerRuns.provider, provider), gte(providerRuns.startedAt, since)));
+    .where(and(
+      eq(providerRuns.workspaceId, workspaceId),
+      eq(providerRuns.provider, provider),
+      ne(providerRuns.operation, "economic_pacing_state"),
+      gte(providerRuns.startedAt, since),
+    ));
 
   let items = 0;
   let errors = 0;

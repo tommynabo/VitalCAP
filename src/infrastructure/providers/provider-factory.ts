@@ -1,3 +1,4 @@
+import { computeProviderBudgetPacing, getElapsedOperatingFraction } from "@/services/autopilot/economic-pacing";
 import { createHash } from "node:crypto";
 import type { EmailVerificationProvider, MapsDiscoveryProvider, SerpDiscoveryProvider } from "@/domain/providers/types";
 import type { EngineType } from "@/domain/campaigns/types";
@@ -9,7 +10,7 @@ import { MockSerpDiscoveryProvider } from "./serp/mock-provider";
 import { MAX_TRANSIENT_RETRIES, SERPER_ESTIMATED_COST_PER_QUERY_USD, SERPER_LINKEDIN_DAILY_EXPLORATION_LIMIT_USD, SerperDiscoveryProvider } from "./serp/serper-provider";
 import { MockEmailVerificationProvider } from "./email-verification/mock-provider";
 import { MillionVerifierEmailVerificationProvider, MILLIONVERIFIER_ESTIMATED_COST_PER_EMAIL_USD } from "./email-verification/millionverifier-provider";
-import { getGlobalSerperSpendToday, getProviderRunByRequestKey, getSerperRecoveryState, getSerperSpendByPurpose, getTodaySpendUsd, recordProviderRun, reserveSerperProviderRun, updateProviderRun } from "@/infrastructure/neon/repositories/provider-runs";
+import { getGlobalSerperSpendToday, getLatestProviderEconomicPacingStates, getProviderRunByRequestKey, getSerperRecoveryState, getSerperSpendByPurpose, getTodaySpendUsd, recordProviderRun, reserveSerperProviderRun, updateProviderRun } from "@/infrastructure/neon/repositories/provider-runs";
 import { getAutopilotSettings } from "@/infrastructure/neon/repositories/autopilot";
 import { getEffectiveAutopilotState } from "@/domain/autopilot/types";
 import { getDayBounds } from "@/lib/time/day-bounds";
@@ -110,6 +111,21 @@ export function createSerpDiscoveryProvider(workspaceId: string, engineType: Eng
   provider.search = async (input) => {
     const settings = await getAutopilotSettings(workspaceId);
     const now = new Date();
+    const [serperSpendToday, latestPacingStates] = await Promise.all([
+      getGlobalSerperSpendToday(now),
+      getLatestProviderEconomicPacingStates(workspaceId, settings.timezone, now),
+    ]);
+    const economicPacing = computeProviderBudgetPacing({
+      spendTodayUsd: serperSpendToday,
+      dailyCapUsd: env.SERPER_DAILY_COST_LIMIT_USD,
+      elapsedOperatingFraction: getElapsedOperatingFraction(
+        settings.timezone,
+        now,
+        settings.operatingStartHour ?? 7,
+        settings.operatingEndHour ?? 22,
+      ),
+      previousState: latestPacingStates.serper,
+    });
     const recoveryState = await getSerperRecoveryState(now);
     if (recoveryState.allocationPaused && !recoveryState.recoveryProbeEligible) {
       throw new ProviderBudgetExceededError(
@@ -154,6 +170,7 @@ export function createSerpDiscoveryProvider(workspaceId: string, engineType: Eng
       maxResults,
       planningWindow,
       recoveryProbe,
+      economicPaceState: economicPacing.state,
       ...(discoveryJobId ? { discoveryJobId } : {}),
     };
     const existing = await getProviderRunByRequestKey(requestKey);
@@ -165,6 +182,13 @@ export function createSerpDiscoveryProvider(workspaceId: string, engineType: Eng
       if (existing.status === "failed") throw new ProviderBudgetExceededError(existing.error ?? "Serper request failed in this planning window.", nextProviderPlanningWindowAt());
       if (existing.status === "starting") throw new ProviderBudgetExceededError("Serper request is already in progress for this planning window.", nextProviderPlanningWindowAt());
       return { results: [], usage: { calls: 0, items: 0, errors: 0, totalLatencyMs: 0, costUsd: 0, quotaRemaining: null }, providerRunId: existing.id };
+    }
+
+    if (!recoveryProbe && economicPacing.state === "NEAR_DAILY_CAP") {
+      throw new ProviderBudgetExceededError(
+        "Serper allocation is paused near the daily budget cap.",
+        getDayBounds(settings.timezone, now).end,
+      );
     }
 
     const reservation = await reserveSerperProviderRun({

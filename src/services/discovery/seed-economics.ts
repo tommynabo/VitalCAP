@@ -10,7 +10,10 @@ export const SEED_ECONOMICS_POLICY = {
   minimumItems: 50,
   zeroNoveltyRunsBeforeCooldown: 2,
   zeroNoveltyCooldownDays: 7,
+  lowEconomicCooldownHours: 24,
+  extremelyLowNoveltyThreshold: 0.03,
   explorationFraction: 0.12,
+  pressuredExplorationFraction: 0.05,
   explorationMaxResults: 20,
   returningSeedMaxResults: 20,
   highNoveltyThreshold: 0.5,
@@ -124,15 +127,34 @@ function cooldownUntil(performance: SeedEconomicPerformance | undefined): Date |
   return new Date(lastRun.getTime() + SEED_ECONOMICS_POLICY.zeroNoveltyCooldownDays * 24 * 60 * 60 * 1000);
 }
 
+function lowEconomicCooldownUntil(performance: SeedEconomicPerformance | undefined, noveltyRate: number | null): Date | null {
+  if (
+    !performance
+    || performance.recentRuns < SEED_ECONOMICS_POLICY.minimumRuns
+    || performance.sampleSize < SEED_ECONOMICS_POLICY.minimumItems
+    || performance.outcomeAttributionComplete !== true
+    || noveltyRate === null
+    || noveltyRate > SEED_ECONOMICS_POLICY.extremelyLowNoveltyThreshold
+    || (performance.confirmedInstantlyImportsFromSeed ?? 0) > 0
+    || !performance.lastRunAt
+  ) return null;
+  const lastRun = new Date(performance.lastRunAt);
+  if (Number.isNaN(lastRun.getTime())) return null;
+  return new Date(lastRun.getTime() + SEED_ECONOMICS_POLICY.lowEconomicCooldownHours * 60 * 60 * 1000);
+}
+
 export function scoreSeedEconomicPerformance(
   seed: SearchSeed,
   performance: SeedEconomicPerformance | undefined,
   now: Date,
   medianCostPerConfirmedImport: number | null = null,
+  medianCostPerNewRaw: number | null = null,
 ): SeedEconomicPolicyResult {
   const confident = isSampleConfident(performance);
   const noveltyRate = clampRate(performance?.noveltyRate);
-  const coolingUntil = confident && noveltyRate === 0 ? cooldownUntil(performance) : null;
+  const coolingUntil = confident
+    ? cooldownUntil(performance) ?? lowEconomicCooldownUntil(performance, noveltyRate)
+    : null;
   if (coolingUntil && now.getTime() < coolingUntil.getTime()) {
     return {
       tier: "zero",
@@ -193,6 +215,18 @@ export function scoreSeedEconomicPerformance(
       Math.min(SEED_ECONOMICS_POLICY.costWeightCeiling, costWeight),
     );
   }
+  if (
+    confident
+    && (performance?.costPerNewRaw ?? 0) > 0
+    && medianCostPerNewRaw !== null
+    && medianCostPerNewRaw > 0
+  ) {
+    const rawCostWeight = Math.sqrt(medianCostPerNewRaw / performance!.costPerNewRaw!);
+    priorityScore *= Math.max(
+      SEED_ECONOMICS_POLICY.costWeightFloor,
+      Math.min(SEED_ECONOMICS_POLICY.costWeightCeiling, rawCostWeight),
+    );
+  }
 
   return {
     tier,
@@ -245,6 +279,7 @@ export function planSeedBatches(input: {
   now: Date;
   configuredMaxResults?: number;
   batchCostLimitUsd?: number;
+  economicPressure?: boolean;
 }): SeedBatchPlanningResult {
   const target = Math.max(0, Math.floor(input.rawNeeded));
   const seedLimit = Math.max(0, Math.floor(input.maxSeeds));
@@ -257,11 +292,16 @@ export function planSeedBatches(input: {
     .map((item) => item.costPerConfirmedImport)
     .filter((value): value is number => value !== null && value !== undefined && value > 0);
   const medianCost = median(confidentCosts);
+  const confidentRawCosts = [...input.performanceBySeed.values()]
+    .filter((item) => isSampleConfident(item))
+    .map((item) => item.costPerNewRaw)
+    .filter((value): value is number => value !== null && value !== undefined && value > 0);
+  const medianCostPerNewRaw = median(confidentRawCosts);
   const candidates = input.seeds
     .map((seed, index) => ({
       seed,
       index,
-      policy: scoreSeedEconomicPerformance(seed, input.performanceBySeed.get(seed.id), input.now, medianCost),
+      policy: scoreSeedEconomicPerformance(seed, input.performanceBySeed.get(seed.id), input.now, medianCost, medianCostPerNewRaw),
     }))
     .filter(({ seed, policy }) => policy.eligible
       && (!seed.nextEligibleAt || new Date(seed.nextEligibleAt).getTime() <= input.now.getTime()))
@@ -272,8 +312,18 @@ export function planSeedBatches(input: {
 
   const coreCandidates = candidates.filter(({ policy }) => !policy.exploration && policy.tier !== "zero");
   const explorationCandidates = candidates.filter(({ policy }) => policy.exploration);
+  const hasProtectedSupply = coreCandidates.some(({ policy }) => policy.tier === "high" || policy.tier === "good");
+  const hasMatureWeakSupply = coreCandidates.some(({ seed, policy }) => {
+    const performance = input.performanceBySeed.get(seed.id);
+    return policy.tier === "marginal" || policy.tier === "low"
+      ? isSampleConfident(performance)
+      : false;
+  });
+  const economicPressureActive = Boolean(input.economicPressure && hasProtectedSupply && hasMatureWeakSupply);
   const explorationTarget = explorationCandidates.length > 0
-    ? Math.floor(target * SEED_ECONOMICS_POLICY.explorationFraction)
+    ? Math.floor(target * (economicPressureActive
+      ? SEED_ECONOMICS_POLICY.pressuredExplorationFraction
+      : SEED_ECONOMICS_POLICY.explorationFraction))
     : 0;
   const providerMaximum = input.configuredMaxResults ?? APIFY_MAX_RESULTS_PER_SEARCH;
   const batchCostLimitUsd = input.batchCostLimitUsd ?? APIFY_DEFAULT_BATCH_COST_LIMIT_USD;
@@ -293,7 +343,10 @@ export function planSeedBatches(input: {
   const selectedGeographies = new Set<string>();
   const coreTarget = target - explorationTarget;
   let selectedCoreCapacity = 0;
-  for (const tier of ["high", "good", "marginal", "low"] as const) {
+  const coreTierOrder = economicPressureActive
+    ? ["high", "good"] as const
+    : ["high", "good", "marginal", "low"] as const;
+  for (const tier of coreTierOrder) {
     const tierCandidates = coreCandidates.filter(({ policy }) => policy.tier === tier);
     const remainingCandidates = tierCandidates.filter(({ seed }) => !selectedCoreIds.has(seed.id));
     while (selectedCore.length < seedLimit && selectedCoreCapacity < coreTarget && remainingCandidates.length > 0) {
