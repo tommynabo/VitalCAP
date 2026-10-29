@@ -10,7 +10,7 @@ import { MockSerpDiscoveryProvider } from "./serp/mock-provider";
 import { MAX_TRANSIENT_RETRIES, SERPER_ESTIMATED_COST_PER_QUERY_USD, SERPER_LINKEDIN_DAILY_EXPLORATION_LIMIT_USD, SerperDiscoveryProvider } from "./serp/serper-provider";
 import { MockEmailVerificationProvider } from "./email-verification/mock-provider";
 import { MillionVerifierEmailVerificationProvider, MILLIONVERIFIER_ESTIMATED_COST_PER_EMAIL_USD } from "./email-verification/millionverifier-provider";
-import { getGlobalSerperSpendToday, getLatestProviderEconomicPacingStates, getProviderRunByRequestKey, getSerperRecoveryState, getSerperSpendByPurpose, getTodaySpendUsd, recordProviderRun, reserveSerperProviderRun, updateProviderRun } from "@/infrastructure/neon/repositories/provider-runs";
+import { getGlobalSerperSpendToday, getLatestProviderEconomicPacingStates, getProviderRunByRequestKey, getSerperRecoveryState, getTodaySpendUsd, recordProviderRun, reserveSerperProviderRun, updateProviderRun } from "@/infrastructure/neon/repositories/provider-runs";
 import { getAutopilotSettings } from "@/infrastructure/neon/repositories/autopilot";
 import { getEffectiveAutopilotState } from "@/domain/autopilot/types";
 import { getDayBounds } from "@/lib/time/day-bounds";
@@ -112,7 +112,7 @@ export function createSerpDiscoveryProvider(workspaceId: string, engineType: Eng
     const settings = await getAutopilotSettings(workspaceId);
     const now = new Date();
     const [serperSpendToday, latestPacingStates] = await Promise.all([
-      getGlobalSerperSpendToday(now),
+      getGlobalSerperSpendToday(now, undefined, settings.timezone),
       getLatestProviderEconomicPacingStates(workspaceId, settings.timezone, now),
     ]);
     const economicPacing = computeProviderBudgetPacing({
@@ -173,6 +173,11 @@ export function createSerpDiscoveryProvider(workspaceId: string, engineType: Eng
       economicPaceState: economicPacing.state,
       ...(discoveryJobId ? { discoveryJobId } : {}),
     };
+    const purposeLimitUsd = purpose === "linkedin_owner_discovery"
+      ? Math.min(env.SERPER_DAILY_COST_LIMIT_USD * 0.05, SERPER_LINKEDIN_DAILY_EXPLORATION_LIMIT_USD)
+      : purpose === "maps_deep_enrichment"
+        ? env.SERPER_DAILY_COST_LIMIT_USD * 0.1
+        : null;
     const existing = await getProviderRunByRequestKey(requestKey);
     if (existing) {
       if (existing.status === "budget_blocked") {
@@ -199,6 +204,7 @@ export function createSerpDiscoveryProvider(workspaceId: string, engineType: Eng
       itemsRequested: maxResults,
       costUsd: reserveCostUsd,
       dailyCostLimitUsd: env.SERPER_DAILY_COST_LIMIT_USD,
+      ...(purposeLimitUsd === null ? {} : { purposeLimitUsd }),
       metadata: requestMetadata,
       timeZone: settings.timezone,
     });
@@ -210,40 +216,6 @@ export function createSerpDiscoveryProvider(workspaceId: string, engineType: Eng
       if (reservation.providerRun.status === "failed") throw new ProviderBudgetExceededError(reservation.providerRun.error ?? "Serper request failed in this planning window.", nextProviderPlanningWindowAt());
       if (reservation.providerRun.status === "starting") throw new ProviderBudgetExceededError("Serper request is already in progress for this planning window.", nextProviderPlanningWindowAt());
       return { results: [], usage: { calls: 0, items: 0, errors: 0, totalLatencyMs: 0, costUsd: 0, quotaRemaining: null }, providerRunId: reservation.providerRun.id };
-    }
-
-    const spendToday = await getGlobalSerperSpendToday(now, requestKey);
-    if (spendToday + reserveCostUsd > env.SERPER_DAILY_COST_LIMIT_USD) {
-      const { end: retryAt } = getDayBounds(settings.timezone);
-      const message = `Serper daily budget exhausted; retrying after ${retryAt.toISOString()}.`;
-      await updateProviderRun(reservation.providerRun.id, {
-        status: "budget_blocked",
-        costUsd: 0,
-        finishedAt: new Date(),
-        error: message,
-        metadata: { ...requestMetadata, retryAt: retryAt.toISOString(), budgetBlocked: true },
-      });
-      throw new ProviderBudgetExceededError(message, retryAt);
-    }
-
-    const purposeLimitUsd = purpose === "linkedin_owner_discovery"
-      ? Math.min(env.SERPER_DAILY_COST_LIMIT_USD * 0.05, SERPER_LINKEDIN_DAILY_EXPLORATION_LIMIT_USD)
-      : purpose === "maps_deep_enrichment"
-        ? env.SERPER_DAILY_COST_LIMIT_USD * 0.1
-        : Number.POSITIVE_INFINITY;
-    if (Number.isFinite(purposeLimitUsd)) {
-      const purposeSpend = await getSerperSpendByPurpose(purpose, now, requestKey);
-      if (purposeSpend + reserveCostUsd > purposeLimitUsd) {
-        const { end: retryAt } = getDayBounds(settings.timezone, now);
-        await updateProviderRun(reservation.providerRun.id, {
-          status: "budget_blocked",
-          costUsd: 0,
-          finishedAt: new Date(),
-          error: `Serper purpose allowance reached; retrying after ${retryAt.toISOString()}.`,
-          metadata: { ...requestMetadata, retryAt: retryAt.toISOString(), purposeBudgetBlocked: true },
-        });
-        throw new ProviderBudgetExceededError("Serper purpose allowance reached.", retryAt);
-      }
     }
 
     let output;

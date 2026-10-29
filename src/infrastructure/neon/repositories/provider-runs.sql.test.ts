@@ -90,9 +90,11 @@ describe("Apify provider run reservation SQL", () => {
       requestKey: "serper:stable-key",
       seedId: "00000000-0000-0000-0000-000000000003",
       itemsRequested: 10,
-      costUsd: 0.01,
+      costUsd: 0.001,
       dailyCostLimitUsd: 0.5,
-      metadata: { engineType: "google_serp", discoveryJobId: "00000000-0000-0000-0000-000000000004" },
+      purposeLimitUsd: 0.025,
+      metadata: { engineType: "linkedin_owner", purpose: "linkedin_owner_discovery", discoveryJobId: "00000000-0000-0000-0000-000000000004" },
+      timeZone: "Europe/Madrid",
     }, 1523, new Date("2026-10-19T12:00:00.000Z")));
 
     expect(query.sql).toContain("safety.committed_raw_requests + safety.additional_raw_requests <=");
@@ -100,11 +102,30 @@ describe("Apify provider run reservation SQL", () => {
     expect(query.sql).toContain("WHERE run.discovery_job_id = job.id::text");
     expect(query.sql).not.toContain("concurrent_apify_run_count");
     expect(query.sql).toContain("cost_safety.spent_today +");
+    expect(query.sql).toContain("purpose_safety.spent_today +");
+    expect(query.sql).toContain("AS serper_purpose_spent_today");
+    expect(query.sql).toContain("purpose_blocked AS (");
+    expect(query.sql).toContain("'budget_blocked'");
+    expect(query.sql).toContain("finished_at");
     expect(query.sql).toContain("provider = 'serper'");
     expect(query.sql).toContain("ON CONFLICT (request_key) WHERE request_key IS NOT NULL DO NOTHING");
     expect(query.params).toContain(1523);
     expect(query.params).toContain(0.5);
+    expect(query.params).toContain(0.001);
+    expect(query.params).toContain(0.025);
+    expect(query.params).toContain("linkedin_owner_discovery");
+    expect(query.params.some((parameter) => {
+      if (typeof parameter !== "string") return false;
+      try {
+        const metadata = JSON.parse(parameter) as Record<string, unknown>;
+        return metadata.purposeBudgetBlocked === true && metadata.retryAt === "2026-10-19T22:00:00.000Z";
+      } catch {
+        return false;
+      }
+    })).toBe(true);
     expect(query.params).toContain("00000000-0000-0000-0000-000000000004");
+    expect(query.params.some((parameter) => parameter instanceof Date && parameter.toISOString() === "2026-10-18T22:00:00.000Z")).toBe(true);
+    expect(query.params.some((parameter) => parameter instanceof Date && parameter.toISOString() === "2026-10-19T22:00:00.000Z")).toBe(true);
   });
 
   it("marks a legacy configuration failure only when a recovery reservation is inserted", () => {

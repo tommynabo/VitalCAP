@@ -178,7 +178,7 @@ export async function getAutopilotPacingState(workspaceId: string, now = new Dat
   const env = getMapsEnv();
   const effectiveBudget = Math.min(env.APIFY_DAILY_COST_LIMIT_USD, settings.maxDailyApifySpendUsd ?? Number.POSITIVE_INFINITY);
   const serpEnv = getSerperEnv();
-  const serperSpendToday = await getGlobalSerperSpendToday(now);
+  const serperSpendToday = await getGlobalSerperSpendToday(now, undefined, settings.timezone);
   const apifyAvailable = isProviderAvailableForDiscovery(
     env.MAPS_PROVIDER === "apify" && Boolean(env.APIFY_API_TOKEN),
     providerHealth,

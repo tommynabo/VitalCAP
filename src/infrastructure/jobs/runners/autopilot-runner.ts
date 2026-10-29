@@ -163,7 +163,7 @@ export async function runAutopilotCronTick(now: Date = new Date()): Promise<Auto
 
     const mapsEnv = getMapsEnv();
     const serperEnv = getSerperEnv();
-    const serperSpendToday = await getGlobalSerperSpendToday(now);
+    const serperSpendToday = await getGlobalSerperSpendToday(now, undefined, settings.timezone);
     const serperBudgetRemaining = Math.max(0, serperEnv.SERPER_DAILY_COST_LIMIT_USD - serperSpendToday);
     const apifyDailyCap = Math.min(mapsEnv.APIFY_DAILY_COST_LIMIT_USD, settings.maxDailyApifySpendUsd ?? Number.POSITIVE_INFINITY);
     const latestEconomicPacing = await getLatestProviderEconomicPacingStates(workspaceId, settings.timezone, now);

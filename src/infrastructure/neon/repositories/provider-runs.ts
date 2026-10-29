@@ -41,6 +41,7 @@ export interface ReserveSerperProviderRunInput {
   itemsRequested: number;
   costUsd: number;
   dailyCostLimitUsd: number;
+  purposeLimitUsd?: number;
   metadata: Record<string, unknown>;
   timeZone?: string;
 }
@@ -167,32 +168,38 @@ export async function reserveSerperProviderRun(input: ReserveSerperProviderRunIn
   const db = getDb();
   const maxRequests = getCoreEnv().ACTIVATION_MAX_DAILY_RAW_REQUESTS;
   const now = new Date();
+  const retryAt = getDayBounds(input.timeZone ?? "Europe/Madrid", now).end;
   const [row] = await executeUnderGlobalDailyRawCapLock(buildReserveSerperProviderRunQuery(input, maxRequests, now)) as Array<{
     inserted_row: unknown;
+    purpose_blocked_row: unknown;
     safety_row: { committed_raw_requests: number; additional_raw_requests: number } | null;
     serper_spent_today: number;
+    serper_purpose_spent_today: number;
     existing_row: unknown;
   }>;
-  if (row?.inserted_row || row?.existing_row) {
+  if (row?.inserted_row || row?.purpose_blocked_row || row?.existing_row) {
     const existing = await getProviderRunByRequestKey(input.requestKey);
     if (!existing) throw new Error(`Unable to resolve Serper provider run ${input.requestKey}.`);
     return { providerRun: existing, created: Boolean(row.inserted_row) };
   }
 
   if (row?.safety_row && row.safety_row.committed_raw_requests + row.safety_row.additional_raw_requests > maxRequests) {
-    const retryAt = getDayBounds(input.timeZone ?? "Europe/Madrid", now).end;
     throw new ProviderBudgetExceededError("Provider reservation is blocked by the daily raw request cap.", retryAt, "raw_request_cap");
   }
   if (row && Number(row.serper_spent_today) + input.costUsd > input.dailyCostLimitUsd) {
-    const retryAt = getDayBounds(input.timeZone ?? "Europe/Madrid", now).end;
     throw new ProviderBudgetExceededError("Serper reservation is blocked by the daily cost limit.", retryAt);
+  }
+  if (row && input.purposeLimitUsd !== undefined
+    && Number(row.serper_purpose_spent_today) + input.costUsd > input.purposeLimitUsd) {
+    throw new ProviderBudgetExceededError("Serper reservation is blocked by the daily purpose limit.", retryAt);
   }
   throw new Error(`Unable to reserve Serper provider run ${input.requestKey}.`);
 }
 
 export function buildReserveSerperProviderRunQuery(input: ReserveSerperProviderRunInput, maxRequests: number, now: Date) {
   const discoveryJobId = typeof input.metadata.discoveryJobId === "string" ? input.metadata.discoveryJobId : "";
-  const { start, end } = getDayBounds("UTC", now);
+  const { start, end } = getDayBounds(input.timeZone ?? "Europe/Madrid", now);
+  const retryAt = end.toISOString();
   return sql`
     WITH ${buildDailyRawRequestCommitmentCtes(now)},
     raw_safety AS (
@@ -223,6 +230,14 @@ export function buildReserveSerperProviderRunQuery(input: ReserveSerperProviderR
         AND started_at >= ${start}
         AND started_at < ${end}
     ),
+    purpose_safety AS (
+      SELECT COALESCE(SUM(cost_usd), 0)::numeric AS spent_today
+      FROM provider_runs
+      WHERE provider = 'serper'
+        AND started_at >= ${start}
+        AND started_at < ${end}
+        AND metadata->>'purpose' = ${String(input.metadata.purpose ?? "")}
+    ),
     inserted AS (
       INSERT INTO provider_runs (
         workspace_id, campaign_id, provider, operation, request_key, seed_id, status,
@@ -231,16 +246,40 @@ export function buildReserveSerperProviderRunQuery(input: ReserveSerperProviderR
       SELECT ${input.workspaceId}::uuid, ${input.campaignId}::uuid, 'serper', 'search',
         ${input.requestKey}, ${input.seedId ?? null}::uuid, 'starting', ${input.itemsRequested},
         0, ${input.costUsd}, ${JSON.stringify(input.metadata)}::jsonb
-      FROM safety, cost_safety
+      FROM safety, cost_safety, purpose_safety
       WHERE safety.committed_raw_requests + safety.additional_raw_requests <= ${maxRequests}
         AND cost_safety.spent_today + ${input.costUsd} <= ${input.dailyCostLimitUsd}
+        AND (${input.purposeLimitUsd ?? null}::numeric IS NULL
+          OR purpose_safety.spent_today + ${input.costUsd} <= ${input.purposeLimitUsd ?? null}::numeric)
+      ON CONFLICT (request_key) WHERE request_key IS NOT NULL DO NOTHING
+      RETURNING *
+    ),
+    purpose_blocked AS (
+      INSERT INTO provider_runs (
+        workspace_id, campaign_id, provider, operation, request_key, seed_id, status,
+        items_requested, items_returned, cost_usd, error, metadata, finished_at
+      )
+      SELECT ${input.workspaceId}::uuid, ${input.campaignId}::uuid, 'serper', 'search',
+        ${input.requestKey}, ${input.seedId ?? null}::uuid, 'budget_blocked', ${input.itemsRequested},
+        0, 0, 'Serper purpose allowance reached.', ${JSON.stringify({
+          ...input.metadata,
+          retryAt,
+          purposeBudgetBlocked: true,
+        })}::jsonb, CURRENT_TIMESTAMP
+      FROM safety, cost_safety, purpose_safety
+      WHERE safety.committed_raw_requests + safety.additional_raw_requests <= ${maxRequests}
+        AND cost_safety.spent_today + ${input.costUsd} <= ${input.dailyCostLimitUsd}
+        AND ${input.purposeLimitUsd ?? null}::numeric IS NOT NULL
+        AND purpose_safety.spent_today + ${input.costUsd} > ${input.purposeLimitUsd ?? null}::numeric
       ON CONFLICT (request_key) WHERE request_key IS NOT NULL DO NOTHING
       RETURNING *
     )
     SELECT
       (SELECT row_to_json(inserted.*) FROM inserted) AS inserted_row,
+      (SELECT row_to_json(purpose_blocked.*) FROM purpose_blocked) AS purpose_blocked_row,
       (SELECT row_to_json(safety.*) FROM safety) AS safety_row,
       (SELECT spent_today FROM cost_safety) AS serper_spent_today,
+      (SELECT spent_today FROM purpose_safety) AS serper_purpose_spent_today,
       (SELECT row_to_json(existing.*) FROM provider_runs existing WHERE existing.request_key = ${input.requestKey}) AS existing_row
   `;
 }
@@ -857,9 +896,9 @@ export async function getTodaySpendUsd(workspaceId: string, provider: string, ti
   return row?.total ?? 0;
 }
 
-export async function getSerperSpendByPurpose(purpose: string, now = new Date(), excludeRequestKey?: string): Promise<number> {
+export async function getSerperSpendByPurpose(purpose: string, now = new Date(), excludeRequestKey?: string, timeZone = "Europe/Madrid"): Promise<number> {
   const db = getDb();
-  const { start, end } = getDayBounds("UTC", now);
+  const { start, end } = getDayBounds(timeZone, now);
   const [row] = await db.select({ total: sql<number>`COALESCE(SUM(${providerRuns.costUsd}), 0)` })
     .from(providerRuns)
     .where(and(
@@ -893,9 +932,9 @@ export async function getSerperRecoveryState(now = new Date()): Promise<SerperRe
   return resolveSerperRecoveryState({ latest: rows[0], currentCredentialFingerprint, now });
 }
 
-export async function getGlobalSerperSpendToday(now = new Date(), excludeRequestKey?: string): Promise<number> {
+export async function getGlobalSerperSpendToday(now = new Date(), excludeRequestKey?: string, timeZone = "Europe/Madrid"): Promise<number> {
   const db = getDb();
-  const { start, end } = getDayBounds("UTC", now);
+  const { start, end } = getDayBounds(timeZone, now);
   const [row] = await db.select({ total: sql<number>`COALESCE(SUM(${providerRuns.costUsd}), 0)` })
     .from(providerRuns)
     .where(and(
@@ -911,10 +950,11 @@ export async function getSerperCostDiagnostics(input: {
   dailyCapUsd: number;
   operatorProvidedBalanceUsd?: number;
   now?: Date;
+  timeZone?: string;
 }): Promise<SerperCostDiagnostics> {
   const db = getDb();
   const now = input.now ?? new Date();
-  const today = getDayBounds("UTC", now);
+  const today = getDayBounds(input.timeZone ?? "Europe/Madrid", now);
   const rollingStart = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
   const rows = await db.select({
     status: providerRuns.status,

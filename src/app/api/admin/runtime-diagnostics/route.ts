@@ -133,18 +133,19 @@ export async function GET() {
     const mapsEnv = getMapsEnv();
     const serperEnv = getSerperEnv();
     const diagnosticsNow = new Date();
-    const [campaignRows, [settings], apifyRecovery, watchdogRows, discoveryRecoveryJobs, systemDiagnostics, serperRecovery, serperCostDiagnostics] = await Promise.all([
+    const [settings] = await db.select({
+      enabled: autopilotSettings.enabled,
+      systemPaused: autopilotSettings.systemPaused,
+      systemPauseReason: autopilotSettings.systemPauseReason,
+      systemPausedAt: autopilotSettings.systemPausedAt,
+      emergencyStopped: autopilotSettings.emergencyStopped,
+      target: autopilotSettings.globalDailyTarget,
+      targetMetric: autopilotSettings.targetMetric,
+      timezone: autopilotSettings.timezone,
+    }).from(autopilotSettings).where(eq(autopilotSettings.workspaceId, workspaceId)).limit(1);
+    const timeZone = settings?.timezone ?? "Europe/Madrid";
+    const [campaignRows, apifyRecovery, watchdogRows, discoveryRecoveryJobs, systemDiagnostics, serperRecovery, serperCostDiagnostics] = await Promise.all([
       listCampaigns(workspaceId),
-      db.select({
-        enabled: autopilotSettings.enabled,
-        systemPaused: autopilotSettings.systemPaused,
-        systemPauseReason: autopilotSettings.systemPauseReason,
-        systemPausedAt: autopilotSettings.systemPausedAt,
-        emergencyStopped: autopilotSettings.emergencyStopped,
-        target: autopilotSettings.globalDailyTarget,
-        targetMetric: autopilotSettings.targetMetric,
-        timezone: autopilotSettings.timezone,
-      }).from(autopilotSettings).where(eq(autopilotSettings.workspaceId, workspaceId)).limit(1),
       getApifyRecoverySnapshot(workspaceId),
       getWatchdogWorkspaceSignals(workspaceId),
       getRecoveryProbeDiscoveryJobs(workspaceId),
@@ -159,10 +160,10 @@ export async function GET() {
         dailyCapUsd: serperEnv.SERPER_DAILY_COST_LIMIT_USD,
         operatorProvidedBalanceUsd: serperEnv.SERPER_OPERATOR_BALANCE_USD,
         now: diagnosticsNow,
+        timeZone,
       }),
     ]);
     const watchdogSignals = watchdogRows[0] ?? null;
-    const timeZone = settings?.timezone ?? "Europe/Madrid";
     const economicCampaigns = campaignRows.filter((campaign) => campaign.engineType === "maps_fast"
       || campaign.engineType === "maps_deep"
       || campaign.engineType === "google_serp"

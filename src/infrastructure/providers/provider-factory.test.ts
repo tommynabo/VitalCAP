@@ -165,36 +165,37 @@ describe("Serper provider run recording", () => {
       recoveredAt: null,
     });
     mockGetGlobalSerperSpendToday.mockResolvedValue(0.5);
+    mockReserveSerperProviderRun.mockRejectedValueOnce(Object.assign(new Error("Serper reservation blocked"), { name: "ProviderBudgetExceededError" }));
     const provider = createSerpDiscoveryProvider("workspace-1", "google_serp", "campaign-1");
 
     await expect(provider.search({ query: "safe rotated-key probe", maxResults: 10 }))
       .rejects.toMatchObject({ name: "ProviderBudgetExceededError" });
 
     expect(mockSearch).not.toHaveBeenCalled();
-    expect(mockUpdateProviderRun).toHaveBeenCalledWith("run-1", expect.objectContaining({
-      status: "budget_blocked",
-      costUsd: 0,
-      metadata: expect.objectContaining({ purpose: "recovery_probe", recoveryProbe: true }),
-    }));
+    expect(mockUpdateProviderRun).not.toHaveBeenCalled();
   });
 
   it.each([
-    ["linkedin_owner", "linkedin_owner_discovery", 0.024],
-    ["maps_deep", "maps_deep_enrichment", 0.049],
-  ] as const)("blocks %s when its daily purpose allowance cannot cover the reserved attempts", async (engineType, purpose, currentSpend) => {
-    mockGetSerperSpendByPurpose.mockResolvedValue(currentSpend);
+    ["linkedin_owner", "linkedin_owner_discovery", 0.025],
+    ["maps_deep", "maps_deep_enrichment", 0.05],
+  ] as const)("passes the %s purpose ceiling into the atomic reservation", async (engineType, purpose, purposeLimitUsd) => {
+    mockReserveSerperProviderRun.mockResolvedValueOnce({
+      providerRun: { id: "run-blocked", status: "budget_blocked", metadata: { retryAt: "2026-10-19T22:00:00.000Z" } },
+      created: false,
+    });
     const provider = createSerpDiscoveryProvider("workspace-1", engineType, "campaign-1");
 
     await expect(provider.search({ query: "safe purpose limit probe", maxResults: 5 }))
       .rejects.toMatchObject({ name: "ProviderBudgetExceededError" });
 
     expect(mockSearch).not.toHaveBeenCalled();
-    expect(mockGetSerperSpendByPurpose).toHaveBeenCalledWith(purpose, expect.any(Date), expect.any(String));
-    expect(mockUpdateProviderRun).toHaveBeenCalledWith("run-1", expect.objectContaining({
-      status: "budget_blocked",
-      costUsd: 0,
-      metadata: expect.objectContaining({ purpose, purposeBudgetBlocked: true }),
+    expect(mockReserveSerperProviderRun).toHaveBeenCalledWith(expect.objectContaining({
+      costUsd: 0.002,
+      purposeLimitUsd,
+      metadata: expect.objectContaining({ purpose }),
     }));
+    expect(mockGetSerperSpendByPurpose).not.toHaveBeenCalled();
+    expect(mockUpdateProviderRun).not.toHaveBeenCalled();
   });
 
   it("does not contact Serper again during the billing recovery cooldown", async () => {
