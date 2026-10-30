@@ -11,6 +11,7 @@ export const JOB_LEASE_MS = 5 * 60 * 1000;
 const MAX_CLAIM_BATCH_SIZE = 100;
 export const MAX_RECOVERABLE_RAW_PROCESSING_ATTEMPTS = 1;
 export const MAX_RECOVERABLE_RAW_PROCESSING_JOBS_PER_TICK = 5;
+export const MAPS_FAST_TEMPORARY_PROVIDER_ERROR = "Maps Fast website recovery provider is temporarily unavailable.";
 export const IDEMPOTENCY_PROBE_RECOVERY_VERSION = "idempotency_probe_v1";
 export const ACCOUNT_DOMAIN_FIX_RECOVERY_VERSION = "account_domain_fix_v1";
 
@@ -86,6 +87,158 @@ export function buildRequeueStaleLockedJobsQuery(table: QueueTable, now: Date, s
   `;
 }
 
+export function buildRequeueProviderBlockedMapsFastJobsQuery(workspaceId: string, now: Date, limit: number) {
+  const boundedLimit = normalizeBatchSize(limit);
+  const nowIso = now.toISOString();
+
+  return sql`
+    WITH eligible AS MATERIALIZED (
+      SELECT raw.id AS raw_id, raw.campaign_id
+      FROM raw_candidates raw
+      JOIN campaigns campaign ON campaign.id = raw.campaign_id
+        AND campaign.workspace_id = ${workspaceId}::uuid
+        AND campaign.status = 'active'
+      LEFT JOIN accounts account ON account.workspace_id = campaign.workspace_id
+        AND (account.id = raw.account_id OR (
+          raw.account_id IS NULL
+          AND account.google_place_id = NULLIF(raw.raw_payload #>> '{place,externalPlaceId}', '')
+        ))
+      WHERE raw.processed = false
+        AND raw.engine_type = 'maps_fast'
+        AND raw.discovered_at >= (TIMESTAMP '2026-10-29 00:00:00' AT TIME ZONE 'Europe/Madrid')
+        AND raw.processing_metrics->>'websiteRecoveryStatus' = 'provider_blocked'
+        AND EXISTS (
+          SELECT 1
+          FROM processing_jobs source_job
+          JOIN dead_letter_jobs dead_letter ON dead_letter.source_table = 'processing_jobs'
+            AND dead_letter.source_job_id = source_job.id
+          WHERE source_job.type = 'process_raw_candidate'
+            AND source_job.payload->>'rawCandidateId' = raw.id::text
+            AND source_job.status = 'dead_letter'
+            AND source_job.last_error = ${MAPS_FAST_TEMPORARY_PROVIDER_ERROR}
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM raw_candidates duplicate
+          WHERE duplicate.id <> raw.id
+            AND duplicate.campaign_id = raw.campaign_id
+            AND duplicate.engine_type = 'maps_fast'
+            AND (
+              (raw.account_id IS NOT NULL AND duplicate.account_id = raw.account_id)
+              OR (
+                NULLIF(raw.raw_payload #>> '{place,externalPlaceId}', '') IS NOT NULL
+                AND duplicate.raw_payload #>> '{place,externalPlaceId}' = raw.raw_payload #>> '{place,externalPlaceId}'
+              )
+            )
+            AND (
+              duplicate.processing_metrics->>'websiteRecoveryStatus' IN ('succeeded', 'terminal_no_match')
+              OR (
+                duplicate.processing_metrics->>'websiteRecoveryStatus' = 'provider_blocked'
+                AND (duplicate.discovered_at, duplicate.id) < (raw.discovered_at, raw.id)
+                AND EXISTS (
+                  SELECT 1 FROM processing_jobs duplicate_job
+                  JOIN dead_letter_jobs duplicate_dead_letter ON duplicate_dead_letter.source_table = 'processing_jobs'
+                    AND duplicate_dead_letter.source_job_id = duplicate_job.id
+                  WHERE duplicate_job.type = 'process_raw_candidate'
+                    AND duplicate_job.payload->>'rawCandidateId' = duplicate.id::text
+                    AND duplicate_job.status = 'dead_letter'
+                    AND duplicate_job.last_error = ${MAPS_FAST_TEMPORARY_PROVIDER_ERROR}
+                )
+              )
+            )
+        )
+        AND ((raw.account_id IS NULL AND account.id IS NULL) OR (
+          account.id IS NOT NULL
+          AND account.status NOT IN ('rejected_country', 'rejected_icp', 'duplicate_merged', 'archived')
+          AND (
+            account.status IN ('qualified', 'contactable', 'outreach_ready')
+            OR EXISTS (
+              SELECT 1 FROM campaign_memberships membership
+              WHERE membership.campaign_id = raw.campaign_id
+                AND membership.account_id = account.id
+                AND membership.stage IN ('qualified', 'ready')
+            )
+          )
+        ))
+        AND NOT EXISTS (
+          SELECT 1 FROM contact_points contact
+          WHERE contact.workspace_id = campaign.workspace_id
+            AND contact.account_id = account.id
+            AND contact.type = 'email'
+            AND contact.verification_status = 'valid'
+            AND NULLIF(TRIM(contact.normalized_value), '') IS NOT NULL
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM instantly_lead_imports imported
+          WHERE imported.workspace_id = campaign.workspace_id
+            AND imported.account_id = account.id
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM suppression_entries suppression
+          WHERE suppression.workspace_id = campaign.workspace_id
+            AND (suppression.account_id = account.id OR suppression.contact_point_id IN (
+              SELECT contact.id FROM contact_points contact
+              WHERE contact.workspace_id = campaign.workspace_id
+                AND contact.account_id = account.id
+            ))
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM conversations conversation
+          WHERE conversation.workspace_id = campaign.workspace_id
+            AND conversation.account_id = account.id
+            AND conversation.state = 'suppressed'
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM processing_jobs active_job
+          WHERE active_job.type = 'process_raw_candidate'
+            AND active_job.payload->>'rawCandidateId' = raw.id::text
+            AND active_job.status IN ('pending', 'processing')
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM processing_jobs daily_recovery
+          WHERE daily_recovery.type = 'process_raw_candidate'
+            AND daily_recovery.payload->>'rawCandidateId' = raw.id::text
+            AND daily_recovery.payload->>'providerRecoveryDay' = to_char(${nowIso}::timestamptz AT TIME ZONE 'Europe/Madrid', 'YYYY-MM-DD')
+        )
+      ORDER BY raw.discovered_at ASC, raw.id ASC
+      FOR UPDATE OF raw SKIP LOCKED
+      LIMIT ${boundedLimit}
+    ), inserted AS (
+      INSERT INTO processing_jobs (
+        campaign_id, type, payload, status, attempt_count, max_attempts, idempotency_key, next_attempt_at
+      )
+      SELECT eligible.campaign_id, 'process_raw_candidate',
+        jsonb_build_object(
+          'rawCandidateId', eligible.raw_id::text,
+          'providerRecoveryDay', to_char(${nowIso}::timestamptz AT TIME ZONE 'Europe/Madrid', 'YYYY-MM-DD'),
+          'recoveryDisposition', 'recoverable'
+        ),
+        'pending', 0, 1,
+        'raw_candidate_provider_recovery:' || eligible.raw_id::text || ':'
+          || to_char(${nowIso}::timestamptz AT TIME ZONE 'Europe/Madrid', 'YYYY-MM-DD'),
+        ${nowIso}::timestamptz
+      FROM eligible
+      ON CONFLICT DO NOTHING
+      RETURNING id
+    )
+    SELECT (SELECT COUNT(*) FROM eligible)::int AS candidates_found,
+      (SELECT COUNT(*) FROM inserted)::int AS jobs_enqueued;
+  `;
+}
+
+async function requeueProviderBlockedMapsFastJobs(
+  workspaceId: string,
+  now: Date,
+  limit: number,
+): Promise<DeadLetterRecoveryResult> {
+  if (limit <= 0) return { candidatesFound: 0, jobsEnqueued: 0 };
+  const result = await getDb().execute(buildRequeueProviderBlockedMapsFastJobsQuery(workspaceId, now, limit));
+  const [row] = result.rows as Array<{ candidates_found?: number | string; jobs_enqueued?: number | string }>;
+  return {
+    candidatesFound: Number(row?.candidates_found ?? 0),
+    jobsEnqueued: Number(row?.jobs_enqueued ?? 0),
+  };
+}
+
 export function buildRecoverableRawProcessingJobsQuery(workspaceId: string, now: Date, limit: number) {
   const boundedLimit = normalizeBatchSize(limit);
   const nowIso = now.toISOString();
@@ -106,6 +259,7 @@ export function buildRecoverableRawProcessingJobsQuery(workspaceId: string, now:
         AND dead_letter.source_job_id = source_job.id
       WHERE raw.processed = false
         AND raw.engine_type = 'maps_fast'
+        AND raw.processing_metrics->>'websiteRecoveryStatus' IS DISTINCT FROM 'provider_blocked'
         AND raw.discovered_at >= (
           date_trunc('day', ${nowIso}::timestamptz AT TIME ZONE COALESCE(settings.timezone, 'Europe/Madrid'))
           AT TIME ZONE COALESCE(settings.timezone, 'Europe/Madrid')
@@ -168,6 +322,7 @@ export function buildRecoverableRawProcessingJobsQuery(workspaceId: string, now:
         AND legacy_dead_letter.source_job_id = legacy_source.id
       WHERE raw.processed = false
         AND raw.engine_type = 'maps_fast'
+        AND raw.processing_metrics->>'websiteRecoveryStatus' IS DISTINCT FROM 'provider_blocked'
         AND raw.discovered_at >= (
           date_trunc('day', ${nowIso}::timestamptz AT TIME ZONE COALESCE(settings.timezone, 'Europe/Madrid'))
           AT TIME ZONE COALESCE(settings.timezone, 'Europe/Madrid')
@@ -246,6 +401,7 @@ export function buildRecoverableRawProcessingJobsQuery(workspaceId: string, now:
         AND diagnostic_dead_letter.source_job_id = diagnostic_job.id
       WHERE raw.processed = false
         AND raw.engine_type = 'maps_fast'
+        AND raw.processing_metrics->>'websiteRecoveryStatus' IS DISTINCT FROM 'provider_blocked'
         AND raw.discovered_at >= (
           date_trunc('day', ${nowIso}::timestamptz AT TIME ZONE COALESCE(settings.timezone, 'Europe/Madrid'))
           AT TIME ZONE COALESCE(settings.timezone, 'Europe/Madrid')
@@ -307,12 +463,14 @@ export interface DeadLetterRecoveryResult {
 }
 
 export async function recoverDeadLetteredRawCandidates(workspaceId: string, now = new Date(), limit = MAX_RECOVERABLE_RAW_PROCESSING_JOBS_PER_TICK): Promise<DeadLetterRecoveryResult> {
-  const db = getDb();
-  const result = await db.execute(buildRecoverableRawProcessingJobsQuery(workspaceId, now, limit));
+  const providerBlocked = await requeueProviderBlockedMapsFastJobs(workspaceId, now, limit);
+  const remainingLimit = Math.max(0, limit - providerBlocked.jobsEnqueued);
+  if (remainingLimit === 0) return providerBlocked;
+  const result = await getDb().execute(buildRecoverableRawProcessingJobsQuery(workspaceId, now, remainingLimit));
   const [row] = result.rows as Array<{ candidates_found?: number | string; jobs_enqueued?: number | string }>;
   return {
-    candidatesFound: Number(row?.candidates_found ?? 0),
-    jobsEnqueued: Number(row?.jobs_enqueued ?? 0),
+    candidatesFound: providerBlocked.candidatesFound + Number(row?.candidates_found ?? 0),
+    jobsEnqueued: providerBlocked.jobsEnqueued + Number(row?.jobs_enqueued ?? 0),
   };
 }
 

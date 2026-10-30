@@ -767,13 +767,12 @@ describe("runProcessingCronTick", () => {
     expect(mocks.deferProcessingJob).toHaveBeenCalledWith(expect.objectContaining({
       jobId: "maps-fast-recovery",
       nextAttemptAt: new Date("2026-10-20T00:00:00Z"),
-      consumeAttempt: true,
     }));
     expect(mocks.failProcessingJob).not.toHaveBeenCalled();
     expect(mocks.completeProcessingJob).not.toHaveBeenCalled();
   });
 
-  it("dead-letters repeated budget deferrals at the existing processing attempt limit", async () => {
+  it("defers budget exhaustion without dead-lettering at the processing attempt limit", async () => {
     prepareMapsFastRecoveryJob();
     mocks.claimProcessingJobs.mockReset()
       .mockResolvedValueOnce([{
@@ -789,11 +788,12 @@ describe("runProcessingCronTick", () => {
 
     await runProcessingCronTick(1, new Date("2026-10-20T12:00:00Z"));
 
-    expect(mocks.deferProcessingJob).not.toHaveBeenCalled();
-    expect(mocks.failProcessingJob).toHaveBeenCalledWith(expect.objectContaining({
-      job: expect.objectContaining({ attemptCount: 5, maxAttempts: 5 }),
-      error: expect.any(ProviderBudgetExceededError),
+    expect(mocks.deferProcessingJob).toHaveBeenCalledWith(expect.objectContaining({
+      jobId: "maps-fast-recovery",
+      nextAttemptAt: new Date("2026-10-21T00:00:00Z"),
+      reason: "Serper daily budget exhausted",
     }));
+    expect(mocks.failProcessingJob).not.toHaveBeenCalled();
   });
 
   it("does not repeat a paid lookup when the persisted atomic claim is already held", async () => {
@@ -811,6 +811,11 @@ describe("runProcessingCronTick", () => {
 
   it("persists a recovered domain as Serper evidence and uses it for canonical account enrichment", async () => {
     prepareMapsFastRecoveryJob();
+    mocks.listUnlinkedWebsiteEmailEvidence.mockResolvedValue([{
+      value: "info@farmacia-ejemplo.es",
+      normalizedValue: "info@farmacia-ejemplo.es",
+      sourceUrl: "https://farmacia-ejemplo.es/contacto",
+    }]);
     const search = vi.fn().mockResolvedValue({
       results: [recoveredWebsite.evidence],
       usage: { calls: 1, items: 1, errors: 0, totalLatencyMs: 10, costUsd: 0.001, quotaRemaining: null },
@@ -831,6 +836,20 @@ describe("runProcessingCronTick", () => {
       rawSnapshot: expect.objectContaining({ kind: "maps_fast_website_recovery", provider: "serper" }),
     }));
     expect(mocks.getWebsiteEnrichmentStatus).toHaveBeenCalledWith("account-id", "farmacia-ejemplo.es");
+    expect(mocks.enrichWebsite).toHaveBeenCalledWith(expect.objectContaining({
+      accountId: "account-id",
+      websiteUrl: recoveredWebsite.websiteUrl,
+    }));
+    expect(mocks.insertContactPointWithStatus).toHaveBeenCalledWith(expect.objectContaining({
+      normalizedValue: "info@farmacia-ejemplo.es",
+      verificationStatus: "unverified",
+      sourceType: "website_enrichment",
+    }));
+    expect(mocks.enqueueVerificationJob).toHaveBeenCalledWith(expect.objectContaining({
+      contactPointId: "contact-point-id",
+      normalizedEmail: "info@farmacia-ejemplo.es",
+      provider: "millionverifier",
+    }));
   });
 
   it("finalizes a successful Serper no-match as terminal and does not retry it", async () => {

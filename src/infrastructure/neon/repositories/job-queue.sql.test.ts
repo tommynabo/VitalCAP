@@ -1,7 +1,7 @@
 import { PgDialect } from "drizzle-orm/pg-core";
 import { describe, expect, it } from "vitest";
 import { PROVIDER_DEFERRED_JOB_ERROR_PREFIX } from "@/domain/discovery/types";
-import { buildClaimJobsQuery, buildDeadLetterExpiredJobsQuery, buildDeferJobQuery, buildRecoveryFailureMetadataSql, buildRequeueStaleLockedJobsQuery, buildRecoverableRawProcessingJobsQuery, buildWakeProviderDeferredMapsDiscoveryJobsQuery, ACCOUNT_DOMAIN_FIX_RECOVERY_VERSION, IDEMPOTENCY_PROBE_RECOVERY_VERSION, MAX_RECOVERABLE_RAW_PROCESSING_ATTEMPTS, MAX_RECOVERABLE_RAW_PROCESSING_JOBS_PER_TICK } from "./job-queue";
+import { buildClaimJobsQuery, buildDeadLetterExpiredJobsQuery, buildDeferJobQuery, buildRecoveryFailureMetadataSql, buildRequeueProviderBlockedMapsFastJobsQuery, buildRequeueStaleLockedJobsQuery, buildRecoverableRawProcessingJobsQuery, buildWakeProviderDeferredMapsDiscoveryJobsQuery, ACCOUNT_DOMAIN_FIX_RECOVERY_VERSION, IDEMPOTENCY_PROBE_RECOVERY_VERSION, MAPS_FAST_TEMPORARY_PROVIDER_ERROR, MAX_RECOVERABLE_RAW_PROCESSING_ATTEMPTS, MAX_RECOVERABLE_RAW_PROCESSING_JOBS_PER_TICK } from "./job-queue";
 
 const dialect = new PgDialect();
 const claimTime = new Date("2026-10-18T09:00:00.000Z");
@@ -193,6 +193,36 @@ describe("job queue SQL builders", () => {
     expect(query.sql).not.toMatch(/completed|dead_letter/);
   });
 
+  it("requeues only retryable Maps Fast provider-blocked contactability jobs once per Madrid day", () => {
+    const query = dialect.sqlToQuery(buildRequeueProviderBlockedMapsFastJobsQuery(
+      "workspace-1",
+      new Date("2026-10-30T12:00:00.000Z"),
+      MAX_RECOVERABLE_RAW_PROCESSING_JOBS_PER_TICK,
+    ));
+
+    expect(query.sql).toContain("raw.engine_type = 'maps_fast'");
+    expect(query.sql).toContain("TIMESTAMP '2026-10-29 00:00:00' AT TIME ZONE 'Europe/Madrid'");
+    expect(query.sql).toContain("raw.processing_metrics->>'websiteRecoveryStatus' = 'provider_blocked'");
+    expect(query.sql).not.toContain("raw.processing_metrics->>'websiteRecoveryStatus' = 'terminal_no_match'");
+    expect(query.params).toContain(MAPS_FAST_TEMPORARY_PROVIDER_ERROR);
+    expect(query.sql).toContain("source_job.status = 'dead_letter'");
+    expect(query.sql).toContain("duplicate.processing_metrics->>'websiteRecoveryStatus' IN ('succeeded', 'terminal_no_match')");
+    expect(query.sql).toContain("(duplicate.discovered_at, duplicate.id) < (raw.discovered_at, raw.id)");
+    expect(query.sql).toContain("account.status IN ('qualified', 'contactable', 'outreach_ready')");
+    expect(query.sql).toContain("membership.stage IN ('qualified', 'ready')");
+    expect(query.sql).toContain("contact.verification_status = 'valid'");
+    expect(query.sql).toContain("FROM instantly_lead_imports imported");
+    expect(query.sql).toContain("FROM suppression_entries suppression");
+    expect(query.sql).toContain("conversation.state = 'suppressed'");
+    expect(query.sql).toContain("daily_recovery.payload->>'providerRecoveryDay'");
+    expect(query.sql).toContain("'recoveryDisposition', 'recoverable'");
+    expect(query.sql).not.toContain("'skipMapsFastWebsiteRecovery', true");
+    expect(query.sql).toContain("'raw_candidate_provider_recovery:'");
+    expect(query.sql).toContain("FOR UPDATE OF raw SKIP LOCKED");
+    expect(query.sql).not.toMatch(/INSERT INTO (raw_candidates|discovery_jobs|provider_runs|instantly_lead_imports)/i);
+    expect(query.sql).toContain("LIMIT");
+  });
+
   it("creates one bounded retry for a recoverable dead-letter raw", () => {
     const workspaceId = "00000000-0000-0000-0000-000000000001";
     const now = new Date("2026-10-20T12:00:00.000Z");
@@ -246,6 +276,7 @@ describe("job queue SQL builders", () => {
     const query = dialect.sqlToQuery(buildRecoverableRawProcessingJobsQuery("workspace-1", claimTime, 5));
 
     expect(query.sql).toContain("dead_letter.payload #>> '{_vitalcapRecovery,disposition}' = 'recoverable'");
+    expect(query.sql).toContain("raw.processing_metrics->>'websiteRecoveryStatus' IS DISTINCT FROM 'provider_blocked'");
     expect(query.sql).toContain("source_job.last_error !~*");
     expect(query.params).toContain("invalid|not[_ ]?found|unauthorized|forbidden|bad[_ ]?request");
     expect(query.sql).toContain("source_job.last_error IS NULL AND dead_letter.last_error ~*");

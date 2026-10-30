@@ -1029,17 +1029,12 @@ export async function runProcessingCronTick(
           await runWithDeadlineSignal(cleanupDeadline.signal, async () => {
             if (!jobCompletedPersisted) {
               if (jobError instanceof ProviderBudgetExceededError) {
-                if (job.attemptCount >= job.maxAttempts) {
-                  await failProcessingJob({ workerId, job, error: jobError, now });
-                } else {
-                  await deferProcessingJob({
-                    jobId: job.id,
-                    workerId,
-                    nextAttemptAt: jobError.retryAt,
-                    reason: jobError.message,
-                    consumeAttempt: true,
-                  });
-                }
+                await deferProcessingJob({
+                  jobId: job.id,
+                  workerId,
+                  nextAttemptAt: jobError.retryAt,
+                  reason: jobError.message,
+                });
               } else if (jobError instanceof ProviderFailureError && jobError.retryAt) {
                 if (job.attemptCount >= job.maxAttempts) {
                   await failProcessingJob({ workerId, job, error: jobError, now });
