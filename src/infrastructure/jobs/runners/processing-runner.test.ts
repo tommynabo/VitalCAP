@@ -891,6 +891,30 @@ describe("runProcessingCronTick", () => {
     expect(mocks.completeProcessingJob).not.toHaveBeenCalled();
   });
 
+  it("defers temporary provider failure for a one-attempt recovery job without consuming its attempt", async () => {
+    prepareMapsFastRecoveryJob({}, { providerRecoveryDay: "2026-10-30", recoveryDisposition: "recoverable" });
+    mocks.claimProcessingJobs.mockReset().mockResolvedValueOnce([{
+      ...makeJob("maps-fast-recovery"),
+      type: "process_raw_candidate",
+      attemptCount: 1,
+      maxAttempts: 1,
+      payload: { rawCandidateId: "raw-candidate-id", providerRecoveryDay: "2026-10-30", recoveryDisposition: "recoverable" },
+    }]).mockResolvedValueOnce([]);
+    const now = new Date("2026-10-30T08:00:00.000Z");
+    const transientError = new ProviderTransientError("temporary Serper outage", now);
+    mocks.createSerpDiscoveryProvider.mockReturnValue({ providerName: "serper", search: vi.fn().mockRejectedValue(transientError) });
+
+    await runProcessingCronTick(1, now);
+
+    expect(mocks.deferProcessingJob).toHaveBeenCalledWith(expect.objectContaining({
+      jobId: "maps-fast-recovery",
+      nextAttemptAt: expect.any(Date),
+      consumeAttempt: false,
+    }));
+    expect(mocks.failProcessingJob).not.toHaveBeenCalled();
+    expect(mocks.completeProcessingJob).not.toHaveBeenCalled();
+  });
+
   it("reclaims recovery after a prior processing attempt was interrupted in started state", async () => {
     prepareMapsFastRecoveryJob();
     mocks.getRawCandidateById.mockResolvedValue({

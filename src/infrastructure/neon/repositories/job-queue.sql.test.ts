@@ -75,6 +75,16 @@ describe("job queue SQL builders", () => {
     expect(whereClause).not.toContain("payload->>'origin'");
   });
 
+  it("prioritizes provider-blocked recovery jobs ahead of normal processing jobs", () => {
+    const processingSql = buildProcessingClaimQuery().sql;
+    const orderClause = processingSql.slice(processingSql.indexOf("ORDER BY"), processingSql.indexOf("FOR UPDATE"));
+
+    expect(orderClause.replace(/\s+/g, " ").trim()).toBe(
+      "ORDER BY CASE WHEN j.payload->>'providerRecoveryDay' IS NOT NULL THEN 0 ELSE 1 END ASC, j.next_attempt_at ASC NULLS FIRST, j.created_at ASC, j.id ASC",
+    );
+    expect(buildDiscoveryClaimQuery().sql).not.toContain("providerRecoveryDay");
+  });
+
   it("keeps max-attempt recovery jobs ineligible under the shared attempt guard", () => {
     const query = buildDiscoveryClaimQuery();
     const whereClause = query.sql.slice(query.sql.indexOf("WHERE"), query.sql.indexOf("ORDER BY"));
@@ -218,6 +228,8 @@ describe("job queue SQL builders", () => {
     expect(query.sql).toContain("FROM suppression_entries suppression");
     expect(query.sql).toContain("conversation.state = 'suppressed'");
     expect(query.sql).toContain("daily_recovery.payload->>'providerRecoveryDay'");
+    expect(query.sql).toContain("daily_recovery.status <> 'dead_letter'");
+    expect(query.sql).toContain("daily_recovery.last_error IS DISTINCT FROM");
     expect(query.sql).toContain("'recoveryDisposition', 'recoverable'");
     expect(query.sql).not.toContain("'skipMapsFastWebsiteRecovery', true");
     expect(query.sql).toContain("'raw_candidate_provider_recovery:'");

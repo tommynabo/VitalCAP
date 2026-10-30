@@ -56,6 +56,7 @@ interface ProcessingJobPayload {
   rawCandidateId: string;
   recoveryAttempt?: number;
   recoveryDisposition?: "recoverable";
+  providerRecoveryDay?: string;
   skipMapsFastWebsiteRecovery?: boolean;
 }
 
@@ -1036,7 +1037,8 @@ export async function runProcessingCronTick(
                   reason: jobError.message,
                 });
               } else if (jobError instanceof ProviderFailureError && jobError.retryAt) {
-                if (job.attemptCount >= job.maxAttempts) {
+                const isProviderRecoveryJob = job.payload.providerRecoveryDay !== undefined;
+                if (!isProviderRecoveryJob && job.attemptCount >= job.maxAttempts) {
                   await failProcessingJob({ workerId, job, error: jobError, now });
                 } else {
                   await deferProcessingJob({
@@ -1044,7 +1046,7 @@ export async function runProcessingCronTick(
                     workerId,
                     nextAttemptAt: jobError.retryAt,
                     reason: jobError.message,
-                    consumeAttempt: true,
+                    consumeAttempt: !isProviderRecoveryJob,
                   });
                 }
               } else {

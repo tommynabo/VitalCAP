@@ -195,6 +195,10 @@ export function buildRequeueProviderBlockedMapsFastJobsQuery(workspaceId: string
           WHERE daily_recovery.type = 'process_raw_candidate'
             AND daily_recovery.payload->>'rawCandidateId' = raw.id::text
             AND daily_recovery.payload->>'providerRecoveryDay' = to_char(${nowIso}::timestamptz AT TIME ZONE 'Europe/Madrid', 'YYYY-MM-DD')
+            AND (
+              daily_recovery.status <> 'dead_letter'
+              OR daily_recovery.last_error IS DISTINCT FROM ${MAPS_FAST_TEMPORARY_PROVIDER_ERROR}
+            )
         )
       ORDER BY raw.discovered_at ASC, raw.id ASC
       FOR UPDATE OF raw SKIP LOCKED
@@ -654,7 +658,10 @@ export function buildClaimJobsQuery(table: QueueTable, input: ClaimJobsInput, no
                 OR j.locked_at IS NULL
                 OR j.locked_at + (${leaseSeconds} * interval '1 second') <= ${nowIso}::timestamptz
               )
-            ORDER BY j.next_attempt_at ASC NULLS FIRST
+            ORDER BY CASE WHEN j.payload->>'providerRecoveryDay' IS NOT NULL THEN 0 ELSE 1 END ASC,
+              j.next_attempt_at ASC NULLS FIRST,
+              j.created_at ASC,
+              j.id ASC
             FOR UPDATE OF j SKIP LOCKED
             LIMIT ${boundedBatchSize}
           )
