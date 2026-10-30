@@ -103,8 +103,7 @@ export function buildRequeueProviderBlockedMapsFastJobsQuery(workspaceId: string
           raw.account_id IS NULL
           AND account.google_place_id = NULLIF(raw.raw_payload #>> '{place,externalPlaceId}', '')
         ))
-      WHERE raw.processed = false
-        AND raw.engine_type = 'maps_fast'
+      WHERE raw.engine_type = 'maps_fast'
         AND raw.discovered_at >= (TIMESTAMP '2026-10-29 00:00:00' AT TIME ZONE 'Europe/Madrid')
         AND raw.processing_metrics->>'websiteRecoveryStatus' = 'provider_blocked'
         AND EXISTS (
@@ -146,19 +145,17 @@ export function buildRequeueProviderBlockedMapsFastJobsQuery(workspaceId: string
               )
             )
         )
-        AND ((raw.account_id IS NULL AND account.id IS NULL) OR (
-          account.id IS NOT NULL
-          AND account.status NOT IN ('rejected_country', 'rejected_icp', 'duplicate_merged', 'archived')
-          AND (
-            account.status IN ('qualified', 'contactable', 'outreach_ready')
-            OR EXISTS (
-              SELECT 1 FROM campaign_memberships membership
-              WHERE membership.campaign_id = raw.campaign_id
-                AND membership.account_id = account.id
-                AND membership.stage IN ('qualified', 'ready')
-            )
+        AND account.id IS NOT NULL
+        AND account.status NOT IN ('rejected_country', 'rejected_icp', 'duplicate_merged', 'archived')
+        AND (
+          account.status IN ('qualified', 'contactable', 'outreach_ready')
+          OR EXISTS (
+            SELECT 1 FROM campaign_memberships membership
+            WHERE membership.campaign_id = raw.campaign_id
+              AND membership.account_id = account.id
+              AND membership.stage IN ('qualified', 'ready')
           )
-        ))
+        )
         AND NOT EXISTS (
           SELECT 1 FROM contact_points contact
           WHERE contact.workspace_id = campaign.workspace_id

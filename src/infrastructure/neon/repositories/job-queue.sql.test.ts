@@ -193,7 +193,7 @@ describe("job queue SQL builders", () => {
     expect(query.sql).not.toMatch(/completed|dead_letter/);
   });
 
-  it("requeues only retryable Maps Fast provider-blocked contactability jobs once per Madrid day", () => {
+  it("supports processed historical raws only through strict Maps Fast provider-blocked recovery", () => {
     const query = dialect.sqlToQuery(buildRequeueProviderBlockedMapsFastJobsQuery(
       "workspace-1",
       new Date("2026-10-30T12:00:00.000Z"),
@@ -201,8 +201,11 @@ describe("job queue SQL builders", () => {
     ));
 
     expect(query.sql).toContain("raw.engine_type = 'maps_fast'");
+    expect(query.sql).not.toContain("raw.processed = false");
     expect(query.sql).toContain("TIMESTAMP '2026-10-29 00:00:00' AT TIME ZONE 'Europe/Madrid'");
     expect(query.sql).toContain("raw.processing_metrics->>'websiteRecoveryStatus' = 'provider_blocked'");
+    expect(query.sql).toContain("account.id IS NOT NULL");
+    expect(query.sql).not.toContain("raw.account_id IS NULL AND account.id IS NULL");
     expect(query.sql).not.toContain("raw.processing_metrics->>'websiteRecoveryStatus' = 'terminal_no_match'");
     expect(query.params).toContain(MAPS_FAST_TEMPORARY_PROVIDER_ERROR);
     expect(query.sql).toContain("source_job.status = 'dead_letter'");
@@ -221,6 +224,17 @@ describe("job queue SQL builders", () => {
     expect(query.sql).toContain("FOR UPDATE OF raw SKIP LOCKED");
     expect(query.sql).not.toMatch(/INSERT INTO (raw_candidates|discovery_jobs|provider_runs|instantly_lead_imports)/i);
     expect(query.sql).toContain("LIMIT");
+  });
+
+  it("keeps processed raws excluded from generic dead-letter recovery", () => {
+    const query = dialect.sqlToQuery(buildRecoverableRawProcessingJobsQuery(
+      "workspace-1",
+      new Date("2026-10-30T12:00:00.000Z"),
+      MAX_RECOVERABLE_RAW_PROCESSING_JOBS_PER_TICK,
+    ));
+
+    expect(query.sql).toContain("raw.processed = false");
+    expect(query.sql).toContain("raw.processing_metrics->>'websiteRecoveryStatus' IS DISTINCT FROM 'provider_blocked'");
   });
 
   it("creates one bounded retry for a recoverable dead-letter raw", () => {
