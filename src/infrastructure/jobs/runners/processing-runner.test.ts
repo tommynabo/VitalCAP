@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ProviderBudgetExceededError, ProviderFailureError, ProviderTransientError } from "@/domain/providers/errors";
 import type { MapsPlaceResult } from "@/domain/providers/types";
 import type { ProcessedCandidateResult, ProcessingContext } from "@/services/discovery/candidate-processor";
+import { WATCHDOG_QUEUE_PAUSE_REASON } from "@/services/autopilot/watchdog-pause-policy";
 import {
   createProcessingCronDiagnosticsContext,
   logProcessingCronFailure,
@@ -710,8 +711,8 @@ describe("runProcessingCronTick", () => {
   });
 
   it("does not query Serper while paused and preserves recovery through bounded job retry", async () => {
-    prepareMapsFastRecoveryJob();
-    mocks.getAutopilotSettings.mockResolvedValue({ enabled: true, systemPaused: true, emergencyStopped: false, timezone: "Europe/Madrid" });
+    prepareMapsFastRecoveryJob({}, { providerRecoveryDay: "2026-10-30" });
+    mocks.getAutopilotSettings.mockResolvedValue({ enabled: true, systemPaused: true, systemPauseReason: "operator_hold", emergencyStopped: false, timezone: "Europe/Madrid" });
 
     await runProcessingCronTick(1);
 
@@ -724,10 +725,66 @@ describe("runProcessingCronTick", () => {
     expect(mocks.deferProcessingJob).toHaveBeenCalledWith(expect.objectContaining({
       jobId: "maps-fast-recovery",
       nextAttemptAt: expect.any(Date),
-      consumeAttempt: true,
+      consumeAttempt: false,
     }));
     expect(mocks.failProcessingJob).not.toHaveBeenCalled();
     expect(mocks.completeProcessingJob).not.toHaveBeenCalled();
+  });
+
+  it("allows bounded Maps Fast recovery during a watchdog-owned queue pause", async () => {
+    prepareMapsFastRecoveryJob({}, { providerRecoveryDay: "2026-10-30", recoveryDisposition: "recoverable" });
+    mocks.getAutopilotSettings.mockResolvedValue({
+      enabled: true,
+      systemPaused: true,
+      systemPauseReason: WATCHDOG_QUEUE_PAUSE_REASON,
+      emergencyStopped: false,
+      timezone: "Europe/Madrid",
+    });
+    const search = vi.fn().mockResolvedValue({ results: [] });
+    mocks.createSerpDiscoveryProvider.mockReturnValue({ providerName: "serper", search });
+
+    await runProcessingCronTick(1);
+
+    expect(mocks.claimMapsFastWebsiteRecovery).toHaveBeenCalledOnce();
+    expect(search).toHaveBeenCalledOnce();
+    expect(mocks.deferProcessingJob).not.toHaveBeenCalled();
+    expect(mocks.failProcessingJob).not.toHaveBeenCalled();
+  });
+
+  it("keeps ordinary Maps Fast processing blocked during a watchdog-owned queue pause", async () => {
+    prepareMapsFastRecoveryJob();
+    mocks.getAutopilotSettings.mockResolvedValue({
+      enabled: true,
+      systemPaused: true,
+      systemPauseReason: WATCHDOG_QUEUE_PAUSE_REASON,
+      emergencyStopped: false,
+      timezone: "Europe/Madrid",
+    });
+    const search = vi.fn();
+    mocks.createSerpDiscoveryProvider.mockReturnValue({ providerName: "serper", search });
+
+    await runProcessingCronTick(1);
+
+    expect(mocks.claimMapsFastWebsiteRecovery).not.toHaveBeenCalled();
+    expect(search).not.toHaveBeenCalled();
+    expect(mocks.deferProcessingJob).toHaveBeenCalledWith(expect.objectContaining({
+      jobId: "maps-fast-recovery",
+      consumeAttempt: true,
+    }));
+  });
+
+  it("keeps Maps Fast recovery blocked during an emergency stop", async () => {
+    prepareMapsFastRecoveryJob({}, { providerRecoveryDay: "2026-10-30" });
+    mocks.getAutopilotSettings.mockResolvedValue({ enabled: true, systemPaused: false, emergencyStopped: true, timezone: "Europe/Madrid" });
+
+    await runProcessingCronTick(1);
+
+    expect(mocks.createSerpDiscoveryProvider).not.toHaveBeenCalled();
+    expect(mocks.claimMapsFastWebsiteRecovery).not.toHaveBeenCalled();
+    expect(mocks.deferProcessingJob).toHaveBeenCalledWith(expect.objectContaining({
+      jobId: "maps-fast-recovery",
+      consumeAttempt: false,
+    }));
   });
 
   it("retries through bounded job backoff when Serper is unavailable", async () => {

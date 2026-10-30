@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { Account, AccountStatus } from "@/domain/accounts/types";
 import { ProviderBudgetExceededError, ProviderFailureError, ProviderTransientError } from "@/domain/providers/errors";
-import { getEffectiveAutopilotState } from "@/domain/autopilot/types";
+import { WATCHDOG_QUEUE_PAUSE_REASON } from "@/services/autopilot/watchdog-pause-policy";
 import type { CampaignMembershipStage } from "@/domain/campaigns/types";
 import type { CandidateProcessingMetrics } from "@/domain/discovery/types";
 import { getCampaignById } from "@/infrastructure/neon/repositories/campaigns";
@@ -352,7 +352,12 @@ async function executeProcessingJob(
         let attemptClaimed = false;
         try {
           const settings = await runProcessingCronStage(diagnostics, "PROCESS_SETTINGS", () => getAutopilotSettings(campaign.workspaceId));
-          if (getEffectiveAutopilotState(settings) !== "running") throw new ProviderDisabledError("serper");
+          const watchdogQueuePaused = job.payload.providerRecoveryDay !== undefined
+            && settings.systemPaused
+            && settings.systemPauseReason === WATCHDOG_QUEUE_PAUSE_REASON;
+          if (!settings.enabled || settings.emergencyStopped || (settings.systemPaused && !watchdogQueuePaused)) {
+            throw new ProviderDisabledError("serper");
+          }
 
           const provider = createSerpDiscoveryProvider(campaign.workspaceId, "maps_fast", campaign.id);
           if (provider.providerName !== "serper") {
