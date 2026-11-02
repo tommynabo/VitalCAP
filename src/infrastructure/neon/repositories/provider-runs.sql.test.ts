@@ -83,9 +83,16 @@ describe("Apify provider run reservation SQL", () => {
     expect(query.sql).toContain("run.provider IN ('apify', 'serper')");
     expect(query.sql).toContain("<=");
     expect(query.sql).toContain("safety.reservation_cost_usd > 0");
-    expect(query.sql).toContain("cost_safety.accounted_actual_spend + cost_safety.account_reserved_spend");
+    expect(query.sql).toContain("reconciled_cost_safety.accounted_actual_spend + reconciled_cost_safety.account_reserved_spend");
     expect(query.sql).toContain("local.external_run_id IS NULL OR NOT EXISTS");
     expect(query.sql).toContain("safety.real_spend_today - safety.internal_recorded_spend");
+    expect(query.sql).toContain("CROSS JOIN reconciled_cost_safety");
+    expect(query.sql).toContain("reconciled_cost_safety.real_spend_today");
+    expect(query.sql).toContain("reconciled_cost_safety.accounted_actual_spend");
+    const safetyCteStart = query.sql.indexOf("    safety AS (");
+    const insertedCteStart = query.sql.indexOf("    inserted AS (", safetyCteStart);
+    const safetyCteSql = query.sql.slice(safetyCteStart, insertedCteStart);
+    expect(safetyCteSql).not.toMatch(/(?<![A-Za-z0-9_])cost_safety\./);
     expect(query.sql).toContain("safety.recovery_probe_count = 0");
     expect(query.sql).toContain("metadata->>'credentialFingerprint'");
     expect(query.params).toContain("safe-credential-fingerprint");
@@ -112,7 +119,7 @@ describe("Apify provider run reservation SQL", () => {
 
     expect(query.sql).toContain("LEAST(");
     expect(query.sql).toContain("GREATEST(cost_safety.real_spend_today, cost_safety.internal_recorded_spend) AS accounted_actual_spend");
-    expect(query.sql).toContain("cost_safety.accounted_actual_spend + cost_safety.account_reserved_spend + cost_safety.unobserved_local_spend");
+    expect(query.sql).toContain("reconciled_cost_safety.accounted_actual_spend + reconciled_cost_safety.account_reserved_spend + reconciled_cost_safety.unobserved_local_spend");
     expect(query.sql).toContain("safety.reservation_cost_usd > 0");
     expect(query.sql).toContain("ON CONFLICT (request_key) WHERE request_key IS NOT NULL DO NOTHING");
     expect(query.params).toContain(5);

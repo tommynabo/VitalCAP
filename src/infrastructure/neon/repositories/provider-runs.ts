@@ -508,11 +508,11 @@ export function buildReserveApifyProviderRunQuery(
         raw_safety.concurrent_apify_run_count,
         raw_safety.committed_raw_requests AS requested_today,
         GREATEST(${input.itemsRequested} - raw_safety.job_unrepresented_raw_requests, 0)::int AS additional_raw_requests,
-        cost_safety.real_spend_today,
-        cost_safety.account_reserved_spend,
-        cost_safety.internal_recorded_spend,
-        cost_safety.accounted_actual_spend + cost_safety.account_reserved_spend + cost_safety.unobserved_local_spend AS cost_today,
-        LEAST(${hardBatchCostLimit}, GREATEST(${hardDailyCostLimit} - cost_safety.accounted_actual_spend - cost_safety.account_reserved_spend - cost_safety.unobserved_local_spend, 0)) AS reservation_cost_usd,
+        reconciled_cost_safety.real_spend_today,
+        reconciled_cost_safety.account_reserved_spend,
+        reconciled_cost_safety.internal_recorded_spend,
+        reconciled_cost_safety.accounted_actual_spend + reconciled_cost_safety.account_reserved_spend + reconciled_cost_safety.unobserved_local_spend AS cost_today,
+        LEAST(${hardBatchCostLimit}, GREATEST(${hardDailyCostLimit} - reconciled_cost_safety.accounted_actual_spend - reconciled_cost_safety.account_reserved_spend - reconciled_cost_safety.unobserved_local_spend, 0)) AS reservation_cost_usd,
         raw_safety.recovery_probe_count
       FROM raw_safety
       CROSS JOIN reconciled_cost_safety

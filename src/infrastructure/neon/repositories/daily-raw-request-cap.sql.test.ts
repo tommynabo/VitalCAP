@@ -131,7 +131,7 @@ describe("global daily raw request cap SQL", () => {
       expect(queries[0]?.query).toContain("pg_advisory_xact_lock");
       expect(queries[1]?.kind).toBe("query");
       expect(queries[1]?.query).toContain("safety.reservation_cost_usd > 0");
-      expect(queries[1]?.query).toContain("cost_safety.accounted_actual_spend + cost_safety.account_reserved_spend");
+      expect(queries[1]?.query).toContain("reconciled_cost_safety.accounted_actual_spend + reconciled_cost_safety.account_reserved_spend");
     }
   });
 });
