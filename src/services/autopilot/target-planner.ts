@@ -102,6 +102,7 @@ export function planApifyRecoveryProbe(input: {
   cooldownAt: Date | null;
   credentialFingerprint: string;
   failureEpoch: string;
+  recoveryGeneration?: string;
   now: Date;
   timeZone: string;
 }): DiscoveryOrder[] {
@@ -129,7 +130,7 @@ export function planApifyRecoveryProbe(input: {
     desiredRawCount,
     reason: "Apify recovery probe after provider cooldown.",
     planningWindow,
-    idempotencyKey: `apify-recovery-probe:${input.workspaceId}:${campaign.id}:${input.credentialFingerprint}:${input.failureEpoch}`,
+    idempotencyKey: `apify-recovery-probe:${input.workspaceId}:${campaign.id}:${input.credentialFingerprint}:${input.failureEpoch}:${input.recoveryGeneration ?? "stable"}`,
     origin: "recovery_probe",
   }];
 }

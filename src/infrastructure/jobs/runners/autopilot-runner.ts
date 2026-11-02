@@ -318,6 +318,7 @@ export async function runAutopilotCronTick(now: Date = new Date()): Promise<Auto
       failureEpoch: apifyRecovery.latestFailureAt
         ? new Date(apifyRecovery.latestFailureAt).toISOString()
         : apifyRecovery.nextRecoveryAttemptAt?.toISOString() ?? "unknown",
+      recoveryGeneration: process.env.VERCEL_GIT_COMMIT_SHA ?? process.env.VERCEL_URL ?? "local",
       now,
       timeZone: settings.timezone,
     });

@@ -461,6 +461,11 @@ describe("Apify recovery allocation integration", () => {
     })[0]?.idempotencyKey).not.toBe(eligible.probes[0]?.idempotencyKey);
     expect(planApifyRecoveryProbe({
       workspaceId: "workspace-1", campaigns, rawNeeded: 100, eligible: true, dailyBudgetAllowed: true,
+      cooldownAt: eligible.snapshot.nextRecoveryAttemptAt, credentialFingerprint: "credential-a",
+      failureEpoch: "2026-10-11T11:59:00.000Z", recoveryGeneration: "release-2", now, timeZone: "Europe/Madrid",
+    })[0]?.idempotencyKey).not.toBe(eligible.probes[0]?.idempotencyKey);
+    expect(planApifyRecoveryProbe({
+      workspaceId: "workspace-1", campaigns, rawNeeded: 100, eligible: true, dailyBudgetAllowed: true,
       cooldownAt: new Date("2026-10-11T12:05:00.000Z"), credentialFingerprint: "credential-a",
       failureEpoch: "2026-10-11T11:59:00.000Z", now: new Date("2026-10-11T12:05:00.000Z"), timeZone: "Europe/Madrid",
     })[0]?.idempotencyKey).toBe(eligible.probes[0]?.idempotencyKey);
