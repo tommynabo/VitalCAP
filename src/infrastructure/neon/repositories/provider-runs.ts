@@ -494,7 +494,7 @@ export function buildReserveApifyProviderRunQuery(
             0
           )
           FROM discovery_jobs job
-          WHERE job.id::text = ${typeof input.metadata?.discoveryJobId === "string" ? input.metadata.discoveryJobId : ""}
+          WHERE job.id::text = ${typeof input.metadata?.discoveryJobId === "string" ? input.metadata.discoveryJobId : ""}::text
             AND job.status IN ('pending', 'processing')
         ), 0)::int AS job_unrepresented_raw_requests,
         (SELECT COUNT(*) FROM provider_runs WHERE provider = 'apify' AND status = 'manual_reconciliation_required')::int AS unreconciled_count,
