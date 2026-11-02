@@ -531,8 +531,8 @@ export function buildReserveApifyProviderRunQuery(
           'apifyReconciliationDeltaUsdAtReservation', safety.real_spend_today - safety.internal_recorded_spend,
           'apifyReservedSpendUsdAtReservation', safety.account_reserved_spend,
           'apifyAccountCommittedSpendUsdAtReservation', safety.cost_today,
-          'apifyAccountRunCountAtReservation', ${input.accountCostSnapshot.runCount},
-          'apifyCostObservedAt', ${now.toISOString()},
+          'apifyAccountRunCountAtReservation', ${input.accountCostSnapshot.runCount}::int,
+          'apifyCostObservedAt', ${now.toISOString()}::text,
           'reservedCostUsd', safety.reservation_cost_usd
         ), NOW()
       FROM safety

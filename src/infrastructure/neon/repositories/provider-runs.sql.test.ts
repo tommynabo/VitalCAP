@@ -96,6 +96,8 @@ describe("Apify provider run reservation SQL", () => {
     expect(query.sql).toContain("safety.recovery_probe_count = 0");
     expect(query.sql).toContain("metadata->>'credentialFingerprint'");
     expect(query.sql).toMatch(/job\.id::text = \$\d+::text/);
+    expect(query.sql).toMatch(/'apifyAccountRunCountAtReservation', \$\d+::int/);
+    expect(query.sql).toMatch(/'apifyCostObservedAt', \$\d+::text/);
     expect(query.params).toContain("safe-credential-fingerprint");
     expect(query.sql).toContain("safety.concurrent_apify_run_count <");
     expect(query.sql).toContain("provider = 'apify' AND status IN ('starting', 'queued', 'running')");
