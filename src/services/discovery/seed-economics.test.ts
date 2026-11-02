@@ -78,7 +78,7 @@ describe("seed economics", () => {
     expect(duplicateExistingRaw + invalidOrUnmappable).toBe(itemsReturned - insertedNewRaw);
   });
 
-  it("keeps small samples exploratory and does not exhaust one zero-novelty run", () => {
+  it("keeps unknown seeds to a small probe and cools a mature zero-novelty result", () => {
     const smallSample = scoreSeedEconomicPerformance(seed("small"), performance({
       recentRuns: 1,
       itemsReturned: 10,
@@ -92,10 +92,12 @@ describe("seed economics", () => {
       sampleSize: 100,
       noveltyRate: 0,
       zeroNoveltyRunStreak: 1,
+      confirmedInstantlyImportsFromSeed: 0,
     }), now);
 
-    expect(smallSample).toMatchObject({ tier: "exploration", eligible: true, exploration: true });
-    expect(oneLargeRun).toMatchObject({ tier: "zero", eligible: true, maxResults: 10 });
+    expect(smallSample).toMatchObject({ tier: "exploration", eligible: true, exploration: true, maxResults: 10 });
+    expect(oneLargeRun).toMatchObject({ tier: "zero", eligible: false, maxResults: 0 });
+    expect(oneLargeRun.cooldownUntil).toBe("2026-10-28T10:00:00.000Z");
   });
 
   it("cools repeated confident zero-novelty seeds and permits re-exploration after expiry", () => {
@@ -103,17 +105,18 @@ describe("seed economics", () => {
       recentRuns: 3,
       noveltyRate: 0,
       zeroNoveltyRunStreak: 2,
+      confirmedInstantlyImportsFromSeed: 0,
       lastRunAt: "2026-10-20T10:00:00.000Z",
     });
-    const cooling = scoreSeedEconomicPerformance(seed("cooling"), repeatedZero, new Date("2026-10-26T10:00:00.000Z"));
+    const cooling = scoreSeedEconomicPerformance(seed("cooling"), repeatedZero, new Date("2026-10-22T10:00:00.000Z"));
     const returned = scoreSeedEconomicPerformance(seed("returned"), repeatedZero, new Date("2026-10-28T10:00:00.000Z"));
 
     expect(cooling).toMatchObject({ eligible: false, maxResults: 0, tier: "zero" });
-    expect(cooling.cooldownUntil).toBe("2026-10-27T10:00:00.000Z");
-    expect(returned).toMatchObject({ eligible: true, exploration: true, maxResults: 20 });
+    expect(cooling.cooldownUntil).toBe("2026-10-23T10:00:00.000Z");
+    expect(returned).toMatchObject({ eligible: true, exploration: true, maxResults: 5 });
   });
 
-  it("cools extremely low-novelty sources only after mature, fully attributed evidence with no imports", () => {
+  it("cools mature sub-10% sources only with complete attribution and no confirmed imports", () => {
     const matureWeakSource = performance({
       noveltyRate: 0.02,
       zeroNoveltyRunStreak: 0,
@@ -132,11 +135,41 @@ describe("seed economics", () => {
     expect(oneRun.eligible).toBe(true);
   });
 
-  it("gives high-novelty seeds more batch capacity than low-novelty seeds", () => {
+  it("strongly limits repeated sub-10% novelty while retaining seeds with confirmed-import value", () => {
+    const repeatedLowNovelty = performance({
+      recentRuns: 3,
+      sampleSize: 100,
+      noveltyRate: 0.08,
+      zeroNoveltyRunStreak: 0,
+      outcomeAttributionComplete: false,
+      confirmedInstantlyImportsFromSeed: 0,
+      lastRunAt: "2026-10-27T09:00:00.000Z",
+    });
+    const limited = scoreSeedEconomicPerformance(seed("repeated-low"), repeatedLowNovelty, now);
+    const cooled = scoreSeedEconomicPerformance(seed("attributed-low"), {
+      ...repeatedLowNovelty,
+      outcomeAttributionComplete: true,
+    }, now);
+    const importProductive = scoreSeedEconomicPerformance(seed("import-productive"), {
+      ...repeatedLowNovelty,
+      outcomeAttributionComplete: true,
+      confirmedInstantlyImportsFromSeed: 5,
+      confirmedImportYield: 0.5,
+    }, now);
+
+    expect(limited).toMatchObject({ tier: "low", eligible: true, maxResults: 5 });
+    expect(cooled).toMatchObject({ tier: "zero", eligible: false, maxResults: 0 });
+    expect(importProductive).toMatchObject({ tier: "low", eligible: true, maxResults: 5 });
+    expect(importProductive.priorityScore).toBeGreaterThan(limited.priorityScore);
+  });
+
+  it("keeps large batches for high/good novelty and sharply limits low novelty", () => {
     const high = scoreSeedEconomicPerformance(seed("high"), performance({ noveltyRate: 0.7 }), now);
+    const good = scoreSeedEconomicPerformance(seed("good"), performance({ noveltyRate: 0.3 }), now);
     const low = scoreSeedEconomicPerformance(seed("low"), performance({ noveltyRate: 0.05 }), now);
-    expect(high.maxResults).toBeGreaterThan(low.maxResults);
-    expect(high.maxResults).toBeLessThanOrEqual(100);
+    expect(high.maxResults).toBe(100);
+    expect(good.maxResults).toBe(100);
+    expect(low.maxResults).toBe(5);
   });
 
   it("reallocates a low-novelty seed's planned capacity to productive seeds", () => {
@@ -161,7 +194,7 @@ describe("seed economics", () => {
     ]);
     const { batches } = planSeedBatches({ seeds, performanceBySeed: performances, rawNeeded: 100, maxSeeds: 3, now });
 
-    expect(batches.find((batch) => batch.seed.id === "new")?.requestedItems).toBe(12);
+    expect(batches.find((batch) => batch.seed.id === "new")?.requestedItems).toBe(5);
     expect(batches.reduce((sum, batch) => sum + batch.requestedItems, 0)).toBe(100);
   });
 
@@ -205,12 +238,12 @@ describe("seed economics", () => {
     const core = result.batches.filter((batch) => !batch.policy.exploration);
 
     expect(core.map((batch) => batch.seed.id)).toEqual(["good"]);
-    expect(exploration.every((batch) => batch.requestedItems <= 20)).toBe(true);
-    expect(result.explorationRequestedItems).toBeLessThanOrEqual(100 * 0.12);
-    expect(result.explorationRequestedItems).toBe(12);
+    expect(exploration.every((batch) => batch.requestedItems <= 10)).toBe(true);
+    expect(result.explorationRequestedItems).toBeLessThanOrEqual(100 * 0.05);
+    expect(result.explorationRequestedItems).toBe(5);
   });
 
-  it("does not round exploration above 12% for small requested targets", () => {
+  it("does not round exploration above 5% for small requested targets", () => {
     const result = planSeedBatches({
       seeds: [seed("new-a"), seed("new-b")],
       performanceBySeed: new Map(),
@@ -220,7 +253,7 @@ describe("seed economics", () => {
     });
 
     expect(result.explorationRequestedItems).toBe(0);
-    expect(result.explorationRequestedItems).toBeLessThanOrEqual(8 * 0.12);
+    expect(result.explorationRequestedItems).toBeLessThanOrEqual(8 * 0.05);
   });
 
   it("does not let 206 low-sample seeds overwhelm productive seeds", () => {
@@ -231,12 +264,12 @@ describe("seed economics", () => {
 
     expect(result.batches.filter((batch) => !batch.policy.exploration).length).toBe(3);
     expect(result.batches.filter((batch) => batch.policy.exploration).length).toBe(2);
-    expect(result.explorationRequestedItems).toBeLessThanOrEqual(30);
+    expect(result.explorationRequestedItems).toBeLessThanOrEqual(25);
     expect(result.batches.slice(0, 3).every((batch) => batch.policy.tier === "high")).toBe(true);
   });
 
   it("never assigns zero-novelty seeds to core and reports constrained capacity", () => {
-    const zeroPerformance = performance({ noveltyRate: 0, zeroNoveltyRunStreak: 1 });
+    const zeroPerformance = performance({ noveltyRate: 0, zeroNoveltyRunStreak: 0 });
     const result = planSeedBatches({
       seeds: [seed("zero-a"), seed("zero-b")],
       performanceBySeed: new Map([
@@ -250,7 +283,7 @@ describe("seed economics", () => {
 
     expect(result.batches.every((batch) => batch.policy.tier === "zero" && batch.policy.exploration)).toBe(true);
     expect(result.coreRequestedItems).toBe(0);
-    expect(result.explorationRequestedItems).toBe(12);
+    expect(result.explorationRequestedItems).toBe(5);
     expect(result.productiveSeedCapacityConstrained).toBe(true);
   });
 
@@ -268,7 +301,7 @@ describe("seed economics", () => {
     });
 
     expect(result.batches.map((batch) => batch.seed.id)).toEqual(["high", "good", "new"]);
-    expect(result.explorationRequestedItems).toBeLessThanOrEqual(120);
+    expect(result.explorationRequestedItems).toBeLessThanOrEqual(50);
     expect(result.productiveSeedCapacityConstrained).toBe(true);
   });
 
@@ -346,7 +379,7 @@ describe("seed economics", () => {
     expect(expensive.priorityScore).toBeGreaterThanOrEqual(efficient.priorityScore * 0.6);
   });
 
-  it("protects high/good sources and reduces exploration to 5% under mature economic pressure", () => {
+  it("protects high/good sources and reduces exploration to 2% under mature economic pressure", () => {
     const result = planSeedBatches({
       seeds: [seed("high"), seed("marginal"), seed("new")],
       performanceBySeed: new Map([
@@ -361,8 +394,8 @@ describe("seed economics", () => {
 
     expect(result.batches.map((batch) => batch.seed.id)).toContain("high");
     expect(result.batches.map((batch) => batch.seed.id)).not.toContain("marginal");
-    expect(result.explorationRequestedItems).toBe(5);
-    expect(result.explorationRequestedItems).toBeLessThanOrEqual(100 * 0.12);
+    expect(result.explorationRequestedItems).toBe(2);
+    expect(result.explorationRequestedItems).toBeLessThanOrEqual(100 * 0.02);
   });
 
   it("projects the verified zero-novelty bucket at more than 15% savings with all useful raw retained", () => {

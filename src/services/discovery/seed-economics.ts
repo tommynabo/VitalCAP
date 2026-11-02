@@ -8,22 +8,22 @@ import {
 export const SEED_ECONOMICS_POLICY = {
   minimumRuns: 3,
   minimumItems: 50,
-  zeroNoveltyRunsBeforeCooldown: 2,
-  zeroNoveltyCooldownDays: 7,
+  zeroNoveltyRunsBeforeCooldown: 1,
+  zeroNoveltyCooldownHours: 72,
   lowEconomicCooldownHours: 24,
-  extremelyLowNoveltyThreshold: 0.03,
-  explorationFraction: 0.12,
-  pressuredExplorationFraction: 0.05,
-  explorationMaxResults: 20,
-  returningSeedMaxResults: 20,
+  lowNoveltyCooldownThreshold: 0.1,
+  explorationFraction: 0.05,
+  pressuredExplorationFraction: 0.02,
+  explorationMaxResults: 10,
+  returningSeedMaxResults: 5,
   highNoveltyThreshold: 0.5,
   goodNoveltyThreshold: 0.25,
   marginalNoveltyThreshold: 0.1,
   highMaxResults: 100,
   goodMaxResults: 100,
   marginalMaxResults: 35,
-  lowMaxResults: 15,
-  zeroMaxResults: 10,
+  lowMaxResults: 5,
+  zeroMaxResults: 5,
   maxResultsPerSeed: 100,
   minConfirmedImportsForCostWeight: 5,
   minDownstreamOutcomesForYield: 5,
@@ -121,10 +121,14 @@ function downstreamYield(performance: SeedEconomicPerformance | undefined): numb
 }
 
 function cooldownUntil(performance: SeedEconomicPerformance | undefined): Date | null {
-  if (!performance?.lastRunAt || performance.zeroNoveltyRunStreak < SEED_ECONOMICS_POLICY.zeroNoveltyRunsBeforeCooldown) return null;
+  if (
+    !performance?.lastRunAt
+    || performance.zeroNoveltyRunStreak < SEED_ECONOMICS_POLICY.zeroNoveltyRunsBeforeCooldown
+    || (performance.confirmedInstantlyImportsFromSeed ?? 0) > 0
+  ) return null;
   const lastRun = new Date(performance.lastRunAt);
   if (Number.isNaN(lastRun.getTime())) return null;
-  return new Date(lastRun.getTime() + SEED_ECONOMICS_POLICY.zeroNoveltyCooldownDays * 24 * 60 * 60 * 1000);
+  return new Date(lastRun.getTime() + SEED_ECONOMICS_POLICY.zeroNoveltyCooldownHours * 60 * 60 * 1000);
 }
 
 function lowEconomicCooldownUntil(performance: SeedEconomicPerformance | undefined, noveltyRate: number | null): Date | null {
@@ -134,7 +138,7 @@ function lowEconomicCooldownUntil(performance: SeedEconomicPerformance | undefin
     || performance.sampleSize < SEED_ECONOMICS_POLICY.minimumItems
     || performance.outcomeAttributionComplete !== true
     || noveltyRate === null
-    || noveltyRate > SEED_ECONOMICS_POLICY.extremelyLowNoveltyThreshold
+    || noveltyRate >= SEED_ECONOMICS_POLICY.lowNoveltyCooldownThreshold
     || (performance.confirmedInstantlyImportsFromSeed ?? 0) > 0
     || !performance.lastRunAt
   ) return null;
