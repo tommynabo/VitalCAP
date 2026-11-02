@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { ApifyClient, classifyApifyRunFailure } from "./apify-client";
+import { ApifyClient, classifyApifyRunFailure, reconcileApifyRunCost } from "./apify-client";
 
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
@@ -72,6 +72,88 @@ describe("ApifyClient", () => {
     const fetchImpl = vi.fn().mockResolvedValue(new Response("unauthorized", { status }));
     const client = new ApifyClient({ apiToken: "t", fetchImpl });
     await expect(client.getRun("run1")).rejects.toMatchObject({ kind: "authentication", retryAt: expect.any(Date) });
+  });
+
+  it("classifies a quota-related 403 as billing exhaustion but keeps permission 403s as authentication", async () => {
+    const billingClient = new ApifyClient({
+      apiToken: "t",
+      fetchImpl: vi.fn().mockResolvedValue(new Response(JSON.stringify({ error: { type: "usage-limit-exceeded", message: "Monthly usage limit exceeded" } }), { status: 403 })),
+    });
+    const permissionClient = new ApifyClient({
+      apiToken: "t",
+      fetchImpl: vi.fn().mockResolvedValue(new Response(JSON.stringify({ error: { type: "insufficient-permissions", message: "Not allowed" } }), { status: 403 })),
+    });
+
+    await expect(billingClient.getRun("run1")).rejects.toMatchObject({ kind: "billing", failureKind: "billing" });
+    await expect(permissionClient.getRun("run1")).rejects.toMatchObject({ kind: "authentication", failureKind: "authentication" });
+  });
+
+  it("sums real run costs and outstanding ceilings for the requested account window", async () => {
+    const fetchImpl = vi.fn()
+      .mockResolvedValueOnce(jsonResponse({ data: {
+        total: 3,
+        items: [
+          { id: "done", status: "SUCCEEDED", startedAt: "2026-10-19T23:10:00.000Z", usageTotalUsd: 0.2 },
+          { id: "active", status: "RUNNING", startedAt: "2026-10-19T23:20:00.000Z", usageTotalUsd: 0.1 },
+          { id: "outside", status: "SUCCEEDED", startedAt: "2026-10-20T00:00:00.000Z", usageTotalUsd: 3 },
+        ],
+      } }))
+      .mockResolvedValueOnce(jsonResponse({ data: { total: 1, items: [
+        { id: "active", status: "RUNNING", startedAt: "2026-10-19T23:20:00.000Z", usageTotalUsd: 0.1 },
+      ] } }))
+      .mockResolvedValueOnce(jsonResponse({ data: {
+        id: "active", actId: "actor", status: "RUNNING", defaultDatasetId: null,
+        usageTotalUsd: 0.1, options: { maxTotalChargeUsd: 0.5 },
+        startedAt: "2026-10-19T23:20:00.000Z", finishedAt: null,
+      } }));
+    const client = new ApifyClient({ apiToken: "t", fetchImpl });
+
+    const snapshot = await client.getAccountCostSnapshot(
+      new Date("2026-10-19T22:00:00.000Z"),
+      new Date("2026-10-20T00:00:00.000Z"),
+    );
+
+    expect(snapshot.actualSpendUsd).toBeCloseTo(0.3);
+    expect(snapshot.reservedSpendUsd).toBeCloseTo(0.4);
+    expect(snapshot.committedSpendUsd).toBeCloseTo(0.7);
+    expect(snapshot.runCount).toBe(2);
+    expect(snapshot.runIds).toEqual(["done", "active"]);
+    expect(snapshot.dayStart).toBe("2026-10-19T22:00:00.000Z");
+    expect(snapshot.dayEnd).toBe("2026-10-20T00:00:00.000Z");
+    expect(String(fetchImpl.mock.calls[0]?.[0])).toContain("startedAfter=2026-10-19T22%3A00%3A00.000Z");
+    expect(String(fetchImpl.mock.calls[0]?.[0])).toContain("startedBefore=2026-10-20T00%3A00%3A00.000Z");
+    expect(String(fetchImpl.mock.calls[1]?.[0])).toContain("status=READY%2CRUNNING%2CTIMING-OUT%2CABORTING");
+    expect(String(fetchImpl.mock.calls[2]?.[0])).toContain("/actor-runs/active");
+  });
+
+  it("fails closed when an in-flight account run has no charge ceiling", async () => {
+    const fetchImpl = vi.fn()
+      .mockResolvedValueOnce(jsonResponse({ data: {
+        total: 1,
+        items: [{ id: "active", status: "RUNNING", startedAt: "2026-10-19T23:20:00.000Z", usageTotalUsd: 0.1 }],
+      } }))
+      .mockResolvedValueOnce(jsonResponse({ data: { total: 1, items: [
+        { id: "active", status: "RUNNING", startedAt: "2026-10-19T23:20:00.000Z", usageTotalUsd: 0.1 },
+      ] } }))
+      .mockResolvedValueOnce(jsonResponse({ data: {
+        id: "active", actId: "actor", status: "RUNNING", defaultDatasetId: null,
+        usageTotalUsd: 0.1, options: { maxTotalChargeUsd: null },
+        startedAt: "2026-10-19T23:20:00.000Z", finishedAt: null,
+      } }));
+    const client = new ApifyClient({ apiToken: "t", fetchImpl });
+
+    await expect(client.getAccountCostSnapshot(new Date("2026-10-19T22:00:00.000Z"), new Date("2026-10-20T00:00:00.000Z")))
+      .rejects.toThrow(/no verifiable charge ceiling/);
+  });
+
+  it("reconciles a final actual run cost against its reservation", () => {
+    expect(reconcileApifyRunCost(0.5, 0.31)).toEqual({
+      reservedCostUsd: 0.5,
+      actualCostUsd: 0.31,
+      varianceUsd: -0.19,
+      exceedsReservation: false,
+    });
+    expect(reconcileApifyRunCost(0.25, 0.3).exceedsReservation).toBe(true);
   });
 
   it("classifies network errors as transient provider failures", async () => {

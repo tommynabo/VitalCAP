@@ -34,9 +34,38 @@ export interface ApifyRun {
   status: ApifyRunStatus;
   defaultDatasetId: string | null;
   usageTotalUsd: number | null;
+  options?: { maxTotalChargeUsd?: number | null };
   startedAt: string;
   finishedAt: string | null;
   statusMessage?: string | null;
+}
+
+export interface ApifyAccountCostSnapshot {
+  dayStart: string;
+  dayEnd: string;
+  actualSpendUsd: number;
+  reservedSpendUsd: number;
+  committedSpendUsd: number;
+  runCount: number;
+  runIds: string[];
+}
+
+export function reconcileApifyRunCost(reservedCostUsd: number, actualCostUsd: number): {
+  reservedCostUsd: number;
+  actualCostUsd: number;
+  varianceUsd: number;
+  exceedsReservation: boolean;
+} {
+  if (![reservedCostUsd, actualCostUsd].every((value) => Number.isFinite(value) && value >= 0)) {
+    throw new ProviderTransientError("Apify run cost reconciliation received an invalid amount.");
+  }
+  const varianceUsd = actualCostUsd - reservedCostUsd;
+  return {
+    reservedCostUsd,
+    actualCostUsd,
+    varianceUsd,
+    exceedsReservation: varianceUsd > 0.000001,
+  };
 }
 
 export type ApifyFailureKind = "transient" | "billing" | "authentication" | "configuration" | "actor_resource_limit";
@@ -84,12 +113,12 @@ export class ApifyRequestError extends ProviderFailureError {
   constructor(
     message: string,
     readonly status: number,
-    failureKind?: "actor_resource_limit",
+    failureKind?: ApifyFailureKind,
   ) {
     const now = Date.now();
     const retryDelay = failureKind === "actor_resource_limit"
       ? 30 * 60 * 1000
-      : status === 402
+      : failureKind === "billing" || status === 402
       ? 30 * 60 * 1000
       : status === 401 || status === 403
         ? 6 * 60 * 60 * 1000
@@ -98,13 +127,13 @@ export class ApifyRequestError extends ProviderFailureError {
           : null;
     const kind = failureKind === "actor_resource_limit"
       ? "transient"
-      : status === 402
+      : failureKind ?? (status === 402
       ? "billing"
       : status === 401 || status === 403
         ? "authentication"
         : retryDelay === null
           ? "configuration"
-          : "transient";
+          : "transient");
     super(message, kind, retryDelay === null ? null : new Date(now + retryDelay));
     this.name = "ApifyRequestError";
     this.failureKind = failureKind ?? kind;
@@ -147,10 +176,11 @@ export class ApifyClient {
     if (!response.ok) {
       const body = await response.text().catch(() => "");
       const actorMemoryLimit = isActorMemoryLimit(body);
+      const billingFailure = response.status === 402 || (response.status === 403 && isApifyBillingFailure(body));
       const message = actorMemoryLimit
         ? "Apify actor resource limit rejected the run."
         : `Apify ${action} failed: HTTP ${response.status}.`;
-      throw new ApifyRequestError(message, response.status, actorMemoryLimit ? "actor_resource_limit" : undefined);
+      throw new ApifyRequestError(message, response.status, actorMemoryLimit ? "actor_resource_limit" : billingFailure ? "billing" : undefined);
     }
     try {
       return await response.json();
@@ -187,6 +217,124 @@ export class ApifyClient {
     });
     const body = (await this.parseOrThrow(response, "get run status")) as { data: ApifyRun };
     return body.data;
+  }
+
+  async getAccountCostSnapshot(start: Date, end: Date): Promise<ApifyAccountCostSnapshot> {
+    if (!Number.isFinite(start.getTime()) || !Number.isFinite(end.getTime()) || start >= end) {
+      throw new ProviderConfigurationError("Apify spend window is invalid.");
+    }
+
+    const pageSize = 1000;
+    const runs: Array<Pick<ApifyRun, "id" | "status" | "startedAt" | "usageTotalUsd" | "options">> = [];
+    for (let offset = 0; ; offset += pageSize) {
+      const params = new URLSearchParams({
+        startedAfter: start.toISOString(),
+        startedBefore: end.toISOString(),
+        desc: "1",
+        limit: String(pageSize),
+        offset: String(offset),
+      });
+      const response = await this.fetch(`${this.baseUrl}/actor-runs?${params.toString()}`, {
+        method: "GET",
+        headers: this.authHeaders(),
+      });
+      const body = await this.parseOrThrow(response, "list account runs") as {
+        data?: { total?: unknown; items?: unknown };
+      };
+      const items = body.data?.items;
+      if (!Array.isArray(items)) throw new ProviderTransientError("Apify account run list returned an invalid response.");
+      for (const value of items) {
+        if (!value || typeof value !== "object") throw new ProviderTransientError("Apify account run list returned an invalid run.");
+        const run = value as Record<string, unknown>;
+        if (typeof run.id !== "string" || typeof run.status !== "string" || typeof run.startedAt !== "string") {
+          throw new ProviderTransientError("Apify account run list returned incomplete run data.");
+        }
+        const startedAt = Date.parse(run.startedAt);
+        if (!Number.isFinite(startedAt)) throw new ProviderTransientError("Apify account run list returned an invalid start time.");
+        if (startedAt >= start.getTime() && startedAt < end.getTime()) {
+          runs.push({
+            id: run.id,
+            status: run.status as ApifyRunStatus,
+            startedAt: run.startedAt,
+            usageTotalUsd: typeof run.usageTotalUsd === "number" ? run.usageTotalUsd : null,
+          });
+        }
+      }
+      const total = body.data?.total;
+      if (typeof total !== "number" || !Number.isFinite(total) || total < 0) {
+        throw new ProviderTransientError("Apify account run list returned an invalid total.");
+      }
+      if (offset + items.length >= total || items.length === 0) break;
+    }
+
+    const activeParams = new URLSearchParams({
+      startedBefore: end.toISOString(),
+      status: "READY,RUNNING,TIMING-OUT,ABORTING",
+      desc: "1",
+      limit: String(pageSize),
+      offset: "0",
+    });
+    const activeResponse = await this.fetch(`${this.baseUrl}/actor-runs?${activeParams.toString()}`, {
+      method: "GET",
+      headers: this.authHeaders(),
+    });
+    const activeBody = await this.parseOrThrow(activeResponse, "list in-flight account runs") as {
+      data?: { total?: unknown; items?: unknown };
+    };
+    const activeItems = activeBody.data?.items;
+    if (!Array.isArray(activeItems) || typeof activeBody.data?.total !== "number" || activeBody.data.total > pageSize) {
+      throw new ProviderTransientError("Apify in-flight account run list is incomplete; refusing new allocation.");
+    }
+    const runById = new Map(runs.map((run) => [run.id, run]));
+    for (const value of activeItems) {
+      if (!value || typeof value !== "object") throw new ProviderTransientError("Apify in-flight account run list returned an invalid run.");
+      const run = value as Record<string, unknown>;
+      if (typeof run.id !== "string" || typeof run.status !== "string" || typeof run.startedAt !== "string") {
+        throw new ProviderTransientError("Apify in-flight account run list returned incomplete run data.");
+      }
+      const startedAt = Date.parse(run.startedAt);
+      if (!Number.isFinite(startedAt) || startedAt >= end.getTime()) continue;
+      if (!runById.has(run.id)) {
+        runById.set(run.id, {
+          id: run.id,
+          status: run.status as ApifyRunStatus,
+          startedAt: run.startedAt,
+          usageTotalUsd: typeof run.usageTotalUsd === "number" ? run.usageTotalUsd : null,
+        });
+      }
+    }
+    runs.splice(0, runs.length, ...runById.values());
+
+    let actualSpendUsd = 0;
+    let reservedSpendUsd = 0;
+    for (const listedRun of runs) {
+      const run = ApifyClient.TERMINAL_STATUSES.includes(listedRun.status)
+        ? listedRun
+        : await this.getActorRun(listedRun.id);
+      const actual = run.usageTotalUsd;
+      if (typeof actual !== "number" || !Number.isFinite(actual) || actual < 0) {
+        throw new ProviderTransientError("Apify account run cost is unavailable; refusing new allocation.");
+      }
+      const startedBeforeWindow = Date.parse(listedRun.startedAt) < start.getTime();
+      if (!startedBeforeWindow) actualSpendUsd += actual;
+      if (!ApifyClient.TERMINAL_STATUSES.includes(run.status)) {
+        const ceiling = run.options?.maxTotalChargeUsd;
+        if (typeof ceiling !== "number" || !Number.isFinite(ceiling) || ceiling < 0) {
+          throw new ProviderTransientError("An in-flight Apify account run has no verifiable charge ceiling; refusing new allocation.");
+        }
+        reservedSpendUsd += startedBeforeWindow ? ceiling : Math.max(0, ceiling - actual);
+      }
+    }
+
+    return {
+      dayStart: start.toISOString(),
+      dayEnd: end.toISOString(),
+      actualSpendUsd,
+      reservedSpendUsd,
+      committedSpendUsd: actualSpendUsd + reservedSpendUsd,
+      runCount: runs.length,
+      runIds: runs.map((run) => run.id),
+    };
   }
 
   async startRun(actorId: string, input: Record<string, unknown>, options: { maxTotalChargeUsd?: number; timeoutSecs?: number } = {}): Promise<ApifyRun> {
@@ -245,4 +393,15 @@ export class ApifyClient {
     }
     return run;
   }
+}
+
+function isApifyBillingFailure(body: string): boolean {
+  let detail = body;
+  try {
+    const parsed = JSON.parse(body) as { error?: { type?: unknown; message?: unknown } };
+    detail = [parsed.error?.type, parsed.error?.message].filter((value): value is string => typeof value === "string").join(" ");
+  } catch {
+    // Some Apify errors are returned as plain text.
+  }
+  return /billing|payment|credit|quota|usage[-_ ]limit|insufficient funds|insufficient credits|exhausted/i.test(detail);
 }

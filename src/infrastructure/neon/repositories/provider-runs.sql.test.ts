@@ -1,8 +1,18 @@
 import { PgDialect } from "drizzle-orm/pg-core";
 import { describe, expect, it } from "vitest";
+import { getDayBounds } from "@/lib/time/day-bounds";
 import { buildApifyPollingDuePredicate, buildReserveApifyProviderRunQuery, buildReserveSerperProviderRunQuery, getApifyReservationFailureDetails, getSafePostgresErrorCode, resolveSerperRecoveryState } from "./provider-runs";
 
 const dialect = new PgDialect();
+const accountCostSnapshot = {
+  actualSpendUsd: 0.1,
+  reservedSpendUsd: 0.2,
+  committedSpendUsd: 0.3,
+  runCount: 1,
+  runIds: ["observed-run"],
+  dayStart: "2026-10-10T22:00:00.000Z",
+  dayEnd: "2026-10-11T22:00:00.000Z",
+};
 
 describe("Serper credential-aware recovery state", () => {
   const failedAt = new Date("2026-10-28T10:00:00.000Z");
@@ -61,6 +71,7 @@ describe("Apify provider run reservation SQL", () => {
       requestKey: "apify:stable-key",
       seedId: "00000000-0000-0000-0000-000000000003",
       itemsRequested: 10,
+      accountCostSnapshot,
       recoveryProbe: true,
       metadata: { credentialFingerprint: "safe-credential-fingerprint" },
     }, 1500, 15, new Date("2026-10-11T00:00:00.000Z"), 0.05));
@@ -71,7 +82,10 @@ describe("Apify provider run reservation SQL", () => {
     expect(query.sql).toContain("safety.additional_raw_requests <=");
     expect(query.sql).toContain("run.provider IN ('apify', 'serper')");
     expect(query.sql).toContain("<=");
-    expect(query.sql).toContain("safety.cost_today +");
+    expect(query.sql).toContain("safety.reservation_cost_usd > 0");
+    expect(query.sql).toContain("cost_safety.accounted_actual_spend + cost_safety.account_reserved_spend");
+    expect(query.sql).toContain("local.external_run_id IS NULL OR NOT EXISTS");
+    expect(query.sql).toContain("safety.real_spend_today - safety.internal_recorded_spend");
     expect(query.sql).toContain("safety.recovery_probe_count = 0");
     expect(query.sql).toContain("metadata->>'credentialFingerprint'");
     expect(query.params).toContain("safe-credential-fingerprint");
@@ -79,8 +93,52 @@ describe("Apify provider run reservation SQL", () => {
     expect(query.sql).toContain("provider = 'apify' AND status IN ('starting', 'queued', 'running')");
     expect(query.sql).toContain("ON CONFLICT (request_key) WHERE request_key IS NOT NULL DO NOTHING");
     expect(query.params).toContain(1500);
-    expect(query.params).toContain(15);
+    expect(query.params).toContain(5);
+    expect(query.params).toContain(0.1);
+    expect(query.params).toContain(0.2);
     expect(query.params).toContain(4);
+  });
+  it("reserves only the remaining account headroom under the hard daily and batch caps", () => {
+    const query = dialect.sqlToQuery(buildReserveApifyProviderRunQuery({
+      workspaceId: "00000000-0000-0000-0000-000000000001",
+      campaignId: "00000000-0000-0000-0000-000000000002",
+      operation: "maps_search",
+      requestKey: "apify:headroom",
+      seedId: "00000000-0000-0000-0000-000000000003",
+      itemsRequested: 10,
+      accountCostSnapshot: { ...accountCostSnapshot, actualSpendUsd: 4.7, reservedSpendUsd: 0.1, committedSpendUsd: 4.8 },
+      metadata: {},
+    }, 1500, 15, new Date("2026-10-19T22:00:00.000Z"), 2));
+
+    expect(query.sql).toContain("LEAST(");
+    expect(query.sql).toContain("GREATEST(cost_safety.real_spend_today, cost_safety.internal_recorded_spend) AS accounted_actual_spend");
+    expect(query.sql).toContain("cost_safety.accounted_actual_spend + cost_safety.account_reserved_spend + cost_safety.unobserved_local_spend");
+    expect(query.sql).toContain("safety.reservation_cost_usd > 0");
+    expect(query.sql).toContain("ON CONFLICT (request_key) WHERE request_key IS NOT NULL DO NOTHING");
+    expect(query.params).toContain(5);
+    expect(query.params).toContain(0.5);
+    expect(query.params).toContain(4.7);
+    expect(query.params).toContain(0.1);
+  });
+
+  it("starts a fresh reservation spend window at Madrid midnight, including DST changes", () => {
+    const now = new Date("2026-03-29T12:00:00.000Z");
+    const bounds = getDayBounds("Europe/Madrid", now);
+    expect(bounds.start.toISOString()).toBe("2026-03-28T23:00:00.000Z");
+    expect(bounds.end.toISOString()).toBe("2026-03-29T22:00:00.000Z");
+
+    const query = dialect.sqlToQuery(buildReserveApifyProviderRunQuery({
+      workspaceId: "00000000-0000-0000-0000-000000000001",
+      campaignId: "00000000-0000-0000-0000-000000000002",
+      operation: "maps_search",
+      requestKey: "apify:madrid-day-reset",
+      seedId: "00000000-0000-0000-0000-000000000003",
+      itemsRequested: 10,
+      accountCostSnapshot,
+      metadata: {},
+    }, 1500, 5, bounds.start, 0.5, now));
+
+    expect(query.params).toContain("2026-03-28T23:00:00.000Z");
   });
 
   it("applies the same global cap to Serper and replaces its discovery-job reservation", () => {
@@ -136,6 +194,7 @@ describe("Apify provider run reservation SQL", () => {
       requestKey: "apify:legacy-recovery",
       seedId: "00000000-0000-0000-0000-000000000003",
       itemsRequested: 10,
+      accountCostSnapshot,
       recoveryProbe: true,
       metadata: { configurationFingerprint: "safe-config-fingerprint" },
     }, 1500, 15, new Date("2026-10-11T00:00:00.000Z"), 0.05));

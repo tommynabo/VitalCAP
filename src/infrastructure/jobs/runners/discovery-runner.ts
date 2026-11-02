@@ -34,6 +34,7 @@ import { resolvePlanningWindow } from "@/services/autopilot/target-planner";
 import { getMapsEnv } from "@/lib/config/env";
 import { logEvent } from "@/lib/observability/structured-logger";
 import { getApifyFailureClass, getApifyFailureKind } from "@/infrastructure/providers/maps/apify-client";
+import { ApifyClient } from "@/infrastructure/providers/maps/apify-client";
 import { getDayBounds } from "@/lib/time/day-bounds";
 import { planSeedBatches, scoreSeedEconomicPerformance } from "@/services/discovery/seed-economics";
 import type { EconomicPacingState } from "@/services/autopilot/economic-pacing";
@@ -330,7 +331,7 @@ async function executeDiscoveryJob(
       getTodaySpendUsd(campaign.workspaceId, "apify", settings.timezone, now),
       getLatestProviderEconomicPacingStates(campaign.workspaceId, settings.timezone, now),
     ]);
-    const dailyCap = Math.min(mapsEnv.APIFY_DAILY_COST_LIMIT_USD, settings.maxDailyApifySpendUsd ?? Number.POSITIVE_INFINITY);
+    const dailyCap = Math.min(5, mapsEnv.APIFY_DAILY_COST_LIMIT_USD, settings.maxDailyApifySpendUsd ?? Number.POSITIVE_INFINITY);
     const economicPacing = computeProviderBudgetPacing({
       spendTodayUsd: spendToday,
       dailyCapUsd: dailyCap,
@@ -458,7 +459,7 @@ async function executeDiscoveryJob(
       maxSeeds,
       now: new Date(),
       configuredMaxResults: APIFY_MAX_RESULTS_PER_SEARCH,
-      batchCostLimitUsd: mapsEnv?.APIFY_BATCH_COST_LIMIT_USD ?? APIFY_DEFAULT_BATCH_COST_LIMIT_USD,
+      batchCostLimitUsd: Math.min(mapsEnv?.APIFY_BATCH_COST_LIMIT_USD ?? APIFY_DEFAULT_BATCH_COST_LIMIT_USD, APIFY_DEFAULT_BATCH_COST_LIMIT_USD),
       economicPressure: executionEconomicPaceState === "AHEAD_OF_BUDGET_PACE"
         || executionEconomicPaceState === "NEAR_DAILY_CAP",
     })
@@ -553,7 +554,7 @@ async function executeDiscoveryJob(
       ? resolveApifyMaxResults({
         requestedItems: plannedItems,
         configuredMaxResults: APIFY_MAX_RESULTS_PER_SEARCH,
-        batchCostLimitUsd: mapsEnv?.APIFY_BATCH_COST_LIMIT_USD ?? APIFY_DEFAULT_BATCH_COST_LIMIT_USD,
+        batchCostLimitUsd: Math.min(mapsEnv?.APIFY_BATCH_COST_LIMIT_USD ?? APIFY_DEFAULT_BATCH_COST_LIMIT_USD, APIFY_DEFAULT_BATCH_COST_LIMIT_USD),
       })
       : plannedItems;
     if (requestedItems <= 0) continue;
@@ -597,6 +598,10 @@ async function executeDiscoveryJob(
       });
       let reservation;
       try {
+        const apiToken = mapsEnv?.APIFY_API_TOKEN;
+        if (!apiToken) throw new ProviderConfigurationError("APIFY_API_TOKEN is required to verify the account spend before allocation.");
+        const accountDay = getDayBounds("Europe/Madrid", startedAt);
+        const accountCostSnapshot = await new ApifyClient({ apiToken }).getAccountCostSnapshot(accountDay.start, accountDay.end);
         reservation = await reserveApifyProviderRun({
           workspaceId: campaign.workspaceId,
           campaignId: campaign.id,
@@ -604,6 +609,7 @@ async function executeDiscoveryJob(
           requestKey,
           seedId: seed.id,
           itemsRequested: requestedItems,
+          accountCostSnapshot,
           recoveryProbe,
           metadata: {
             engineType: job.payload.engineType,
@@ -663,6 +669,22 @@ async function executeDiscoveryJob(
       }
       reservationId = reservation.providerRun.id;
       reservationMetadata = (reservation.providerRun.metadata ?? {}) as Record<string, unknown>;
+      const reconciliation = {
+        realSpendUsd: reservationMetadata.apifyRealSpendUsdAtReservation,
+        internalSpendUsd: reservationMetadata.apifyInternalRecordedSpendUsdAtReservation,
+        deltaUsd: reservationMetadata.apifyReconciliationDeltaUsdAtReservation,
+        committedUsd: reservationMetadata.apifyAccountCommittedSpendUsdAtReservation,
+      };
+      if (Object.values(reconciliation).every((value) => typeof value === "number")) {
+        logEvent("info", "apify.cost.reconciliation", {
+          correlationId: reservationId,
+          workspaceId: campaign.workspaceId,
+          providerRunId: reservationId,
+          ...reconciliation,
+          reservationUsd: reservation.providerRun.costUsd,
+          apifyRunCount: reservationMetadata.apifyAccountRunCountAtReservation,
+        });
+      }
       seedRunId = await insertSearchSeedRun({
         seedId: seed.id,
         startedAt: startedAt.toISOString(),
@@ -751,7 +773,6 @@ async function executeDiscoveryJob(
         externalDatasetId: result.providerRun.externalDatasetId,
         status: result.providerRun.status,
         itemsRequested: result.providerRun.itemsRequested,
-        costUsd: result.providerRun.costUsd,
         metadata: mergeApifyProviderRunMetadata(
           reservationMetadata,
           result.providerRun.metadata,

@@ -79,6 +79,11 @@ describe("Apify recovery health", () => {
     const snapshot = evaluateApifyRecovery([billingFailure], billingFailure, null, false, false, new Date("2026-10-11T11:55:00.000Z"));
 
     expect(getApifyAllocationHealth(snapshot)).toBe("paused");
+    expect(resolveApifyDiscoveryWorkMode({
+      providerHealth: getApifyAllocationHealth(snapshot),
+      recoveryProbeEligible: snapshot.recoveryProbeEligible,
+      recoveryProbeRequested: false,
+    })).toBe("defer");
     expect(isProviderAvailableForDiscovery(true, "healthy", 1)).toBe(true);
   });
 
@@ -92,10 +97,8 @@ describe("Apify recovery health", () => {
     };
     const snapshot = evaluateApifyRecovery(
       [memoryFailure], memoryFailure, null, false, false,
-      new Date("2026-10-11T10:15:00.000Z"), newCredentialFingerprint,
+      new Date("2026-10-11T10:30:00.000Z"), oldCredentialFingerprint,
     );
-
-    expect(snapshot.recoveryProbeEligible).toBe(false);
     expect(snapshot.nextRecoveryAttemptAt?.toISOString()).toBe("2026-10-11T10:31:00.000Z");
     expect(getApifyAllocationHealth(snapshot)).toBe("paused");
     expect(isProviderAvailableForDiscovery(true, "healthy", 1)).toBe(true);

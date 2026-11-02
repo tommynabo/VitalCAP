@@ -68,11 +68,13 @@ export function createMapsDiscoveryProvider(workspaceId: string, role: MapsEngin
     dailyCostLimitUsd: env.APIFY_DAILY_COST_LIMIT_USD,
     batchCostLimitUsd: Math.min(env.APIFY_BATCH_COST_LIMIT_USD, APIFY_DEFAULT_BATCH_COST_LIMIT_USD),
     maxCrawledPlacesPerSearch: APIFY_MAX_RESULTS_PER_SEARCH,
-    getTodaySpendUsd: async (excludeRequestKey) => {
-      const settings = await getAutopilotSettings(workspaceId);
-      return getTodaySpendUsd(workspaceId, "apify", settings.timezone, new Date(), excludeRequestKey);
+    getReservedCostUsd: async (requestKey) => {
+      const reservation = await getProviderRunByRequestKey(requestKey);
+      if (!reservation || reservation.provider !== "apify" || reservation.costUsd <= 0) {
+        throw new ProviderConfigurationError("Apify run has no valid persisted cost reservation.");
+      }
+      return reservation.costUsd;
     },
-    getBudgetRetryAt: async () => getDayBounds((await getAutopilotSettings(workspaceId)).timezone).end,
     getAutopilotState: async () => getEffectiveAutopilotState(await getAutopilotSettings(workspaceId)),
     getWorkspaceDailyCostLimitUsd: async () => (await getAutopilotSettings(workspaceId)).maxDailyApifySpendUsd,
     recordRun: (run) =>

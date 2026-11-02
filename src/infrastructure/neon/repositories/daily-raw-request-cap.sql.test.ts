@@ -10,6 +10,7 @@ const mocks = vi.hoisted(() => ({
 vi.mock("../db", () => ({ getDb: mocks.getDb, getNeonSql: mocks.getNeonSql }));
 
 import { buildDailyRawRequestCapSnapshot, buildDailyRawRequestCapSnapshotQuery, buildEnqueueDiscoveryOrdersWithinDailyRawCapQuery, executeUnderGlobalDailyRawCapLock } from "./daily-raw-request-cap";
+import { buildReserveApifyProviderRunQuery } from "./provider-runs";
 
 const dialect = new PgDialect();
 const now = new Date("2026-10-19T12:00:00.000Z");
@@ -86,7 +87,7 @@ describe("global daily raw request cap SQL", () => {
     expect(query.sql).toMatch(/input\.payload->>'origin' = 'recovery_probe'[\s\S]*OR existing\.status IN \('pending', 'processing'\)/);
   });
 
-  it("uses one transaction-scoped global advisory lock before reading and reserving capacity", async () => {
+  it("serializes concurrent Apify reservation statements behind the transaction-scoped global lock", async () => {
     const neon = Object.assign(
       (strings: TemplateStringsArray, ...parameters: unknown[]) => ({
         kind: "template",
@@ -101,13 +102,36 @@ describe("global daily raw request cap SQL", () => {
     mocks.getNeonSql.mockReturnValue(neon);
     mocks.transaction.mockResolvedValue([[], [{ reserved: 1 }]]);
 
-    const rows = await executeUnderGlobalDailyRawCapLock(buildDailyRawRequestCapSnapshotQuery(now));
+    const snapshot = {
+      actualSpendUsd: 4.7,
+      reservedSpendUsd: 0.1,
+      committedSpendUsd: 4.8,
+      runCount: 1,
+      runIds: ["observed-run"],
+      dayStart: "2026-10-19T22:00:00.000Z",
+      dayEnd: "2026-10-20T22:00:00.000Z",
+    };
+    const reservationQueries = ["concurrent-a", "concurrent-b"].map((requestKey) => buildReserveApifyProviderRunQuery({
+      workspaceId: "00000000-0000-0000-0000-000000000001",
+      campaignId: "00000000-0000-0000-0000-000000000002",
+      operation: "maps_search",
+      requestKey,
+      seedId: "00000000-0000-0000-0000-000000000003",
+      itemsRequested: 10,
+      accountCostSnapshot: snapshot,
+      metadata: {},
+    }, 1500, 5, new Date(snapshot.dayStart), 0.5, now));
 
-    expect(rows).toEqual([{ reserved: 1 }]);
-    expect(mocks.transaction).toHaveBeenCalledTimes(1);
-    const [queries] = mocks.transaction.mock.calls[0] as [Array<{ kind: string; query: string }>];
-    expect(queries).toHaveLength(2);
-    expect(queries[0]?.query).toContain("pg_advisory_xact_lock");
-    expect(queries[1]?.kind).toBe("query");
+    const results = await Promise.all(reservationQueries.map(executeUnderGlobalDailyRawCapLock));
+
+    expect(results).toEqual([[{ reserved: 1 }], [{ reserved: 1 }]]);
+    expect(mocks.transaction).toHaveBeenCalledTimes(2);
+    for (const [queries] of mocks.transaction.mock.calls as [Array<{ kind: string; query: string }> ][]) {
+      expect(queries).toHaveLength(2);
+      expect(queries[0]?.query).toContain("pg_advisory_xact_lock");
+      expect(queries[1]?.kind).toBe("query");
+      expect(queries[1]?.query).toContain("safety.reservation_cost_usd > 0");
+      expect(queries[1]?.query).toContain("cost_safety.accounted_actual_spend + cost_safety.account_reserved_spend");
+    }
   });
 });

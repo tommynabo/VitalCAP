@@ -7,13 +7,16 @@
  * or deployment.
  */
 import { writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { and, eq, inArray, sql } from "drizzle-orm";
 import { getMapsEnv } from "../../src/lib/config/env";
+import { getDayBounds } from "../../src/lib/time/day-bounds";
 import { getDb, schema } from "../../src/infrastructure/neon/db";
-import { getTodaySpendUsd, recordProviderRun } from "../../src/infrastructure/neon/repositories/provider-runs";
+import { reserveApifyProviderRun } from "../../src/infrastructure/neon/repositories/provider-runs";
 import { insertRawCandidates } from "../../src/infrastructure/neon/repositories/discovery";
 import { enqueueProcessingJob } from "../../src/infrastructure/neon/repositories/job-queue";
 import { runProcessingCronTick } from "../../src/infrastructure/jobs/runners/processing-runner";
+import { ApifyClient } from "../../src/infrastructure/providers/maps/apify-client";
 import { ApifyMapsDiscoveryProvider } from "../../src/infrastructure/providers/maps/apify-provider";
 import { COMPASS_ACTOR_ID } from "../../src/infrastructure/providers/maps/apify-actors/compass-adapter";
 import { evaluateProviderHealth } from "../../src/services/discovery/provider-health";
@@ -152,31 +155,50 @@ async function main(): Promise<void> {
   const beforeAccountIds = new Set(beforeMemberships.map((row) => row.accountId));
   await db.update(schema.campaigns).set({ status: "active", autopilotEnabled: false }).where(eq(schema.campaigns.id, campaignId));
 
+  const requestKey = `maps-smoke:${randomUUID()}`;
+  const dayBounds = getDayBounds("Europe/Madrid");
+  const accountCostSnapshot = await new ApifyClient({ apiToken: env.APIFY_API_TOKEN }).getAccountCostSnapshot(dayBounds.start, dayBounds.end);
+  await reserveApifyProviderRun({
+    workspaceId,
+    campaignId,
+    operation: "maps_search",
+    requestKey,
+    actorId: COMPASS_ACTOR_ID,
+    seedId: randomUUID(),
+    itemsRequested: MAX_RESULTS,
+    accountCostSnapshot,
+    metadata: { origin: "operator_smoke" },
+  });
+
   const provider = new ApifyMapsDiscoveryProvider({
     apiToken: env.APIFY_API_TOKEN,
     actorId: COMPASS_ACTOR_ID,
     dailyCostLimitUsd: env.APIFY_DAILY_COST_LIMIT_USD,
     batchCostLimitUsd: env.APIFY_BATCH_COST_LIMIT_USD,
     maxCrawledPlacesPerSearch: MAX_RESULTS,
-    getTodaySpendUsd: () => getTodaySpendUsd(workspaceId, "apify"),
-    recordRun: (run) =>
-      recordProviderRun({
-        workspaceId,
-        campaignId,
-        provider: "apify",
-        operation: "maps_search",
+    getReservedCostUsd: async (key) => {
+      const [run] = await db.select({ costUsd: schema.providerRuns.costUsd })
+        .from(schema.providerRuns)
+        .where(eq(schema.providerRuns.requestKey, key))
+        .limit(1);
+      return run?.costUsd ?? 0;
+    },
+    recordRun: async (run) => {
+      await db.update(schema.providerRuns).set({
         externalRunId: run.externalRunId,
         externalDatasetId: run.externalDatasetId,
         status: run.status,
         itemsRequested: run.itemsRequested,
         itemsReturned: run.itemsReturned,
         costUsd: run.costUsd,
-        metadata: { actorId: run.actorId, errorMessage: run.errorMessage ?? null },
-      }),
+        error: run.errorMessage ?? null,
+        finishedAt: new Date(),
+      }).where(eq(schema.providerRuns.requestKey, requestKey));
+    },
   });
 
   try {
-    const output = await provider.search({ query: QUERY, geography: LOCATION, pageToken: null });
+    const output = await provider.search({ query: QUERY, geography: LOCATION, pageToken: null, requestKey, maxResults: MAX_RESULTS });
     if (output.results.length > MAX_RESULTS) throw new Error(`Provider returned ${output.results.length} results; maximum is ${MAX_RESULTS}.`);
     const uniquePlaceIds = new Set(output.results.map((place) => place.externalPlaceId).filter((id): id is string => Boolean(id)));
     const [discoveryJob] = await db

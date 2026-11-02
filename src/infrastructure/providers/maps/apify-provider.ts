@@ -28,9 +28,7 @@ export interface ApifyMapsProviderConfig {
   getWorkspaceDailyCostLimitUsd?: () => Promise<number | null>;
   batchCostLimitUsd: number;
   maxCrawledPlacesPerSearch?: number;
-  /** Injected so this provider never imports the Neon repository layer directly (keeps it DB-free and unit-testable). */
-  getTodaySpendUsd: (excludeRequestKey?: string) => Promise<number>;
-  getBudgetRetryAt?: () => Promise<Date>;
+  getReservedCostUsd: (requestKey: string) => Promise<number>;
   getAutopilotState?: () => Promise<"running" | "paused" | "emergency_stopped" | "system_paused">;
   recordRun?: (run: {
     actorId: string;
@@ -76,13 +74,14 @@ export class ApifyMapsDiscoveryProvider implements MapsDiscoveryProvider {
     return Math.min(this.config.dailyCostLimitUsd, workspaceLimit ?? this.config.dailyCostLimitUsd);
   }
 
-  private async getChargeLimit(requestKey?: string): Promise<number> {
-    const remainingBudget = await this.getEffectiveDailyLimit() - await this.config.getTodaySpendUsd(requestKey);
-    if (remainingBudget <= 0) {
-      const retryAt = await this.config.getBudgetRetryAt?.() ?? new Date(Date.now() + 24 * 60 * 60 * 1000);
-      throw new ApifyCostLimitExceededError("Apify daily budget is exhausted; refusing to start a run.", retryAt);
+  private async getReservedChargeLimit(requestKey?: string): Promise<number> {
+    if (!requestKey) throw new ProviderConfigurationError("Apify run requires an idempotent persisted cost reservation.");
+    const reservedCostUsd = await this.config.getReservedCostUsd(requestKey);
+    const hardLimitUsd = Math.min(await this.getEffectiveDailyLimit(), 5, this.config.batchCostLimitUsd, 0.5);
+    if (!Number.isFinite(reservedCostUsd) || reservedCostUsd <= 0 || reservedCostUsd > hardLimitUsd) {
+      throw new ApifyCostLimitExceededError("Apify run has no valid reservation within the configured hard cost limits.");
     }
-    return Math.min(this.config.batchCostLimitUsd, remainingBudget);
+    return reservedCostUsd;
   }
 
   async startAsync(input: MapsSearchInput): Promise<AsyncMapsRun> {
@@ -90,7 +89,7 @@ export class ApifyMapsDiscoveryProvider implements MapsDiscoveryProvider {
     if (autopilotState && !allowsNewApifyRun(autopilotState)) {
       throw new ProviderConfigurationError(`Autopilot is ${autopilotState}; refusing to start a new Apify run.`);
     }
-    const maxTotalChargeUsd = await this.getChargeLimit(input.requestKey);
+    const maxTotalChargeUsd = await this.getReservedChargeLimit(input.requestKey);
     if (this.config.actorId !== COMPASS_ACTOR_ID) {
       throw new ProviderConfigurationError(`No verified input adapter exists for Apify actor ${this.config.actorId}.`);
     }
@@ -118,7 +117,7 @@ export class ApifyMapsDiscoveryProvider implements MapsDiscoveryProvider {
   async search(input: MapsSearchInput): Promise<MapsSearchOutput> {
     const start = Date.now();
 
-    const maxTotalChargeUsd = await this.getChargeLimit(input.requestKey);
+    const maxTotalChargeUsd = await this.getReservedChargeLimit(input.requestKey);
 
     if (this.config.actorId !== COMPASS_ACTOR_ID) {
       throw new ProviderConfigurationError(`No verified input adapter exists for Apify actor ${this.config.actorId}.`);

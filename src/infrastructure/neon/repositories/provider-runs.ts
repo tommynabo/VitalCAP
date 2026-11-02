@@ -10,6 +10,8 @@ import { ProviderBudgetExceededError, ProviderFailureError, ProviderSafetyError 
 import { createApifyConfigurationFingerprint, createApifyCredentialFingerprint, evaluateApifyRecovery, hasCurrentCredentialRecoveryProbeInFlight, resolveApifyRecoveryCredentialFingerprint, type ApifyRecoveryRun } from "@/services/discovery/provider-health";
 import { getCoreEnv, getMapsEnv, getSerperEnv } from "@/lib/config/env";
 import { SERPER_ESTIMATED_COST_PER_QUERY_USD } from "@/infrastructure/providers/serp/serper-provider";
+import { APIFY_DEFAULT_BATCH_COST_LIMIT_USD } from "@/services/discovery/apify-request-capacity";
+import type { ApifyAccountCostSnapshot } from "@/infrastructure/providers/maps/apify-client";
 import type { EconomicPacingState } from "@/services/autopilot/economic-pacing";
 
 export interface RecordProviderRunInput {
@@ -339,6 +341,7 @@ export interface ReserveApifyProviderRunInput {
   actorId?: string | null;
   seedId: string;
   itemsRequested: number;
+  accountCostSnapshot: ApifyAccountCostSnapshot;
   metadata?: Record<string, unknown>;
   recoveryProbe?: boolean;
 }
@@ -440,6 +443,8 @@ export function buildReserveApifyProviderRunQuery(
   now = new Date(),
   maxConcurrentRuns = MAX_CONCURRENT_APIFY_RUNS_PER_WORKSPACE,
 ) {
+  const hardDailyCostLimit = Math.min(maxCost, 5);
+  const hardBatchCostLimit = Math.min(expectedCostUsd, APIFY_DEFAULT_BATCH_COST_LIMIT_USD);
   const configurationFingerprint = typeof input.metadata?.configurationFingerprint === "string"
     ? input.metadata.configurationFingerprint
     : null;
@@ -448,6 +453,36 @@ export function buildReserveApifyProviderRunQuery(
     : null;
   return sql`
     WITH ${buildDailyRawRequestCommitmentCtes(now)},
+    cost_safety AS (
+      SELECT
+        ${input.accountCostSnapshot.actualSpendUsd}::numeric AS real_spend_today,
+        ${input.accountCostSnapshot.reservedSpendUsd}::numeric AS account_reserved_spend,
+        COALESCE((
+          SELECT SUM(local.cost_usd)
+          FROM provider_runs local
+          WHERE local.provider = 'apify'
+            AND local.started_at >= ${dayStart.toISOString()}::timestamptz
+            AND local.status IN ('starting', 'queued', 'running', 'succeeded', 'ingesting')
+            AND (local.external_run_id IS NULL OR NOT EXISTS (
+              SELECT 1
+              FROM jsonb_array_elements_text(${JSON.stringify(input.accountCostSnapshot.runIds)}::jsonb) AS observed(run_id)
+              WHERE observed.run_id = local.external_run_id
+            ))
+        ), 0)::numeric AS unobserved_local_spend,
+        COALESCE((
+          SELECT SUM(terminal.cost_usd)
+          FROM provider_runs terminal
+          WHERE terminal.provider = 'apify'
+            AND terminal.started_at >= ${dayStart.toISOString()}::timestamptz
+            AND terminal.status NOT IN ('starting', 'queued', 'running', 'budget_blocked', 'manual_reconciliation_required')
+            AND terminal.operation <> 'economic_pacing_state'
+        ), 0)::numeric AS internal_recorded_spend
+    ),
+    reconciled_cost_safety AS (
+      SELECT cost_safety.*,
+        GREATEST(cost_safety.real_spend_today, cost_safety.internal_recorded_spend) AS accounted_actual_spend
+      FROM cost_safety
+    ),
     raw_safety AS (
       SELECT daily_raw_commitment.committed_raw_requests,
         COALESCE((
@@ -462,9 +497,8 @@ export function buildReserveApifyProviderRunQuery(
           WHERE job.id::text = ${typeof input.metadata?.discoveryJobId === "string" ? input.metadata.discoveryJobId : ""}
             AND job.status IN ('pending', 'processing')
         ), 0)::int AS job_unrepresented_raw_requests,
-        (SELECT COUNT(*) FROM provider_runs WHERE workspace_id = ${input.workspaceId}::uuid AND status = 'manual_reconciliation_required')::int AS unreconciled_count,
+        (SELECT COUNT(*) FROM provider_runs WHERE provider = 'apify' AND status = 'manual_reconciliation_required')::int AS unreconciled_count,
         (SELECT COUNT(*) FROM provider_runs WHERE workspace_id = ${input.workspaceId}::uuid AND provider = 'apify' AND status IN ('starting', 'queued', 'running'))::int AS concurrent_apify_run_count,
-        (SELECT COALESCE(SUM(cost_usd), 0) FROM provider_runs WHERE workspace_id = ${input.workspaceId}::uuid AND provider = 'apify' AND started_at >= ${dayStart.toISOString()}::timestamptz)::numeric AS cost_today,
         (SELECT COUNT(*) FROM provider_runs WHERE workspace_id = ${input.workspaceId}::uuid AND provider = 'apify' AND status IN ('starting', 'queued', 'running', 'succeeded', 'ingesting') AND COALESCE((metadata->>'recoveryProbe')::boolean, false) = true AND metadata->>'credentialFingerprint' = ${credentialFingerprint}::text)::int AS recovery_probe_count
       FROM daily_raw_commitment
     ),
@@ -474,9 +508,14 @@ export function buildReserveApifyProviderRunQuery(
         raw_safety.concurrent_apify_run_count,
         raw_safety.committed_raw_requests AS requested_today,
         GREATEST(${input.itemsRequested} - raw_safety.job_unrepresented_raw_requests, 0)::int AS additional_raw_requests,
-        raw_safety.cost_today,
+        cost_safety.real_spend_today,
+        cost_safety.account_reserved_spend,
+        cost_safety.internal_recorded_spend,
+        cost_safety.accounted_actual_spend + cost_safety.account_reserved_spend + cost_safety.unobserved_local_spend AS cost_today,
+        LEAST(${hardBatchCostLimit}, GREATEST(${hardDailyCostLimit} - cost_safety.accounted_actual_spend - cost_safety.account_reserved_spend - cost_safety.unobserved_local_spend, 0)) AS reservation_cost_usd,
         raw_safety.recovery_probe_count
       FROM raw_safety
+      CROSS JOIN reconciled_cost_safety
     ),
     inserted AS (
       INSERT INTO provider_runs (
@@ -484,13 +523,23 @@ export function buildReserveApifyProviderRunQuery(
       )
       SELECT
         ${input.workspaceId}::uuid, ${input.campaignId}::uuid, 'apify', ${input.operation}, ${input.requestKey},
-        ${input.actorId ?? null}, ${input.seedId}::uuid, 'starting', ${input.itemsRequested}, 0, ${expectedCostUsd},
-        ${JSON.stringify({ ...(input.metadata ?? {}), recoveryProbe: input.recoveryProbe ?? false })}::jsonb, NOW()
+        ${input.actorId ?? null}, ${input.seedId}::uuid, 'starting', ${input.itemsRequested}, 0, safety.reservation_cost_usd,
+        ${JSON.stringify({ ...(input.metadata ?? {}), recoveryProbe: input.recoveryProbe ?? false })}::jsonb || jsonb_build_object(
+          'apifyCostSource', 'actor_run_usageTotalUsd',
+          'apifyRealSpendUsdAtReservation', safety.real_spend_today,
+          'apifyInternalRecordedSpendUsdAtReservation', safety.internal_recorded_spend,
+          'apifyReconciliationDeltaUsdAtReservation', safety.real_spend_today - safety.internal_recorded_spend,
+          'apifyReservedSpendUsdAtReservation', safety.account_reserved_spend,
+          'apifyAccountCommittedSpendUsdAtReservation', safety.cost_today,
+          'apifyAccountRunCountAtReservation', ${input.accountCostSnapshot.runCount},
+          'apifyCostObservedAt', ${now.toISOString()},
+          'reservedCostUsd', safety.reservation_cost_usd
+        ), NOW()
       FROM safety
       WHERE safety.unreconciled_count = 0
         AND safety.concurrent_apify_run_count < ${maxConcurrentRuns}
         AND safety.requested_today + safety.additional_raw_requests <= ${maxRequests}
-        AND safety.cost_today + ${expectedCostUsd} <= ${maxCost}
+        AND safety.reservation_cost_usd > 0
         AND (${input.recoveryProbe ?? false} = false OR safety.recovery_probe_count = 0)
       ON CONFLICT (request_key) WHERE request_key IS NOT NULL DO NOTHING
       RETURNING *
@@ -536,7 +585,6 @@ export async function getApifyRecoverySnapshot(workspaceId: string, now = new Da
       metadata: providerRuns.metadata,
       recoveryJobPayload: discoveryJobs.payload,
     }).from(providerRuns).leftJoin(discoveryJobs, sql`${providerRuns.metadata}->>'discoveryJobId' = ${discoveryJobs.id}::text`).where(and(
-      eq(providerRuns.workspaceId, workspaceId),
       eq(providerRuns.provider, "apify"),
       ne(providerRuns.operation, "economic_pacing_state"),
       gte(providerRuns.startedAt, since),
@@ -548,7 +596,6 @@ export async function getApifyRecoverySnapshot(workspaceId: string, now = new Da
       error: providerRuns.error,
       metadata: providerRuns.metadata,
     }).from(providerRuns).where(and(
-      eq(providerRuns.workspaceId, workspaceId),
       eq(providerRuns.provider, "apify"),
       ne(providerRuns.operation, "economic_pacing_state"),
       inArray(providerRuns.status, ["failed", "aborted", "timed_out"]),
@@ -559,7 +606,6 @@ export async function getApifyRecoverySnapshot(workspaceId: string, now = new Da
       metadata: providerRuns.metadata,
       recoveryJobPayload: discoveryJobs.payload,
     }).from(providerRuns).leftJoin(discoveryJobs, sql`${providerRuns.metadata}->>'discoveryJobId' = ${discoveryJobs.id}::text`).where(and(
-      eq(providerRuns.workspaceId, workspaceId),
       eq(providerRuns.provider, "apify"),
       ne(providerRuns.operation, "economic_pacing_state"),
       inArray(providerRuns.status, ["succeeded", "ingested", "completed"]),
@@ -604,7 +650,7 @@ export async function getApifyRecoverySnapshot(workspaceId: string, now = new Da
   const currentCredentialFingerprint = createApifyCredentialFingerprint(mapsEnv.APIFY_API_TOKEN);
   const probeInFlight = hasCurrentCredentialRecoveryProbeInFlight(runs, currentCredentialFingerprint);
   const unreconciled = await db.select({ id: providerRuns.id }).from(providerRuns).where(and(
-    eq(providerRuns.workspaceId, workspaceId),
+    eq(providerRuns.provider, "apify"),
     eq(providerRuns.status, "manual_reconciliation_required"),
   )).limit(1);
   const latestSuccess = successRows[0];
@@ -657,11 +703,17 @@ export async function reserveApifyProviderRun(input: ReserveApifyProviderRunInpu
 
   const env = await import("@/lib/config/env");
   const maxRequests = env.getCoreEnv().ACTIVATION_MAX_DAILY_RAW_REQUESTS;
-  const maxCost = Math.min(env.getMapsEnv().APIFY_DAILY_COST_LIMIT_USD, settings.maxDailySpend ?? Number.POSITIVE_INFINITY);
+  const maxCost = Math.min(5, env.getMapsEnv().APIFY_DAILY_COST_LIMIT_USD, settings.maxDailySpend ?? Number.POSITIVE_INFINITY);
 
   const now = new Date();
-  const { start } = getDayBounds(settings.timezone, now);
-  const expectedCostUsd = input.itemsRequested * 0.005; // conservative
+  const { start, end } = getDayBounds("Europe/Madrid", now);
+  if (input.accountCostSnapshot.dayStart !== start.toISOString() || input.accountCostSnapshot.dayEnd !== end.toISOString()) {
+    throw tagApifyReservationFailure(
+      new ProviderFailureError("Apify account usage window changed before reservation; refusing allocation.", "transient", end),
+      "SQL_OR_UNKNOWN_RESERVATION_FAILURE",
+    );
+  }
+  const batchCostLimitUsd = Math.min(APIFY_DEFAULT_BATCH_COST_LIMIT_USD, env.getMapsEnv().APIFY_BATCH_COST_LIMIT_USD);
 
   // 2. Atomic insertion with guard conditions in one Neon HTTP statement.
   let result;
@@ -671,7 +723,7 @@ export async function reserveApifyProviderRun(input: ReserveApifyProviderRunInpu
       maxRequests,
       maxCost,
       start,
-      expectedCostUsd,
+      batchCostLimitUsd,
       now,
       MAX_CONCURRENT_APIFY_RUNS_PER_WORKSPACE,
     )) };
@@ -687,7 +739,7 @@ export async function reserveApifyProviderRun(input: ReserveApifyProviderRunInpu
 
   const row = result.rows[0] as {
     inserted_row: unknown;
-    safety_row: { unreconciled_count: number; concurrent_apify_run_count: number; requested_today: number; additional_raw_requests: number; cost_today: number; recovery_probe_count: number } | null;
+    safety_row: { unreconciled_count: number; concurrent_apify_run_count: number; requested_today: number; additional_raw_requests: number; cost_today: number; reservation_cost_usd: number; recovery_probe_count: number } | null;
     existing_row: unknown;
   } | undefined;
   if (row?.inserted_row) {
@@ -743,8 +795,8 @@ export async function reserveApifyProviderRun(input: ReserveApifyProviderRunInpu
       "RAW_CAP",
     );
   }
-  if (safety && safety.cost_today + expectedCostUsd > maxCost) {
-    const { end: retryAt } = getDayBounds(settings.timezone);
+  if (safety && Number(safety.cost_today) >= maxCost) {
+    const { end: retryAt } = getDayBounds("Europe/Madrid");
     throw tagApifyReservationFailure(
       new ProviderBudgetExceededError("Provider reservation is blocked by the daily Apify spend cap.", retryAt),
       "DAILY_COST_CAP",

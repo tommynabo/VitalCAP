@@ -2,7 +2,7 @@ import { listWorkspaceIds } from "@/infrastructure/neon/repositories/workspace";
 import { getTodaySpendUsd, listApifyRunsForPolling, updateProviderRun, claimProviderRunForIngestion } from "@/infrastructure/neon/repositories/provider-runs";
 import { getMapsEnv } from "@/lib/config/env";
 import { getAutopilotSettings } from "@/infrastructure/neon/repositories/autopilot";
-import { ApifyClient, classifyApifyRunFailure, getApifyFailureClass, getApifyFailureKind } from "@/infrastructure/providers/maps/apify-client";
+import { ApifyClient, classifyApifyRunFailure, getApifyFailureClass, getApifyFailureKind, reconcileApifyRunCost } from "@/infrastructure/providers/maps/apify-client";
 import { mapCompassItemToPlaceResult } from "@/infrastructure/providers/maps/apify-actors/compass-adapter";
 import { ingestApifyProviderRun, type ProviderRunIngestionAccounting } from "@/infrastructure/neon/repositories/provider-run-ingestion";
 import { ProviderFailureError } from "@/domain/providers/errors";
@@ -92,11 +92,46 @@ export async function runProviderRunsCronTick(maxRuns = MAX_RUNS_PER_TICK): Prom
         continue;
       }
       const run = await client.getActorRun(providerRun.externalRunId!);
-      const usageCost = run.usageTotalUsd ?? providerRun.costUsd;
       if (run.status === "READY" || run.status === "RUNNING" || run.status === "TIMING-OUT" || run.status === "ABORTING") {
-        await updateProviderRun(providerRun.id, { status: "running", externalDatasetId: run.defaultDatasetId ?? providerRun.externalDatasetId, costUsd: usageCost });
+        await updateProviderRun(providerRun.id, { status: "running", externalDatasetId: run.defaultDatasetId ?? providerRun.externalDatasetId });
         continue;
       }
+
+      if (typeof run.usageTotalUsd !== "number" || !Number.isFinite(run.usageTotalUsd) || run.usageTotalUsd < 0) {
+        await updateProviderRun(providerRun.id, {
+          status: "manual_reconciliation_required",
+          finishedAt: run.finishedAt ? new Date(run.finishedAt) : new Date(),
+          error: "Apify finished without a verifiable actual cost.",
+          metadata: { ...((providerRun.metadata ?? {}) as Record<string, unknown>), apifyCostReconciliationStatus: "unavailable" },
+        });
+        warnings.push(`provider_run ${providerRun.id}: actual Apify cost is unavailable; allocation paused for reconciliation.`);
+        continue;
+      }
+
+      const reservationMetadata = (providerRun.metadata ?? {}) as Record<string, unknown>;
+      const reservedCostUsd = typeof reservationMetadata.reservedCostUsd === "number"
+        ? reservationMetadata.reservedCostUsd
+        : providerRun.costUsd;
+      const reconciliation = reconcileApifyRunCost(reservedCostUsd, run.usageTotalUsd);
+      const reconciliationMetadata = {
+        ...reservationMetadata,
+        apifyCostReconciliationStatus: reconciliation.exceedsReservation ? "reservation_exceeded" : "reconciled",
+        apifyReservedCostUsd: reconciliation.reservedCostUsd,
+        apifyActualCostUsd: reconciliation.actualCostUsd,
+        apifyReservationVarianceUsd: reconciliation.varianceUsd,
+      };
+      if (reconciliation.exceedsReservation) {
+        await updateProviderRun(providerRun.id, {
+          status: "manual_reconciliation_required",
+          costUsd: reconciliation.actualCostUsd,
+          finishedAt: run.finishedAt ? new Date(run.finishedAt) : new Date(),
+          error: "Apify actual cost exceeded its reserved charge ceiling; allocation paused for reconciliation.",
+          metadata: reconciliationMetadata,
+        });
+        warnings.push(`provider_run ${providerRun.id}: actual Apify cost exceeded its reservation; allocation paused.`);
+        continue;
+      }
+      const usageCost = reconciliation.actualCostUsd;
 
       if (run.status !== "SUCCEEDED") {
         const terminalStatus = run.status === "ABORTED" ? "aborted" : run.status === "TIMED-OUT" ? "timed_out" : "failed";
@@ -115,7 +150,7 @@ export async function runProviderRunsCronTick(maxRuns = MAX_RUNS_PER_TICK): Prom
           finishedAt: run.finishedAt ? new Date(run.finishedAt) : new Date(),
           error: failure.message,
           metadata: {
-            ...((providerRun.metadata ?? {}) as Record<string, unknown>),
+            ...reconciliationMetadata,
             failureKind,
             ...(getApifyFailureClass(failure) ? { failureClass: getApifyFailureClass(failure) } : {}),
             ...(credentialFingerprint ? { credentialFingerprint } : {}),
@@ -140,6 +175,7 @@ export async function runProviderRunsCronTick(maxRuns = MAX_RUNS_PER_TICK): Prom
           externalDatasetId: run.defaultDatasetId ?? providerRun.externalDatasetId,
           costUsd: usageCost,
           finishedAt: run.finishedAt ? new Date(run.finishedAt) : new Date(),
+          metadata: reconciliationMetadata,
         });
       }
 

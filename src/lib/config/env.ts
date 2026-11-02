@@ -82,8 +82,8 @@ const mapsEnvSchema = z.object({
   APIFY_MAPS_DEEP_ACTOR: z.string().default("compass/crawler-google-places"),
   APIFY_MAPS_FALLBACK_ACTOR: z.string().default("compass/crawler-google-places"),
   APIFY_MAPS_CONTACT_ENRICHMENT_ACTOR: z.string().optional(),
-  APIFY_DAILY_COST_LIMIT_USD: z.coerce.number().positive().default(15),
-  APIFY_BATCH_COST_LIMIT_USD: z.coerce.number().default(2),
+  APIFY_DAILY_COST_LIMIT_USD: z.coerce.number().positive().default(5),
+  APIFY_BATCH_COST_LIMIT_USD: z.coerce.number().positive().default(0.5),
 }).superRefine((env, ctx) => {
   if (getCoreEnv().APP_ENV === "production" && env.MAPS_PROVIDER === "mock") {
     ctx.addIssue({ code: "custom", message: "MAPS_PROVIDER=mock is forbidden in production.", path: ["MAPS_PROVIDER"] });
