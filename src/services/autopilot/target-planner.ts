@@ -54,8 +54,6 @@ export interface EngineWorkAllocationInput extends Omit<MapsFastAllocationInput,
 export const MAX_RAW_PER_PLANNING_WINDOW = 500;
 export const MAX_APIFY_RECOVERY_PROBE_RAW = 10;
 export const MIN_IMPORTS_FOR_COST_WEIGHT = 5;
-const COST_WEIGHT_FLOOR = 0.75;
-const COST_WEIGHT_CEILING = 1.25;
 
 function median(values: readonly number[]): number | null {
   if (values.length === 0) return null;
@@ -77,8 +75,7 @@ function confirmedImportCostWeight(
     || medianCostPerImport === null || medianCostPerImport <= 0
   ) return 1;
 
-  const relativeWeight = Math.sqrt(medianCostPerImport / costPerImport);
-  return Math.max(COST_WEIGHT_FLOOR, Math.min(COST_WEIGHT_CEILING, relativeWeight));
+  return medianCostPerImport / costPerImport;
 }
 
 export function planningWindowKey(now: Date, timeZone: string, windowMinutes = 15): string {
@@ -175,6 +172,10 @@ export function allocateEngineWork(input: EngineWorkAllocationInput): DiscoveryO
     const queuePenalty = Math.min(0.75, (performance?.queueDepth ?? 0) / 1_000);
     const exhaustionPenalty = Math.min(0.75, performance?.seedExhaustion ?? 0);
     const costWeight = confirmedImportCostWeight(performance, medianCostPerImport);
+    const matureImportEconomics = (performance?.confirmedImportCount ?? 0) >= MIN_IMPORTS_FOR_COST_WEIGHT
+      && performance?.costPerConfirmedImportUsd !== null
+      && performance?.costPerConfirmedImportUsd !== undefined
+      && performance.costPerConfirmedImportUsd > 0;
     const matureExpensiveEngine = (performance?.confirmedImportCount ?? 0) >= MIN_IMPORTS_FOR_COST_WEIGHT
       && (performance?.costPerConfirmedImportUsd ?? 0) > (medianCostPerImport ?? Number.POSITIVE_INFINITY);
     const economicPressureWeight = input.economicPressureByEngine?.[campaign.engineType] && matureExpensiveEngine
@@ -184,7 +185,8 @@ export function allocateEngineWork(input: EngineWorkAllocationInput): DiscoveryO
       && (performance?.confirmedImportCount ?? 0) < MIN_IMPORTS_FOR_COST_WEIGHT
       ? 0.1
       : 1;
-    return { campaign, weight: campaign.dailySoftTarget * yieldWeight * (1 - queuePenalty) * (1 - exhaustionPenalty) * costWeight * economicPressureWeight * explorationWeight };
+    const economicWeight = matureImportEconomics ? costWeight : yieldWeight;
+    return { campaign, weight: campaign.dailySoftTarget * economicWeight * (1 - queuePenalty) * (1 - exhaustionPenalty) * economicPressureWeight * explorationWeight };
   });
   let totalWeight = weighted.reduce((sum, item) => sum + item.weight, 0);
   if (totalWeight <= 0) {

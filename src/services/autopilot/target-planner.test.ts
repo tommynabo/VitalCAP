@@ -126,6 +126,29 @@ describe("target planner", () => {
     expect(smallSampleOrders.map((order) => order.desiredRawCount)).toEqual([50, 50]);
   });
 
+  it("lets mature confirmed-import cost dominate raw yield", () => {
+    const orders = allocateEngineWork({
+      workspaceId: "workspace-1",
+      campaigns: [campaign("efficient", 100), campaign("expensive", 100, { engineType: "google_serp" })],
+      capabilities: ["maps_fast", "google_serp"].map((engineType) => ({
+        engineType: engineType as Campaign["engineType"], available: true, providerConfigured: true,
+        providerHealthy: true, providerUntested: false, costAllowed: true, campaignCount: 1,
+        reasonUnavailable: null, reason: null,
+      })),
+      performances: [
+        { campaignId: "efficient", yield: 0.05, confirmedImportCount: 8, costPerConfirmedImportUsd: 0.1, queueDepth: 0, seedExhaustion: 0 },
+        { campaignId: "expensive", yield: 0.8, confirmedImportCount: 8, costPerConfirmedImportUsd: 0.8, queueDepth: 0, seedExhaustion: 0 },
+      ],
+      rawNeeded: 100,
+      reason: "confirmed-import economics",
+      now: new Date("2025-01-01T13:00:00Z"),
+      timeZone: "Europe/Madrid",
+    });
+
+    expect(orders.find((order) => order.campaignId === "efficient")?.desiredRawCount)
+      .toBeGreaterThan(orders.find((order) => order.campaignId === "expensive")?.desiredRawCount ?? 0);
+  });
+
   it("reduces only a mature expensive engine under provider pressure and preserves the global deficit", () => {
     const campaigns = [campaign("efficient", 100), campaign("expensive", 100, { engineType: "google_serp" })];
     const capabilities = ["maps_fast", "google_serp"].map((engineType) => ({

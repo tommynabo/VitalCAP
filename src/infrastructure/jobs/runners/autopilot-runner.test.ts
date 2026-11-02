@@ -167,7 +167,7 @@ describe("runAutopilotCronTick", () => {
     });
   });
 
-  it("enqueues discovery for a zero-import 250 target despite a large stale backlog", async () => {
+  it("avoids new discovery for a zero-import target covered by eligible paid backlog", async () => {
     const now = new Date("2025-06-15T12:00:00Z");
     const pacing = computeAutopilotPacing({
       workspaceId: "workspace-1",
@@ -196,17 +196,11 @@ describe("runAutopilotCronTick", () => {
     mocks.getAutopilotPacingState.mockResolvedValue(pacing);
     const result = await runAutopilotCronTick(now);
 
-    expect(pacing.status).toBe("behind_pace");
-    expect(pacing.targetNeededToPlan).toBeGreaterThan(0);
-    expect(pacing.rawNeededToPlan).toBeGreaterThan(0);
-    expect(result.ordersScheduled).toBeGreaterThan(0);
-    expect(mocks.enqueueDiscoveryOrdersWithinDailyRawCap).toHaveBeenCalledWith(expect.arrayContaining([
-      expect.objectContaining({
-        campaignId: "campaign-1",
-        type: "run_engine_batch",
-        payload: expect.objectContaining({ engineType: "maps_fast", economicPaceState: "UNDER_PACE" }),
-      }),
-    ]), now);
+    expect(pacing.status).toBe("on_pace");
+    expect(pacing.targetNeededToPlan).toBe(0);
+    expect(pacing.rawNeededToPlan).toBe(0);
+    expect(result.ordersScheduled).toBe(0);
+    expect(mocks.enqueueDiscoveryOrdersWithinDailyRawCap).toHaveBeenCalledWith([], now);
     expect(mocks.recordProviderRun).toHaveBeenCalledWith(expect.objectContaining({
       provider: "apify",
       operation: "economic_pacing_state",

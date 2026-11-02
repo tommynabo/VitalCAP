@@ -145,7 +145,7 @@ describe("computeAutopilotPacing", () => {
     expect(withBacklog.rawNeededToPlan).toBeLessThan(withoutBacklog.rawNeededToPlan);
   });
 
-  it("keeps a zero-import 250 target behind pace despite a large stale backlog", () => {
+  it("credits paid backlog up to the pace checkpoint and avoids duplicate raw buying", () => {
     const result = computeAutopilotPacing({
       ...base,
       targetMetric: "instantly_imported",
@@ -159,13 +159,13 @@ describe("computeAutopilotPacing", () => {
       now: new Date("2025-06-15T12:00:00Z"),
     });
 
-    expect(result.expectedImportsFromBacklog).toBeLessThanOrEqual(result.expectedAchievedByNow * 0.1);
-    expect(result.status).toBe("behind_pace");
-    expect(result.targetNeededToPlan).toBeGreaterThan(0);
-    expect(result.rawNeededToPlan).toBeGreaterThan(0);
+    expect(result.expectedImportsFromBacklog).toBeLessThanOrEqual(result.expectedAchievedByNow);
+    expect(result.expectedImportsFromBacklog).toBeGreaterThan(0);
+    expect(result.targetNeededToPlan).toBe(0);
+    expect(result.rawNeededToPlan).toBe(0);
   });
 
-  it("uses resolved contactability yield only after 20 samples and keeps combined credit capped", () => {
+  it("uses resolved contactability yield after 20 samples and avoids raw buying for paid backlog", () => {
     const result = computeAutopilotPacing({
       ...base,
       targetMetric: "instantly_imported",
@@ -181,9 +181,9 @@ describe("computeAutopilotPacing", () => {
 
     expect(result.contactabilityImportYield).toBe(0.3);
     expect(result.expectedImportsFromContactabilityBacklog).toBe(300);
-    expect(result.expectedImportsFromBacklog).toBeLessThanOrEqual(result.expectedAchievedByNow * 0.1);
-    expect(result.status).toBe("behind_pace");
-    expect(result.rawNeededToPlan).toBeGreaterThan(0);
+    expect(result.expectedImportsFromBacklog).toBeLessThanOrEqual(result.expectedAchievedByNow);
+    expect(result.targetNeededToPlan).toBe(0);
+    expect(result.rawNeededToPlan).toBe(0);
     expect(result.contactabilityBackpressureMultiplier).toBe(0.85);
   });
 

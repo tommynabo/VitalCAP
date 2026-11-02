@@ -198,6 +198,31 @@ describe("seed economics", () => {
     expect(batches.reduce((sum, batch) => sum + batch.requestedItems, 0)).toBe(100);
   });
 
+  it("prioritizes mature attributed imports by cost across novelty tiers", () => {
+    const result = planSeedBatches({
+      seeds: [seed("high-expensive"), seed("good-efficient")],
+      performanceBySeed: new Map([
+        ["high-expensive", performance({
+          seedId: "high-expensive",
+          noveltyRate: 0.8,
+          confirmedInstantlyImportsFromSeed: 8,
+          costPerConfirmedImport: 0.8,
+        })],
+        ["good-efficient", performance({
+          seedId: "good-efficient",
+          noveltyRate: 0.3,
+          confirmedInstantlyImportsFromSeed: 8,
+          costPerConfirmedImport: 0.1,
+        })],
+      ]),
+      rawNeeded: 20,
+      maxSeeds: 1,
+      now,
+    });
+
+    expect(result.batches.map((batch) => batch.seed.id)).toEqual(["good-efficient"]);
+  });
+
   it("spreads equally ranked seeds across geographies when capacity allows", () => {
     const seeds = [
       seed("madrid-a", { geography: "Madrid" }),
@@ -287,6 +312,26 @@ describe("seed economics", () => {
     expect(result.productiveSeedCapacityConstrained).toBe(true);
   });
 
+  it("stops exploration when mature seeds have no confirmed-import value or productive capacity", () => {
+    const exhausted = performance({
+      noveltyRate: 0,
+      confirmedInstantlyImportsFromSeed: 0,
+      costPerConfirmedImport: null,
+      zeroNoveltyRunStreak: 1,
+      lastRunAt: now.toISOString(),
+    });
+    const result = planSeedBatches({
+      seeds: [seed("exhausted"), seed("unknown")],
+      performanceBySeed: new Map([["exhausted", { ...exhausted, seedId: "exhausted" }]]),
+      rawNeeded: 100,
+      maxSeeds: 2,
+      now,
+    });
+
+    expect(result.batches).toEqual([]);
+    expect(result.productiveSeedCapacityConstrained).toBe(true);
+  });
+
   it("selects high and good economic tiers before exploration and retains the hard exploration ceiling", () => {
     const seeds = [seed("new"), seed("good"), seed("high")];
     const result = planSeedBatches({
@@ -337,7 +382,7 @@ describe("seed economics", () => {
     expect(result.productiveSeedCapacityConstrained).toBe(true);
   });
 
-  it("uses confirmed-import cost only with a confident sample and limits its weight", () => {
+  it("ranks mature attributed seeds by confirmed-import cost after the minimum sample", () => {
     const baseline = performance({
       seedId: "baseline",
       costPerConfirmedImport: 0.1,
@@ -361,17 +406,22 @@ describe("seed economics", () => {
 
     expect(expensiveScore).toBeLessThan(baselineScore);
     expect(noisyScore).toBeCloseTo(noisyNeutralScore);
-    expect(expensiveScore).toBeGreaterThanOrEqual(baselineScore * 0.75);
+    expect(expensiveScore).toBe(5);
+    expect(baselineScore).toBe(10);
   });
 
   it("ranks mature sources by cost per new raw without changing their tier", () => {
     const expensive = scoreSeedEconomicPerformance(seed("expensive"), performance({
       noveltyRate: 0.4,
       costPerNewRaw: 0.04,
+      confirmedInstantlyImportsFromSeed: 0,
+      costPerConfirmedImport: null,
     }), now, null, 0.01);
     const efficient = scoreSeedEconomicPerformance(seed("efficient"), performance({
       noveltyRate: 0.4,
       costPerNewRaw: 0.005,
+      confirmedInstantlyImportsFromSeed: 0,
+      costPerConfirmedImport: null,
     }), now, null, 0.01);
 
     expect(expensive.tier).toBe(efficient.tier);

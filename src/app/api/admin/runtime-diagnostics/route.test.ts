@@ -6,6 +6,7 @@ const {
   getSerperCostDiagnostics,
   getRecentProviderUsage,
   getApifyDailyEconomicTotals,
+  getApifyAccountCostSnapshot,
   getCurrentWorkspaceId,
   getDb,
   getAutopilotPacingState,
@@ -23,6 +24,7 @@ const {
   getSerperCostDiagnostics: vi.fn(),
   getRecentProviderUsage: vi.fn(),
   getApifyDailyEconomicTotals: vi.fn(),
+  getApifyAccountCostSnapshot: vi.fn(),
   getCurrentWorkspaceId: vi.fn(),
   getDb: vi.fn(),
   getAutopilotPacingState: vi.fn(),
@@ -45,6 +47,11 @@ vi.mock("@/infrastructure/neon/schema/autopilot", () => ({
 vi.mock("@/infrastructure/neon/repositories/workspace", () => ({ getWorkspaceRole }));
 vi.mock("@/infrastructure/neon/repositories/provider-runs", () => ({ getApifyRecoverySnapshot, getSerperRecoveryState, getSerperCostDiagnostics, getRecentProviderUsage }));
 vi.mock("@/infrastructure/neon/repositories/discovery", () => ({ getApifyDailyEconomicTotals, getSeedEconomicPerformance, listSearchSeedsForCampaignEngine }));
+vi.mock("@/infrastructure/providers/maps/apify-client", () => ({
+  ApifyClient: class {
+    getAccountCostSnapshot = getApifyAccountCostSnapshot;
+  },
+}));
 vi.mock("@/infrastructure/neon/repositories/autopilot", () => ({ getAutopilotPacingState }));
 vi.mock("@/infrastructure/neon/repositories/health-diagnostics", () => ({ getSystemHealthDiagnostics }));
 vi.mock("@/infrastructure/neon/repositories/watchdog-signals", () => ({ getRecoveryProbeDiscoveryJobs, getWatchdogWorkspaceSignals }));
@@ -82,6 +89,15 @@ describe("GET /api/admin/runtime-diagnostics recovery errors", () => {
       accountedResultsReturned: 0,
       newRaw: 0,
       duplicates: 0,
+    });
+    getApifyAccountCostSnapshot.mockResolvedValue({
+      dayStart: "2026-10-27T00:00:00.000Z",
+      dayEnd: "2026-10-28T00:00:00.000Z",
+      actualSpendUsd: 0,
+      reservedSpendUsd: 0,
+      committedSpendUsd: 0,
+      runCount: 0,
+      runIds: [],
     });
     getAutopilotPacingState.mockResolvedValue({ instantlyImportedToday: 0, qualifiedToday: 0, validEmailToday: 0 });
     getSeedEconomicPerformance.mockResolvedValue(new Map());
@@ -196,6 +212,11 @@ describe("GET /api/admin/runtime-diagnostics recovery errors", () => {
     expect(body.apify.credentialChangedSinceLatestFailure).toBe(true);
     expect(body.autopilot).toMatchObject({ target: 250, targetMetric: "instantly_imported" });
     expect(body.discoveryEconomics).toMatchObject({
+      apifyDailyCapUsd: 15,
+      apifyAccountSnapshotAvailable: true,
+      apifyRealSpendTodayUsd: 0,
+      apifyReservedSpendTodayUsd: 0,
+      apifyCommittedSpendTodayUsd: 0,
       apifySpendTodayUsd: 0,
       apifyItemsRequestedToday: 0,
       apifyCoreRequestedToday: 0,
@@ -206,6 +227,8 @@ describe("GET /api/admin/runtime-diagnostics recovery errors", () => {
       qualifiedToday: 0,
       validEmailToday: 0,
       instantlyImportedToday: 0,
+      serperDailyCapUsd: 0.5,
+      serperSpendTodayUsd: 0,
     });
     expect(body.serper).toMatchObject({
       reliabilityHealth: "healthy",
@@ -332,5 +355,68 @@ describe("GET /api/admin/runtime-diagnostics recovery errors", () => {
       outcomeAttributionComplete: false,
       qualifiedYield: null,
     });
+  });
+
+  it("exposes per-engine and per-seed cost per valid email with complete attribution", async () => {
+    listCampaigns.mockResolvedValue([{
+      id: "campaign-1",
+      name: "Campaign",
+      status: "active",
+      autopilotEnabled: true,
+      engineType: "maps_fast",
+      dailySoftTarget: 25,
+      timeZone: "Europe/Madrid",
+    }]);
+    listSearchSeedsForCampaignEngine.mockResolvedValue([{
+      id: "seed-1",
+      campaignId: "campaign-1",
+      engineType: "maps_fast",
+      query: "query",
+      geography: "Madrid",
+      lastRunAt: null,
+      totalRaw: 10,
+      totalUnique: 10,
+      totalReady: 0,
+      yieldRate: 0,
+      exhaustionScore: 0,
+      nextEligibleAt: null,
+    }]);
+    getSeedEconomicPerformance.mockResolvedValue(new Map([["seed-1", {
+      seedId: "seed-1",
+      recentRuns: 3,
+      itemsReturned: 10,
+      newRaw: 8,
+      duplicates: 2,
+      noveltyRate: 0.8,
+      providerCostUsd: 0.1,
+      providerCostTodayUsd: 0.1,
+      outcomeAttributionComplete: true,
+      itemsReturnedToday: 10,
+      newRawToday: 8,
+      duplicatesToday: 2,
+      costPerNewRaw: 0.0125,
+      qualifiedFromSeed: 5,
+      websiteFromSeed: 4,
+      emailFoundFromSeed: 3,
+      validEmailFromSeed: 2,
+      confirmedInstantlyImportsFromSeed: 1,
+      qualifiedYield: 0.625,
+      websiteRate: 0.5,
+      emailFoundRate: 0.375,
+      validEmailYield: 0.25,
+      validEmailRate: 0.25,
+      confirmedImportYield: 0.125,
+      instantlyImportRate: 0.125,
+      costPerConfirmedImport: 0.1,
+      sampleSize: 10,
+      zeroNoveltyRunStreak: 0,
+      lastRunAt: "2026-10-27T10:00:00.000Z",
+      nextEligibleAt: null,
+    }]]));
+
+    const body = await (await GET()).json();
+
+    expect(body.discoveryEconomics.byEngine[0]).toMatchObject({ costPerValidEmail: 0.05 });
+    expect(body.discoveryEconomics.bySeed[0]).toMatchObject({ costPerValidEmail: 0.05 });
   });
 });

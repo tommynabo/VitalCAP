@@ -120,6 +120,16 @@ function downstreamYield(performance: SeedEconomicPerformance | undefined): numb
   return 0.1;
 }
 
+function hasMatureImportEconomics(performance: SeedEconomicPerformance | undefined): boolean {
+  return Boolean(
+    performance?.outcomeAttributionComplete
+    && (performance.confirmedInstantlyImportsFromSeed ?? 0) >= SEED_ECONOMICS_POLICY.minConfirmedImportsForCostWeight
+    && performance.costPerConfirmedImport !== null
+    && performance.costPerConfirmedImport !== undefined
+    && performance.costPerConfirmedImport > 0,
+  );
+}
+
 function cooldownUntil(performance: SeedEconomicPerformance | undefined): Date | null {
   if (
     !performance?.lastRunAt
@@ -204,22 +214,14 @@ export function scoreSeedEconomicPerformance(
   }
 
   const qualityComponent = downstreamYield(performance);
+  const matureImportEconomics = hasMatureImportEconomics(performance);
   let priorityScore = noveltyRate * 0.65 + qualityComponent * 0.35;
-  if (
-    (performance?.confirmedInstantlyImportsFromSeed ?? 0) >= SEED_ECONOMICS_POLICY.minConfirmedImportsForCostWeight
-    && performance?.costPerConfirmedImport !== null
-    && performance?.costPerConfirmedImport !== undefined
-    && medianCostPerConfirmedImport !== null
-    && medianCostPerConfirmedImport > 0
-    && performance.costPerConfirmedImport > 0
-  ) {
-    const costWeight = Math.sqrt(medianCostPerConfirmedImport / performance.costPerConfirmedImport);
-    priorityScore *= Math.max(
-      SEED_ECONOMICS_POLICY.costWeightFloor,
-      Math.min(SEED_ECONOMICS_POLICY.costWeightCeiling, costWeight),
-    );
+  if (matureImportEconomics) {
+    priorityScore = 1 / (performance?.costPerConfirmedImport ?? 1);
   }
   if (
+    !matureImportEconomics
+    &&
     confident
     && (performance?.costPerNewRaw ?? 0) > 0
     && medianCostPerNewRaw !== null
@@ -316,6 +318,15 @@ export function planSeedBatches(input: {
 
   const coreCandidates = candidates.filter(({ policy }) => !policy.exploration && policy.tier !== "zero");
   const explorationCandidates = candidates.filter(({ policy }) => policy.exploration);
+  const matureImportCandidates = coreCandidates.filter(({ seed }) =>
+    hasMatureImportEconomics(input.performanceBySeed.get(seed.id)),
+  );
+  const hasMatureImportValue = input.seeds.some((seed) =>
+    (input.performanceBySeed.get(seed.id)?.confirmedInstantlyImportsFromSeed ?? 0) > 0,
+  );
+  const matureSupplyExhausted = !hasMatureImportValue && input.seeds.some((seed) =>
+    isSampleConfident(input.performanceBySeed.get(seed.id)),
+  ) && coreCandidates.length === 0;
   const hasProtectedSupply = coreCandidates.some(({ policy }) => policy.tier === "high" || policy.tier === "good");
   const hasMatureWeakSupply = coreCandidates.some(({ seed, policy }) => {
     const performance = input.performanceBySeed.get(seed.id);
@@ -324,7 +335,7 @@ export function planSeedBatches(input: {
       : false;
   });
   const economicPressureActive = Boolean(input.economicPressure && hasProtectedSupply && hasMatureWeakSupply);
-  const explorationTarget = explorationCandidates.length > 0
+  const explorationTarget = explorationCandidates.length > 0 && !matureSupplyExhausted
     ? Math.floor(target * (economicPressureActive
       ? SEED_ECONOMICS_POLICY.pressuredExplorationFraction
       : SEED_ECONOMICS_POLICY.explorationFraction))
@@ -347,6 +358,22 @@ export function planSeedBatches(input: {
   const selectedGeographies = new Set<string>();
   const coreTarget = target - explorationTarget;
   let selectedCoreCapacity = 0;
+  const matureImportCosts = new Set(matureImportCandidates.map(({ seed }) =>
+    input.performanceBySeed.get(seed.id)?.costPerConfirmedImport,
+  ));
+  const economicallyDistinctMatureSupply = matureImportCosts.size > 1;
+  for (const candidate of economicallyDistinctMatureSupply ? matureImportCandidates : []) {
+    if (selectedCore.length >= seedLimit || selectedCoreCapacity >= coreTarget) break;
+    if (selectedGeographies.has(candidate.seed.geography)) continue;
+    selectedCore.push(candidate);
+    selectedCoreIds.add(candidate.seed.id);
+    selectedGeographies.add(candidate.seed.geography);
+    selectedCoreCapacity += resolveApifyMaxResults({
+      requestedItems: candidate.policy.maxResults,
+      configuredMaxResults: providerMaximum,
+      batchCostLimitUsd,
+    });
+  }
   const coreTierOrder = economicPressureActive
     ? ["high", "good"] as const
     : ["high", "good", "marginal", "low"] as const;

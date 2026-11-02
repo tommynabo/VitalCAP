@@ -9,9 +9,11 @@ import { getApifyDailyEconomicTotals, getSeedEconomicPerformance, listSearchSeed
 import { getSystemHealthDiagnostics } from "@/infrastructure/neon/repositories/health-diagnostics";
 import { getRecoveryProbeDiscoveryJobs, getWatchdogWorkspaceSignals } from "@/infrastructure/neon/repositories/watchdog-signals";
 import { getAutopilotPacingState } from "@/infrastructure/neon/repositories/autopilot";
+import { ApifyClient } from "@/infrastructure/providers/maps/apify-client";
 import { getCurrentWorkspaceId, requireCurrentUser, UnauthorizedError } from "@/lib/auth/workspace";
 import { getMapsEnv, getSerperEnv } from "@/lib/config/env";
 import { resolveNeonVar } from "@/lib/config/env-utils";
+import { getDayBounds } from "@/lib/time/day-bounds";
 import { buildProviderHealthSnapshot, evaluateProviderHealth } from "@/services/discovery/provider-health";
 import { getWatchdogPausePredicates } from "@/services/autopilot/watchdog-pause-policy";
 import { scoreSeedEconomicPerformance } from "@/services/discovery/seed-economics";
@@ -117,6 +119,7 @@ function aggregateSeedEconomics(rows: readonly SeedEconomicPerformance[]) {
     instantlyImported: imports,
     instantlyImportRate: imports !== null && newRaw > 0 ? imports / newRaw : null,
     costPerConfirmedImport: imports !== null && imports > 0 ? providerCostUsd / imports : null,
+    costPerValidEmail: validEmail !== null && validEmail > 0 ? providerCostUsd / validEmail : null,
   };
 }
 
@@ -144,6 +147,7 @@ export async function GET() {
       timezone: autopilotSettings.timezone,
     }).from(autopilotSettings).where(eq(autopilotSettings.workspaceId, workspaceId)).limit(1);
     const timeZone = settings?.timezone ?? "Europe/Madrid";
+    const apifyAccountDay = getDayBounds("Europe/Madrid", diagnosticsNow);
     const [campaignRows, apifyRecovery, watchdogRows, discoveryRecoveryJobs, systemDiagnostics, serperRecovery, serperCostDiagnostics] = await Promise.all([
       listCampaigns(workspaceId),
       getApifyRecoverySnapshot(workspaceId),
@@ -163,6 +167,11 @@ export async function GET() {
         timeZone,
       }),
     ]);
+    const apifyAccountSpend = mapsEnv.MAPS_PROVIDER === "apify" && mapsEnv.APIFY_API_TOKEN
+      ? await new ApifyClient({ apiToken: mapsEnv.APIFY_API_TOKEN })
+        .getAccountCostSnapshot(apifyAccountDay.start, apifyAccountDay.end)
+        .catch(() => null)
+      : null;
     const watchdogSignals = watchdogRows[0] ?? null;
     const economicCampaigns = campaignRows.filter((campaign) => campaign.engineType === "maps_fast"
       || campaign.engineType === "maps_deep"
@@ -359,6 +368,11 @@ export async function GET() {
         targetMetric: settings.targetMetric,
       } : null,
       discoveryEconomics: {
+        apifyDailyCapUsd: mapsEnv.APIFY_DAILY_COST_LIMIT_USD,
+        apifyAccountSnapshotAvailable: apifyAccountSpend !== null,
+        apifyRealSpendTodayUsd: apifyAccountSpend?.actualSpendUsd ?? null,
+        apifyReservedSpendTodayUsd: apifyAccountSpend?.reservedSpendUsd ?? null,
+        apifyCommittedSpendTodayUsd: apifyAccountSpend?.committedSpendUsd ?? null,
         apifySpendTodayUsd: apifyDailyEconomics.spendUsd,
         apifyRunsToday: apifyDailyEconomics.runs,
         apifyItemsRequestedToday: apifyDailyEconomics.itemsRequested,
@@ -379,6 +393,8 @@ export async function GET() {
         validEmailToday: pacing.validEmailToday,
         instantlyImportedToday: pacing.instantlyImportedToday,
         costPerConfirmedImport,
+        serperDailyCapUsd: serperCostDiagnostics.dailyCapUsd,
+        serperSpendTodayUsd: serperCostDiagnostics.spendTodayUsd,
         lowNoveltyCostTodayUsd,
         highNoveltySeedsAvailable: seedEconomics.filter((item) => item.performance?.noveltyRate !== null
           && item.performance?.noveltyRate !== undefined
@@ -404,6 +420,10 @@ export async function GET() {
           validEmailRate: item.performance.validEmailRate,
           instantlyImportRate: item.performance.instantlyImportRate,
           costPerConfirmedImport: item.performance.costPerConfirmedImport,
+          costPerValidEmail: item.performance.outcomeAttributionComplete
+            && (item.performance.validEmailFromSeed ?? 0) > 0
+            ? item.performance.providerCostUsd / item.performance.validEmailFromSeed!
+            : null,
           tier: item.policy.tier,
           eligible: item.policy.eligible,
         }] : []),

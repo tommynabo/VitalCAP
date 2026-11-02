@@ -217,7 +217,7 @@ export function computeAutopilotPacing(input: PacingComputationInput): Autopilot
   const elapsedOperatingFraction = Math.min(1, Math.max(0, (nowMinutes - startMinutes) / windowLength));
   const expectedAchievedByNow = input.dailyTarget * elapsedOperatingFraction;
   const remainingTarget = Math.max(0, input.dailyTarget - input.targetAchievedToday);
-  const backlogCreditCap = Math.floor(Math.min(remainingTarget, expectedAchievedByNow * 0.1));
+  const backlogCreditCap = Math.min(remainingTarget, expectedAchievedByNow);
   const qualifiedContactabilityBacklog = Math.max(0, input.qualifiedContactabilityBacklog ?? 0);
   const contactabilityHistoricalSample = Math.max(0, input.contactabilityHistoricalSample ?? 0);
   const contactabilityImportYield = contactabilityHistoricalSample >= 20
