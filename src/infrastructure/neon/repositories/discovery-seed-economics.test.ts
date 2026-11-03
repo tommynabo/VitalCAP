@@ -13,6 +13,9 @@ describe("seed economic performance query", () => {
     expect(query.sql).toContain("run.metadata #>> '{ingestionAccounting,INSERTED_NEW_RAW}'");
     expect(query.sql).toContain("run.metadata #>> '{ingestionAccounting,DUPLICATE_EXISTING_RAW}'");
     expect(query.sql).toContain("outcome_attribution_complete");
+    expect(query.sql).toContain("outcome_attribution_coverage");
+    expect(query.sql).toMatch(/coverage\.attributable_raw::float \/ coverage\.total_raw >= \$\d+/);
+    expect(query.params).toContain(0.95);
     expect(query.sql).toContain("THEN COALESCE(outcomes.qualified_from_seed, 0)::int ELSE NULL END");
     expect(query.sql).toContain("run.items_returned");
     expect(query.sql).toContain("run.cost_usd");

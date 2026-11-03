@@ -6,7 +6,7 @@ import type { EngineType } from "@/domain/campaigns/types";
 import type { CandidateProcessingMetrics, RawCandidate, SearchSeed, SearchSeedRun } from "@/domain/discovery/types";
 import { getDayBounds } from "@/lib/time/day-bounds";
 import { recomputeSeedMetrics, recordSeedRun } from "@/services/discovery/geography-planner";
-import { calculateSeedNoveltyRate, type SeedEconomicPerformance } from "@/services/discovery/seed-economics";
+import { calculateSeedNoveltyRate, SEED_ECONOMICS_POLICY, type SeedEconomicPerformance } from "@/services/discovery/seed-economics";
 
 function toSearchSeed(row: typeof searchSeeds.$inferSelect): SearchSeed {
   return {
@@ -177,20 +177,27 @@ export function buildSeedEconomicPerformanceQuery(campaignId: string, engineType
       COALESCE(rollup.provider_cost_today_usd, 0)::float AS provider_cost_today_usd,
       COALESCE(coverage.total_raw, 0) > 0
         AND coverage.total_raw = coverage.attributable_raw AS outcome_attribution_complete,
+      CASE WHEN coverage.total_raw > 0
+        THEN coverage.attributable_raw::float / coverage.total_raw ELSE NULL END AS outcome_attribution_coverage,
       COALESCE(rollup.items_returned_today, 0)::int AS items_returned_today,
       COALESCE(rollup.new_raw_today, 0)::int AS new_raw_today,
       COALESCE(rollup.duplicates_today, 0)::int AS duplicates_today,
       COALESCE(rollup.zero_novelty_run_streak, 0)::int AS zero_novelty_run_streak,
       rollup.last_run_at,
-      CASE WHEN coverage.total_raw > 0 AND coverage.total_raw = coverage.attributable_raw
+      CASE WHEN coverage.total_raw > 0
+          AND coverage.attributable_raw::float / coverage.total_raw >= ${SEED_ECONOMICS_POLICY.minimumOutcomeAttributionCoverage}
         THEN COALESCE(outcomes.qualified_from_seed, 0)::int ELSE NULL END AS qualified_from_seed,
-      CASE WHEN coverage.total_raw > 0 AND coverage.total_raw = coverage.attributable_raw
+      CASE WHEN coverage.total_raw > 0
+          AND coverage.attributable_raw::float / coverage.total_raw >= ${SEED_ECONOMICS_POLICY.minimumOutcomeAttributionCoverage}
         THEN COALESCE(outcomes.website_from_seed, 0)::int ELSE NULL END AS website_from_seed,
-      CASE WHEN coverage.total_raw > 0 AND coverage.total_raw = coverage.attributable_raw
+      CASE WHEN coverage.total_raw > 0
+          AND coverage.attributable_raw::float / coverage.total_raw >= ${SEED_ECONOMICS_POLICY.minimumOutcomeAttributionCoverage}
         THEN COALESCE(outcomes.email_found_from_seed, 0)::int ELSE NULL END AS email_found_from_seed,
-      CASE WHEN coverage.total_raw > 0 AND coverage.total_raw = coverage.attributable_raw
+      CASE WHEN coverage.total_raw > 0
+          AND coverage.attributable_raw::float / coverage.total_raw >= ${SEED_ECONOMICS_POLICY.minimumOutcomeAttributionCoverage}
         THEN COALESCE(outcomes.valid_email_from_seed, 0)::int ELSE NULL END AS valid_email_from_seed,
-      CASE WHEN coverage.total_raw > 0 AND coverage.total_raw = coverage.attributable_raw
+      CASE WHEN coverage.total_raw > 0
+          AND coverage.attributable_raw::float / coverage.total_raw >= ${SEED_ECONOMICS_POLICY.minimumOutcomeAttributionCoverage}
         THEN COALESCE(outcomes.confirmed_imports_from_seed, 0)::int ELSE NULL END AS confirmed_imports_from_seed
     FROM search_seeds seed
     LEFT JOIN run_rollup rollup ON rollup.seed_id = seed.id
@@ -243,6 +250,9 @@ export async function getSeedEconomicPerformance(
       providerCostUsd,
       providerCostTodayUsd: economicCount(row.provider_cost_today_usd),
       outcomeAttributionComplete: row.outcome_attribution_complete === true,
+      outcomeAttributionCoverage: row.outcome_attribution_coverage === null || row.outcome_attribution_coverage === undefined
+        ? null
+        : Math.max(0, Math.min(1, Number(row.outcome_attribution_coverage))),
       itemsReturnedToday: economicCount(row.items_returned_today),
       newRawToday: economicCount(row.new_raw_today),
       duplicatesToday: economicCount(row.duplicates_today),

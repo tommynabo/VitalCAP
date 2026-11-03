@@ -135,6 +135,37 @@ describe("seed economics", () => {
     expect(oneRun.eligible).toBe(true);
   });
 
+  it("uses high-coverage outcomes for ranking without cooling incomplete zero-import seeds", () => {
+    const partialAttribution = performance({
+      outcomeAttributionComplete: false,
+      outcomeAttributionCoverage: 0.95,
+      confirmedInstantlyImportsFromSeed: 5,
+      confirmedImportYield: 0.2,
+      costPerConfirmedImport: 0.1,
+    });
+    const partialWithNoImports = performance({
+      outcomeAttributionComplete: false,
+      outcomeAttributionCoverage: 0.95,
+      confirmedInstantlyImportsFromSeed: 0,
+      confirmedImportYield: 0,
+      noveltyRate: 0,
+      zeroNoveltyRunStreak: 1,
+    });
+    const belowThreshold = scoreSeedEconomicPerformance(seed("below"), performance({
+      outcomeAttributionComplete: false,
+      outcomeAttributionCoverage: 0.9499,
+      confirmedInstantlyImportsFromSeed: 5,
+      confirmedImportYield: 0.2,
+      costPerConfirmedImport: 0.1,
+    }), now);
+    const partial = scoreSeedEconomicPerformance(seed("partial"), partialAttribution, now);
+    const partialNoImports = scoreSeedEconomicPerformance(seed("partial-no-imports"), partialWithNoImports, now);
+
+    expect(partial.priorityScore).toBeGreaterThan(belowThreshold.priorityScore);
+    expect(partialNoImports.eligible).toBe(true);
+    expect(partialNoImports.cooldownUntil).toBeNull();
+  });
+
   it("strongly limits repeated sub-10% novelty while retaining seeds with confirmed-import value", () => {
     const repeatedLowNovelty = performance({
       recentRuns: 3,

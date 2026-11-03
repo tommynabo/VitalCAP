@@ -8,6 +8,7 @@ import {
 export const SEED_ECONOMICS_POLICY = {
   minimumRuns: 3,
   minimumItems: 50,
+  minimumOutcomeAttributionCoverage: 0.95,
   zeroNoveltyRunsBeforeCooldown: 1,
   zeroNoveltyCooldownHours: 72,
   lowEconomicCooldownHours: 24,
@@ -42,6 +43,7 @@ export interface SeedEconomicPerformance {
   providerCostUsd: number;
   providerCostTodayUsd: number;
   outcomeAttributionComplete: boolean;
+  outcomeAttributionCoverage?: number | null;
   itemsReturnedToday: number;
   newRawToday: number;
   duplicatesToday: number;
@@ -107,7 +109,7 @@ function isSampleConfident(performance: SeedEconomicPerformance | undefined): bo
 }
 
 function downstreamYield(performance: SeedEconomicPerformance | undefined): number {
-  if (!performance) return 0.1;
+  if (!hasReliableOutcomeAttribution(performance)) return 0.1;
   if ((performance.confirmedInstantlyImportsFromSeed ?? 0) >= SEED_ECONOMICS_POLICY.minDownstreamOutcomesForYield) {
     return clampRate(performance.confirmedImportYield) ?? 0.1;
   }
@@ -122,7 +124,7 @@ function downstreamYield(performance: SeedEconomicPerformance | undefined): numb
 
 function hasMatureImportEconomics(performance: SeedEconomicPerformance | undefined): boolean {
   return Boolean(
-    performance?.outcomeAttributionComplete
+    hasReliableOutcomeAttribution(performance)
     && (performance.confirmedInstantlyImportsFromSeed ?? 0) >= SEED_ECONOMICS_POLICY.minConfirmedImportsForCostWeight
     && performance.costPerConfirmedImport !== null
     && performance.costPerConfirmedImport !== undefined
@@ -130,9 +132,19 @@ function hasMatureImportEconomics(performance: SeedEconomicPerformance | undefin
   );
 }
 
+export function hasReliableOutcomeAttribution(
+  performance: SeedEconomicPerformance | undefined,
+): performance is SeedEconomicPerformance {
+  return Boolean(performance && (
+    performance.outcomeAttributionComplete
+    || (performance.outcomeAttributionCoverage ?? 0) >= SEED_ECONOMICS_POLICY.minimumOutcomeAttributionCoverage
+  ));
+}
+
 function cooldownUntil(performance: SeedEconomicPerformance | undefined): Date | null {
   if (
     !performance?.lastRunAt
+    || performance.outcomeAttributionComplete !== true
     || performance.zeroNoveltyRunStreak < SEED_ECONOMICS_POLICY.zeroNoveltyRunsBeforeCooldown
     || (performance.confirmedInstantlyImportsFromSeed ?? 0) > 0
   ) return null;

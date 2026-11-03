@@ -16,7 +16,7 @@ import { resolveNeonVar } from "@/lib/config/env-utils";
 import { getDayBounds } from "@/lib/time/day-bounds";
 import { buildProviderHealthSnapshot, evaluateProviderHealth } from "@/services/discovery/provider-health";
 import { getWatchdogPausePredicates } from "@/services/autopilot/watchdog-pause-policy";
-import { scoreSeedEconomicPerformance } from "@/services/discovery/seed-economics";
+import { hasReliableOutcomeAttribution, scoreSeedEconomicPerformance } from "@/services/discovery/seed-economics";
 import type { SeedEconomicPerformance } from "@/services/discovery/seed-economics";
 import { sanitizeRecoveryJobError } from "./sanitize-recovery-error";
 import { SERPER_LINKEDIN_DAILY_EXPLORATION_LIMIT_USD } from "@/infrastructure/providers/serp/serper-provider";
@@ -88,10 +88,11 @@ function aggregateSeedEconomics(rows: readonly SeedEconomicPerformance[]) {
   const newRaw = total((row) => row.newRaw);
   const duplicates = total((row) => row.duplicates);
   const attributedRows = rows.filter((row) => row.outcomeAttributionComplete);
+  const reliableRows = rows.filter(hasReliableOutcomeAttribution);
   const attributedTotal = (selector: (row: SeedEconomicPerformance) => number | null) =>
-    attributedRows.reduce((sum, row) => sum + (selector(row) ?? 0), 0);
+    reliableRows.reduce((sum, row) => sum + (selector(row) ?? 0), 0);
   const outcomeTotal = (selector: (row: SeedEconomicPerformance) => number | null) =>
-    rows.length > 0 && attributedRows.length === rows.length ? attributedTotal(selector) : null;
+    rows.length > 0 && reliableRows.length === rows.length ? attributedTotal(selector) : null;
   const qualified = outcomeTotal((row) => row.qualifiedFromSeed);
   const website = outcomeTotal((row) => row.websiteFromSeed);
   const emailFound = outcomeTotal((row) => row.emailFoundFromSeed);
@@ -99,7 +100,8 @@ function aggregateSeedEconomics(rows: readonly SeedEconomicPerformance[]) {
   const imports = outcomeTotal((row) => row.confirmedInstantlyImportsFromSeed);
   return {
     outcomeAttributionCompleteSeeds: attributedRows.length,
-    outcomeAttributionUnknownSeeds: rows.length - attributedRows.length,
+    outcomeAttributionReliableSeeds: reliableRows.length,
+    outcomeAttributionUnknownSeeds: rows.length - reliableRows.length,
     recentRuns: total((row) => row.recentRuns),
     sampleSize: total((row) => row.sampleSize),
     itemsReturned: total((row) => row.itemsReturned),
@@ -414,13 +416,14 @@ export async function GET() {
           providerCostUsd: item.performance.providerCostUsd,
           costPerNewRaw: item.performance.costPerNewRaw,
           outcomeAttributionComplete: item.performance.outcomeAttributionComplete,
+          outcomeAttributionCoverage: item.performance.outcomeAttributionCoverage,
           qualifiedYield: item.performance.qualifiedYield,
           websiteRate: item.performance.websiteRate,
           emailFoundRate: item.performance.emailFoundRate,
           validEmailRate: item.performance.validEmailRate,
           instantlyImportRate: item.performance.instantlyImportRate,
           costPerConfirmedImport: item.performance.costPerConfirmedImport,
-          costPerValidEmail: item.performance.outcomeAttributionComplete
+          costPerValidEmail: hasReliableOutcomeAttribution(item.performance)
             && (item.performance.validEmailFromSeed ?? 0) > 0
             ? item.performance.providerCostUsd / item.performance.validEmailFromSeed!
             : null,
