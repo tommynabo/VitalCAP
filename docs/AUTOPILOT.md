@@ -1,19 +1,26 @@
 # Autopilot — Vitalcap Outreach OS
 
-Autopilot is the primary product (§0.2), not a manual search tool. This document covers the Phase 0 vocabulary/math already implemented and the Phase 2/5 scope not yet built.
+Autopilot is the primary product, not a manual search tool. This document describes the implemented runtime; the early Phase 0/2/5 descriptions below have been superseded by the production-wired runners and cron routes.
 
-## What exists today (Phase 0 + Phase 2)
+## Current Runtime
 
-- **Vocabulary** (`src/domain/autopilot/types.ts`): `ProviderHealthStatus`, `EngineTargetState`, `GlobalAutopilotState`, `RebalanceDecision`.
-- **Pure target math** (`src/lib/autopilot/targets.ts`, tested in `targets.test.ts`): `sumReady`, `sumSoftTargets`, `globalDeficit`, `engineDeficit`, `globalProgressPct`. Deliberately contains no rebalancing decision logic — the Phase 2 services below build on top of it, unmodified.
-- **`PacingService`** (`src/services/autopilot/pacing-service.ts`): `computePacing(dailyTarget, actualReady, now, window)` — linear-trajectory expected-ready calculation against an 8–20 Europe/Madrid operating window, returns `behind`/`ahead`/`on_track` plus a `suggestedBatchMultiplier`.
-- **`QuotaRebalancer`** (`src/services/autopilot/quota-rebalancer.ts`): `computeRebalancing(state, now)` — for each engine behind its soft target, splits the deficit proportionally by yield across up to 2 healthy, non-paused donor engines, producing `RebalanceDecision`s with human-readable reasons matching the master spec's worked example format.
-- **`QueueHealthService`** (`src/services/autopilot/queue-health-service.ts`): `evaluateQueueHealth(jobs, now)` — pending/processing/dead-letter counts, oldest-pending age, stuck-processing detection (lease expired without completion).
-- **`ProviderHealthService`** logic (`src/services/discovery/provider-health.ts`, built alongside the discovery engines): `evaluateProviderHealth(usage, thresholds)` — error-rate + quota-based health verdict (`healthy`/`degraded`/`paused`/`unknown`).
-- **`AutopilotScheduler`** (`src/services/autopilot/autopilot-scheduler.ts`): `runAutopilotTick(state, jobs, now)` — the single orchestration point composing pacing, rebalancing, Hybrid Fill decisions (`services/discovery/hybrid-fill-decision.ts`), and queue health into one tick result.
-- **`simulate-autopilot-day.ts`** (`src/services/autopilot/`): end-to-end demonstration harness — drives all five engines' mock providers, runs candidates through the shared processor with cross-engine dedup, forces a LinkedIn Owner provider outage to exercise the paused/degraded + Hybrid Fill fallback path, exercises job-queue retry/backoff/dead-letter, and produces a ready-buffer-days figure plus one scheduler tick against the resulting state. No real sending, no real provider calls.
-- **Seed state** (`src/lib/seed/dev-seed.ts`): reproduces the exact §0.4 worked example (Maps Fast 60 / Maps Deep 50 / Google SERP 63 / LinkedIn Owner 27 / Hybrid Fill 50 = 250), with LinkedIn Owner marked `degraded` and three sample `RebalanceDecision` log entries matching the master doc's example reasoning strings.
-- **UI** (`/` Dashboard and `/autopilot`): renders global progress, a KPI row (ready/target, progress %, soft target total, sent, ready buffer, system health), per-engine cards, and a shared `RebalanceActivity` rail component — all against seed data, read-only.
+- **Planning** (`src/infrastructure/jobs/runners/autopilot-runner.ts`): ticks workspaces, respects pause/emergency states, uses watchdog queue health for discovery backpressure, calculates workspace-wide target deficit, and accounts for in-flight work.
+- **Allocation and pacing**: distributes bounded work across eligible campaigns using provider health, yield, queue depth, seed exhaustion, spend caps, and economic pacing. `hybrid_fill` reroutes orders to available concrete engines; it is not an independent provider.
+- **Durable execution**: discovery, processing, and verification use Neon-backed jobs and separate cron runners. Discovery supports asynchronous provider ingestion; watchdog and provider-run jobs monitor stuck or degraded work.
+- **Email verification** (`src/infrastructure/jobs/runners/verification-runner.ts`): the protected verification cron enqueues eligible work, claims jobs, calls the configured provider, persists results through the Neon verification cache, and updates compliance/readiness state.
+- **Compliance**: suppression, verification status, channel eligibility, and persisted compliance decisions gate outreach readiness. Unknown eligibility is not treated as permission to send.
+- **Cron schedule**: `vercel.json` configures autopilot every 30 minutes, discovery every 15 minutes, processing and verification every 5/10 minutes respectively, plus provider polling and watchdog jobs.
+- **UI and controls**: the dashboard and Autopilot surfaces are connected to the operational API; emergency stop and workspace pause states are enforced by the runners.
+
+## Activation Limits
+
+- **Outbound is not live**: the latest Phase 8Q report states `DRY_RUN` and Instantly disabled. Do not infer real sending from discovery or readiness passing.
+- **Live verification remains an operational gate**: Phase 8Q reports the verification queue and adapter as passing but live provider verification as deferred. Run a controlled provider smoke test and confirm environment configuration before relying on live verification.
+- **Targets and spend caps are environment-specific**: Phase 8N's target of 5/day and raw cap of 15 were activation-test settings, not universal production defaults.
+
+## Documentation History
+
+The Phase 8Q audit's original gap list predates the current verification implementation: the runner, cron route, Neon queue, and database cache now exist. Treat that list as a historical snapshot; the Phase 8Q report still correctly records live verification as deferred.
 
 ## Target model rules (carried forward from `docs/MASTER_SPEC.md` §4)
 
@@ -22,11 +29,8 @@ Autopilot is the primary product (§0.2), not a manual search tool. This documen
 3. Distinguish funnel stages strictly: raw discovered → unique accounts → contacts found → verified contacts → outreach-ready → sent → delivered → replied → positive → meeting booked → won/lost. Raw discovery volume is never counted as progress (`engineDeficit`/`globalProgressPct` only look at `readyToday`, never `rawQueueDepth`).
 4. Maintain a 3–7 day ready buffer (250/day ⇒ 750–1750 outreach-ready prospects) so sending never depends on discovery being live at send time.
 
-## Not yet implemented (Phase 3 — real scheduling wiring)
+## Remaining Go-Live Work
 
-- Background job orchestration (Vercel Cron or equivalent) driving `runAutopilotTick` on a real schedule against a real Supabase-backed job table.
-- Persisted job/queue tables backing `DiscoveryJob`/`ProcessingJob` (`domain/discovery/types.ts`) — today's `job-queue.ts` is pure functions over `JobRecord[]`, ready for a repository to wrap.
-
-## Not yet implemented (Phase 5 — flagship UI)
-
-- Target allocation visualization, dead-letter/failure warnings drawer, manual override controls, historical trend charts.
+- Complete and record a live email-verification smoke test with the production provider configuration.
+- Keep outbound in dry-run until delivery credentials, compliance policy, and a deliberately bounded live canary are separately approved and verified.
+- Refresh phase reports when operational state changes so historical audits are not mistaken for current implementation status.
