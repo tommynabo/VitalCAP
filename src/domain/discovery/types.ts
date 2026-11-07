@@ -80,6 +80,7 @@ export interface JobRecord<TPayload = Record<string, unknown>> {
   lastError: string | null;
   createdAt: string;
   updatedAt: string;
+  watchdogRecovery?: boolean;
 }
 
 export type DiscoveryJob = JobRecord<{ engineType: EngineType; seedId?: string }>;

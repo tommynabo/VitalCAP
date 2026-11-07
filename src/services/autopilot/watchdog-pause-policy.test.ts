@@ -8,6 +8,7 @@ import {
   getDiscoveryBackpressureMultiplier,
   getProcessingHealthState,
   getWatchdogPausePredicates,
+  isWatchdogQueuePauseResumeEligible,
   WATCHDOG_QUEUE_PAUSE_REASON,
   WATCHDOG_RECONCILIATION_PAUSE_REASON,
 } from "./watchdog-pause-policy";
@@ -153,6 +154,23 @@ describe("evaluateWatchdogPause", () => {
     expect(evaluateWatchdogPause(paused, signals, now)).toEqual(clearState);
   });
 
+  it("does not re-pause a bounded recoverable backlog on the next watchdog tick", () => {
+    const paused = {
+      systemPaused: true,
+      systemPauseReason: WATCHDOG_QUEUE_PAUSE_REASON,
+      systemPausedAt: new Date("2025-01-01T01:00:00Z"),
+    };
+    const signals = {
+      ...clearSignals,
+      oldDueDiscovery: 4,
+      recoverableOldDueDiscovery: 4,
+    };
+    const resumed = evaluateWatchdogPause(paused, signals, now);
+
+    expect(resumed).toEqual(clearState);
+    expect(evaluateWatchdogPause(resumed, signals, new Date("2025-01-01T03:00:00Z"))).toEqual(clearState);
+  });
+
   it("keeps the watchdog pause for attempted, ineligible, or oversized discovery backlogs", () => {
     const paused = {
       systemPaused: true,
@@ -172,6 +190,17 @@ describe("evaluateWatchdogPause", () => {
     const manualPause = { systemPaused: true, systemPauseReason: "operator_hold", systemPausedAt: now };
 
     expect(evaluateWatchdogPause(manualPause, clearSignals, now)).toEqual(manualPause);
+  });
+
+  it("does not auto-resume a watchdog pause while emergency stop is active", () => {
+    const paused = {
+      systemPaused: true,
+      systemPauseReason: WATCHDOG_QUEUE_PAUSE_REASON,
+      systemPausedAt: now,
+    };
+
+    expect(evaluateWatchdogPause(paused, { ...clearSignals, emergencyStopped: true }, new Date("2025-01-01T03:00:00Z"))).toEqual(paused);
+    expect(isWatchdogQueuePauseResumeEligible({ ...clearSignals, emergencyStopped: true })).toBe(false);
   });
 });
 

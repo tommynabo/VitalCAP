@@ -167,6 +167,38 @@ describe("runAutopilotCronTick", () => {
     });
   });
 
+  it("does not add discovery work while old due recovery jobs are waiting to drain", async () => {
+    const now = new Date("2025-06-15T12:00:00Z");
+    mocks.getWatchdogWorkspaceSignals.mockResolvedValue([{
+      workspaceId: "workspace-1",
+      oldDueDiscovery: 4,
+      recoverableOldDueDiscovery: 4,
+      deferredDiscovery: 0,
+      oldProcessing: 0,
+      staleDiscoveryLocks: 0,
+      staleProcessingLocks: 0,
+      manualReconciliations: 0,
+      processingPending: 0,
+      processingCompletedRecent: 0,
+      processingFailedRecent: 0,
+      processingTimedOutRecent: 0,
+      processingEnqueuedRecent: 0,
+      emergencyStopped: false,
+      systemPaused: false,
+      systemPauseReason: null,
+      systemPausedAt: null,
+      oldestDueDiscoveryAgeMinutes: 45,
+      oldestProcessingAgeMinutes: null,
+      recoveryProbeDiscoveryCount: 0,
+    }]);
+
+    const result = await runAutopilotCronTick(now);
+
+    expect(result.ordersScheduled).toBe(0);
+    expect(mocks.enqueueDiscoveryOrdersWithinDailyRawCap).not.toHaveBeenCalled();
+    expect(mocks.getAutopilotPacingState).not.toHaveBeenCalled();
+  });
+
   it("avoids new discovery for a zero-import target covered by eligible paid backlog", async () => {
     const now = new Date("2025-06-15T12:00:00Z");
     const pacing = computeAutopilotPacing({

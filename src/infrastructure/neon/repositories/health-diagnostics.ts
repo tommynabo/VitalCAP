@@ -274,6 +274,7 @@ export async function getSystemHealthDiagnostics(input: {
           : "other";
   const queue = queueResult.rows[0] as Record<string, unknown> | undefined;
   const processingSignals = {
+    emergencyStopped: count(autopilot?.emergency_stopped_count) > 0,
     oldDueDiscovery: count(queue?.watchdog_old_due_discovery),
     recoverableOldDueDiscovery: count(queue?.recoverable_old_due_discovery),
     deferredDiscovery: count(queue?.deferred_discovery),

@@ -1,5 +1,23 @@
 import { describe, expect, it } from "vitest";
-import { getApifyDiscoveryBatchCap, getApifyStartupCostPatch, mergeApifyProviderRunMetadata } from "./discovery-runner";
+import { WATCHDOG_QUEUE_PAUSE_REASON } from "@/services/autopilot/watchdog-pause-policy";
+import { canExecuteWatchdogRecoveryJob, getApifyDiscoveryBatchCap, getApifyStartupCostPatch, mergeApifyProviderRunMetadata } from "./discovery-runner";
+
+describe("watchdog recovery discovery execution", () => {
+  const watchdogPausedSettings = {
+    enabled: true,
+    systemPaused: true,
+    systemPauseReason: WATCHDOG_QUEUE_PAUSE_REASON,
+    emergencyStopped: false,
+  };
+
+  it("executes only a marked recovery claim under the watchdog-owned pause", () => {
+    expect(canExecuteWatchdogRecoveryJob(watchdogPausedSettings, { watchdogRecovery: true })).toBe(true);
+    expect(canExecuteWatchdogRecoveryJob(watchdogPausedSettings, { watchdogRecovery: false })).toBe(false);
+    expect(canExecuteWatchdogRecoveryJob({ ...watchdogPausedSettings, systemPauseReason: "operator_hold" }, { watchdogRecovery: true })).toBe(false);
+    expect(canExecuteWatchdogRecoveryJob({ ...watchdogPausedSettings, emergencyStopped: true }, { watchdogRecovery: true })).toBe(false);
+    expect(canExecuteWatchdogRecoveryJob({ ...watchdogPausedSettings, enabled: false }, { watchdogRecovery: true })).toBe(false);
+  });
+});
 
 describe("Apify discovery reservation state", () => {
   it("preserves credential and configuration fingerprints through async provider updates", () => {

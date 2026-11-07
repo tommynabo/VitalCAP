@@ -19,6 +19,7 @@ export interface WatchdogQueueSignals {
   processingTimedOutRecent?: number;
   processingEnqueuedRecent?: number;
   recoverableOldDueDiscovery?: number;
+  emergencyStopped?: boolean;
 }
 
 export type ProcessingHealthState = "healthy" | "healthy_draining" | "stalled";
@@ -91,6 +92,8 @@ export function getWatchdogPausePredicates(signals: WatchdogQueueSignals): strin
 }
 
 export function isWatchdogQueuePauseResumeEligible(signals: WatchdogQueueSignals): boolean {
+  if (signals.emergencyStopped) return false;
+
   const pending = signals.processingPending ?? signals.oldProcessing;
   const completed = signals.processingCompletedRecent ?? 0;
   const failures = signals.processingFailedRecent ?? 0;
@@ -121,10 +124,10 @@ export function evaluateWatchdogPause(
   if (current.systemPaused && !WATCHDOG_OWNED_PAUSE_REASONS.has(current.systemPauseReason ?? "")) {
     return current;
   }
+  if (current.systemPaused && signals.emergencyStopped) return current;
 
   const queueUnhealthy = getWatchdogPausePredicates(signals).length > 0;
-  const queuePauseOwned = current.systemPaused && current.systemPauseReason === WATCHDOG_QUEUE_PAUSE_REASON;
-  const queueRecovered = queuePauseOwned && isWatchdogQueuePauseResumeEligible(signals);
+  const queueRecovered = isWatchdogQueuePauseResumeEligible(signals);
   const reason = signals.manualReconciliations > 0
     ? WATCHDOG_RECONCILIATION_PAUSE_REASON
     : queueUnhealthy && !queueRecovered

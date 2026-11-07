@@ -1,6 +1,7 @@
 import { PgDialect } from "drizzle-orm/pg-core";
 import { describe, expect, it } from "vitest";
 import { PROVIDER_DEFERRED_JOB_ERROR_PREFIX } from "@/domain/discovery/types";
+import { WATCHDOG_QUEUE_PAUSE_REASON } from "@/services/autopilot/watchdog-pause-policy";
 import { buildClaimJobsQuery, buildDeadLetterExpiredJobsQuery, buildDeferJobQuery, buildRecoveryFailureMetadataSql, buildRequeueProviderBlockedMapsFastJobsQuery, buildRequeueStaleLockedJobsQuery, buildRecoverableRawProcessingJobsQuery, buildWakeProviderDeferredMapsDiscoveryJobsQuery, ACCOUNT_DOMAIN_FIX_RECOVERY_VERSION, IDEMPOTENCY_PROBE_RECOVERY_VERSION, MAPS_FAST_TEMPORARY_PROVIDER_ERROR, MAX_RECOVERABLE_RAW_PROCESSING_ATTEMPTS, MAX_RECOVERABLE_RAW_PROCESSING_JOBS_PER_TICK } from "./job-queue";
 
 const dialect = new PgDialect();
@@ -12,6 +13,17 @@ function buildDiscoveryClaimQuery(batchSize = 1) {
     batchSize,
     campaignId: "campaign-1",
     requireAutopilot: true,
+    leaseMs: 5 * 60 * 1000,
+  }, claimTime));
+}
+
+function buildWatchdogRecoveryDiscoveryClaimQuery(batchSize = 100) {
+  return dialect.sqlToQuery(buildClaimJobsQuery("discovery_jobs", {
+    workerId: "worker-1",
+    batchSize,
+    campaignId: "campaign-1",
+    requireAutopilot: true,
+    allowWatchdogRecovery: true,
     leaseMs: 5 * 60 * 1000,
   }, claimTime));
 }
@@ -125,6 +137,23 @@ describe("job queue SQL builders", () => {
     expect(processingSql).not.toContain("aps.system_paused");
     expect(processingSql).toContain("aps.emergency_stopped = false");
     expect(processingSql).toMatch(/j\.next_attempt_at IS NULL OR j\.next_attempt_at <= \$\d+::timestamptz/);
+  });
+
+  it("allows only a five-job bounded drain for pristine old jobs under a watchdog-owned pause", () => {
+    const query = buildWatchdogRecoveryDiscoveryClaimQuery();
+    const limitParameter = Number(query.sql.match(/LIMIT \$(\d+)/)?.[1]);
+
+    expect(query.sql).toContain("aps.system_paused = true");
+    expect(query.sql).toContain("aps.system_pause_reason =");
+    expect(query.sql).toContain("aps.emergency_stopped = false");
+    expect(query.sql).toContain("j.status = 'pending'");
+    expect(query.sql).toContain("j.attempt_count = 0");
+    expect(query.sql).toContain("j.last_error IS NULL");
+    expect(query.sql).toContain("j.created_at < NOW() - INTERVAL '30 minutes'");
+    expect(query.sql).toContain("COALESCE(j.payload->>'origin', '') <> 'recovery_probe'");
+    expect(query.sql).toContain("RETURNING job.*, claimable.watchdog_recovery");
+    expect(query.params).toContain(WATCHDOG_QUEUE_PAUSE_REASON);
+    expect(query.params[limitParameter - 1]).toBe(5);
   });
 
   it("limits a single-job discovery claim to at most one row", () => {

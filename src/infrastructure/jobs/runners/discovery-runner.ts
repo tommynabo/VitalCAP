@@ -1,5 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { EngineType } from "@/domain/campaigns/types";
+import type { JobRecord } from "@/domain/discovery/types";
+import type { AutopilotSettings } from "@/domain/autopilot/types";
 import { getProviderFailureRetryAt, ProviderBudgetExceededError, ProviderConfigurationError, ProviderFailureError } from "@/domain/providers/errors";
 import { getCampaignById, listActiveCampaigns } from "@/infrastructure/neon/repositories/campaigns";
 import { listWorkspaceIds } from "@/infrastructure/neon/repositories/workspace";
@@ -25,6 +27,7 @@ import {
 import { getApifyRecoverySnapshot, getApifyReservationFailureDetails, getLatestProviderEconomicPacingStates, getRecentProviderUsage, getSerperRecoveryState, getTodaySpendUsd, recordProviderRun, reserveApifyProviderRun, updateProviderRun } from "@/infrastructure/neon/repositories/provider-runs";
 import { getAutopilotSettings } from "@/infrastructure/neon/repositories/autopilot";
 import { getEffectiveAutopilotState } from "@/domain/autopilot/types";
+import { WATCHDOG_QUEUE_PAUSE_REASON } from "@/services/autopilot/watchdog-pause-policy";
 import { buildCampaignSeedCatalog, buildMapsSeedCatalog, buildSerpSeedCatalog, LINKEDIN_OWNER_ROLE_QUERIES, ICP_CATEGORY_TERMS } from "@/services/discovery/spain-search-catalog";
 import { getNicheId } from "@/services/discovery/niche-profiles";
 import { createDiscoveryEngine } from "./engine-factory";
@@ -91,6 +94,17 @@ interface DiscoveryJobPayload {
 }
 
 type PreReservationStage = "bootstrap" | "load_seeds" | "plan_batch";
+
+export function canExecuteWatchdogRecoveryJob(
+  settings: Pick<AutopilotSettings, "enabled" | "systemPaused" | "systemPauseReason" | "emergencyStopped">,
+  job: Pick<JobRecord, "watchdogRecovery">,
+): boolean {
+  return job.watchdogRecovery === true
+    && settings.enabled
+    && settings.systemPaused
+    && settings.systemPauseReason === WATCHDOG_QUEUE_PAUSE_REASON
+    && !settings.emergencyStopped;
+}
 
 function getErrorClass(error: unknown): string {
   return error instanceof Error ? error.constructor.name : typeof error;
@@ -229,7 +243,7 @@ interface DiscoveryHandoffCounters {
 }
 
 async function executeDiscoveryJob(
-  job: { id: string; campaignId: string; payload: DiscoveryJobPayload },
+  job: JobRecord<DiscoveryJobPayload>,
   counters: DiscoveryHandoffCounters,
 ): Promise<number> {
   if (job.payload.origin === "recovery_probe") {
@@ -264,7 +278,7 @@ async function executeDiscoveryJob(
   });
   const settings = await runPreProviderStage(job, "load_autopilot_settings", () => getAutopilotSettings(campaign.workspaceId));
   const autopilotState = await runPreProviderStage(job, "resolve_autopilot_state", () => getEffectiveAutopilotState(settings));
-  if (autopilotState !== "running") return 0;
+  if (autopilotState !== "running" && !canExecuteWatchdogRecoveryJob(settings, job)) return 0;
 
   const provider = job.payload.engineType === "maps_fast" || job.payload.engineType === "maps_deep" ? "apify" : "serper";
   let executionEconomicPaceState = job.payload.economicPaceState;
@@ -898,7 +912,7 @@ export async function runDiscoveryCronTick(maxJobsPerTick: number, now: Date = n
   let pausedWorkspaces = 0;
   let emergencyStoppedWorkspaces = 0;
 
-  const jobs = await claimDiscoveryJobs<DiscoveryJobPayload>({ workerId, batchSize: maxJobsPerTick, now });
+  const jobs = await claimDiscoveryJobs<DiscoveryJobPayload>({ workerId, batchSize: maxJobsPerTick, now, allowWatchdogRecovery: true });
   for (const job of jobs) {
     jobsClaimed += 1;
     try {

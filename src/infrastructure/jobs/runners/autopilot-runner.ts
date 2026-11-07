@@ -115,6 +115,16 @@ export async function runAutopilotCronTick(now: Date = new Date()): Promise<Auto
       watchdogPauseRequired: processingHealthState === "stalled",
     });
 
+    if (processingSignals && processingSignals.oldDueDiscovery > 0) {
+      logEvent("info", "autopilot.discovery_backlog_drain", {
+        correlationId: workspaceId,
+        workspaceId,
+        oldDueDiscovery: processingSignals.oldDueDiscovery,
+        recoverableOldDueDiscovery: processingSignals.recoverableOldDueDiscovery,
+      });
+      continue;
+    }
+
     const campaigns = await listAutopilotEnabledCampaigns(workspaceId);
     if (!campaigns.length) continue;
     for (const campaign of campaigns) {

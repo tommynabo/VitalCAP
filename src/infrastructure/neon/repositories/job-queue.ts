@@ -6,6 +6,7 @@ import { deadLetterJobs } from "../schema/outreach";
 import type { JobRecord, JobStatus } from "@/domain/discovery/types";
 import { ProviderFailureError } from "@/domain/providers/errors";
 import { computeBackoffMs, isPermanentError, PERMANENT_JOB_ERROR_PATTERN } from "@/infrastructure/jobs/job-queue";
+import { MAX_WATCHDOG_RECOVERY_DISCOVERY_JOBS, WATCHDOG_QUEUE_PAUSE_REASON } from "@/services/autopilot/watchdog-pause-policy";
 
 export const JOB_LEASE_MS = 5 * 60 * 1000;
 const MAX_CLAIM_BATCH_SIZE = 100;
@@ -527,6 +528,7 @@ interface JobRow {
   last_error: string | null;
   created_at: string;
   updated_at: string;
+  watchdog_recovery?: boolean;
 }
 
 interface FailableJob {
@@ -554,6 +556,7 @@ function toJobRecord<T>(row: JobRow): JobRecord<T> {
     lastError: row.last_error,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+    ...(row.watchdog_recovery === true ? { watchdogRecovery: true } : {}),
   };
 }
 
@@ -578,6 +581,7 @@ async function claim<T>(
   batchSize: number,
   campaignId?: string,
   requireAutopilot = true,
+  allowWatchdogRecovery = false,
 ): Promise<JobRecord<T>[]> {
   const db = getDb();
   const result = await db.execute(buildClaimJobsQuery(table, {
@@ -585,6 +589,7 @@ async function claim<T>(
     batchSize,
     campaignId,
     requireAutopilot,
+    allowWatchdogRecovery,
     now,
     leaseMs,
   }, now));
@@ -598,22 +603,44 @@ export function buildClaimJobsQuery(table: QueueTable, input: ClaimJobsInput, no
   const leaseSeconds = Math.max(1, Math.ceil((input.leaseMs ?? JOB_LEASE_MS) / 1000));
   const boundedBatchSize = normalizeBatchSize(input.batchSize);
   const requireAutopilot = input.requireAutopilot ?? true;
+  const allowWatchdogRecovery = table === "discovery_jobs"
+    && requireAutopilot
+    && input.allowWatchdogRecovery === true;
+  const claimBatchSize = allowWatchdogRecovery
+    ? Math.min(boundedBatchSize, MAX_WATCHDOG_RECOVERY_DISCOVERY_JOBS)
+    : boundedBatchSize;
+  const watchdogRecoveryEligible = allowWatchdogRecovery
+    ? sql`aps.system_paused = true
+        AND aps.system_pause_reason = ${WATCHDOG_QUEUE_PAUSE_REASON}
+        AND aps.enabled = true
+        AND aps.emergency_stopped = false
+        AND c.autopilot_enabled = true
+        AND j.status = 'pending'
+        AND j.attempt_count = 0
+        AND j.last_error IS NULL
+        AND j.created_at < NOW() - INTERVAL '30 minutes'
+        AND COALESCE(j.payload->>'origin', '') <> 'recovery_probe'`
+    : sql`false`;
   const workerId = input.workerId;
 
   return table === "discovery_jobs"
     ? sql`
           WITH claimable AS (
-            SELECT j.id
+            SELECT j.id, (${watchdogRecoveryEligible}) AS watchdog_recovery
             FROM discovery_jobs j
             JOIN campaigns c ON c.id = j.campaign_id
             LEFT JOIN autopilot_settings aps ON aps.workspace_id = c.workspace_id
             WHERE c.status = 'active'
-              AND (${requireAutopilot} = false OR (
-                c.autopilot_enabled = true
-                AND aps.enabled = true
-                AND aps.emergency_stopped = false
-                AND aps.system_paused = false
-              ))
+              AND (
+                ${requireAutopilot} = false
+                OR (
+                  c.autopilot_enabled = true
+                  AND aps.enabled = true
+                  AND aps.emergency_stopped = false
+                  AND aps.system_paused = false
+                )
+                OR (${watchdogRecoveryEligible})
+              )
               AND (${inputCampaignId}::uuid IS NULL OR j.campaign_id = ${inputCampaignId}::uuid)
               AND j.status IN ('pending', 'processing')
               AND (j.next_attempt_at IS NULL OR j.next_attempt_at <= ${nowIso}::timestamptz)
@@ -629,7 +656,7 @@ export function buildClaimJobsQuery(table: QueueTable, input: ClaimJobsInput, no
               j.created_at ASC,
               j.id ASC
             FOR UPDATE OF j SKIP LOCKED
-            LIMIT ${boundedBatchSize}
+            LIMIT ${claimBatchSize}
           )
           UPDATE discovery_jobs AS job
           SET status = 'processing',
@@ -639,7 +666,7 @@ export function buildClaimJobsQuery(table: QueueTable, input: ClaimJobsInput, no
               updated_at = ${nowIso}::timestamptz
           FROM claimable
           WHERE job.id = claimable.id
-          RETURNING job.*;
+          RETURNING job.*, claimable.watchdog_recovery;
         `
     : sql`
           WITH claimable AS (
@@ -682,12 +709,13 @@ export interface ClaimJobsInput {
   batchSize: number;
   campaignId?: string;
   requireAutopilot?: boolean;
+  allowWatchdogRecovery?: boolean;
   now?: Date;
   leaseMs?: number;
 }
 
 export async function claimDiscoveryJobs<T = Record<string, unknown>>(input: ClaimJobsInput): Promise<JobRecord<T>[]> {
-  return claim<T>("discovery_jobs", input.workerId, input.now ?? new Date(), input.leaseMs ?? JOB_LEASE_MS, input.batchSize, input.campaignId, input.requireAutopilot ?? true);
+  return claim<T>("discovery_jobs", input.workerId, input.now ?? new Date(), input.leaseMs ?? JOB_LEASE_MS, input.batchSize, input.campaignId, input.requireAutopilot ?? true, input.allowWatchdogRecovery ?? false);
 }
 
 export async function claimProcessingJobs<T = Record<string, unknown>>(input: ClaimJobsInput): Promise<JobRecord<T>[]> {

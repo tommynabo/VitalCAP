@@ -39,6 +39,7 @@ describe("watchdog processing-health signal SQL", () => {
     expect(query.sql).toContain("AS processing_timed_out_recent");
     expect(query.sql).toContain("AS processing_enqueued_recent");
     expect(query.sql).toContain("AS recoverable_old_due_discovery");
+    expect(query.sql).toContain("aps.emergency_stopped");
     expect(query.sql).toContain("dj.attempt_count = 0");
     expect(query.sql).toContain("dj.attempt_count < dj.max_attempts");
     expect(query.sql).toContain("recovery_settings.emergency_stopped = false");

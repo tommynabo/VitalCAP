@@ -6,6 +6,7 @@ import { JOB_LEASE_MS, STALE_JOB_LOCK_THRESHOLD_MS } from "./job-queue";
 
 export interface WatchdogWorkspaceSignals extends WatchdogQueueSignals {
   workspaceId: string;
+  emergencyStopped: boolean;
   systemPaused: boolean;
   systemPauseReason: string | null;
   systemPausedAt: Date | null;
@@ -233,7 +234,8 @@ export function buildWatchdogWorkspaceSignalsQuery(workspaceId?: string) {
       END::float AS oldest_processing_age_minutes,
       aps.system_paused,
       aps.system_pause_reason,
-      aps.system_paused_at
+      aps.system_paused_at,
+      aps.emergency_stopped
     FROM workspace_health wh
     JOIN autopilot_settings aps ON aps.workspace_id = wh.workspace_id AND aps.enabled = true
   `;
@@ -266,6 +268,7 @@ export async function getWatchdogWorkspaceSignals(workspaceId?: string): Promise
     staleDiscoveryLocks: toCount(row.stale_discovery_locks),
     staleProcessingLocks: toCount(row.stale_processing_locks),
     manualReconciliations: toCount(row.provider_reconciliations),
+    emergencyStopped: row.emergency_stopped === true,
     systemPaused: row.system_paused === true,
     systemPauseReason: typeof row.system_pause_reason === "string" ? row.system_pause_reason : null,
     systemPausedAt: row.system_paused_at ? new Date(String(row.system_paused_at)) : null,
