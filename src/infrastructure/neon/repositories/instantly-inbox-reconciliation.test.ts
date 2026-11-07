@@ -29,7 +29,11 @@ vi.mock("@/infrastructure/neon/db", () => {
   return { getDb: mocks.getDb, schema };
 });
 
-const { listConfiguredInstantlyCampaigns, dedupeConfiguredInstantlyCampaigns } = await import("./instantly-inbox-reconciliation");
+const {
+  dedupeConfiguredInstantlyCampaigns,
+  listConfiguredInstantlyCampaigns,
+  listSetterReplyReadbackCandidates,
+} = await import("./instantly-inbox-reconciliation");
 
 function database() {
   const builder = (table?: { __table?: string }) => {
@@ -37,6 +41,8 @@ function database() {
     const query = {
       from(value: { __table: string }) { currentTable = value.__table; return query; },
       where() { return query; },
+      innerJoin() { return query; },
+      limit() { return query; },
       then(resolve: (value: unknown[]) => unknown, reject?: (reason: unknown) => unknown) {
         try {
           return Promise.resolve(resolve(mocks.rows[currentTable ?? ""] ?? []));
@@ -87,5 +93,58 @@ describe("Instantly inbox campaign discovery", () => {
 
     expect(targets).toEqual([{ providerCampaignId: "provider-target", workspaceId: "workspace-1" }]);
     expect(targets[0]).not.toHaveProperty("campaignId");
+  });
+});
+
+describe("Setter reply readback timestamp mapping", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.rows = {};
+    mocks.getDb.mockReturnValue(database());
+  });
+
+  it.each([
+    [new Date("2026-10-22T11:00:00.000Z"), "2026-10-22T11:00:00.000Z"],
+    ["2026-10-22T11:00:00.000Z", "2026-10-22T11:00:00.000Z"],
+  ])("normalizes valid persisted timestamp %s", async (attemptedAt, expected) => {
+    mocks.rows.conversationMessages = [{
+      workspaceId: "workspace-1",
+      campaignId: "campaign-1",
+      conversationId: "conversation-1",
+      providerCampaignId: "provider-campaign-1",
+      providerMessageId: null,
+      email: "lead@example.es",
+      emailAccount: null,
+      providerThreadId: null,
+      replyToUuid: null,
+      subject: "",
+      finalText: "Approved reply",
+      attemptedAt,
+      setterDraftId: "draft-1",
+    }];
+
+    await expect(listSetterReplyReadbackCandidates({ staleSendingBefore: new Date(), limit: 10 }))
+      .resolves.toMatchObject([{ attemptedAt: expected }]);
+  });
+
+  it("rejects an invalid persisted timestamp instead of hiding it", async () => {
+    mocks.rows.conversationMessages = [{
+      workspaceId: "workspace-1",
+      campaignId: "campaign-1",
+      conversationId: "conversation-1",
+      providerCampaignId: "provider-campaign-1",
+      providerMessageId: null,
+      email: "lead@example.es",
+      emailAccount: null,
+      providerThreadId: null,
+      replyToUuid: null,
+      subject: "",
+      finalText: "Approved reply",
+      attemptedAt: "not-a-timestamp",
+      setterDraftId: "draft-1",
+    }];
+
+    await expect(listSetterReplyReadbackCandidates({ staleSendingBefore: new Date(), limit: 10 }))
+      .rejects.toThrow("Invalid attemptedAt timestamp");
   });
 });

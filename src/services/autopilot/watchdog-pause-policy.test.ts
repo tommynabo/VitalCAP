@@ -138,6 +138,36 @@ describe("evaluateWatchdogPause", () => {
     expect(state).toEqual(clearState);
   });
 
+  it("resumes for a bounded backlog of untouched, eligible discovery jobs", () => {
+    const paused = {
+      systemPaused: true,
+      systemPauseReason: WATCHDOG_QUEUE_PAUSE_REASON,
+      systemPausedAt: new Date("2025-01-01T01:00:00Z"),
+    };
+    const signals = {
+      ...clearSignals,
+      oldDueDiscovery: 4,
+      recoverableOldDueDiscovery: 4,
+    };
+
+    expect(evaluateWatchdogPause(paused, signals, now)).toEqual(clearState);
+  });
+
+  it("keeps the watchdog pause for attempted, ineligible, or oversized discovery backlogs", () => {
+    const paused = {
+      systemPaused: true,
+      systemPauseReason: WATCHDOG_QUEUE_PAUSE_REASON,
+      systemPausedAt: new Date("2025-01-01T01:00:00Z"),
+    };
+
+    for (const signals of [
+      { ...clearSignals, oldDueDiscovery: 1, recoverableOldDueDiscovery: 0 },
+      { ...clearSignals, oldDueDiscovery: 6, recoverableOldDueDiscovery: 6 },
+    ]) {
+      expect(evaluateWatchdogPause(paused, signals, now)).toEqual(paused);
+    }
+  });
+
   it("preserves pauses owned by another safety control", () => {
     const manualPause = { systemPaused: true, systemPauseReason: "operator_hold", systemPausedAt: now };
 

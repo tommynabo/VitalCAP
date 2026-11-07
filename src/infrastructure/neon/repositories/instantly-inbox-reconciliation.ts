@@ -39,6 +39,18 @@ export interface SetterReplyReadbackCandidate {
 
 const ACTIVE_IMPORT_STATUSES = ["instantly_added", "skipped_existing"] as const;
 
+function normalizeAttemptedAt(value: unknown): string {
+  const timestamp = value instanceof Date
+    ? value
+    : typeof value === "string"
+      ? new Date(value)
+      : null;
+  if (!timestamp || !Number.isFinite(timestamp.getTime())) {
+    throw new TypeError("Invalid attemptedAt timestamp returned by inbox reconciliation query");
+  }
+  return timestamp.toISOString();
+}
+
 export function dedupeConfiguredInstantlyCampaigns(
   ...sources: ConfiguredInstantlyCampaign[][]
 ): ConfiguredInstantlyCampaign[] {
@@ -212,7 +224,7 @@ export async function listSetterReplyReadbackCandidates(input: {
     replyToUuid: sql<string | null>`${schema.conversationMessages.metadata}->>'replyToUuid'`,
     subject: sql<string | null>`${schema.conversationMessages.metadata}->>'subject'`,
     finalText: schema.setterFeedback.finalText,
-    attemptedAt: sql<Date>`coalesce(
+    attemptedAt: sql<unknown>`coalesce(
       nullif(${schema.conversationMessages.metadata}->'replyDelivery'->>'attemptedAt', '')::timestamptz,
       nullif(${schema.conversationMessages.metadata}->'replyDelivery'->>'failedAt', '')::timestamptz,
       ${schema.conversations.updatedAt}
@@ -236,7 +248,7 @@ export async function listSetterReplyReadbackCandidates(input: {
       replyToUuid: row.replyToUuid,
       subject: row.subject ?? "",
       finalText: row.finalText,
-      attemptedAt: row.attemptedAt.toISOString(),
+      attemptedAt: normalizeAttemptedAt(row.attemptedAt),
       setterDraftId: row.setterDraftId,
     }];
   });

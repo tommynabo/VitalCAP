@@ -160,6 +160,22 @@ export async function getSystemHealthDiagnostics(input: {
             AND LEFT(COALESCE(job.last_error, ''), ${PROVIDER_DEFERRED_JOB_ERROR_PREFIX.length}) <> ${PROVIDER_DEFERRED_JOB_ERROR_PREFIX})::int AS due_pending_discovery,
         (SELECT COUNT(*) FROM discovery_jobs job JOIN campaigns campaign ON campaign.id = job.campaign_id
           WHERE job.status = 'pending' AND campaign.workspace_id = ${input.workspaceId}::uuid
+            AND (job.next_attempt_at IS NULL OR job.next_attempt_at <= ${input.now.toISOString()}::timestamptz)
+            AND LEFT(COALESCE(job.last_error, ''), ${PROVIDER_DEFERRED_JOB_ERROR_PREFIX.length}) <> ${PROVIDER_DEFERRED_JOB_ERROR_PREFIX}
+            AND COALESCE(job.payload->>'origin', '') <> 'recovery_probe'
+            AND job.created_at < ${new Date(input.now.getTime() - 30 * 60_000).toISOString()}::timestamptz)::int AS watchdog_old_due_discovery,
+        (SELECT COUNT(*) FROM discovery_jobs job JOIN campaigns campaign ON campaign.id = job.campaign_id
+          JOIN autopilot_settings settings ON settings.workspace_id = campaign.workspace_id
+          WHERE job.status = 'pending' AND campaign.workspace_id = ${input.workspaceId}::uuid
+            AND (job.next_attempt_at IS NULL OR job.next_attempt_at <= ${input.now.toISOString()}::timestamptz)
+            AND LEFT(COALESCE(job.last_error, ''), ${PROVIDER_DEFERRED_JOB_ERROR_PREFIX.length}) <> ${PROVIDER_DEFERRED_JOB_ERROR_PREFIX}
+            AND COALESCE(job.payload->>'origin', '') <> 'recovery_probe'
+            AND job.created_at < ${new Date(input.now.getTime() - 30 * 60_000).toISOString()}::timestamptz
+            AND job.attempt_count = 0 AND job.attempt_count < job.max_attempts AND job.last_error IS NULL
+            AND campaign.status = 'active' AND campaign.autopilot_enabled = true
+            AND settings.enabled = true AND settings.emergency_stopped = false)::int AS recoverable_old_due_discovery,
+        (SELECT COUNT(*) FROM discovery_jobs job JOIN campaigns campaign ON campaign.id = job.campaign_id
+          WHERE job.status = 'pending' AND campaign.workspace_id = ${input.workspaceId}::uuid
             AND (job.next_attempt_at > ${input.now.toISOString()}::timestamptz
               OR LEFT(COALESCE(job.last_error, ''), ${PROVIDER_DEFERRED_JOB_ERROR_PREFIX.length}) = ${PROVIDER_DEFERRED_JOB_ERROR_PREFIX}))::int AS deferred_discovery,
         (SELECT COUNT(*) FROM discovery_jobs job JOIN campaigns campaign ON campaign.id = job.campaign_id
@@ -258,7 +274,8 @@ export async function getSystemHealthDiagnostics(input: {
           : "other";
   const queue = queueResult.rows[0] as Record<string, unknown> | undefined;
   const processingSignals = {
-    oldDueDiscovery: count(queue?.due_pending_discovery),
+    oldDueDiscovery: count(queue?.watchdog_old_due_discovery),
+    recoverableOldDueDiscovery: count(queue?.recoverable_old_due_discovery),
     deferredDiscovery: count(queue?.deferred_discovery),
     oldProcessing: count(queue?.processing_old_pending),
     staleDiscoveryLocks: count(queue?.discovery_stale_locks),

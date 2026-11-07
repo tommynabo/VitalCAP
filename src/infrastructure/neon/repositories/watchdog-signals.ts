@@ -12,6 +12,7 @@ export interface WatchdogWorkspaceSignals extends WatchdogQueueSignals {
   oldestDueDiscoveryAgeMinutes: number | null;
   oldestProcessingAgeMinutes: number | null;
   recoveryProbeDiscoveryCount: number;
+  recoverableOldDueDiscovery: number;
 }
 
 export interface RecoveryProbeDiscoveryJobDiagnostic {
@@ -163,6 +164,18 @@ export function buildWatchdogWorkspaceSignalsQuery(workspaceId?: string) {
     discovery_health AS (
       SELECT c.workspace_id,
         COUNT(*) FILTER (WHERE ${oldDueDiscovery})::int AS old_due_discovery,
+        COUNT(*) FILTER (WHERE ${oldDueDiscovery}
+          AND dj.attempt_count = 0
+          AND dj.attempt_count < dj.max_attempts
+          AND dj.last_error IS NULL
+          AND c.status = 'active'
+          AND c.autopilot_enabled = true
+          AND EXISTS (
+            SELECT 1 FROM autopilot_settings recovery_settings
+            WHERE recovery_settings.workspace_id = c.workspace_id
+              AND recovery_settings.enabled = true
+              AND recovery_settings.emergency_stopped = false
+          ))::int AS recoverable_old_due_discovery,
         MIN(dj.created_at) FILTER (WHERE ${oldDueDiscovery}) AS oldest_due_discovery_at,
         COUNT(*) FILTER (WHERE ${providerDeferredDiscovery})::int AS deferred_discovery,
         COUNT(*) FILTER (WHERE ${recoveryProbeDiscovery})::int AS recovery_probe_discovery,
@@ -192,6 +205,7 @@ export function buildWatchdogWorkspaceSignalsQuery(workspaceId?: string) {
     workspace_health AS (
       SELECT w.id AS workspace_id,
         COALESCE(dh.old_due_discovery, 0)::int AS old_due_discovery,
+        COALESCE(dh.recoverable_old_due_discovery, 0)::int AS recoverable_old_due_discovery,
         dh.oldest_due_discovery_at,
         COALESCE(dh.deferred_discovery, 0)::int AS deferred_discovery,
         COALESCE(dh.recovery_probe_discovery, 0)::int AS recovery_probe_discovery,
@@ -241,6 +255,7 @@ export async function getWatchdogWorkspaceSignals(workspaceId?: string): Promise
   return (result.rows as Array<Record<string, unknown>>).map((row) => ({
     workspaceId: String(row.workspace_id),
     oldDueDiscovery: toCount(row.old_due_discovery),
+    recoverableOldDueDiscovery: toCount(row.recoverable_old_due_discovery),
     deferredDiscovery: toCount(row.deferred_discovery),
     oldProcessing: toCount(row.old_processing),
     processingPending: toCount(row.processing_pending),

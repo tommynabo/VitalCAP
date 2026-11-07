@@ -18,12 +18,14 @@ export interface WatchdogQueueSignals {
   processingFailedRecent?: number;
   processingTimedOutRecent?: number;
   processingEnqueuedRecent?: number;
+  recoverableOldDueDiscovery?: number;
 }
 
 export type ProcessingHealthState = "healthy" | "healthy_draining" | "stalled";
 
 export const PROCESSING_BASE_MAX_JOBS_PER_TICK = 8;
 export const PROCESSING_HARD_MAX_JOBS_PER_TICK = 16;
+export const MAX_WATCHDOG_RECOVERY_DISCOVERY_JOBS = 5;
 const PROCESSING_REPEAT_FAILURE_THRESHOLD = 3;
 const PROCESSING_REPEAT_TIMEOUT_THRESHOLD = 2;
 const PROCESSING_UNCONTROLLED_GROWTH_THRESHOLD = 32;
@@ -97,7 +99,11 @@ export function isWatchdogQueuePauseResumeEligible(signals: WatchdogQueueSignals
   const growingUncontrollably = pending > 100
     && enqueued - completed >= PROCESSING_UNCONTROLLED_GROWTH_THRESHOLD;
 
-  return signals.oldDueDiscovery === 0
+  const discoveryBacklogRecoverable = signals.oldDueDiscovery === 0
+    || (signals.oldDueDiscovery <= MAX_WATCHDOG_RECOVERY_DISCOVERY_JOBS
+      && (signals.recoverableOldDueDiscovery ?? 0) === signals.oldDueDiscovery);
+
+  return discoveryBacklogRecoverable
     && signals.staleDiscoveryLocks === 0
     && signals.staleProcessingLocks === 0
     && signals.manualReconciliations === 0
