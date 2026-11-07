@@ -110,6 +110,38 @@ describe("processRawCandidate — maps candidates", () => {
     expect(result.readyForOutreach).toBe(true);
   });
 
+  it("qualifies a niche business only with Maps evidence of a physical location", async () => {
+    const physicalStudio = await processRawCandidate(
+      mapsPayload({
+        name: "Estudio Yoga Norte",
+        category: "Yoga studio",
+        address: "Calle Mayor 1",
+        websiteUrl: "https://yoganorte.es",
+      }),
+      "maps_deep",
+      baseContext({ niche: "yoga_pilates" }),
+    );
+    const noPhysicalAddress = await processRawCandidate(
+      mapsPayload({
+        name: "Estudio Yoga Norte",
+        category: "Yoga studio",
+        address: null,
+        websiteUrl: "https://yoganorte.es",
+      }),
+      "maps_deep",
+      baseContext({ niche: "yoga_pilates" }),
+    );
+    const legacyCampaign = await processRawCandidate(
+      mapsPayload({ name: "Estudio Yoga Norte", category: "Yoga studio", address: "Calle Mayor 1" }),
+      "maps_deep",
+      baseContext(),
+    );
+
+    expect(physicalStudio).toMatchObject({ businessType: "yoga_pilates_studio", icpQualified: true });
+    expect(noPhysicalAddress).toMatchObject({ businessType: "yoga_pilates_studio", icpQualified: false });
+    expect(legacyCampaign).toMatchObject({ businessType: "other_retail", icpQualified: false });
+  });
+
   it("does not call Serper when a Maps Fast source website already exists", async () => {
     const recoverMapsFastWebsite = vi.fn();
     const result = await processRawCandidate(

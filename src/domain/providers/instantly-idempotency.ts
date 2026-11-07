@@ -7,11 +7,6 @@ export function createInstantlyImportIdempotencyKey(input: {
   providerCampaignId: string;
 }): string {
   return createHash("sha256")
-    .update(JSON.stringify([
-      input.workspaceId,
-      input.accountId,
-      input.contactPointId,
-      input.providerCampaignId,
-    ]))
+    .update(JSON.stringify([input.workspaceId, input.accountId]))
     .digest("hex");
 }

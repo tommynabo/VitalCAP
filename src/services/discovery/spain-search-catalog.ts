@@ -1,6 +1,7 @@
 import type { EngineType } from "@/domain/campaigns/types";
 import type { SearchSeed } from "@/domain/discovery/types";
 import { SPAIN_PROVINCES } from "@/lib/geography/spain-provinces";
+import { getNicheProfile, type NicheId } from "./niche-profiles";
 
 /**
  * ICP category terms consumed by query-expanding engines (§2.8). Kept in
@@ -52,8 +53,12 @@ function emptySeed(campaignId: string, engineType: EngineType, query: string, ge
  * province/autonomous city. Geography is used solely to make nationwide
  * coverage tractable; it never filters candidates by city or population.
  */
-export function buildMapsSeedCatalog(campaignId: string, engineType: "maps_fast" | "maps_deep"): SearchSeed[] {
-  return ICP_CATEGORY_TERMS.flatMap((query) =>
+export function buildMapsSeedCatalog(
+  campaignId: string,
+  engineType: "maps_fast" | "maps_deep",
+  categoryTerms: readonly string[] = ICP_CATEGORY_TERMS,
+): SearchSeed[] {
+  return categoryTerms.flatMap((query) =>
     SPAIN_PROVINCES.map((province) => emptySeed(campaignId, engineType, query, province.name)),
   );
 }
@@ -75,7 +80,7 @@ export function buildHybridMapsSeedCatalog(campaignId: string): SearchSeed[] {
 export function buildSerpSeedCatalog(
   campaignId: string,
   engineType: "google_serp" | "linkedin_owner",
-  queryTerms: readonly string[],
+  queryTerms: readonly string[] = ICP_CATEGORY_TERMS,
 ): SearchSeed[] {
   const seeds: SearchSeed[] = [];
   for (const term of queryTerms) {
@@ -84,6 +89,25 @@ export function buildSerpSeedCatalog(
     }
   }
   return seeds;
+}
+
+export function buildCampaignSeedCatalog(
+  campaignId: string,
+  engineType: EngineType,
+  niche: NicheId | null,
+): SearchSeed[] {
+  const profile = niche ? getNicheProfile(niche) : null;
+  if (!profile) {
+    if (engineType === "maps_fast" || engineType === "maps_deep") return buildMapsSeedCatalog(campaignId, engineType);
+    if (engineType === "google_serp") return buildSerpSeedCatalog(campaignId, "google_serp");
+    if (engineType === "linkedin_owner") return buildSerpSeedCatalog(campaignId, "linkedin_owner", LINKEDIN_OWNER_ROLE_QUERIES);
+    return [];
+  }
+
+  if (engineType === "maps_fast" || engineType === "maps_deep") return buildMapsSeedCatalog(campaignId, engineType, profile.categoryTerms);
+  if (engineType === "google_serp") return buildSerpSeedCatalog(campaignId, "google_serp", profile.categoryTerms);
+  if (engineType === "linkedin_owner") return buildSerpSeedCatalog(campaignId, "linkedin_owner", profile.categoryTerms);
+  return [];
 }
 
 export const LINKEDIN_OWNER_ROLE_QUERIES = [

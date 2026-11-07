@@ -15,7 +15,8 @@ import { getAutopilotEnginePerformance } from "@/infrastructure/neon/repositorie
 import { decideHybridFill } from "@/services/discovery/hybrid-fill-decision";
 import { buildEngineCapabilities } from "@/services/autopilot/engine-capability";
 import { createApifyCredentialFingerprint, getApifyAllocationHealth, evaluateProviderHealth } from "@/services/discovery/provider-health";
-import { buildMapsSeedCatalog, buildSerpSeedCatalog, ICP_CATEGORY_TERMS, LINKEDIN_OWNER_ROLE_QUERIES } from "@/services/discovery/spain-search-catalog";
+import { buildCampaignSeedCatalog, buildMapsSeedCatalog, buildSerpSeedCatalog, ICP_CATEGORY_TERMS, LINKEDIN_OWNER_ROLE_QUERIES } from "@/services/discovery/spain-search-catalog";
+import { getNicheId } from "@/services/discovery/niche-profiles";
 import { getDeliveryEnv, getMapsEnv, getSerperEnv } from "@/lib/config/env";
 import { SERPER_ESTIMATED_COST_PER_QUERY_USD } from "@/infrastructure/providers/serp/serper-provider";
 import type { SearchSeed } from "@/domain/discovery/types";
@@ -35,6 +36,8 @@ export interface AutopilotRunnerResult {
 }
 
 function catalogFor(campaign: Campaign): SearchSeed[] {
+  const niche = getNicheId(campaign.engineConfig?.niche);
+  if (niche) return buildCampaignSeedCatalog(campaign.id, campaign.engineType, niche);
   if (campaign.engineType === "maps_fast" || campaign.engineType === "maps_deep") return buildMapsSeedCatalog(campaign.id, campaign.engineType);
   if (campaign.engineType === "google_serp") return buildSerpSeedCatalog(campaign.id, "google_serp", ICP_CATEGORY_TERMS);
   if (campaign.engineType === "linkedin_owner") return buildSerpSeedCatalog(campaign.id, "linkedin_owner", LINKEDIN_OWNER_ROLE_QUERIES);
@@ -246,7 +249,7 @@ export async function runAutopilotCronTick(now: Date = new Date()): Promise<Auto
 
     const concreteCampaigns = campaigns.filter((campaign) => campaign.engineType !== "hybrid_fill");
     const seedSets = await Promise.all(concreteCampaigns.map((campaign) => listSearchSeedsForCampaignEngine(campaign.id, campaign.engineType)));
-    const enginePerformanceByCampaign = await getAutopilotEnginePerformance(workspaceId, getDeliveryEnv().INSTANTLY_CAMPAIGN_ID, now);
+    const enginePerformanceByCampaign = await getAutopilotEnginePerformance(workspaceId, now);
     const recentImportSample = [...enginePerformanceByCampaign.values()]
       .reduce((total, performance) => total + performance.confirmedImportCount, 0);
     const recentRawSample = [...enginePerformanceByCampaign.values()]

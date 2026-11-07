@@ -7,7 +7,8 @@ import { ProviderBudgetExceededError, ProviderFailureError } from "@/domain/prov
 import { normalizeAddress, normalizeBusinessName, normalizeDomain, normalizePhoneES } from "@/lib/normalization";
 import { evaluateSpainEligibility, type SpainEligibilityVerdict } from "@/lib/geography/spain-eligibility";
 import { evaluateAccountDedup, type AccountIdentitySignals } from "@/services/deduplication/account-dedup";
-import { classifyBusinessType, isAcceptedIcpBusinessType } from "./business-type";
+import { classifyBusinessType, classifyNicheBusinessType, isAcceptedIcpBusinessType, isAcceptedNicheBusinessType } from "./business-type";
+import type { NicheId } from "./niche-profiles";
 import { extractCandidateEmailsWithDiagnostics } from "@/services/enrichment/email-extraction";
 import { computeStrategicPriority } from "@/services/routing/contact-priority";
 import { isContactPointAcceptable, DEFAULT_VERIFICATION_ACCEPTANCE_POLICY, type VerificationAcceptancePolicy } from "@/services/verification/acceptance-policy";
@@ -100,6 +101,7 @@ export interface ProcessingContext {
   deferVerification?: boolean;
   /** Default off (§2.9) — LinkedIn never guesses a personal email pattern unless a campaign explicitly opts in, and even then this pipeline still only reports it, never invents a source. */
   allowExperimentalEmailGuessing?: boolean;
+  niche?: NicheId;
 }
 
 const PURCHASING_LABELS = new Set(["compras", "purchasing", "pedidos"]);
@@ -314,7 +316,10 @@ export async function processRawCandidate(
   const matchedAccountKey = isDuplicate ? dedupDecision.matches[0]?.accountId ?? null : null;
 
   const spainResult = evaluateSpainEligibility(spainInput);
-  const businessType = classifyBusinessType(categoryText);
+  const classificationText = context.niche ? `${businessNameGuess} ${categoryText}` : categoryText;
+  const businessType = context.niche
+    ? classifyNicheBusinessType(classificationText, context.niche)
+    : classifyBusinessType(categoryText);
 
   if (spainResult.verdict === "rejected") {
     return {
@@ -336,7 +341,12 @@ export async function processRawCandidate(
 
   // Keep non-ICP discoveries auditable, but never spend enrichment or
   // verification capacity on them and never allow them into qualification.
-  if (!isAcceptedIcpBusinessType(businessType)) {
+  const acceptedIcp = context.niche
+    ? isAcceptedNicheBusinessType(businessType, context.niche)
+      && payload.kind === "maps"
+      && Boolean(payload.place.address?.trim())
+    : isAcceptedIcpBusinessType(businessType);
+  if (!acceptedIcp) {
     return {
       engineType,
       accountKey,
@@ -350,7 +360,9 @@ export async function processRawCandidate(
       processingMetrics: initialProcessingMetrics(engineType, payload, websiteUrl, context.existingProcessingMetrics, context.now),
       serperEmailRecovery: { candidatesFound: 0, candidatesRelevant: 0, duplicateCandidatesSkipped: 0 },
       readyForOutreach: false,
-      rejectionReason: `Rejected ICP: ${businessType} is outside the pharmacy, parapharmacy, and herbal-shop scope`,
+      rejectionReason: context.niche
+        ? `Rejected ICP: ${businessType} does not meet the ${context.niche} physical-business criteria`
+        : `Rejected ICP: ${businessType} is outside the pharmacy, parapharmacy, and herbal-shop scope`,
     };
   }
 

@@ -123,7 +123,7 @@ describe("getAutopilotPacingMetrics raw discovery accounting", () => {
       return { rows: [] };
     });
 
-    const metrics = await getAutopilotPacingMetrics("workspace-1", "Europe/Madrid", now, "instantly-campaign");
+    const metrics = await getAutopilotPacingMetrics("workspace-1", "Europe/Madrid", now);
     const aggregateSql = execute.mock.calls
       .map(([statement]) => dialect.sqlToQuery(statement).sql)
       .find((query) => query.includes("WITH qualified AS MATERIALIZED"));
@@ -161,7 +161,7 @@ describe("getAutopilotPacingMetrics raw discovery accounting", () => {
       return { rows: [] };
     });
 
-    const metrics = await getAutopilotPacingMetrics("workspace-1", "Europe/Madrid", now, "instantly-campaign");
+    const metrics = await getAutopilotPacingMetrics("workspace-1", "Europe/Madrid", now);
 
     expect(metrics.contactabilityHistoricalSample).toBe(20);
     expect(metrics.contactabilityImportYield).toBe(0.3);

@@ -11,6 +11,10 @@ export type BusinessType =
   | "herbal_shop"
   | "sports_nutrition_store"
   | "supplement_store"
+  | "yoga_pilates_studio"
+  | "spa_wellness_center"
+  | "premium_fitness_center"
+  | "personal_training_studio"
   | "other_retail";
 
 export type AccountStatus =

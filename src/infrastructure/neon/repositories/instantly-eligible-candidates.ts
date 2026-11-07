@@ -26,6 +26,7 @@ export interface InstantEligibleCandidateRow extends InstantEligibleCandidateIde
 
 export interface InstantEligibleCandidateQueryOptions {
   providerCampaignId: string;
+  campaignId?: string;
   workspaceId?: string;
   createdSince?: Date;
   rawDiscoveredWithin?: { start: Date; end: Date };
@@ -48,6 +49,9 @@ export function buildInstantEligibleCandidatesQuery(options: InstantEligibleCand
           : sql``;
   const workspaceFilter = options.workspaceId
     ? sql`AND c.workspace_id = ${options.workspaceId}::uuid`
+    : sql``;
+  const campaignFilter = options.campaignId
+    ? sql`AND cm.campaign_id = ${options.campaignId}::uuid`
     : sql``;
   const rawDiscoveryFilter = options.rawDiscoveredWithin
     ? sql`AND EXISTS (
@@ -151,6 +155,7 @@ export function buildInstantEligibleCandidatesQuery(options: InstantEligibleCand
           AND conv.account_id = a.id
       )
       ${workspaceFilter}
+      ${campaignFilter}
       ${rawDiscoveryFilter}
       ${candidateScopeFilter}
       ${existingImportFilter}

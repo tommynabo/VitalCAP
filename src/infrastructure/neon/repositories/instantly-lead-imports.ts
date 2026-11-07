@@ -45,15 +45,39 @@ export async function findInstantlyLeadImportByEmail(
   return (result.rows[0] as Record<string, unknown> | undefined) ?? null;
 }
 
+export async function findInstantlyLeadImportByAccount(
+  workspaceId: string,
+  accountId: string,
+): Promise<Record<string, unknown> | null> {
+  const db = getDb();
+  const result = await db.execute(sql`
+    SELECT id, status, provider_campaign_id, source_campaign_id
+    FROM instantly_lead_imports
+    WHERE workspace_id = ${workspaceId}
+      AND account_id = ${accountId}
+    ORDER BY created_at ASC
+    LIMIT 1
+  `);
+  return (result.rows[0] as Record<string, unknown> | undefined) ?? null;
+}
+
 export async function claimInstantlyLeadImports(
   limit: number,
   now: Date,
   contactPointIds?: readonly string[],
+  providerCampaignId?: string,
+  sourceCampaignId?: string,
 ): Promise<Record<string, unknown>[]> {
   const db = getDb();
   const lockExpiry = new Date(now.getTime() - 15 * 60_000);
   const contactPointFilter = contactPointIds
     ? sql`AND contact_point_id IN ${contactPointIds}`
+    : sql``;
+  const providerCampaignFilter = providerCampaignId
+    ? sql`AND provider_campaign_id = ${providerCampaignId}`
+    : sql``;
+  const sourceCampaignFilter = sourceCampaignId
+    ? sql`AND source_campaign_id = ${sourceCampaignId}::uuid`
     : sql``;
   const claimed = await db.execute(sql`
     WITH available AS (
@@ -63,6 +87,8 @@ export async function claimInstantlyLeadImports(
         AND (locked_at IS NULL OR locked_at < ${lockExpiry.toISOString()})
         AND (next_attempt_at IS NULL OR next_attempt_at <= ${now.toISOString()})
         AND attempt_count < max_attempts
+        ${providerCampaignFilter}
+        ${sourceCampaignFilter}
         ${contactPointFilter}
       ORDER BY CASE WHEN status = 'reconciliation_required' THEN 0 ELSE 1 END, created_at ASC
       LIMIT ${limit}

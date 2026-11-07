@@ -13,7 +13,7 @@ import type { AutopilotSettings, EngineTargetState, GlobalAutopilotState, Provid
 import { getDayBounds } from "@/lib/time/day-bounds";
 import { getAutopilotPacingMetrics } from "./autopilot-pacing";
 import { getApifyRecoverySnapshot, getGlobalSerperSpendToday, getRecentProviderUsage, getSerperRecoveryState, getTodaySpendUsd } from "./provider-runs";
-import { getDeliveryEnv, getMapsEnv, getSerperEnv } from "@/lib/config/env";
+import { getMapsEnv, getSerperEnv } from "@/lib/config/env";
 import {
   ENGINE_TYPES,
   engineProviderHealthForType,
@@ -157,8 +157,7 @@ async function getEngineProviderHealth(workspaceId: string, engineType: EngineTy
 
 export async function getAutopilotPacingState(workspaceId: string, now = new Date()) {
   const settings = await getAutopilotSettings(workspaceId);
-  const instantlyCampaignId = getDeliveryEnv().INSTANTLY_CAMPAIGN_ID;
-  const metrics = await getAutopilotPacingMetrics(workspaceId, settings.timezone, now, instantlyCampaignId);
+  const metrics = await getAutopilotPacingMetrics(workspaceId, settings.timezone, now);
   const apifyRecovery = await getApifyRecoverySnapshot(workspaceId, now);
   const providerHealth = getApifyAllocationHealth(apifyRecovery);
   const serperRecovery = await getSerperRecoveryState(now);

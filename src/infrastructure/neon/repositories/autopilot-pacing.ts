@@ -66,7 +66,6 @@ export async function getAutopilotPacingMetrics(
   workspaceId: string,
   timeZone: string,
   now = new Date(),
-  providerCampaignId: string | null = null,
 ): Promise<AutopilotPacingMetrics> {
   const db = getDb();
   const { start, end } = getDayBounds(timeZone, now);
@@ -259,7 +258,7 @@ export async function getAutopilotPacingMetrics(
           EXISTS (
             SELECT 1 FROM instantly_lead_imports ili
             WHERE ili.workspace_id = q.workspace_id AND ili.account_id = q.account_id
-              AND ili.provider_campaign_id = ${providerCampaignId ?? ''}
+              AND ili.source_campaign_id = q.campaign_id
               AND ili.status = 'instantly_added' AND ili.provider_lead_id IS NOT NULL
           ) AS confirmed_imported,
           EXISTS (
@@ -392,7 +391,7 @@ export async function getAutopilotPacingMetrics(
             JOIN contact_points imported_cp ON imported_cp.id = imported.contact_point_id
               AND imported_cp.account_id = imported.account_id
             WHERE imported.workspace_id = hc.workspace_id AND imported.account_id = hc.account_id
-              AND imported.provider_campaign_id = ${providerCampaignId ?? ''}
+              AND imported.source_campaign_id = hc.campaign_id
               AND imported.status = 'instantly_added' AND imported.provider_lead_id IS NOT NULL
               AND imported.uploaded_at >= hc.qualified_at
               AND imported_cp.type = 'email' AND imported_cp.verification_status = 'valid'
@@ -432,7 +431,7 @@ export async function getAutopilotPacingMetrics(
             SELECT 1 FROM instantly_lead_imports imported
             JOIN contact_points cp ON cp.id = imported.contact_point_id AND cp.account_id = imported.account_id
             WHERE imported.workspace_id = ${workspaceId}::uuid AND imported.account_id = recovery_scope.account_id
-              AND imported.provider_campaign_id = ${providerCampaignId ?? ''}
+              AND imported.source_campaign_id = recovery_scope.campaign_id
               AND imported.status = 'instantly_added' AND imported.provider_lead_id IS NOT NULL
               AND imported.uploaded_at >= NULLIF(metrics->>'websiteAttributionCompletedAt', '')::timestamptz
               AND cp.type = 'email' AND cp.verification_status = 'valid'
@@ -457,9 +456,9 @@ export async function getAutopilotPacingMetrics(
     db.execute(sql`
       SELECT count(DISTINCT ili.account_id)::int AS total
       FROM instantly_lead_imports ili
+      JOIN campaigns c ON c.id = ili.source_campaign_id AND c.workspace_id = ili.workspace_id AND c.status = 'active'
       JOIN contact_points cp ON cp.id = ili.contact_point_id
       WHERE ili.workspace_id = ${workspaceId}::uuid
-        AND ili.provider_campaign_id = ${providerCampaignId ?? ""}
         AND ili.status = 'instantly_added'
         AND ili.provider_lead_id IS NOT NULL
         AND ili.uploaded_at >= ${start.toISOString()}::timestamptz
@@ -488,7 +487,10 @@ export async function getAutopilotPacingMetrics(
         (SELECT count(*)::int
          FROM instantly_lead_imports ili
          WHERE ili.workspace_id = ${workspaceId}::uuid
-           AND ili.provider_campaign_id = ${providerCampaignId ?? ""}
+           AND EXISTS (
+             SELECT 1 FROM campaigns c
+             WHERE c.id = ili.source_campaign_id AND c.workspace_id = ili.workspace_id AND c.status = 'active'
+           )
            AND ili.status = 'instantly_added'
            AND ili.provider_lead_id IS NOT NULL
            AND ili.uploaded_at >= ${historyStart.toISOString()}::timestamptz
@@ -505,9 +507,9 @@ export async function getAutopilotPacingMetrics(
     db.execute(sql`
       SELECT count(*)::int AS total
       FROM instantly_lead_imports ili
+      JOIN campaigns c ON c.id = ili.source_campaign_id AND c.workspace_id = ili.workspace_id AND c.status = 'active'
       JOIN contact_points cp ON cp.id = ili.contact_point_id
       WHERE ili.workspace_id = ${workspaceId}::uuid
-        AND ili.provider_campaign_id = ${providerCampaignId ?? ""}
         AND (
           ili.status IN ('eligible', 'instantly_queued')
           OR (ili.status IN ('failed', 'deferred') AND ili.next_attempt_at <= ${now.toISOString()}::timestamptz)
@@ -548,7 +550,7 @@ export async function getAutopilotPacingMetrics(
     `),
   ]);
   const importHistory = importHistoryRows.rows[0] as { imported_count?: unknown; source_count?: unknown } | undefined;
-  const confirmedImportsToday = providerCampaignId ? numberValue(importStatsRows.rows[0]?.total) : 0;
+  const confirmedImportsToday = numberValue(importStatsRows.rows[0]?.total);
   return {
     discoveredToday: numberValue(funnel?.discovered),
     withEmailToday: numberValue(funnel?.with_email),
@@ -557,8 +559,8 @@ export async function getAutopilotPacingMetrics(
     verificationInFlight: numberValue(verificationRows.rows[0]?.total),
     qualifiedToday: numberValue((qualifiedRows.rows[0] as { total?: unknown } | undefined)?.total),
     instantlyImportedToday: confirmedImportsToday,
-    eligibleImportBacklog: providerCampaignId ? numberValue(importBacklogRows.rows[0]?.total) : 0,
-    historicalImportCount: providerCampaignId ? numberValue(importHistory?.imported_count) : 0,
+    eligibleImportBacklog: numberValue(importBacklogRows.rows[0]?.total),
+    historicalImportCount: numberValue(importHistory?.imported_count),
     historicalImportSourceCount: numberValue(importHistory?.source_count),
     rawRequestedToday: numberValue((rawRequestedRows.rows[0] as { total?: unknown } | undefined)?.total),
     rawReturnedToday: numberValue((rawRows.rows[0] as { total?: unknown } | undefined)?.total),

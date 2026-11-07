@@ -35,6 +35,7 @@ import type { EmailVerificationProvider, WebsiteFetcher } from "@/domain/provide
 import { enqueueVerificationJob } from "@/infrastructure/neon/repositories/verification-queue";
 import { getVerificationEnv } from "@/lib/config/env";
 import { processRawCandidate, createInitialCandidateProcessingMetrics, deriveIncomingIdentitySignals, hasLinkedInEmployerAccount, type CandidateRawPayload, type ProcessedCandidateResult } from "@/services/discovery/candidate-processor";
+import { getNicheId } from "@/services/discovery/niche-profiles";
 import { mergeMissingAccountFields, type IncomingAccountFields } from "@/services/accounts/account-enrichment-merge";
 import { realWebsiteFetcher, providerLabelForEngine } from "./engine-factory";
 import { WebsiteEnrichmentService, type WebsiteEvidenceFact } from "@/services/enrichment/website-enrichment-service";
@@ -344,6 +345,7 @@ async function executeProcessingJob(
     now: new Date(),
     deferVerification: true,
     existingProcessingMetrics,
+    niche: getNicheId(campaign.engineConfig?.niche) ?? undefined,
     ...(raw.engineType === "maps_fast" && payload.kind === "maps" && !job.payload.skipMapsFastWebsiteRecovery ? {
       recoverMapsFastWebsite: async (place) => {
         const query = buildMapsFastWebsiteRecoveryQuery(place);

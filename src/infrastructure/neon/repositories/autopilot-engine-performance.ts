@@ -8,7 +8,7 @@ function numberValue(value: unknown): number {
   return Number(value ?? 0);
 }
 
-export function buildAutopilotEnginePerformanceQuery(workspaceId: string, targetProviderCampaignId: string, now: Date) {
+export function buildAutopilotEnginePerformanceQuery(workspaceId: string, now: Date) {
   const since = new Date(now.getTime() - ENGINE_PERFORMANCE_WINDOW_DAYS * 24 * 60 * 60 * 1000);
   return sql`
     WITH recent_raw AS (
@@ -54,7 +54,6 @@ export function buildAutopilotEnginePerformanceQuery(workspaceId: string, target
        AND cp.workspace_id = ili.workspace_id
        AND cp.account_id = ili.account_id
       WHERE ili.workspace_id = ${workspaceId}::uuid
-        AND ili.provider_campaign_id = ${targetProviderCampaignId}
         AND ili.status = 'instantly_added'
         AND ili.provider_lead_id IS NOT NULL
         AND ili.uploaded_at >= ${since.toISOString()}::timestamptz
@@ -154,10 +153,9 @@ export function buildAutopilotEnginePerformanceQuery(workspaceId: string, target
 
 export async function getAutopilotEnginePerformance(
   workspaceId: string,
-  targetProviderCampaignId: string,
   now: Date,
 ): Promise<Map<string, EnginePerformanceMetric>> {
-  const result = await getDb().execute(buildAutopilotEnginePerformanceQuery(workspaceId, targetProviderCampaignId, now));
+  const result = await getDb().execute(buildAutopilotEnginePerformanceQuery(workspaceId, now));
   const performanceByCampaign = new Map<string, EnginePerformanceMetric>();
   for (const row of result.rows as Array<Record<string, unknown>>) {
     const campaignId = String(row.campaign_id);

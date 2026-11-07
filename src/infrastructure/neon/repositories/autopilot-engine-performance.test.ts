@@ -3,13 +3,11 @@ import { PgDialect } from "drizzle-orm/pg-core";
 import { buildAutopilotEnginePerformanceQuery } from "./autopilot-engine-performance";
 
 describe("autopilot engine performance query", () => {
-  it("uses confirmed imports for the configured target and excludes ambiguous source attribution", () => {
+  it("attributes confirmed imports to their internal source campaign and excludes ambiguous sources", () => {
     const workspaceId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
-    const targetCampaignId = "target-instantly-campaign";
     const now = new Date("2026-10-11T12:00:00.000Z");
-    const query = new PgDialect().sqlToQuery(buildAutopilotEnginePerformanceQuery(workspaceId, targetCampaignId, now));
+    const query = new PgDialect().sqlToQuery(buildAutopilotEnginePerformanceQuery(workspaceId, now));
 
-    expect(query.sql).toMatch(/ili\.provider_campaign_id = \$\d+/);
     expect(query.sql).toContain("ili.status = 'instantly_added'");
     expect(query.sql).toContain("ili.provider_lead_id IS NOT NULL");
     expect(query.sql).toContain("cp.verification_provider = 'millionverifier'");
@@ -22,7 +20,7 @@ describe("autopilot engine performance query", () => {
     expect(query.sql).toContain("cp.verification_provider = 'millionverifier'");
     expect(query.sql).toContain("FROM provider_runs");
     expect(query.params).toContain(workspaceId);
-    expect(query.params).toContain(targetCampaignId);
+    expect(query.sql).toContain("ili.source_campaign_id = source.campaign_id");
     expect(query.params).toContain("2026-10-04T12:00:00.000Z");
   });
 });

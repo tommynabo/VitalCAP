@@ -25,7 +25,8 @@ import {
 import { getApifyRecoverySnapshot, getApifyReservationFailureDetails, getLatestProviderEconomicPacingStates, getRecentProviderUsage, getSerperRecoveryState, getTodaySpendUsd, recordProviderRun, reserveApifyProviderRun, updateProviderRun } from "@/infrastructure/neon/repositories/provider-runs";
 import { getAutopilotSettings } from "@/infrastructure/neon/repositories/autopilot";
 import { getEffectiveAutopilotState } from "@/domain/autopilot/types";
-import { buildMapsSeedCatalog, buildSerpSeedCatalog, LINKEDIN_OWNER_ROLE_QUERIES, ICP_CATEGORY_TERMS } from "@/services/discovery/spain-search-catalog";
+import { buildCampaignSeedCatalog, buildMapsSeedCatalog, buildSerpSeedCatalog, LINKEDIN_OWNER_ROLE_QUERIES, ICP_CATEGORY_TERMS } from "@/services/discovery/spain-search-catalog";
+import { getNicheId } from "@/services/discovery/niche-profiles";
 import { createDiscoveryEngine } from "./engine-factory";
 import type { SearchSeed } from "@/domain/discovery/types";
 import { createApifyConfigurationFingerprint, createApifyCredentialFingerprint, evaluateProviderHealth, getApifyAllocationHealth, isCurrentApifyRecoveryCredential, resolveApifyDiscoveryWorkMode } from "@/services/discovery/provider-health";
@@ -49,10 +50,13 @@ const DISCOVERY_JOB_TYPE = "run_engine_batch";
 const MAX_SEEDS_PER_JOB = 5;
 const MAX_RAW_PER_SEED = 100;
 
-function catalogForEngine(campaignId: string, engineType: EngineType): SearchSeed[] {
-  if (engineType === "maps_fast" || engineType === "maps_deep") return buildMapsSeedCatalog(campaignId, engineType);
-  if (engineType === "google_serp") return buildSerpSeedCatalog(campaignId, "google_serp", ICP_CATEGORY_TERMS);
-  if (engineType === "linkedin_owner") return buildSerpSeedCatalog(campaignId, "linkedin_owner", LINKEDIN_OWNER_ROLE_QUERIES);
+function catalogForEngine(campaign: Awaited<ReturnType<typeof getCampaignById>>, engineType: EngineType): SearchSeed[] {
+  if (!campaign) return [];
+  const niche = getNicheId(campaign.engineConfig?.niche);
+  if (niche) return buildCampaignSeedCatalog(campaign.id, engineType, niche);
+  if (engineType === "maps_fast" || engineType === "maps_deep") return buildMapsSeedCatalog(campaign.id, engineType);
+  if (engineType === "google_serp") return buildSerpSeedCatalog(campaign.id, "google_serp", ICP_CATEGORY_TERMS);
+  if (engineType === "linkedin_owner") return buildSerpSeedCatalog(campaign.id, "linkedin_owner", LINKEDIN_OWNER_ROLE_QUERIES);
   return []; // hybrid_fill has no catalog of its own — it always delegates to an already-seeded engine
 }
 
@@ -385,7 +389,7 @@ async function executeDiscoveryJob(
   // rather than creating a duplicate candidate source of its own.
   const catalogSeeds = job.payload.engineType === "hybrid_fill"
     ? []
-    : catalogForEngine(campaign.id, job.payload.engineType);
+    : catalogForEngine(campaign, job.payload.engineType);
   if (job.payload.engineType !== "hybrid_fill") {
     await runPreReservationStage(
       job,

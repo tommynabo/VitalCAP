@@ -11,6 +11,7 @@ const mocks = vi.hoisted(() => ({
   claimImports: vi.fn(),
   deferByPlanLimit: vi.fn(),
   enqueueImport: vi.fn(),
+  findImportByAccount: vi.fn(),
   findImportByEmail: vi.fn(),
   getImportCounts: vi.fn(),
   isCircuitOpen: vi.fn(),
@@ -23,6 +24,7 @@ const mocks = vi.hoisted(() => ({
   addLeadToCampaign: vi.fn(),
   findLeadInCampaign: vi.fn(),
   findLeadsByEmail: vi.fn(),
+  listImportTargets: vi.fn(),
 }));
 
 vi.mock("@/infrastructure/neon/db", () => ({ getDb: () => ({ execute: mocks.execute }) }));
@@ -30,11 +32,15 @@ vi.mock("@/infrastructure/neon/repositories/actual-outreach", () => ({
   actualPriorColdOutreachSql: vi.fn(() => ({ strings: ["TRUE"], values: [] })),
   hasActualPriorColdOutreach: mocks.hasActualPriorColdOutreach,
 }));
+vi.mock("@/infrastructure/neon/repositories/instantly-import-targets", () => ({
+  listInstantlyImportTargets: mocks.listImportTargets,
+}));
 vi.mock("@/infrastructure/neon/repositories/instantly-lead-imports", () => ({
   acquireInstantlyImportLock: mocks.acquireLock,
   claimInstantlyLeadImports: mocks.claimImports,
   deferInstantlyLeadImportsForPlanLimit: mocks.deferByPlanLimit,
   enqueueInstantlyLeadImport: mocks.enqueueImport,
+  findInstantlyLeadImportByAccount: mocks.findImportByAccount,
   findInstantlyLeadImportByEmail: mocks.findImportByEmail,
   getInstantlyLeadImportCounts: mocks.getImportCounts,
   isInstantlyImportCircuitOpen: mocks.isCircuitOpen,
@@ -133,6 +139,7 @@ beforeEach(() => {
   mocks.hasActualPriorColdOutreach.mockResolvedValue(false);
   mocks.acquireLock.mockResolvedValue(true);
   mocks.enqueueImport.mockResolvedValue(true);
+  mocks.findImportByAccount.mockResolvedValue(null);
   mocks.findImportByEmail.mockResolvedValue(null);
   mocks.getImportCounts.mockResolvedValue({});
   mocks.releaseLock.mockResolvedValue(undefined);
@@ -154,6 +161,15 @@ beforeEach(() => {
   });
   mocks.findLeadInCampaign.mockResolvedValue("provider-lead-1");
   mocks.findLeadsByEmail.mockResolvedValue([]);
+  mocks.listImportTargets.mockResolvedValue({
+    targets: [{
+      campaignId: "internal-campaign-1",
+      workspaceId: "workspace-1",
+      providerCampaignId: campaignId,
+      legacyFallback: true,
+    }],
+    blockedCampaignIds: [],
+  });
 });
 
 afterEach(() => {
@@ -294,7 +310,7 @@ describe("runInstantlyImportTick", () => {
 
     expect(result.leadsAttempted).toBe(2);
     expect(result.leadsAdded).toBe(2);
-    expect(mocks.claimImports).toHaveBeenCalledWith(2, expect.any(Date), ["contact-point-1", "contact-point-2"]);
+    expect(mocks.claimImports).toHaveBeenCalledWith(2, expect.any(Date), ["contact-point-1", "contact-point-2"], campaignId, "internal-campaign-1");
     expect(mocks.addLeads).not.toHaveBeenCalled();
     expect(mocks.addLeadToCampaign).toHaveBeenCalledTimes(2);
     for (const [input] of mocks.addLeadToCampaign.mock.calls) {
@@ -890,7 +906,7 @@ describe("runInstantlyImportTick", () => {
 
     await runInstantlyImportTick({ contactPointIds: ["contact-point-1"] });
 
-    expect(mocks.claimImports).toHaveBeenCalledWith(1, expect.any(Date), ["contact-point-1"]);
+    expect(mocks.claimImports).toHaveBeenCalledWith(1, expect.any(Date), ["contact-point-1"], campaignId, "internal-campaign-1");
   });
 
   it("allows an ordinary import with positive headroom even when ramp-to-250 capacity is blocked", async () => {

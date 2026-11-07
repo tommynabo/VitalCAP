@@ -9,6 +9,7 @@ import {
   claimInstantlyLeadImports,
   deferInstantlyLeadImportsForPlanLimit,
   enqueueInstantlyLeadImport,
+  findInstantlyLeadImportByAccount,
   findInstantlyLeadImportByEmail,
   getInstantlyLeadImportCounts,
   isInstantlyImportCircuitOpen,
@@ -18,6 +19,7 @@ import {
 } from "@/infrastructure/neon/repositories/instantly-lead-imports";
 import { hasActualPriorColdOutreach } from "@/infrastructure/neon/repositories/actual-outreach";
 import { buildInstantEligibleCandidatesQuery, type InstantEligibleCandidateRow } from "@/infrastructure/neon/repositories/instantly-eligible-candidates";
+import { listInstantlyImportTargets, type InstantImportTarget } from "@/infrastructure/neon/repositories/instantly-import-targets";
 import { evaluateInstantlyLeadEligibility } from "@/services/verification/instantly-lead-eligibility";
 import { logEvent } from "@/lib/observability/structured-logger";
 import { isEmailChannelEligible } from "@/services/compliance/email-channel-policy";
@@ -66,6 +68,7 @@ export interface InstantlyImportTickResult {
 
 async function listEligibleCandidates(options: {
   providerCampaignId: string;
+  campaignId: string;
   createdSince?: Date;
   contactPointIds?: readonly string[];
   backfillAll?: boolean;
@@ -85,6 +88,11 @@ async function enqueueCandidates(
   let emailAlreadyRepresented = 0;
   for (const row of rows) {
     if (!isEmailChannelEligible(row.channel_eligibility)) continue;
+    const priorAccountImport = await findInstantlyLeadImportByAccount(row.workspace_id, row.account_id);
+    if (priorAccountImport) {
+      emailAlreadyRepresented++;
+      continue;
+    }
     const hasPriorOutreach = await hasActualPriorColdOutreach({
       workspaceId: row.workspace_id,
       accountId: row.account_id,
@@ -355,7 +363,7 @@ async function readPipelineMetrics(): Promise<Record<string, number>> {
   };
 }
 
-export async function runInstantlyImportTick(options: {
+async function runInstantlyImportTargetTick(options: {
   createdSince?: Date;
   contactPointIds?: readonly string[];
   backfillAll?: boolean;
@@ -363,38 +371,11 @@ export async function runInstantlyImportTick(options: {
   reconcileEligible?: boolean;
   maxJobs?: number;
   now?: Date;
-} = {}): Promise<InstantlyImportTickResult> {
-  const now = options.now ?? new Date();
+}, target: InstantImportTarget, now: Date): Promise<InstantlyImportTickResult> {
   const env = getDeliveryEnv();
   const db = getDb();
-  const schemaStatus = await db.execute(sql`
-    SELECT
-      to_regclass('public.instantly_lead_imports') IS NOT NULL AS imports_ready,
-      to_regclass('public.instantly_import_locks') IS NOT NULL AS locks_ready
-  `);
-  const [schemaRow] = schemaStatus.rows as Array<{ imports_ready: boolean; locks_ready: boolean }>;
-  if (!schemaRow?.imports_ready || !schemaRow.locks_ready) {
-    return {
-      candidatesFound: 0,
-      leadsQueued: 0,
-      leadsAttempted: 0,
-      leadsAdded: 0,
-      leadsSkipped: 0,
-      leadsDeferred: 0,
-      leadsFailed: 0,
-      reconciliationChecked: 0,
-      reconciliationConfirmedTarget: 0,
-      reconciliationNeedsCampaignMove: 0,
-      reconciliationRetryable: 0,
-      emailAlreadyRepresented: 0,
-      providerStatus: "schema_not_ready",
-      instantlyLeadImportReady: false,
-      instantlyTelemetryReady: false,
-      telemetryWarnings: [],
-      quota: null,
-      metrics: {},
-    };
-  }
+  const providerCampaignId = target.providerCampaignId;
+  const campaignId = target.campaignId;
   const initialMetrics = await readPipelineMetrics();
   const result: InstantlyImportTickResult = {
     candidatesFound: 0,
@@ -428,14 +409,15 @@ export async function runInstantlyImportTick(options: {
   const reconcileEligible = options.processQueueOnly && options.reconcileEligible === true;
   if (!options.processQueueOnly || reconcileEligible) {
     const candidates = await listEligibleCandidates({
-      providerCampaignId: env.INSTANTLY_CAMPAIGN_ID,
+      providerCampaignId,
+      campaignId,
       createdSince: reconcileEligible ? undefined : options.createdSince,
       contactPointIds: reconcileEligible ? undefined : options.contactPointIds,
       backfillAll: reconcileEligible || options.backfillAll,
       forEnqueue: true,
     });
     result.candidatesFound = candidates.length;
-    const enqueueResult = await enqueueCandidates(candidates, env.INSTANTLY_CAMPAIGN_ID);
+    const enqueueResult = await enqueueCandidates(candidates, providerCampaignId);
     result.leadsQueued = enqueueResult.queued;
     result.emailAlreadyRepresented = enqueueResult.emailAlreadyRepresented;
   }
@@ -444,13 +426,13 @@ export async function runInstantlyImportTick(options: {
 
   const lockToken = randomUUID();
   const lockAcquired = await acquireInstantlyImportLock(
-    env.INSTANTLY_CAMPAIGN_ID,
+    providerCampaignId,
     lockToken,
     now,
     new Date(now.getTime() + IMPORT_LOCK_MS),
   );
   if (!lockAcquired) {
-    result.providerStatus = await isInstantlyImportCircuitOpen(env.INSTANTLY_CAMPAIGN_ID) ? "unhealthy" : "busy";
+    result.providerStatus = await isInstantlyImportCircuitOpen(providerCampaignId) ? "unhealthy" : "busy";
     result.metrics = await readPipelineMetrics();
     return result;
   }
@@ -490,7 +472,7 @@ export async function runInstantlyImportTick(options: {
       : await db.execute(sql`
           SELECT COUNT(*)::int AS count
           FROM instantly_lead_imports
-          WHERE provider_campaign_id = ${env.INSTANTLY_CAMPAIGN_ID}
+          WHERE provider_campaign_id = ${providerCampaignId}
             AND status = 'instantly_added'
             AND uploaded_at >= ${new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1)).toISOString()}
         `).then((query) => Number((query.rows[0] as { count?: number } | undefined)?.count ?? 0));
@@ -512,7 +494,7 @@ export async function runInstantlyImportTick(options: {
     };
     result.providerStatus = "ready";
     if (!quotaDecision.allowed) {
-      result.leadsDeferred = await deferInstantlyLeadImportsForPlanLimit(env.INSTANTLY_CAMPAIGN_ID, now);
+      result.leadsDeferred = await deferInstantlyLeadImportsForPlanLimit(providerCampaignId, now);
       result.metrics = await readPipelineMetrics();
       return result;
     }
@@ -521,9 +503,10 @@ export async function runInstantlyImportTick(options: {
       ? IMPORT_BATCH_SIZE
       : Math.max(1, Math.floor(options.maxJobs));
     const slots = Math.min(IMPORT_BATCH_SIZE, requestedBatchSize, quotaDecision.remaining);
-    const jobs = await claimInstantlyLeadImports(slots, now, options.contactPointIds);
+    const jobs = await claimInstantlyLeadImports(slots, now, options.contactPointIds, providerCampaignId, campaignId);
     const currentCandidates = jobs.length > 0 ? await listEligibleCandidates({
-        providerCampaignId: env.INSTANTLY_CAMPAIGN_ID,
+      providerCampaignId,
+      campaignId,
         contactPointIds: jobs.map((job) => String(job.contact_point_id)),
       }) : [];
     const candidateByContactPoint = new Map(currentCandidates.map((candidate) => [candidate.contact_point_id, candidate]));
@@ -562,12 +545,12 @@ export async function runInstantlyImportTick(options: {
         continue;
       }
       result.reconciliationChecked++;
-      const target = await findLeadInCampaignForReconciliation(provider, env.INSTANTLY_CAMPAIGN_ID, candidate.normalized_email);
+      const target = await findLeadInCampaignForReconciliation(provider, providerCampaignId, candidate.normalized_email);
       if (target.authFailure) {
         reconciliationAuthFailure = true;
         result.providerStatus = "unhealthy";
         preserveLock = true;
-        await tripInstantlyImportCircuitBreaker(env.INSTANTLY_CAMPAIGN_ID, lockToken, target.requestId ?? randomUUID());
+        await tripInstantlyImportCircuitBreaker(providerCampaignId, lockToken, target.requestId ?? randomUUID());
         await updateInstantlyLeadImport(jobId, {
           status: "reconciliation_required",
           now,
@@ -606,7 +589,7 @@ export async function runInstantlyImportTick(options: {
       if (!reconciliationAuthFailure) {
         try {
           const workspaceLeads = await provider.findLeadsByEmail(candidate.normalized_email);
-          const outsideTarget = workspaceLeads.find((lead) => lead.campaignId !== env.INSTANTLY_CAMPAIGN_ID);
+          const outsideTarget = workspaceLeads.find((lead) => lead.campaignId !== providerCampaignId);
           if (outsideTarget) {
             await updateInstantlyLeadImport(jobId, {
               status: "needs_campaign_move",
@@ -645,7 +628,7 @@ export async function runInstantlyImportTick(options: {
             reconciliationAuthFailure = true;
             result.providerStatus = "unhealthy";
             preserveLock = true;
-            await tripInstantlyImportCircuitBreaker(env.INSTANTLY_CAMPAIGN_ID, lockToken, details?.requestId ?? randomUUID());
+            await tripInstantlyImportCircuitBreaker(providerCampaignId, lockToken, details?.requestId ?? randomUUID());
           }
           await updateInstantlyLeadImport(jobId, {
             status: "reconciliation_required",
@@ -681,13 +664,13 @@ export async function runInstantlyImportTick(options: {
       try {
         const direct = await importLeadsDirect(
           provider,
-          env.INSTANTLY_CAMPAIGN_ID,
+          providerCampaignId,
           importableJobs.map(({ candidate }) => candidate),
           async (requestId) => {
             result.providerStatus = "unhealthy";
             preserveLock = true;
             await tripInstantlyImportCircuitBreaker(
-              env.INSTANTLY_CAMPAIGN_ID,
+              providerCampaignId,
               lockToken,
               requestId ?? randomUUID(),
             );
@@ -760,9 +743,135 @@ export async function runInstantlyImportTick(options: {
       }
     }
   } finally {
-    if (!preserveLock) await releaseInstantlyImportLock(env.INSTANTLY_CAMPAIGN_ID, lockToken);
+    if (!preserveLock) await releaseInstantlyImportLock(providerCampaignId, lockToken);
   }
 
   result.metrics = await readPipelineMetrics();
   return result;
+}
+
+const IMPORT_RESULT_COUNTS = [
+  "candidatesFound",
+  "leadsQueued",
+  "leadsAttempted",
+  "leadsAdded",
+  "leadsSkipped",
+  "leadsExistingTarget",
+  "leadsNeedsCampaignMove",
+  "leadsNeedsReconciliation",
+  "reconciliationChecked",
+  "reconciliationConfirmedTarget",
+  "reconciliationNeedsCampaignMove",
+  "reconciliationRetryable",
+  "emailAlreadyRepresented",
+  "leadsDeferred",
+  "leadsFailed",
+] as const;
+
+function emptyImportTickResult(providerStatus: InstantlyImportTickResult["providerStatus"], metrics: Record<string, number> = {}): InstantlyImportTickResult {
+  return {
+    candidatesFound: 0,
+    leadsQueued: 0,
+    leadsAttempted: 0,
+    leadsAdded: 0,
+    leadsSkipped: 0,
+    leadsExistingTarget: 0,
+    leadsNeedsCampaignMove: 0,
+    leadsNeedsReconciliation: 0,
+    reconciliationChecked: 0,
+    reconciliationConfirmedTarget: 0,
+    reconciliationNeedsCampaignMove: 0,
+    reconciliationRetryable: 0,
+    emailAlreadyRepresented: 0,
+    leadsDeferred: 0,
+    leadsFailed: 0,
+    providerStatus,
+    instantlyLeadImportReady: false,
+    instantlyTelemetryReady: false,
+    telemetryWarnings: [],
+    quota: null,
+    metrics,
+  };
+}
+
+function importTargetSlots(targetCount: number, maxJobs: number, now: Date): number[] {
+  if (targetCount === 0) return [];
+  const slots = Array.from({ length: targetCount }, () => Math.floor(maxJobs / targetCount));
+  const remainder = maxJobs % targetCount;
+  const offset = Math.floor(now.getTime() / (15 * 60_000)) % targetCount;
+  for (let index = 0; index < remainder; index++) slots[(offset + index) % targetCount]!++;
+  return slots;
+}
+
+function combineImportTickResults(results: readonly InstantlyImportTickResult[]): InstantlyImportTickResult {
+  const combined = emptyImportTickResult("ready");
+  const statusPriority: Record<InstantlyImportTickResult["providerStatus"], number> = {
+    ready: 0,
+    missing_configuration: 1,
+    busy: 2,
+    unhealthy: 3,
+    schema_not_ready: 4,
+  };
+  for (const result of results) {
+    for (const key of IMPORT_RESULT_COUNTS) combined[key] = (combined[key] ?? 0) + (result[key] ?? 0);
+    if (statusPriority[result.providerStatus] > statusPriority[combined.providerStatus]) combined.providerStatus = result.providerStatus;
+    combined.instantlyLeadImportReady ||= result.instantlyLeadImportReady;
+    combined.instantlyTelemetryReady ||= result.instantlyTelemetryReady;
+    combined.telemetryWarnings = [...new Set([...combined.telemetryWarnings, ...result.telemetryWarnings])];
+    combined.metrics = result.metrics;
+    if (result.quota) {
+      combined.quota = combined.quota ? {
+        uploadedContacts: Math.max(combined.quota.uploadedContacts, result.quota.uploadedContacts),
+        hardLimit: Math.min(combined.quota.hardLimit, result.quota.hardLimit),
+        warning: combined.quota.warning || result.quota.warning,
+        monthlyEmailsSent: Math.max(combined.quota.monthlyEmailsSent, result.quota.monthlyEmailsSent),
+        monthlyEmailLimit: Math.min(combined.quota.monthlyEmailLimit, result.quota.monthlyEmailLimit),
+        monthlyWarning: combined.quota.monthlyWarning || result.quota.monthlyWarning,
+      } : result.quota;
+    }
+  }
+  return combined;
+}
+
+export async function runInstantlyImportTick(options: {
+  createdSince?: Date;
+  contactPointIds?: readonly string[];
+  backfillAll?: boolean;
+  processQueueOnly?: boolean;
+  reconcileEligible?: boolean;
+  maxJobs?: number;
+  now?: Date;
+} = {}): Promise<InstantlyImportTickResult> {
+  const now = options.now ?? new Date();
+  const db = getDb();
+  const schemaStatus = await db.execute(sql`
+    SELECT
+      to_regclass('public.instantly_lead_imports') IS NOT NULL AS imports_ready,
+      to_regclass('public.instantly_import_locks') IS NOT NULL AS locks_ready
+  `);
+  const [schemaRow] = schemaStatus.rows as Array<{ imports_ready: boolean; locks_ready: boolean }>;
+  if (!schemaRow?.imports_ready || !schemaRow.locks_ready) return emptyImportTickResult("schema_not_ready");
+
+  if (options.contactPointIds?.length === 0) return emptyImportTickResult("ready", await readPipelineMetrics());
+
+  const { targets, blockedCampaignIds } = await listInstantlyImportTargets();
+  if (blockedCampaignIds.length > 0) {
+    logEvent("warn", "instantly.import_target_blocked", {
+      correlationId: `instantly-targets:${now.toISOString()}`,
+      blockedCampaignCount: blockedCampaignIds.length,
+      reason: "missing_or_shared_campaign_target",
+    });
+  }
+  if (targets.length === 0) return emptyImportTickResult("missing_configuration", await readPipelineMetrics());
+
+  const maxJobs = Math.min(IMPORT_BATCH_SIZE, options.maxJobs === undefined ? IMPORT_BATCH_SIZE : Math.max(0, Math.floor(options.maxJobs)));
+  const allocations = importTargetSlots(targets.length, maxJobs, now);
+  const results: InstantlyImportTickResult[] = [];
+  for (const [index, target] of targets.entries()) {
+    const targetMaxJobs = allocations[index] ?? 0;
+    if (targetMaxJobs === 0) continue;
+    results.push(await runInstantlyImportTargetTick({ ...options, maxJobs: targetMaxJobs }, target, now));
+  }
+  const combined = combineImportTickResults(results);
+  return combined;
 }
