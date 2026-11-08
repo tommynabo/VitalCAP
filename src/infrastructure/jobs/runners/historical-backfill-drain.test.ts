@@ -52,7 +52,7 @@ function emptyDependencies(state: HistoricalBackfillProgress): HistoricalBackfil
     getPreview: async () => emptyPreview,
     repairProviderDisabledJobs: async () => ({ inspected: 0, resolvedFromCurrentResult: 0, reactivated: 0, suppressed: 0 }),
     enqueueVerificationJobs: async () => 0,
-    runVerificationTick: async () => ({ jobsClaimed: 0, emailsVerified: 0, millionVerifierStatus: "ready" }),
+    runVerificationTick: async () => ({ jobsClaimed: 0, staleJobsDeadLettered: 0, emailsVerified: 0, millionVerifierStatus: "ready" }),
     runInstantlyTick: async () => ({
       candidatesFound: 0,
       leadsQueued: 0,
@@ -90,7 +90,7 @@ describe("drainHistoricalBackfill", () => {
       const verified = Math.min(batchSize, state.verificationJobsPending);
       state.verificationJobsPending -= verified;
       state.eligibleValidContactsRemaining += verified;
-      return { jobsClaimed: verified, emailsVerified: verified, millionVerifierStatus: "ready" };
+      return { jobsClaimed: verified, staleJobsDeadLettered: 0, emailsVerified: verified, millionVerifierStatus: "ready" };
     };
     dependencies.runInstantlyTick = async () => {
       const added = Math.min(50, state.eligibleValidContactsRemaining);
@@ -138,6 +138,7 @@ describe("drainHistoricalBackfill", () => {
     const dependencies = emptyDependencies(emptyProgress({ verificationJobsPending: 1 }));
     dependencies.runVerificationTick = async () => ({
       jobsClaimed: 0,
+      staleJobsDeadLettered: 0,
       emailsVerified: 0,
       millionVerifierStatus: "missing_configuration",
     });

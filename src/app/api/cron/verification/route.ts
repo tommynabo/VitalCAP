@@ -27,6 +27,7 @@ export async function GET(request: NextRequest) {
         enqueued,
         providerDisabledRepair,
         jobsClaimed: result.jobsClaimed,
+        staleJobsDeadLettered: result.staleJobsDeadLettered,
         emailsVerified: result.emailsVerified,
         millionVerifierStatus: result.millionVerifierStatus,
         instantly: result.instantly,

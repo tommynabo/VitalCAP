@@ -75,6 +75,7 @@ vi.mock("@/infrastructure/jobs/runners/instantly-import-runner", () => ({
 }));
 
 import {
+  buildDeadLetterExhaustedVerificationJobsQuery,
   enqueueVerificationJobs,
   getHistoricalBackfillProgress,
   repairProviderDisabledVerificationJobs,
@@ -98,6 +99,7 @@ describe("runVerificationCronTick eligibility recheck", () => {
     vi.clearAllMocks();
     mocks.enqueueVerificationJob.mockResolvedValue(true);
     mocks.execute
+      .mockResolvedValueOnce({ rows: [] })
       .mockResolvedValueOnce({ rows: [{
         id: "verification-job-1",
         workspace_id: "workspace-1",
@@ -146,11 +148,13 @@ describe("runVerificationCronTick eligibility recheck", () => {
   afterEach(() => vi.clearAllMocks());
 
   it("claims at most one due failed verification retry per active idempotency key", async () => {
-    mocks.execute.mockReset().mockResolvedValueOnce({ rows: [] });
+    mocks.execute.mockReset()
+      .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [] });
 
     await runVerificationCronTick(10, { skipInstantlyImport: true });
 
-    const claimQuery = sqlParts(mocks.execute.mock.calls[0]?.[0]);
+    const claimQuery = sqlParts(mocks.execute.mock.calls[1]?.[0]);
     expect(claimQuery.text).toContain("candidate.idempotency_key IS NULL");
     expect(claimQuery.text).toContain("active.status IN ('pending', 'processing')");
     expect(claimQuery.text).toContain("candidate.status = 'failed' OR earlier.status IN ('pending', 'processing')");
@@ -158,10 +162,24 @@ describe("runVerificationCronTick eligibility recheck", () => {
     expect(claimQuery.text).toContain("FOR UPDATE OF candidate SKIP LOCKED");
   });
 
+  it("dead-letters only expired verification locks that exhausted all attempts", () => {
+    const now = new Date("2026-11-08T09:00:00.000Z");
+    const query = sqlParts(buildDeadLetterExhaustedVerificationJobsQuery(now));
+
+    expect(query.text).toContain("SET status = 'dead_letter'");
+    expect(query.text).toContain("WHERE status = 'processing'");
+    expect(query.text).toContain("locked_at <");
+    expect(query.text).toContain("attempt_count >= max_attempts");
+    expect(query.text).toContain("RETURNING id");
+    expect(query.values).toContain("2026-11-08T08:45:00.000Z");
+    expect(query.values).toContain(now.toISOString());
+  });
+
   it("suppresses a previously claimed job before creating or calling the provider", async () => {
     const result = await runVerificationCronTick();
 
     expect(result.jobsClaimed).toBe(1);
+    expect(result.staleJobsDeadLettered).toBe(0);
     expect(result.emailsVerified).toBe(0);
     expect(mocks.createProvider).not.toHaveBeenCalled();
     expect(mocks.set).toHaveBeenCalledWith(expect.objectContaining({
@@ -174,7 +192,9 @@ describe("runVerificationCronTick eligibility recheck", () => {
   });
 
   it("runs the requested backfill when there are no verification jobs", async () => {
-    mocks.execute.mockReset().mockResolvedValueOnce({ rows: [] });
+    mocks.execute.mockReset()
+      .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [] });
     const createdSince = new Date("2026-10-02T00:00:00.000Z");
 
     const result = await runVerificationCronTick(50, { createdSince });
@@ -189,7 +209,9 @@ describe("runVerificationCronTick eligibility recheck", () => {
   });
 
   it("runs a full historical backfill when no verification jobs are pending", async () => {
-    mocks.execute.mockReset().mockResolvedValueOnce({ rows: [] });
+    mocks.execute.mockReset()
+      .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [] });
 
     const result = await runVerificationCronTick(50, { backfillAll: true });
 
@@ -203,6 +225,7 @@ describe("runVerificationCronTick eligibility recheck", () => {
 
   it("passes an old email through MillionVerifier and queues only a valid result for import", async () => {
     mocks.execute.mockReset()
+      .mockResolvedValueOnce({ rows: [] })
       .mockResolvedValueOnce({ rows: [{
         id: "verification-job-1",
         workspace_id: "workspace-1",

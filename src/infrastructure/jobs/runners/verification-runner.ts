@@ -25,6 +25,7 @@ const CURRENT_VERIFICATION_TTL_DAYS = 30;
 
 export interface VerificationRunnerResult {
   jobsClaimed: number;
+  staleJobsDeadLettered: number;
   emailsVerified: number;
   cacheHits?: number;
   verificationValid?: number;
@@ -36,6 +37,24 @@ export interface VerificationRunnerResult {
 }
 
 export type VerificationExecutionStage = "VERIFICATION_CLAIM" | "VERIFICATION_PROVIDER" | "VERIFICATION_PERSIST" | "VERIFICATION_COMPLETE";
+
+export function buildDeadLetterExhaustedVerificationJobsQuery(now: Date) {
+  const lockExpiry = new Date(now.getTime() - LOCK_TIMEOUT_MINUTES * 60_000);
+  return sql`
+    UPDATE verification_jobs
+    SET status = 'dead_letter',
+        locked_at = NULL,
+        locked_by = NULL,
+        next_attempt_at = NULL,
+        last_error = COALESCE(NULLIF(BTRIM(last_error), ''), 'Verification lock expired after maximum attempts.'),
+        updated_at = ${now.toISOString()}::timestamptz
+    WHERE status = 'processing'
+      AND locked_at IS NOT NULL
+      AND locked_at < ${lockExpiry.toISOString()}::timestamptz
+      AND attempt_count >= max_attempts
+    RETURNING id
+  `;
+}
 
 export interface ProviderDisabledVerificationRepairResult {
   inspected: number;
@@ -694,6 +713,9 @@ export async function runVerificationCronTick(
   const env = getVerificationEnv();
   const providerName = env.EMAIL_VERIFICATION_PROVIDER;
 
+  const exhaustedStaleJobs = await db.execute(buildDeadLetterExhaustedVerificationJobsQuery(now));
+  const staleJobsDeadLettered = exhaustedStaleJobs.rows.length;
+
   // 1. Lease jobs
   options.onStage?.("VERIFICATION_CLAIM");
   const leased = await db.execute(sql`
@@ -755,6 +777,7 @@ export async function runVerificationCronTick(
     });
     return {
       jobsClaimed: 0,
+      staleJobsDeadLettered,
       emailsVerified: 0,
       millionVerifierStatus: getMillionVerifierStatus(providerName, Boolean(env.MILLION_VERIFIER ?? env.MILLIONVERIFIER_API_KEY)),
       ...(instantly ? { instantly } : {}),
@@ -786,6 +809,7 @@ export async function runVerificationCronTick(
     });
     return {
       jobsClaimed: leased.rows.length,
+      staleJobsDeadLettered,
       emailsVerified: 0,
       millionVerifierStatus: "disabled",
       ...(instantly ? { instantly } : {}),
@@ -1003,6 +1027,7 @@ export async function runVerificationCronTick(
   }
   return {
     jobsClaimed: leased.rows.length,
+    staleJobsDeadLettered,
     emailsVerified: totalEmailsVerified,
     cacheHits: totalCacheHits,
     verificationValid,
