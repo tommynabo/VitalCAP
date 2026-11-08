@@ -7,6 +7,7 @@ import {
   evaluateRampReadiness,
   estimateRequestsRequiredForTarget,
   getCapacityWindowBounds,
+  resolveOperationalDailyTarget,
   rollupConfirmedImports,
   sameCohortYield,
   totalConfirmedImports,
@@ -153,6 +154,54 @@ describe("production capacity metrics", () => {
   it("calculates prospective capacity while auto-send is disabled", () => {
     expect(evaluateInstantlyDeliveryCapacity(deliveryCapacityInput({ autoSendEnabled: false })))
       .toMatchObject({ projectedInitialMonthlyEmails: 7_500, supportsTarget: true });
+  });
+
+  it("keeps the business target separate and chooses the tightest known operational capacity", () => {
+    expect(resolveOperationalDailyTarget({
+      businessDailyTarget: 250,
+      planningDays: 30,
+      remainingContactSlots: 140,
+      monthlyEmailHeadroom: 4_417,
+      dailyRawRequestCap: 9_000,
+      rawRequestsWithBufferForBusinessTarget: 57_297,
+      providerBudgets: {
+        apify: { dailyBudgetUsd: 5, projectedDailySpendForBusinessTargetUsd: 57.309346 },
+        serper: { dailyBudgetUsd: 0.5, projectedDailySpendForBusinessTargetUsd: 4.822838 },
+        verification: { dailyBudgetUsd: 1, projectedDailySpendForBusinessTargetUsd: 4.654671 },
+      },
+    })).toEqual({
+      businessDailyTarget: 250,
+      operationalDailyTarget: 4,
+      readiness: "CAPACITY_LIMITED",
+      limitingConstraints: ["contacts"],
+      constraintTargets: {
+        contacts: 4,
+        monthlyEmails: 147,
+        rawRequests: 39,
+        apify: 21,
+        serper: 25,
+        verification: 53,
+      },
+    });
+  });
+
+  it("fails closed when any required capacity input is unknown", () => {
+    expect(resolveOperationalDailyTarget({
+      businessDailyTarget: 250,
+      planningDays: 30,
+      remainingContactSlots: null,
+      monthlyEmailHeadroom: 4_417,
+      dailyRawRequestCap: 9_000,
+      rawRequestsWithBufferForBusinessTarget: 57_297,
+      providerBudgets: {
+        apify: { dailyBudgetUsd: 5, projectedDailySpendForBusinessTargetUsd: 57.309346 },
+      },
+    })).toMatchObject({
+      businessDailyTarget: 250,
+      operationalDailyTarget: 0,
+      readiness: "UNKNOWN",
+      limitingConstraints: ["contacts"],
+    });
   });
 
   it("requires delivery, provider, pause, dead-letter, raw-cap, and yield gates to be ready", () => {

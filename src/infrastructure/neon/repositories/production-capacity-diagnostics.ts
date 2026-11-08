@@ -21,6 +21,7 @@ import {
   DISCOVERY_ENGINE_TYPES,
   estimateRequestsRequiredForTarget,
   getCapacityWindowBounds,
+  resolveOperationalDailyTarget,
   rollupConfirmedImports,
   sameCohortYield,
   totalConfirmedImports,
@@ -787,6 +788,22 @@ export async function getProductionCapacityDiagnostics(
   const requiredVerificationBudgetIncreaseUsd = baseScenario.verificationDailyCostUsd === null
     ? null
     : Math.max(0, baseScenario.verificationDailyCostUsd - verificationEnv.EMAIL_VERIFICATION_DAILY_COST_LIMIT_USD);
+  const operationalTarget = resolveOperationalDailyTarget({
+    businessDailyTarget: targetLeadsPerDay,
+    planningDays,
+    remainingContactSlots: deliveryCapacity.remainingContactSlots,
+    monthlyEmailHeadroom: deliveryCapacity.monthlyEmailHeadroom,
+    dailyRawRequestCap: currentRawRequestCap,
+    rawRequestsWithBufferForBusinessTarget: baseRawRequestsWithBuffer,
+    providerBudgets: {
+      apify: { dailyBudgetUsd: apifyBudget, projectedDailySpendForBusinessTargetUsd: baseScenario.apifyDailyCostUsd },
+      serper: { dailyBudgetUsd: serperEnv.SERPER_DAILY_COST_LIMIT_USD, projectedDailySpendForBusinessTargetUsd: baseScenario.serperDailyCostUsd },
+      emailVerification: {
+        dailyBudgetUsd: verificationEnv.EMAIL_VERIFICATION_DAILY_COST_LIMIT_USD,
+        projectedDailySpendForBusinessTargetUsd: baseScenario.verificationDailyCostUsd,
+      },
+    },
+  });
   const bestEngineMix = [...engineMetrics]
     .map((metric) => ({
       engine: metric.engine,
@@ -1086,6 +1103,11 @@ export async function getProductionCapacityDiagnostics(
       requiredAdditionalInitialMonthlySendCapacity: monthlySendCapacityIncrease,
       requiredAdditionalMonthlySendCapacity: monthlySendCapacityIncrease,
       configuredMonthlySendLimitIncrease,
+    },
+    operationalTarget: {
+      ...operationalTarget,
+      scope: "capacity_bounded_readiness_only",
+      autoSendEnabled: false,
     },
     providerHealth: {
       apify: {

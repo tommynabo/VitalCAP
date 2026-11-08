@@ -106,6 +106,68 @@ export function evaluateInstantlyDeliveryCapacity(input: {
   };
 }
 
+export interface OperationalTargetCapacity {
+  businessDailyTarget: number;
+  operationalDailyTarget: number;
+  readiness: "SUPPORTED" | "CAPACITY_LIMITED" | "UNKNOWN";
+  limitingConstraints: string[];
+  constraintTargets: Record<string, number | null>;
+}
+
+export function resolveOperationalDailyTarget(input: {
+  businessDailyTarget: number;
+  planningDays: number;
+  remainingContactSlots: number | null;
+  monthlyEmailHeadroom: number | null;
+  dailyRawRequestCap: number | null;
+  rawRequestsWithBufferForBusinessTarget: number | null;
+  providerBudgets: Record<string, { dailyBudgetUsd: number; projectedDailySpendForBusinessTargetUsd: number | null }>;
+}): OperationalTargetCapacity {
+  const businessDailyTarget = Math.max(0, Math.floor(input.businessDailyTarget));
+  const planningDays = Math.max(1, Math.floor(input.planningDays));
+  const constraintTargets: Record<string, number | null> = {
+    contacts: input.remainingContactSlots === null
+      ? null
+      : Math.floor(Math.max(0, input.remainingContactSlots) / planningDays),
+    monthlyEmails: input.monthlyEmailHeadroom === null
+      ? null
+      : Math.floor(Math.max(0, input.monthlyEmailHeadroom) / planningDays),
+    rawRequests: input.dailyRawRequestCap === null || input.rawRequestsWithBufferForBusinessTarget === null
+      || input.rawRequestsWithBufferForBusinessTarget <= 0
+      ? null
+      : Math.floor(businessDailyTarget * Math.max(0, input.dailyRawRequestCap) / input.rawRequestsWithBufferForBusinessTarget),
+  };
+
+  for (const [provider, budget] of Object.entries(input.providerBudgets)) {
+    constraintTargets[provider] = budget.projectedDailySpendForBusinessTargetUsd === null
+      || budget.projectedDailySpendForBusinessTargetUsd <= 0
+      ? null
+      : Math.floor(businessDailyTarget * Math.max(0, budget.dailyBudgetUsd) / budget.projectedDailySpendForBusinessTargetUsd);
+  }
+
+  const unknownConstraints = Object.entries(constraintTargets)
+    .filter(([, target]) => target === null)
+    .map(([name]) => name);
+  const knownTargets = Object.values(constraintTargets).filter((target): target is number => target !== null);
+  const boundedTarget = Math.min(businessDailyTarget, ...knownTargets);
+  const operationalDailyTarget = unknownConstraints.length > 0 ? 0 : boundedTarget;
+  const limitingConstraints = unknownConstraints.length > 0
+    ? unknownConstraints
+    : Object.entries(constraintTargets)
+      .filter(([, target]) => target !== null && target === boundedTarget)
+      .map(([name]) => name);
+
+  return {
+    businessDailyTarget,
+    operationalDailyTarget,
+    readiness: unknownConstraints.length > 0
+      ? "UNKNOWN"
+      : operationalDailyTarget < businessDailyTarget ? "CAPACITY_LIMITED" : "SUPPORTED",
+    limitingConstraints,
+    constraintTargets,
+  };
+}
+
 export function evaluateRampReadiness(input: {
   deliveryCapacity: CapacityStatus;
   providersHealthy: boolean | null;
