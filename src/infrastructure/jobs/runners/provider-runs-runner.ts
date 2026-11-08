@@ -66,12 +66,15 @@ export interface ProviderRunsCronResult {
 }
 
 /** Polls a bounded number of durable Compass runs; it never waits for an Actor. */
-export async function runProviderRunsCronTick(maxRuns = MAX_RUNS_PER_TICK): Promise<ProviderRunsCronResult> {
+export async function runProviderRunsCronTick(
+  maxRuns = MAX_RUNS_PER_TICK,
+  options: { campaignId?: string; discoveryJobId?: string } = {},
+): Promise<ProviderRunsCronResult> {
   const env = getMapsEnv();
   if (!env.APIFY_API_TOKEN) return { runsChecked: 0, runsIngested: 0, candidatesInserted: 0, itemsReturned: 0, ingestionAccounting: emptyIngestionAccounting(), warnings: ["APIFY_API_TOKEN is not configured."] };
 
   const client = new ApifyClient({ apiToken: env.APIFY_API_TOKEN });
-  const runs = await listApifyRunsForPolling(maxRuns);
+  const runs = await listApifyRunsForPolling(maxRuns, new Date(), options);
   let runsIngested = 0;
   let candidatesInserted = 0;
   let itemsReturned = 0;

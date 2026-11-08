@@ -23,6 +23,16 @@ const STRICT_NICHE_TARGETS: Record<string, string> = {
 };
 const STRICT_NICHE_TARGET_IDS = new Set(Object.values(STRICT_NICHE_TARGETS));
 
+export interface ScopedInstantlyTargetPreflight {
+  campaignId: string;
+  niche: string | null;
+  expectedTarget: string | null;
+  actualTarget: string | null;
+  mappingEnabled: boolean;
+  importReady: boolean;
+  blockReason: string | null;
+}
+
 interface CampaignTargetRow {
   campaign_id: string;
   workspace_id: string;
@@ -166,4 +176,37 @@ export async function listInstantlyImportTargets(): Promise<ReturnType<typeof re
     result.rows as unknown as CampaignTargetRow[],
     getDeliveryEnv().INSTANTLY_CAMPAIGN_ID,
   );
+}
+
+export async function getScopedInstantlyTargetPreflight(
+  campaignId: string,
+  workspaceId: string,
+): Promise<ScopedInstantlyTargetPreflight | null> {
+  const result = await getDb().execute(sql`
+    SELECT c.id AS campaign_id, c.workspace_id, c.engine_config,
+      mapping.campaign_id AS mapping_campaign_id,
+      mapping.enabled AS mapping_enabled,
+      mapping.provider_campaign_id AS mapped_provider_campaign_id
+    FROM campaigns c
+    LEFT JOIN campaign_provider_mappings mapping
+      ON mapping.campaign_id = c.id AND mapping.provider = 'instantly'
+    WHERE c.id = ${campaignId}::uuid
+      AND c.workspace_id = ${workspaceId}::uuid
+  `);
+  const row = result.rows[0] as CampaignTargetRow | undefined;
+  if (!row) return null;
+  const resolved = resolveInstantlyImportTargets([row], getDeliveryEnv().INSTANTLY_CAMPAIGN_ID);
+  const block = resolved.blockedCampaignReasons[0];
+  const config = row.engine_config !== null && typeof row.engine_config === "object" && !Array.isArray(row.engine_config)
+    ? row.engine_config as Record<string, unknown>
+    : {};
+  return {
+    campaignId: row.campaign_id,
+    niche: typeof config.niche === "string" ? config.niche : null,
+    expectedTarget: block?.expectedProviderCampaignId ?? resolved.targets[0]?.providerCampaignId ?? null,
+    actualTarget: row.mapped_provider_campaign_id,
+    mappingEnabled: row.mapping_enabled === true,
+    importReady: resolved.targets.some((target) => target.campaignId === campaignId),
+    blockReason: block?.reason ?? null,
+  };
 }

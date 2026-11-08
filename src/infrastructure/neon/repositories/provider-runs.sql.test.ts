@@ -1,7 +1,7 @@
 import { PgDialect } from "drizzle-orm/pg-core";
 import { describe, expect, it } from "vitest";
 import { getDayBounds } from "@/lib/time/day-bounds";
-import { buildApifyPollingDuePredicate, buildReserveApifyProviderRunQuery, buildReserveSerperProviderRunQuery, getApifyReservationFailureDetails, getSafePostgresErrorCode, resolveSerperRecoveryState } from "./provider-runs";
+import { buildApifyPollingDuePredicate, buildApifyPollingScopePredicate, buildReserveApifyProviderRunQuery, buildReserveSerperProviderRunQuery, getApifyReservationFailureDetails, getSafePostgresErrorCode, resolveSerperRecoveryState } from "./provider-runs";
 
 const dialect = new PgDialect();
 const accountCostSnapshot = {
@@ -224,6 +224,20 @@ describe("Apify provider run reservation SQL", () => {
     expect(query.sql).toContain("metadata->>'pollRetryAt' IS NULL");
     expect(query.sql).toContain("<=");
     expect(query.params).toContain("2026-10-11T18:00:00.000Z");
+  });
+
+  it("scopes Apify polling to both the allowlisted campaign and exact discovery job", () => {
+    const query = dialect.sqlToQuery(buildApifyPollingScopePredicate({
+      campaignId: "00000000-0000-0000-0000-000000000002",
+      discoveryJobId: "00000000-0000-0000-0000-000000000004",
+    })!);
+
+    expect(query.sql).toContain('"provider_runs"."campaign_id" =');
+    expect(query.sql).toContain('"provider_runs"."metadata"->>\'discoveryJobId\' =');
+    expect(query.params).toEqual([
+      "00000000-0000-0000-0000-000000000002",
+      "00000000-0000-0000-0000-000000000004",
+    ]);
   });
 
   it("returns only safe reservation failure details instead of the underlying SQL error", () => {

@@ -1,6 +1,7 @@
 import type { Campaign, EngineType } from "@/domain/campaigns/types";
 import type { EngineCapability } from "./engine-capability";
 import { SAFE_ENGINE_YIELD_PRIOR, type EngineYieldTier } from "./engine-performance";
+import { getNicheId } from "@/services/discovery/niche-profiles";
 
 export interface DiscoveryOrder {
   workspaceId: string;
@@ -85,6 +86,86 @@ export function routeCampaignsToAvailableEngines(
 export const MAX_RAW_PER_PLANNING_WINDOW = 500;
 export const MAX_APIFY_RECOVERY_PROBE_RAW = 10;
 export const MIN_IMPORTS_FOR_COST_WEIGHT = 5;
+export const COLD_START_IMPORT_SAMPLE = MIN_IMPORTS_FOR_COST_WEIGHT;
+
+export interface OperationalNicheCampaign {
+  campaign: Campaign;
+  confirmedImports: number;
+  rawRequestedToday: number;
+  completedProbeCount: number;
+  providerAvailable: boolean;
+}
+
+export interface OperationalEnvelopeInput {
+  businessDailyTarget: number;
+  safeCapacityTarget: number;
+  backlogInventory: number;
+  rawRequestedToday: number;
+  campaigns: readonly OperationalNicheCampaign[];
+}
+
+export interface OperationalEnvelopePlan {
+  businessTarget: number;
+  operationalTarget: number;
+  effectiveSchedulerTarget: number;
+  remainingOperationalDemand: number;
+  backlogContribution: number;
+  coldStartNiches: string[];
+  coldStartProbeBudget: number;
+  coldStartAllocations: Array<{ campaignId: string; niche: string; rawCount: number }>;
+  economicDemand: number;
+  bindingConstraint: "business_target" | "capacity" | "backlog" | "provider";
+}
+
+/** Applies one shared execution envelope only to explicitly tagged rollout niches. */
+export function resolveOperationalEnvelope(input: OperationalEnvelopeInput): OperationalEnvelopePlan {
+  const businessTarget = Math.max(0, Math.floor(input.businessDailyTarget));
+  const operationalTarget = Math.max(0, Math.floor(input.safeCapacityTarget));
+  const effectiveSchedulerTarget = Math.min(businessTarget, operationalTarget);
+  const backlogContribution = Math.max(0, Math.floor(input.backlogInventory));
+  const requestedToday = Math.max(0, Math.floor(input.rawRequestedToday));
+  const remainingOperationalDemand = Math.max(
+    0,
+    effectiveSchedulerTarget - Math.max(backlogContribution, requestedToday),
+  );
+  const nicheCampaigns = input.campaigns.flatMap((item) => {
+    const niche = getNicheId(item.campaign.engineConfig?.niche);
+    return niche ? [{ ...item, niche }] : [];
+  });
+  const availableCampaigns = nicheCampaigns.filter((item) => item.providerAvailable);
+  const coldStart = availableCampaigns
+    .filter((item) => item.confirmedImports < COLD_START_IMPORT_SAMPLE && item.rawRequestedToday === 0)
+    .sort((left, right) => left.completedProbeCount - right.completedProbeCount
+      || left.campaign.createdAt.localeCompare(right.campaign.createdAt)
+      || left.campaign.id.localeCompare(right.campaign.id));
+  const coldStartAllocations = coldStart.slice(0, remainingOperationalDemand).map((item) => ({
+    campaignId: item.campaign.id,
+    niche: item.niche,
+    rawCount: 1,
+  }));
+  const anyProviderAvailable = availableCampaigns.length > 0;
+  const demand = anyProviderAvailable ? remainingOperationalDemand : 0;
+  const bindingConstraint = !anyProviderAvailable
+    ? "provider"
+    : backlogContribution >= effectiveSchedulerTarget && effectiveSchedulerTarget > 0
+      ? "backlog"
+      : operationalTarget < businessTarget
+        ? "capacity"
+        : "business_target";
+
+  return {
+    businessTarget,
+    operationalTarget,
+    effectiveSchedulerTarget,
+    remainingOperationalDemand: demand,
+    backlogContribution,
+    coldStartNiches: coldStart.map((item) => item.niche),
+    coldStartProbeBudget: coldStartAllocations.length,
+    coldStartAllocations,
+    economicDemand: Math.max(0, demand - coldStartAllocations.length),
+    bindingConstraint,
+  };
+}
 
 function median(values: readonly number[]): number | null {
   if (values.length === 0) return null;

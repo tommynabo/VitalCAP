@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { and, asc, desc, eq, gte, inArray, ne, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gte, inArray, ne, sql, type SQL } from "drizzle-orm";
 import { getDayBounds } from "@/lib/time/day-bounds";
 import { getDb } from "../db";
 import { buildDailyRawRequestCommitmentCtes, executeUnderGlobalDailyRawCapLock } from "./daily-raw-request-cap";
@@ -844,8 +844,20 @@ export function buildApifyPollingDuePredicate(now = new Date()) {
   return sql`(metadata->>'pollRetryAt' IS NULL OR (metadata->>'pollRetryAt')::timestamptz <= ${now.toISOString()}::timestamptz)`;
 }
 
-export async function listApifyRunsForPolling(limit: number, now = new Date()) {
+export function buildApifyPollingScopePredicate(scope: { campaignId?: string; discoveryJobId?: string }): SQL | undefined {
+  const predicates: SQL[] = [];
+  if (scope.campaignId) predicates.push(eq(providerRuns.campaignId, scope.campaignId));
+  if (scope.discoveryJobId) predicates.push(sql`${providerRuns.metadata}->>'discoveryJobId' = ${scope.discoveryJobId}`);
+  return predicates.length > 0 ? and(...predicates) : undefined;
+}
+
+export async function listApifyRunsForPolling(
+  limit: number,
+  now = new Date(),
+  scope: { campaignId?: string; discoveryJobId?: string } = {},
+) {
   const db = getDb();
+  const scopePredicate = buildApifyPollingScopePredicate(scope);
   return db
     .select()
     .from(providerRuns)
@@ -853,6 +865,7 @@ export async function listApifyRunsForPolling(limit: number, now = new Date()) {
       eq(providerRuns.provider, "apify"),
       inArray(providerRuns.status, ["starting", "queued", "running", "succeeded"]),
       buildApifyPollingDuePredicate(now),
+      ...(scopePredicate ? [scopePredicate] : []),
     ))
     .orderBy(asc(providerRuns.startedAt), asc(providerRuns.id))
     .limit(limit);

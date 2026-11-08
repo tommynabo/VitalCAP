@@ -97,6 +97,26 @@ describe("job queue SQL builders", () => {
     expect(buildDiscoveryClaimQuery().sql).not.toContain("providerRecoveryDay");
   });
 
+  it("restricts scoped smoke discovery claims to one allowlisted Draft/off campaign and one job", () => {
+    const campaignId = "65b9f85d-4c8b-4e52-99fb-217eb3acac1c";
+    const jobId = "00000000-0000-0000-0000-000000000005";
+    const query = dialect.sqlToQuery(buildClaimJobsQuery("discovery_jobs", {
+      workerId: "scoped-smoke",
+      batchSize: 1,
+      campaignId,
+      jobId,
+      requireAutopilot: false,
+      allowScopedDraftCampaign: true,
+    }, claimTime));
+
+    expect(query.sql).toContain("c.status = 'draft'");
+    expect(query.sql).toContain("c.autopilot_enabled = false");
+    expect(query.sql).toContain("c.engine_config->>'niche' IN");
+    expect(query.sql).toContain("j.id =");
+    expect(query.params).toContain(campaignId);
+    expect(query.params).toContain(jobId);
+  });
+
   it("keeps max-attempt recovery jobs ineligible under the shared attempt guard", () => {
     const query = buildDiscoveryClaimQuery();
     const whereClause = query.sql.slice(query.sql.indexOf("WHERE"), query.sql.indexOf("ORDER BY"));

@@ -5,6 +5,8 @@ const mocks = vi.hoisted(() => ({
   listAutopilotEnabledCampaigns: vi.fn(),
   getAutopilotSettings: vi.fn(),
   getAutopilotPacingState: vi.fn(),
+  getProductionCapacityDiagnostics: vi.fn(),
+  getMultiNicheCampaignInventory: vi.fn(),
   insertRebalanceDecision: vi.fn(),
   enqueueDiscoveryOrdersWithinDailyRawCap: vi.fn(),
   getCampaignQueueDepth: vi.fn(),
@@ -26,9 +28,11 @@ const mocks = vi.hoisted(() => ({
   decideHybridFill: vi.fn(),
   buildMapsSeedCatalog: vi.fn(),
   buildSerpSeedCatalog: vi.fn(),
+  buildCampaignSeedCatalog: vi.fn(() => []),
   getDeliveryEnv: vi.fn(),
   getMapsEnv: vi.fn(),
   getSerperEnv: vi.fn(),
+  getVerificationEnv: vi.fn(),
   refreshWatchdogPauseForWorkspace: vi.fn(),
 }));
 
@@ -40,6 +44,8 @@ vi.mock("@/infrastructure/neon/repositories/autopilot", () => ({
   getAutopilotPacingState: mocks.getAutopilotPacingState,
   insertRebalanceDecision: mocks.insertRebalanceDecision,
 }));
+vi.mock("@/infrastructure/neon/repositories/production-capacity-diagnostics", () => ({ getProductionCapacityDiagnostics: mocks.getProductionCapacityDiagnostics }));
+vi.mock("@/infrastructure/neon/repositories/multi-niche-rollout", () => ({ getMultiNicheCampaignInventory: mocks.getMultiNicheCampaignInventory }));
 vi.mock("@/infrastructure/neon/repositories/job-queue", () => ({
   getCampaignQueueDepth: mocks.getCampaignQueueDepth,
 }));
@@ -76,6 +82,7 @@ vi.mock("@/services/discovery/hybrid-fill-decision", () => ({ decideHybridFill: 
 vi.mock("@/services/discovery/spain-search-catalog", () => ({
   buildMapsSeedCatalog: mocks.buildMapsSeedCatalog,
   buildSerpSeedCatalog: mocks.buildSerpSeedCatalog,
+  buildCampaignSeedCatalog: mocks.buildCampaignSeedCatalog,
   ICP_CATEGORY_TERMS: [],
   LINKEDIN_OWNER_ROLE_QUERIES: [],
 }));
@@ -83,6 +90,7 @@ vi.mock("@/lib/config/env", () => ({
   getDeliveryEnv: mocks.getDeliveryEnv,
   getMapsEnv: mocks.getMapsEnv,
   getSerperEnv: mocks.getSerperEnv,
+  getVerificationEnv: mocks.getVerificationEnv,
 }));
 vi.mock("@/infrastructure/providers/serp/serper-provider", () => ({ SERPER_ESTIMATED_COST_PER_QUERY_USD: 0.01 }));
 
@@ -106,6 +114,14 @@ describe("runAutopilotCronTick", () => {
       emergencyStopped: false,
       systemPaused: false,
       timezone: "Europe/Madrid",
+      globalDailyTarget: 250,
+    });
+    mocks.getProductionCapacityDiagnostics.mockResolvedValue({ operationalTarget: { operationalDailyTarget: 4 } });
+    mocks.getMultiNicheCampaignInventory.mockResolvedValue([]);
+    mocks.getVerificationEnv.mockReturnValue({
+      EMAIL_VERIFICATION_PROVIDER: "millionverifier",
+      MILLIONVERIFIER_API_KEY: "configured",
+      EMAIL_VERIFICATION_DAILY_COST_LIMIT_USD: 1,
     });
     mocks.getCampaignQueueDepth.mockResolvedValue(0);
     mocks.getWatchdogWorkspaceSignals.mockResolvedValue([{
@@ -235,6 +251,137 @@ describe("runAutopilotCronTick", () => {
     expect(scheduledOrders.reduce((sum: number, order: { payload: { desiredRawCount: number } }) => sum + order.payload.desiredRawCount, 0))
       .toBeLessThanOrEqual(MAX_RAW_PER_PLANNING_WINDOW);
     expect(mocks.getGlobalSerperSpendToday).toHaveBeenCalledOnce();
+  });
+
+  it("keeps four rollout niches inside one safe daily envelope and reserves under the scoped cap", async () => {
+    const now = new Date("2025-06-15T12:00:00Z");
+    const rollout = [
+      ["65b9f85d-4c8b-4e52-99fb-217eb3acac1c", "yoga_pilates"],
+      ["5e109452-2df2-4b1b-9afc-7baa1b67fc42", "spas_wellness"],
+      ["47fce807-aac6-4a8a-90f9-6ad3bbbf4ca7", "premium_fitness"],
+      ["53f56788-99d9-4d6a-8c71-ab2ffe075d85", "personal_training"],
+    ] as const;
+    const campaigns = rollout.map(([id, niche]) => ({
+      id,
+      engineType: "maps_fast",
+      engineConfig: { niche },
+      status: "active",
+      autopilotEnabled: true,
+      dailySoftTarget: 250,
+      createdAt: "2025-01-01T00:00:00.000Z",
+    }));
+    mocks.listAutopilotEnabledCampaigns.mockResolvedValue(campaigns);
+    mocks.getAutopilotPacingState.mockResolvedValue(computeAutopilotPacing({
+      workspaceId: "workspace-1", timeZone: "Europe/Madrid", targetMetric: "instantly_imported",
+      dailyTarget: 250, targetAchievedToday: 0, instantlyImportedToday: 0, eligibleImportBacklog: 0,
+      expectedImportsFromBacklog: 0, rawRequestedToday: 0, rawReturnedToday: 0, processingInFlight: 0,
+      providerRunsInFlight: 0, expectedQualifiedFromInFlight: 0, apifySpendToday: 0,
+      apifyDailyBudgetRemaining: 5, providerHealth: "healthy", availableDiscoveryCapacity: true,
+      estimatedYield: 0.1, yieldSampleSize: 0, now, operatingStartHour: 7, operatingEndHour: 22,
+    }));
+    mocks.getMultiNicheCampaignInventory.mockResolvedValue(rollout.map(([campaignId]) => ({
+      campaignId, rawRequestedToday: 0, backlogInventory: 0, confirmedImports: 0, completedProbeCount: 0,
+    })));
+
+    const result = await runAutopilotCronTick(now);
+    const orders = mocks.enqueueDiscoveryOrdersWithinDailyRawCap.mock.calls[0]?.[0] ?? [];
+    const scopedCap = mocks.enqueueDiscoveryOrdersWithinDailyRawCap.mock.calls[0]?.[2];
+
+    expect(result.ordersScheduled).toBe(4);
+    expect(orders).toHaveLength(4);
+    expect(orders.reduce((sum: number, order: { desiredRawCount: number }) => sum + order.desiredRawCount, 0)).toBe(4);
+    expect(scopedCap).toEqual({ campaignIds: rollout.map(([id]) => id), cap: 4 });
+  });
+
+  it("stops rollout discovery when the safe capacity target is exhausted", async () => {
+    const now = new Date("2025-06-15T12:00:00Z");
+    const campaign = {
+      id: "65b9f85d-4c8b-4e52-99fb-217eb3acac1c",
+      engineType: "maps_fast",
+      engineConfig: { niche: "yoga_pilates" },
+      status: "active",
+      autopilotEnabled: true,
+      dailySoftTarget: 250,
+    };
+    mocks.listAutopilotEnabledCampaigns.mockResolvedValue([campaign]);
+    mocks.getProductionCapacityDiagnostics.mockResolvedValue({ operationalTarget: { operationalDailyTarget: 0 } });
+    mocks.getAutopilotPacingState.mockResolvedValue(computeAutopilotPacing({
+      workspaceId: "workspace-1", timeZone: "Europe/Madrid", dailyTarget: 250, targetAchievedToday: 0,
+      rawRequestedToday: 0, rawReturnedToday: 0, processingInFlight: 0, providerRunsInFlight: 0,
+      expectedQualifiedFromInFlight: 0, apifySpendToday: 0, apifyDailyBudgetRemaining: 5,
+      providerHealth: "healthy", availableDiscoveryCapacity: true, estimatedYield: 0.1, yieldSampleSize: 0,
+      now, operatingStartHour: 7, operatingEndHour: 22,
+    }));
+    mocks.getMultiNicheCampaignInventory.mockResolvedValue([{
+      campaignId: campaign.id, rawRequestedToday: 0, backlogInventory: 0, confirmedImports: 0, completedProbeCount: 0,
+    }]);
+
+    const result = await runAutopilotCronTick(now);
+
+    expect(result.ordersScheduled).toBe(0);
+    expect(mocks.enqueueDiscoveryOrdersWithinDailyRawCap.mock.calls[0]?.[2]).toMatchObject({ cap: 0 });
+  });
+
+  it("throttles new-niche discovery when verification budget/provider capacity is exhausted", async () => {
+    const now = new Date("2025-06-15T12:00:00Z");
+    const campaign = {
+      id: "65b9f85d-4c8b-4e52-99fb-217eb3acac1c",
+      engineType: "maps_fast",
+      engineConfig: { niche: "yoga_pilates" },
+      status: "active",
+      autopilotEnabled: true,
+      dailySoftTarget: 250,
+    };
+    mocks.listAutopilotEnabledCampaigns.mockResolvedValue([campaign]);
+    mocks.getTodaySpendUsd.mockResolvedValue(1);
+    mocks.getAutopilotPacingState.mockResolvedValue(computeAutopilotPacing({
+      workspaceId: "workspace-1", timeZone: "Europe/Madrid", dailyTarget: 250, targetAchievedToday: 0,
+      rawRequestedToday: 0, rawReturnedToday: 0, processingInFlight: 0, providerRunsInFlight: 0,
+      expectedQualifiedFromInFlight: 0, apifySpendToday: 0, apifyDailyBudgetRemaining: 5,
+      providerHealth: "healthy", availableDiscoveryCapacity: true, estimatedYield: 0.1, yieldSampleSize: 0,
+      now, operatingStartHour: 7, operatingEndHour: 22,
+    }));
+    mocks.getMultiNicheCampaignInventory.mockResolvedValue([{
+      campaignId: campaign.id, rawRequestedToday: 0, backlogInventory: 0, confirmedImports: 0, completedProbeCount: 0,
+    }]);
+
+    const result = await runAutopilotCronTick(now);
+
+    expect(result.ordersScheduled).toBe(0);
+    expect(mocks.getTodaySpendUsd).toHaveBeenCalledWith("workspace-1", "email_verification", "Europe/Madrid", now);
+    expect(mocks.enqueueDiscoveryOrdersWithinDailyRawCap.mock.calls[0]?.[2]).toMatchObject({ cap: 0 });
+  });
+
+  it("schedules no paid rollout discovery when both discovery providers are unavailable", async () => {
+    const now = new Date("2025-06-15T12:00:00Z");
+    const campaign = {
+      id: "65b9f85d-4c8b-4e52-99fb-217eb3acac1c",
+      engineType: "maps_fast",
+      engineConfig: { niche: "yoga_pilates" },
+      status: "active",
+      autopilotEnabled: true,
+      dailySoftTarget: 250,
+    };
+    mocks.listAutopilotEnabledCampaigns.mockResolvedValue([campaign]);
+    mocks.buildEngineCapabilities.mockReturnValue([
+      { engineType: "maps_fast", available: false, providerConfigured: true, providerHealthy: false, providerUntested: false, costAllowed: false, campaignCount: 1, reasonUnavailable: "provider_paused", reason: "provider_paused" },
+      { engineType: "google_serp", available: false, providerConfigured: true, providerHealthy: false, providerUntested: false, costAllowed: false, campaignCount: 1, reasonUnavailable: "provider_paused", reason: "provider_paused" },
+    ]);
+    mocks.getAutopilotPacingState.mockResolvedValue(computeAutopilotPacing({
+      workspaceId: "workspace-1", timeZone: "Europe/Madrid", dailyTarget: 250, targetAchievedToday: 0,
+      rawRequestedToday: 0, rawReturnedToday: 0, processingInFlight: 0, providerRunsInFlight: 0,
+      expectedQualifiedFromInFlight: 0, apifySpendToday: 0, apifyDailyBudgetRemaining: 5,
+      providerHealth: "healthy", availableDiscoveryCapacity: true, estimatedYield: 0.1, yieldSampleSize: 0,
+      now, operatingStartHour: 7, operatingEndHour: 22,
+    }));
+    mocks.getMultiNicheCampaignInventory.mockResolvedValue([{
+      campaignId: campaign.id, rawRequestedToday: 0, backlogInventory: 2, confirmedImports: 0, completedProbeCount: 0,
+    }]);
+
+    const result = await runAutopilotCronTick(now);
+
+    expect(result.ordersScheduled).toBe(0);
+    expect(mocks.enqueueDiscoveryOrdersWithinDailyRawCap.mock.calls[0]?.[0]).toEqual([]);
   });
 
   it("avoids new discovery for a zero-import target covered by eligible paid backlog", async () => {

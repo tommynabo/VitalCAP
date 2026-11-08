@@ -27,6 +27,7 @@ import {
 import { getApifyRecoverySnapshot, getApifyReservationFailureDetails, getLatestProviderEconomicPacingStates, getRecentProviderUsage, getSerperRecoveryState, getTodaySpendUsd, recordProviderRun, reserveApifyProviderRun, updateProviderRun } from "@/infrastructure/neon/repositories/provider-runs";
 import { getAutopilotSettings } from "@/infrastructure/neon/repositories/autopilot";
 import { getEffectiveAutopilotState } from "@/domain/autopilot/types";
+import { getMultiNicheRolloutEntry } from "@/services/autopilot/multi-niche-rollout";
 import { WATCHDOG_QUEUE_PAUSE_REASON } from "@/services/autopilot/watchdog-pause-policy";
 import { buildCampaignSeedCatalog, buildMapsSeedCatalog, buildSerpSeedCatalog, LINKEDIN_OWNER_ROLE_QUERIES, ICP_CATEGORY_TERMS } from "@/services/discovery/spain-search-catalog";
 import { getNicheId } from "@/services/discovery/niche-profiles";
@@ -91,6 +92,7 @@ interface DiscoveryJobPayload {
   economicPaceState?: EconomicPacingState;
   seedQuery?: string;
   seedGeography?: string;
+  scopedSmoke?: boolean;
 }
 
 type PreReservationStage = "bootstrap" | "load_seeds" | "plan_batch";
@@ -262,7 +264,13 @@ async function executeDiscoveryJob(
   const campaign = await runPreProviderStage(job, "campaign_guard", async () => {
     const currentCampaign = await getCampaignById(job.campaignId);
     if (!currentCampaign) throw new Error("Discovery campaign is unavailable.");
-    if (currentCampaign.status !== "active" || !currentCampaign.autopilotEnabled) {
+    const rollout = getMultiNicheRolloutEntry(currentCampaign.id);
+    const scopedDraftAllowed = job.payload.scopedSmoke === true
+      && rollout !== null
+      && rollout.niche === currentCampaign.engineConfig?.niche
+      && currentCampaign.status === "draft"
+      && !currentCampaign.autopilotEnabled;
+    if (!scopedDraftAllowed && (currentCampaign.status !== "active" || !currentCampaign.autopilotEnabled)) {
       throw new Error("Scheduled discovery is disabled for this campaign.");
     }
     return currentCampaign;
@@ -894,10 +902,24 @@ export interface DiscoveryRunnerResult {
 }
 
 /** One bounded batch of discovery work across every workspace: enqueue-if-missing per workspace, then a single global claim+execute loop of up to `maxJobsPerTick` jobs (claims are global — not workspace-scoped — so this must not be called once per workspace). Called once per `/api/cron/discovery` invocation. */
-export async function runDiscoveryCronTick(maxJobsPerTick: number, now: Date = new Date()): Promise<DiscoveryRunnerResult> {
-  const workspaceIds = await listWorkspaceIds();
-  for (const workspaceId of workspaceIds) {
-    await ensureDiscoveryJobsQueued(workspaceId);
+export interface ScopedDiscoveryExecution {
+  campaignId: string;
+  jobId: string;
+  allowScopedDraftCampaign: true;
+}
+
+export async function runDiscoveryCronTick(
+  maxJobsPerTick: number,
+  now: Date = new Date(),
+  scoped?: ScopedDiscoveryExecution,
+): Promise<DiscoveryRunnerResult> {
+  const scopedCampaign = scoped ? await getCampaignById(scoped.campaignId) : null;
+  if (scoped && (!scopedCampaign || getMultiNicheRolloutEntry(scoped.campaignId)?.niche !== scopedCampaign.engineConfig?.niche)) {
+    throw new Error("Scoped discovery campaign is not allowlisted.");
+  }
+  const workspaceIds = scoped ? [scopedCampaign!.workspaceId] : await listWorkspaceIds();
+  if (!scoped) {
+    for (const workspaceId of workspaceIds) await ensureDiscoveryJobsQueued(workspaceId);
   }
 
   const workerId = `cron-discovery-${randomUUID()}`;
@@ -915,7 +937,17 @@ export async function runDiscoveryCronTick(maxJobsPerTick: number, now: Date = n
   let pausedWorkspaces = 0;
   let emergencyStoppedWorkspaces = 0;
 
-  const jobs = await claimDiscoveryJobs<DiscoveryJobPayload>({ workerId, batchSize: maxJobsPerTick, now, allowWatchdogRecovery: true });
+  const jobs = await claimDiscoveryJobs<DiscoveryJobPayload>({
+    workerId,
+    batchSize: scoped ? 1 : maxJobsPerTick,
+    now,
+    ...(scoped ? {
+      campaignId: scoped.campaignId,
+      jobId: scoped.jobId,
+      requireAutopilot: false,
+      allowScopedDraftCampaign: scoped.allowScopedDraftCampaign,
+    } : { allowWatchdogRecovery: true }),
+  });
   for (const job of jobs) {
     jobsClaimed += 1;
     try {

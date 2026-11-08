@@ -25,6 +25,11 @@ export interface DailyRawCapDiscoveryOrder {
   desiredRawCount: number;
 }
 
+export interface ScopedDailyRawCap {
+  campaignIds: readonly string[];
+  cap: number;
+}
+
 export interface ReservedDailyRawCapOrder {
   id: string;
   idempotencyKey: string;
@@ -103,7 +108,46 @@ export function buildEnqueueDiscoveryOrdersWithinDailyRawCapQuery(
   orders: readonly DailyRawCapDiscoveryOrder[],
   cap: number,
   now: Date,
+  scopedCap?: ScopedDailyRawCap,
 ) {
+  const scopedCampaignIds = scopedCap?.campaignIds ?? [];
+  const scopedCampaignIdList = scopedCampaignIds.length > 0
+    ? sql.join(scopedCampaignIds.map((campaignId) => sql`${campaignId}::uuid`), sql`, `)
+    : sql`NULL::uuid`;
+  const scopedCommitmentCtes = scopedCap && scopedCampaignIds.length > 0
+    ? sql`
+      scoped_provider_commitment AS (
+        SELECT COALESCE(SUM(GREATEST(run.items_requested, 0)), 0)::int AS provider_reserved_raw_requests
+        FROM provider_runs run
+        JOIN workspace_day_bounds bounds ON bounds.workspace_id = run.workspace_id
+        WHERE run.campaign_id IN (${scopedCampaignIdList})
+          AND run.provider IN ('apify', 'serper')
+          AND (
+            (run.started_at >= bounds.day_start AND run.started_at < bounds.day_end)
+            OR run.status IN ('starting', 'queued', 'running', 'succeeded', 'ingesting')
+          )
+      ),
+      scoped_queued_commitment AS (
+        SELECT COALESCE(SUM(GREATEST(
+          CASE WHEN job.payload->>'desiredRawCount' ~ '^[0-9]+$'
+            THEN (job.payload->>'desiredRawCount')::int ELSE 0 END
+            - COALESCE(represented.provider_reserved_raw_requests, 0),
+          0
+        )), 0)::int AS queued_raw_requests
+        FROM discovery_jobs job
+        LEFT JOIN provider_requests_by_discovery_job represented ON represented.discovery_job_id = job.id::text
+        WHERE job.campaign_id IN (${scopedCampaignIdList})
+          AND job.type = 'run_engine_batch'
+          AND job.status IN ('pending', 'processing')
+          AND (job.status = 'processing' OR job.attempt_count < job.max_attempts)
+      ),
+      scoped_daily_commitment AS (
+        SELECT provider.provider_reserved_raw_requests + queued.queued_raw_requests AS committed_raw_requests
+        FROM scoped_provider_commitment provider
+        CROSS JOIN scoped_queued_commitment queued
+      )
+    `
+    : sql`scoped_daily_commitment AS (SELECT 0::int AS committed_raw_requests)`;
   const inputOrders = orders.map((order, orderIndex) => ({
     campaign_id: order.campaignId,
     type: order.type,
@@ -116,6 +160,7 @@ export function buildEnqueueDiscoveryOrdersWithinDailyRawCapQuery(
 
   return sql`
     WITH ${buildDailyRawRequestCommitmentCtes(now)},
+    ${scopedCommitmentCtes},
     input_orders AS (
       SELECT *
       FROM jsonb_to_recordset(${JSON.stringify(inputOrders)}::jsonb) AS input(
@@ -149,10 +194,19 @@ export function buildEnqueueDiscoveryOrdersWithinDailyRawCapQuery(
             - COALESCE(SUM(eligible.desired_raw_count) OVER (
               ORDER BY eligible.priority, eligible.order_index
               ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
-            ), 0)
+            ), 0),
+          CASE WHEN eligible.campaign_id IN (${scopedCampaignIdList})
+            THEN ${Math.max(0, Math.floor(scopedCap?.cap ?? 0))} - scoped_daily_commitment.committed_raw_requests
+              - COALESCE(SUM(CASE WHEN eligible.campaign_id IN (${scopedCampaignIdList}) THEN eligible.desired_raw_count ELSE 0 END) OVER (
+                ORDER BY eligible.priority, eligible.order_index
+                ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+              ), 0)
+            ELSE ${cap}
+          END
         ))::int AS reserved_raw_count
       FROM eligible_orders eligible
       CROSS JOIN daily_raw_commitment
+      CROSS JOIN scoped_daily_commitment
     ),
     inserted_orders AS (
       INSERT INTO discovery_jobs (campaign_id, type, payload, idempotency_key)
@@ -227,9 +281,10 @@ export async function getDailyRawRequestCapSnapshot(now = new Date()): Promise<D
 export async function enqueueDiscoveryOrdersWithinDailyRawCap(
   orders: readonly DailyRawCapDiscoveryOrder[],
   now = new Date(),
+  scopedCap?: ScopedDailyRawCap,
 ): Promise<{ snapshot: DailyRawRequestCapSnapshot; orders: ReservedDailyRawCapOrder[] }> {
   const cap = getCoreEnv().ACTIVATION_MAX_DAILY_RAW_REQUESTS;
-  const rows = await executeUnderGlobalDailyRawCapLock(buildEnqueueDiscoveryOrdersWithinDailyRawCapQuery(orders, cap, now));
+  const rows = await executeUnderGlobalDailyRawCapLock(buildEnqueueDiscoveryOrdersWithinDailyRawCapQuery(orders, cap, now, scopedCap));
   const row = rows[0] as {
     provider_reserved_raw_requests: unknown;
     queued_raw_requests: unknown;

@@ -87,6 +87,32 @@ describe("global daily raw request cap SQL", () => {
     expect(query.sql).toMatch(/input\.payload->>'origin' = 'recovery_probe'[\s\S]*OR existing\.status IN \('pending', 'processing'\)/);
   });
 
+  it("enforces an additional atomic daily cap across the four rollout campaigns", () => {
+    const campaignIds = [
+      "00000000-0000-0000-0000-000000000001",
+      "00000000-0000-0000-0000-000000000002",
+      "00000000-0000-0000-0000-000000000003",
+      "00000000-0000-0000-0000-000000000004",
+    ];
+    const query = dialect.sqlToQuery(buildEnqueueDiscoveryOrdersWithinDailyRawCapQuery([{
+      campaignId: campaignIds[0]!,
+      type: "run_engine_batch",
+      payload: { engineType: "maps_fast", desiredRawCount: 4, origin: "normal" },
+      idempotencyKey: "rollout-probe",
+      desiredRawCount: 4,
+    }], 9000, now, { campaignIds, cap: 4 }));
+
+    expect(query.sql).toContain("scoped_provider_commitment");
+    expect(query.sql).toContain("scoped_queued_commitment");
+    expect(query.sql).toContain("scoped_daily_commitment.committed_raw_requests");
+    expect(query.sql).toContain("run.campaign_id IN (");
+    expect(query.sql).toContain("job.campaign_id IN (");
+    expect(query.sql).toContain("eligible.campaign_id IN (");
+    expect(query.params).toContain(4);
+    expect(query.params).toContain(9000);
+    for (const campaignId of campaignIds) expect(query.params).toContain(campaignId);
+  });
+
   it("serializes concurrent Apify reservation statements behind the transaction-scoped global lock", async () => {
     const neon = Object.assign(
       (strings: TemplateStringsArray, ...parameters: unknown[]) => ({

@@ -6,6 +6,7 @@ import { ProviderBudgetExceededError } from "@/domain/providers/errors";
 import { DbVerificationCacheStore } from "@/services/verification/db-verification-cache";
 import { verifyEmailsWithCache } from "@/services/verification/email-verification-cache";
 import { getDeliveryEnv, getVerificationEnv } from "@/lib/config/env";
+import { MULTI_NICHE_ROLLOUT_CAMPAIGN_IDS } from "@/services/autopilot/multi-niche-rollout";
 import { enqueueVerificationJob } from "@/infrastructure/neon/repositories/verification-queue";
 import { actualPriorColdOutreachSql } from "@/infrastructure/neon/repositories/actual-outreach";
 import { upsertCampaignMembership } from "@/infrastructure/neon/repositories/campaigns";
@@ -291,8 +292,24 @@ async function deferVerificationJobs(
   }
 }
 
-export async function enqueueVerificationJobs(options: { createdSince?: Date } = {}): Promise<number> {
+export async function enqueueVerificationJobs(options: {
+  createdSince?: Date;
+  campaignId?: string;
+  allowScopedDraftCampaign?: true;
+  batchSize?: number;
+} = {}): Promise<number> {
   const db = getDb();
+  const batchSize = Math.min(HISTORICAL_PREPARATION_BATCH_SIZE, Math.max(1, options.batchSize ?? HISTORICAL_PREPARATION_BATCH_SIZE));
+  const rolloutCampaignIdList = sql.join(MULTI_NICHE_ROLLOUT_CAMPAIGN_IDS.map((campaignId) => sql`${campaignId}::uuid`), sql`, `);
+  const scopedDraftCampaign = options.campaignId && options.allowScopedDraftCampaign
+    ? sql`c.id = ${options.campaignId}::uuid
+        AND c.id IN (${rolloutCampaignIdList})
+        AND c.status = 'draft'
+        AND c.autopilot_enabled = false
+        AND c.engine_config->>'niche' IN ('yoga_pilates', 'spas_wellness', 'premium_fitness', 'personal_training')`
+    : sql`false`;
+  const campaignEligibility = sql`((c.status = 'active' AND c.autopilot_enabled = true) OR (${scopedDraftCampaign}))`;
+  const campaignScopeFilter = options.campaignId ? sql`AND c.id = ${options.campaignId}::uuid` : sql``;
   const createdRawFilter = options.createdSince
     ? sql`AND rc.discovered_at >= ${options.createdSince.toISOString()}`
     : sql``;
@@ -303,13 +320,13 @@ export async function enqueueVerificationJobs(options: { createdSince?: Date } =
     JOIN accounts a ON a.id = rc.account_id AND a.workspace_id = c.workspace_id
     LEFT JOIN campaign_memberships cm ON cm.campaign_id = c.id AND cm.account_id = a.id
     WHERE rc.processed = true
-      AND c.status = 'active'
-      AND c.autopilot_enabled = true
+      AND ${campaignEligibility}
+      ${campaignScopeFilter}
       AND a.status IN ('qualified', 'contactable', 'outreach_ready')
       AND (cm.id IS NULL OR cm.stage = 'discovered')
       ${createdRawFilter}
     ORDER BY a.id
-    LIMIT ${HISTORICAL_PREPARATION_BATCH_SIZE}
+    LIMIT ${batchSize}
   `);
   for (const row of preparationRows.rows as Array<{ workspace_id: string; campaign_id: string; account_id: string }>) {
     await upsertCampaignMembership({
@@ -324,8 +341,8 @@ export async function enqueueVerificationJobs(options: { createdSince?: Date } =
     FROM campaign_memberships cm
     JOIN campaigns c ON c.id = cm.campaign_id
     JOIN accounts a ON a.id = cm.account_id AND a.workspace_id = c.workspace_id
-    WHERE c.status = 'active'
-      AND c.autopilot_enabled = true
+    WHERE ${campaignEligibility}
+      ${campaignScopeFilter}
       AND cm.stage IN ('qualified', 'contact_selected', 'ready')
       AND a.status IN ('qualified', 'contactable', 'outreach_ready')
       AND EXISTS (
@@ -347,7 +364,7 @@ export async function enqueueVerificationJobs(options: { createdSince?: Date } =
         WHERE cp.account_id = a.id AND cp.workspace_id = a.workspace_id AND cp.type = 'email'
       )
     ORDER BY a.id
-    LIMIT ${HISTORICAL_PREPARATION_BATCH_SIZE}
+    LIMIT ${batchSize}
   `);
   const { evaluateComplianceForAccount } = await import("@/services/compliance/compliance-evaluator");
   const preparedAccounts = new Set<string>();
@@ -370,8 +387,8 @@ export async function enqueueVerificationJobs(options: { createdSince?: Date } =
       JOIN campaigns c ON cm.campaign_id = c.id
       JOIN accounts a ON a.id = cm.account_id AND a.workspace_id = c.workspace_id
       WHERE cm.stage IN ('qualified', 'contact_selected', 'ready')
-        AND c.status = 'active'
-        AND c.autopilot_enabled = true
+        AND ${campaignEligibility}
+        ${campaignScopeFilter}
         AND a.status IN ('qualified', 'contactable', 'outreach_ready')
         AND cm.contacted_at IS NULL
         AND NOT EXISTS (
@@ -703,7 +720,14 @@ export async function getHistoricalBackfillPreview(): Promise<HistoricalBackfill
 
 export async function runVerificationCronTick(
   maxJobs: number = BATCH_SIZE,
-  options: { createdSince?: Date; backfillAll?: boolean; skipInstantlyImport?: boolean; onStage?: (stage: VerificationExecutionStage) => void } = {},
+  options: {
+    createdSince?: Date;
+    backfillAll?: boolean;
+    skipInstantlyImport?: boolean;
+    campaignId?: string;
+    allowScopedDraftCampaign?: true;
+    onStage?: (stage: VerificationExecutionStage) => void;
+  } = {},
 ): Promise<VerificationRunnerResult> {
   const db = getDb();
   const now = new Date();
@@ -713,7 +737,9 @@ export async function runVerificationCronTick(
   const env = getVerificationEnv();
   const providerName = env.EMAIL_VERIFICATION_PROVIDER;
 
-  const exhaustedStaleJobs = await db.execute(buildDeadLetterExhaustedVerificationJobsQuery(now));
+  const exhaustedStaleJobs = options.campaignId
+    ? { rows: [] }
+    : await db.execute(buildDeadLetterExhaustedVerificationJobsQuery(now));
   const staleJobsDeadLettered = exhaustedStaleJobs.rows.length;
 
   // 1. Lease jobs
@@ -726,6 +752,12 @@ export async function runVerificationCronTick(
         AND candidate.status IN ('pending', 'failed', 'processing')
         AND candidate.attempt_count < candidate.max_attempts
         AND candidate.provider = ${providerName}
+        AND (${options.campaignId ?? null}::uuid IS NULL OR EXISTS (
+          SELECT 1 FROM contact_points scoped_cp
+          JOIN campaign_memberships scoped_cm ON scoped_cm.account_id = scoped_cp.account_id
+          WHERE scoped_cp.id = candidate.contact_point_id
+            AND scoped_cm.campaign_id = ${options.campaignId ?? null}::uuid
+        ))
         AND (
           candidate.status <> 'failed'
           OR NOT EXISTS (

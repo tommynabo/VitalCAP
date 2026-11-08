@@ -64,6 +64,7 @@ interface ProcessingJobPayload {
 export interface ProcessingRunnerOptions {
   enrichContacts?: boolean;
   campaignId?: string;
+  allowScopedDraftCampaign?: true;
   correlationId?: string;
   timeBudgetMs?: number;
   perJobBudgetMs?: number;
@@ -970,6 +971,7 @@ export async function runProcessingCronTick(
             now,
             campaignId: options.campaignId,
             requireAutopilot: options.campaignId === undefined,
+            allowScopedDraftCampaign: options.allowScopedDraftCampaign,
           }),
           cronDeadline.signal,
         )));

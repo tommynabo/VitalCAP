@@ -5,19 +5,23 @@ import { WATCHDOG_QUEUE_PAUSE_REASON } from "@/services/autopilot/watchdog-pause
 import { listAutopilotEnabledCampaigns } from "@/infrastructure/neon/repositories/campaigns";
 import { listWorkspaceIds } from "@/infrastructure/neon/repositories/workspace";
 import { getAutopilotSettings, getAutopilotPacingState, insertRebalanceDecision } from "@/infrastructure/neon/repositories/autopilot";
+import { getProductionCapacityDiagnostics } from "@/infrastructure/neon/repositories/production-capacity-diagnostics";
+import { getMultiNicheCampaignInventory } from "@/infrastructure/neon/repositories/multi-niche-rollout";
 import { getCampaignQueueDepth } from "@/infrastructure/neon/repositories/job-queue";
 import { getWatchdogWorkspaceSignals } from "@/infrastructure/neon/repositories/watchdog-signals";
 import { enqueueDiscoveryOrdersWithinDailyRawCap } from "@/infrastructure/neon/repositories/daily-raw-request-cap";
 import { bootstrapSearchSeeds, listSearchSeedsForCampaignEngine } from "@/infrastructure/neon/repositories/discovery";
 import { getApifyRecoverySnapshot, getGlobalSerperSpendToday, getLatestProviderEconomicPacingStates, getRecentProviderUsage, getSerperRecoveryState, getTodaySpendUsd, recordProviderRun } from "@/infrastructure/neon/repositories/provider-runs";
-import { allocateEngineWork, MAX_APIFY_RECOVERY_PROBE_RAW, MAX_RAW_PER_PLANNING_WINDOW, planApifyRecoveryProbe, planningWindowKey, rerouteEngineOrders, routeCampaignsToAvailableEngines, type EnginePlanningPerformance } from "@/services/autopilot/target-planner";
+import { allocateEngineWork, MAX_APIFY_RECOVERY_PROBE_RAW, MAX_RAW_PER_PLANNING_WINDOW, planApifyRecoveryProbe, planningWindowKey, rerouteEngineOrders, resolveOperationalEnvelope, routeCampaignsToAvailableEngines, type EnginePlanningPerformance } from "@/services/autopilot/target-planner";
 import { autopilotEnginePerformanceKey, getAutopilotEnginePerformance } from "@/infrastructure/neon/repositories/autopilot-engine-performance";
 import { decideHybridFill } from "@/services/discovery/hybrid-fill-decision";
 import { buildEngineCapabilities } from "@/services/autopilot/engine-capability";
 import { createApifyCredentialFingerprint, getApifyAllocationHealth, evaluateProviderHealth } from "@/services/discovery/provider-health";
 import { buildCampaignSeedCatalog, buildMapsSeedCatalog, buildSerpSeedCatalog, ICP_CATEGORY_TERMS, LINKEDIN_OWNER_ROLE_QUERIES } from "@/services/discovery/spain-search-catalog";
 import { getNicheId } from "@/services/discovery/niche-profiles";
-import { getDeliveryEnv, getMapsEnv, getSerperEnv } from "@/lib/config/env";
+import { getDeliveryEnv, getMapsEnv, getSerperEnv, getVerificationEnv } from "@/lib/config/env";
+import { MULTI_NICHE_ROLLOUT_CAMPAIGN_IDS, getMultiNicheRolloutEntry } from "@/services/autopilot/multi-niche-rollout";
+import { getDayBounds } from "@/lib/time/day-bounds";
 import { SERPER_ESTIMATED_COST_PER_QUERY_USD } from "@/infrastructure/providers/serp/serper-provider";
 import type { SearchSeed } from "@/domain/discovery/types";
 import { refreshWatchdogPauseForWorkspace } from "./watchdog-runner";
@@ -127,6 +131,11 @@ export async function runAutopilotCronTick(now: Date = new Date()): Promise<Auto
 
     const campaigns = await listAutopilotEnabledCampaigns(workspaceId);
     if (!campaigns.length) continue;
+    const rolloutCampaigns = campaigns.filter((campaign) => {
+      const entry = getMultiNicheRolloutEntry(campaign.id);
+      return entry !== null && entry.niche === campaign.engineConfig?.niche;
+    });
+    const legacyCampaigns = campaigns.filter((campaign) => !rolloutCampaigns.some((rollout) => rollout.id === campaign.id));
     for (const campaign of campaigns) {
       const catalog = catalogFor(campaign);
       if (catalog.length) await bootstrapSearchSeeds(campaign.id, campaign.engineType, catalog);
@@ -161,7 +170,7 @@ export async function runAutopilotCronTick(now: Date = new Date()): Promise<Auto
       ...pacing.recoveryOutcomes,
     });
     // The target and budget are workspace-wide, never multiplied by engines.
-    if (pacing.remainingTarget <= 0) {
+    if (pacing.remainingTarget <= 0 && rolloutCampaigns.length === 0) {
       logEvent("info", "autopilot.target_reached_stop", {
         correlationId: `autopilot:${workspaceId}`,
         workspaceId,
@@ -261,6 +270,7 @@ export async function runAutopilotCronTick(now: Date = new Date()): Promise<Auto
     });
 
     const concreteCampaigns = campaigns.filter((campaign) => campaign.engineType !== "hybrid_fill");
+    const legacyConcreteCampaigns = legacyCampaigns.filter((campaign) => campaign.engineType !== "hybrid_fill");
     const performanceEngineTypesByCampaign = concreteCampaigns.map((campaign) => campaign.engineType === "maps_fast"
       ? [campaign.engineType, "google_serp" as const]
       : [campaign.engineType]);
@@ -331,6 +341,68 @@ export async function runAutopilotCronTick(now: Date = new Date()): Promise<Auto
         };
       }),
     ));
+    const allocationCampaigns = routeCampaignsToAvailableEngines(concreteCampaigns, capabilities, performances);
+    const legacyAllocationCampaigns = allocationCampaigns.filter((campaign) => !rolloutCampaigns.some((rollout) => rollout.id === campaign.id));
+    const nicheAllocationCampaigns = allocationCampaigns.filter((campaign) => rolloutCampaigns.some((rollout) => rollout.id === campaign.id));
+    let operationalPlan: ReturnType<typeof resolveOperationalEnvelope> | null = null;
+    let rolloutInventory: Awaited<ReturnType<typeof getMultiNicheCampaignInventory>> = [];
+    if (rolloutCampaigns.length > 0) {
+      try {
+        const [capacity, inventory] = await Promise.all([
+          getProductionCapacityDiagnostics(workspaceId, now),
+          getMultiNicheCampaignInventory(MULTI_NICHE_ROLLOUT_CAMPAIGN_IDS, getDayBounds(settings.timezone, now).start, getDayBounds(settings.timezone, now).end, now),
+        ]);
+        rolloutInventory = inventory;
+        const verificationEnv = getVerificationEnv();
+        const verificationSpend = await getTodaySpendUsd(workspaceId, "email_verification", settings.timezone, now);
+        const verificationAvailable = verificationEnv.EMAIL_VERIFICATION_PROVIDER === "millionverifier"
+          && Boolean(verificationEnv.MILLIONVERIFIER_API_KEY)
+          && verificationEnv.EMAIL_VERIFICATION_DAILY_COST_LIMIT_USD > verificationSpend;
+        const inventoryByCampaign = new Map(inventory.map((item) => [item.campaignId, item]));
+        const routedCampaignById = new Map(nicheAllocationCampaigns.map((campaign) => [campaign.id, campaign]));
+        operationalPlan = resolveOperationalEnvelope({
+          businessDailyTarget: settings.globalDailyTarget,
+          safeCapacityTarget: verificationAvailable ? capacity.operationalTarget.operationalDailyTarget : 0,
+          backlogInventory: inventory.reduce((total, item) => total + item.backlogInventory, 0),
+          rawRequestedToday: inventory.reduce((total, item) => total + item.rawRequestedToday, 0),
+          campaigns: rolloutCampaigns.flatMap((campaign) => {
+            const entry = getMultiNicheRolloutEntry(campaign.id);
+            const stats = inventoryByCampaign.get(campaign.id);
+            if (!entry || !stats) return [];
+            const routed = routedCampaignById.get(campaign.id);
+            const capability = capabilities.find((item) => item.engineType === routed?.engineType);
+            return [{
+              campaign,
+              confirmedImports: stats.confirmedImports,
+              rawRequestedToday: stats.rawRequestedToday,
+              completedProbeCount: stats.completedProbeCount,
+              providerAvailable: Boolean(capability?.available) && verificationAvailable,
+            }];
+          }),
+        });
+        logEvent("info", "autopilot.multi_niche_operational_envelope", {
+          correlationId: `autopilot:${workspaceId}`,
+          workspaceId,
+          businessTarget: operationalPlan.businessTarget,
+          operationalTarget: operationalPlan.operationalTarget,
+          effectiveSchedulerTarget: operationalPlan.effectiveSchedulerTarget,
+          remainingOperationalDemand: operationalPlan.remainingOperationalDemand,
+          coldStartNiches: operationalPlan.coldStartNiches,
+          coldStartProbeBudget: operationalPlan.coldStartProbeBudget,
+          backlogContribution: operationalPlan.backlogContribution,
+          bindingConstraint: verificationAvailable ? operationalPlan.bindingConstraint : "verification_provider",
+          verificationAvailable,
+          globalCampaignIds: MULTI_NICHE_ROLLOUT_CAMPAIGN_IDS,
+        });
+      } catch (error) {
+        logEvent("error", "autopilot.multi_niche_capacity_unavailable", {
+          correlationId: `autopilot:${workspaceId}`,
+          workspaceId,
+          errorClass: error instanceof Error ? error.constructor.name : "NonError",
+          effectiveSchedulerTarget: 0,
+        });
+      }
+    }
     const recoveryRawNeed = apifyRecovery.recoveryProbeEligible
       ? Math.min(MAX_APIFY_RECOVERY_PROBE_RAW, pacing.rawRequestsRemaining)
       : 0;
@@ -341,7 +413,7 @@ export async function runAutopilotCronTick(now: Date = new Date()): Promise<Auto
     const planningRawLimit = Math.floor(unscaledPlanningRawLimit * discoveryBackpressureMultiplier);
     const recoveryProbeOrders = planApifyRecoveryProbe({
       workspaceId,
-      campaigns: concreteCampaigns,
+      campaigns: legacyConcreteCampaigns,
       rawNeeded: planningRawLimit,
       eligible: apifyRecovery.recoveryProbeEligible,
       dailyBudgetAllowed: pacing.apifyDailyBudgetRemaining > 0,
@@ -371,9 +443,8 @@ export async function runAutopilotCronTick(now: Date = new Date()): Promise<Auto
       });
     }
     const recoveryProbeRaw = recoveryProbeOrders.reduce((total, order) => total + order.desiredRawCount, 0);
-    const allocationCampaigns = routeCampaignsToAvailableEngines(concreteCampaigns, capabilities, performances);
     let orders = allocateEngineWork({
-      workspaceId, campaigns: allocationCampaigns, capabilities, performances,
+      workspaceId, campaigns: legacyAllocationCampaigns, capabilities, performances,
       economicPressureByEngine: {
         maps_fast: apifyEconomicPacing.state === "AHEAD_OF_BUDGET_PACE",
         maps_deep: apifyEconomicPacing.state === "AHEAD_OF_BUDGET_PACE",
@@ -382,6 +453,37 @@ export async function runAutopilotCronTick(now: Date = new Date()): Promise<Auto
       },
       rawNeeded: planningRawLimit - recoveryProbeRaw, reason: pacing.explanation, now, timeZone: settings.timezone, origin: "normal",
     });
+    const inventoryByCampaign = new Map(rolloutInventory.map((item) => [item.campaignId, item]));
+    const coldStartOrders = operationalPlan?.coldStartAllocations.flatMap((allocation) => {
+      const campaign = nicheAllocationCampaigns.find((item) => item.id === allocation.campaignId);
+      if (!campaign) return [];
+      const planningWindow = planningWindowKey(now, settings.timezone);
+      return [{
+        workspaceId,
+        campaignId: campaign.id,
+        engineType: campaign.engineType,
+        desiredRawCount: allocation.rawCount,
+        reason: `Bounded cold-start probe for ${allocation.niche}.`,
+        planningWindow,
+        idempotencyKey: `multi-niche-cold-start:${workspaceId}:${campaign.id}:${planningWindow}`,
+        origin: "normal" as const,
+      }];
+    }) ?? [];
+    const matureNicheCampaigns = nicheAllocationCampaigns.filter((campaign) =>
+      (inventoryByCampaign.get(campaign.id)?.confirmedImports ?? 0) >= 5,
+    );
+    const economicNicheOrders = allocateEngineWork({
+      workspaceId,
+      campaigns: matureNicheCampaigns,
+      capabilities,
+      performances,
+      rawNeeded: operationalPlan?.economicDemand ?? 0,
+      reason: "Multi-niche economic exploitation within the operational envelope.",
+      now,
+      timeZone: settings.timezone,
+      origin: "normal",
+    });
+    orders = [...orders, ...coldStartOrders, ...economicNicheOrders];
     for (const performance of performances) {
       const order = orders.find((item) => item.campaignId === performance.campaignId && item.engineType === performance.engineType);
       logEvent("info", "autopilot.cost_efficiency", {
@@ -401,9 +503,9 @@ export async function runAutopilotCronTick(now: Date = new Date()): Promise<Auto
     // Hybrid Fill is a policy: it redirects to an alternative campaign and
     // keeps that engine's real source/metrics, avoiding duplicate accounts.
     const hybridDecisions = decideHybridFill({
-      enabled: campaigns.some((campaign) => campaign.engineType === "hybrid_fill"),
+      enabled: legacyCampaigns.some((campaign) => campaign.engineType === "hybrid_fill"),
       rawDeficit: Math.floor(pacing.rawNeededToPlan * discoveryBackpressureMultiplier),
-      candidates: concreteCampaigns.map((campaign) => {
+      candidates: legacyConcreteCampaigns.map((campaign) => {
         const capability = capabilities.find((item) => item.engineType === campaign.engineType);
         const measured = performances.find((item) => item.campaignId === campaign.id && item.engineType === campaign.engineType);
         return {
@@ -423,7 +525,7 @@ export async function runAutopilotCronTick(now: Date = new Date()): Promise<Auto
       for (const decision of hybridDecisions) {
         const previousRebalance = new Map(orders.map((order) => [order.campaignId, order.rebalanceAmount ?? 0]));
         orders = rerouteEngineOrders({
-          workspaceId, campaigns: concreteCampaigns, capabilities, performances, orders,
+          workspaceId, campaigns: legacyConcreteCampaigns, capabilities, performances, orders,
           rawNeeded: Math.floor(pacing.rawNeededToPlan * discoveryBackpressureMultiplier),
           reason: decision.reason,
           now, timeZone: settings.timezone,
@@ -438,7 +540,7 @@ export async function runAutopilotCronTick(now: Date = new Date()): Promise<Auto
     }
     orders = [...orders, ...recoveryProbeOrders];
 
-    const reservation = await enqueueDiscoveryOrdersWithinDailyRawCap(orders.map((order) => ({
+    const reservationOrders = orders.map((order) => ({
       campaignId: order.campaignId,
       type: "run_engine_batch",
       payload: {
@@ -456,7 +558,13 @@ export async function runAutopilotCronTick(now: Date = new Date()): Promise<Auto
       },
       idempotencyKey: order.idempotencyKey,
       desiredRawCount: order.desiredRawCount,
-    })), now);
+    }));
+    const reservation = rolloutCampaigns.length > 0
+      ? await enqueueDiscoveryOrdersWithinDailyRawCap(reservationOrders, now, {
+        campaignIds: MULTI_NICHE_ROLLOUT_CAMPAIGN_IDS,
+        cap: operationalPlan?.effectiveSchedulerTarget ?? 0,
+      })
+      : await enqueueDiscoveryOrdersWithinDailyRawCap(reservationOrders, now);
     const reservedByKey = new Map(reservation.orders.map((order) => [order.idempotencyKey, order]));
     const reservedOrders = orders.flatMap((order) => {
       const reserved = reservedByKey.get(order.idempotencyKey);

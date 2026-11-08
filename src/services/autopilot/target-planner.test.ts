@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { Campaign } from "@/domain/campaigns/types";
 import { buildEngineCapabilities } from "./engine-capability";
 import { getApifyAllocationHealth, resolveApifyDiscoveryWorkMode, evaluateApifyRecovery, evaluateProviderHealth, type ApifyRecoveryRun } from "@/services/discovery/provider-health";
-import { allocateEngineWork, allocateMapsFastRawNeed, MAX_RAW_PER_PLANNING_WINDOW, planApifyRecoveryProbe, planningWindowKey, rerouteEngineOrders, resolvePlanningWindow, routeCampaignsToAvailableEngines } from "./target-planner";
+import { allocateEngineWork, allocateMapsFastRawNeed, MAX_RAW_PER_PLANNING_WINDOW, planApifyRecoveryProbe, planningWindowKey, rerouteEngineOrders, resolveOperationalEnvelope, resolvePlanningWindow, routeCampaignsToAvailableEngines } from "./target-planner";
 
 function campaign(id: string, target: number, overrides: Partial<Campaign> = {}): Campaign {
   return {
@@ -28,6 +28,139 @@ function campaign(id: string, target: number, overrides: Partial<Campaign> = {})
 }
 
 describe("target planner", () => {
+  it("caps the new-niche scheduler at safe capacity without changing the business target", () => {
+    const niches = ["yoga_pilates", "spas_wellness", "premium_fitness", "personal_training"];
+    const plan = resolveOperationalEnvelope({
+      businessDailyTarget: 250,
+      safeCapacityTarget: 4,
+      backlogInventory: 0,
+      rawRequestedToday: 0,
+      campaigns: niches.map((niche, index) => ({
+        campaign: campaign(`niche-${index}`, 250, { engineConfig: { niche } }),
+        confirmedImports: 0,
+        rawRequestedToday: 0,
+        completedProbeCount: 0,
+        providerAvailable: true,
+      })),
+    });
+
+    expect(plan.businessTarget).toBe(250);
+    expect(plan.operationalTarget).toBe(4);
+    expect(plan.effectiveSchedulerTarget).toBe(4);
+    expect(plan.coldStartProbeBudget).toBe(4);
+    expect(plan.coldStartAllocations.reduce((total, item) => total + item.rawCount, 0)).toBeLessThanOrEqual(4);
+  });
+
+  it("suppresses discovery when candidate backlog already covers the operational target", () => {
+    const plan = resolveOperationalEnvelope({
+      businessDailyTarget: 250,
+      safeCapacityTarget: 4,
+      backlogInventory: 8,
+      rawRequestedToday: 0,
+      campaigns: ["yoga_pilates"].map((niche) => ({
+        campaign: campaign("yoga", 250, { engineConfig: { niche } }),
+        confirmedImports: 0,
+        rawRequestedToday: 0,
+        completedProbeCount: 0,
+        providerAvailable: true,
+      })),
+    });
+
+    expect(plan.remainingOperationalDemand).toBe(0);
+    expect(plan.coldStartProbeBudget).toBe(0);
+    expect(plan.bindingConstraint).toBe("backlog");
+  });
+
+  it("allocates cold-start probes fairly over time without exceeding a one-unit envelope", () => {
+    const niches = ["yoga_pilates", "spas_wellness", "premium_fitness", "personal_training"];
+    const probeCounts = new Map(niches.map((niche) => [niche, 0]));
+    const probed: string[] = [];
+
+    for (let day = 0; day < niches.length; day += 1) {
+      const plan = resolveOperationalEnvelope({
+        businessDailyTarget: 250,
+        safeCapacityTarget: 1,
+        backlogInventory: 0,
+        rawRequestedToday: 0,
+        campaigns: niches.map((niche, index) => ({
+          campaign: campaign(`niche-${index}`, 250, { engineConfig: { niche } }),
+          confirmedImports: 0,
+          rawRequestedToday: 0,
+          completedProbeCount: probeCounts.get(niche) ?? 0,
+          providerAvailable: true,
+        })),
+      });
+      expect(plan.coldStartProbeBudget).toBeLessThanOrEqual(1);
+      const allocated = plan.coldStartAllocations[0]?.niche;
+      expect(allocated).toBeDefined();
+      if (allocated) {
+        probed.push(allocated);
+        probeCounts.set(allocated, (probeCounts.get(allocated) ?? 0) + 1);
+      }
+    }
+
+    expect(new Set(probed)).toEqual(new Set(niches));
+  });
+
+  it("routes mature niches into economic demand and stops cold-start treatment", () => {
+    const plan = resolveOperationalEnvelope({
+      businessDailyTarget: 250,
+      safeCapacityTarget: 4,
+      backlogInventory: 0,
+      rawRequestedToday: 0,
+      campaigns: ["yoga_pilates"].map((niche) => ({
+        campaign: campaign("mature-yoga", 250, { engineConfig: { niche } }),
+        confirmedImports: 5,
+        rawRequestedToday: 0,
+        completedProbeCount: 8,
+        providerAvailable: true,
+      })),
+    });
+
+    expect(plan.coldStartNiches).toEqual([]);
+    expect(plan.coldStartProbeBudget).toBe(0);
+    expect(plan.economicDemand).toBe(4);
+  });
+
+  it("does not add new-niche demand when all eligible providers are unavailable", () => {
+    const plan = resolveOperationalEnvelope({
+      businessDailyTarget: 250,
+      safeCapacityTarget: 4,
+      backlogInventory: 0,
+      rawRequestedToday: 0,
+      campaigns: ["yoga_pilates"].map((niche) => ({
+        campaign: campaign("yoga", 250, { engineConfig: { niche } }),
+        confirmedImports: 0,
+        rawRequestedToday: 0,
+        completedProbeCount: 0,
+        providerAvailable: false,
+      })),
+    });
+
+    expect(plan.remainingOperationalDemand).toBe(0);
+    expect(plan.coldStartProbeBudget).toBe(0);
+    expect(plan.bindingConstraint).toBe("provider");
+  });
+
+  it("leaves legacy campaigns outside the multi-niche envelope", () => {
+    const plan = resolveOperationalEnvelope({
+      businessDailyTarget: 250,
+      safeCapacityTarget: 4,
+      backlogInventory: 0,
+      rawRequestedToday: 0,
+      campaigns: [{
+        campaign: campaign("farmacias", 250, { engineConfig: {} }),
+        confirmedImports: 0,
+        rawRequestedToday: 0,
+        completedProbeCount: 0,
+        providerAvailable: true,
+      }],
+    });
+
+    expect(plan.remainingOperationalDemand).toBe(0);
+    expect(plan.coldStartAllocations).toEqual([]);
+  });
+
   it("allocates raw need by Maps Fast soft-target weight", () => {
     const orders = allocateMapsFastRawNeed({ workspaceId: "workspace-1", campaigns: [campaign("a", 25), campaign("b", 75)], rawNeeded: 10, reason: "behind", now: new Date("2025-01-01T13:00:00Z"), timeZone: "Europe/Madrid" });
     expect(orders.map((order) => order.desiredRawCount)).toEqual([2, 8]);

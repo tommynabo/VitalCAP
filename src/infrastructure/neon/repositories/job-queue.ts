@@ -7,6 +7,7 @@ import type { JobRecord, JobStatus } from "@/domain/discovery/types";
 import { ProviderFailureError } from "@/domain/providers/errors";
 import { computeBackoffMs, isPermanentError, PERMANENT_JOB_ERROR_PATTERN } from "@/infrastructure/jobs/job-queue";
 import { MAX_WATCHDOG_RECOVERY_DISCOVERY_JOBS, WATCHDOG_QUEUE_PAUSE_REASON } from "@/services/autopilot/watchdog-pause-policy";
+import { MULTI_NICHE_ROLLOUT_CAMPAIGN_IDS } from "@/services/autopilot/multi-niche-rollout";
 
 export const JOB_LEASE_MS = 5 * 60 * 1000;
 const MAX_CLAIM_BATCH_SIZE = 100;
@@ -582,14 +583,18 @@ async function claim<T>(
   campaignId?: string,
   requireAutopilot = true,
   allowWatchdogRecovery = false,
+  jobId?: string,
+  allowScopedDraftCampaign = false,
 ): Promise<JobRecord<T>[]> {
   const db = getDb();
   const result = await db.execute(buildClaimJobsQuery(table, {
     workerId,
     batchSize,
     campaignId,
+    jobId,
     requireAutopilot,
     allowWatchdogRecovery,
+    allowScopedDraftCampaign,
     now,
     leaseMs,
   }, now));
@@ -600,6 +605,15 @@ async function claim<T>(
 export function buildClaimJobsQuery(table: QueueTable, input: ClaimJobsInput, now: Date) {
   const nowIso = now.toISOString();
   const inputCampaignId = input.campaignId ?? null;
+  const inputJobId = input.jobId ?? null;
+  const rolloutCampaignIdList = sql.join(MULTI_NICHE_ROLLOUT_CAMPAIGN_IDS.map((campaignId) => sql`${campaignId}::uuid`), sql`, `);
+  const scopedDraftCampaign = input.allowScopedDraftCampaign && inputCampaignId !== null
+    ? sql`c.id = ${inputCampaignId}::uuid
+        AND c.id IN (${rolloutCampaignIdList})
+        AND c.status = 'draft'
+        AND c.autopilot_enabled = false
+        AND c.engine_config->>'niche' IN ('yoga_pilates', 'spas_wellness', 'premium_fitness', 'personal_training')`
+    : sql`false`;
   const leaseSeconds = Math.max(1, Math.ceil((input.leaseMs ?? JOB_LEASE_MS) / 1000));
   const boundedBatchSize = normalizeBatchSize(input.batchSize);
   const requireAutopilot = input.requireAutopilot ?? true;
@@ -630,7 +644,7 @@ export function buildClaimJobsQuery(table: QueueTable, input: ClaimJobsInput, no
             FROM discovery_jobs j
             JOIN campaigns c ON c.id = j.campaign_id
             LEFT JOIN autopilot_settings aps ON aps.workspace_id = c.workspace_id
-            WHERE c.status = 'active'
+            WHERE (c.status = 'active' OR (${scopedDraftCampaign}))
               AND (
                 ${requireAutopilot} = false
                 OR (
@@ -640,8 +654,10 @@ export function buildClaimJobsQuery(table: QueueTable, input: ClaimJobsInput, no
                   AND aps.system_paused = false
                 )
                 OR (${watchdogRecoveryEligible})
+                OR ((${scopedDraftCampaign}) AND aps.enabled = true AND aps.emergency_stopped = false AND aps.system_paused = false)
               )
               AND (${inputCampaignId}::uuid IS NULL OR j.campaign_id = ${inputCampaignId}::uuid)
+              AND (${inputJobId}::uuid IS NULL OR j.id = ${inputJobId}::uuid)
               AND j.status IN ('pending', 'processing')
               AND (j.next_attempt_at IS NULL OR j.next_attempt_at <= ${nowIso}::timestamptz)
               AND j.attempt_count < j.max_attempts
@@ -674,9 +690,10 @@ export function buildClaimJobsQuery(table: QueueTable, input: ClaimJobsInput, no
             FROM processing_jobs j
             JOIN campaigns c ON c.id = j.campaign_id
             LEFT JOIN autopilot_settings aps ON aps.workspace_id = c.workspace_id
-            WHERE c.status = 'active'
+            WHERE (c.status = 'active' OR (${scopedDraftCampaign}))
               AND (${requireAutopilot} = false OR (c.autopilot_enabled = true AND aps.emergency_stopped = false))
               AND (${inputCampaignId}::uuid IS NULL OR j.campaign_id = ${inputCampaignId}::uuid)
+              AND (${inputJobId}::uuid IS NULL OR j.id = ${inputJobId}::uuid)
               AND j.status IN ('pending', 'processing')
               AND (j.next_attempt_at IS NULL OR j.next_attempt_at <= ${nowIso}::timestamptz)
               AND j.attempt_count < j.max_attempts
@@ -708,18 +725,20 @@ export interface ClaimJobsInput {
   workerId: string;
   batchSize: number;
   campaignId?: string;
+  jobId?: string;
   requireAutopilot?: boolean;
   allowWatchdogRecovery?: boolean;
+  allowScopedDraftCampaign?: boolean;
   now?: Date;
   leaseMs?: number;
 }
 
 export async function claimDiscoveryJobs<T = Record<string, unknown>>(input: ClaimJobsInput): Promise<JobRecord<T>[]> {
-  return claim<T>("discovery_jobs", input.workerId, input.now ?? new Date(), input.leaseMs ?? JOB_LEASE_MS, input.batchSize, input.campaignId, input.requireAutopilot ?? true, input.allowWatchdogRecovery ?? false);
+  return claim<T>("discovery_jobs", input.workerId, input.now ?? new Date(), input.leaseMs ?? JOB_LEASE_MS, input.batchSize, input.campaignId, input.requireAutopilot ?? true, input.allowWatchdogRecovery ?? false, input.jobId, input.allowScopedDraftCampaign ?? false);
 }
 
 export async function claimProcessingJobs<T = Record<string, unknown>>(input: ClaimJobsInput): Promise<JobRecord<T>[]> {
-  return claim<T>("processing_jobs", input.workerId, input.now ?? new Date(), input.leaseMs ?? JOB_LEASE_MS, input.batchSize, input.campaignId, input.requireAutopilot ?? true);
+  return claim<T>("processing_jobs", input.workerId, input.now ?? new Date(), input.leaseMs ?? JOB_LEASE_MS, input.batchSize, input.campaignId, input.requireAutopilot ?? true, false, input.jobId, input.allowScopedDraftCampaign ?? false);
 }
 
 export async function claimNextDiscoveryJob<T = Record<string, unknown>>(
