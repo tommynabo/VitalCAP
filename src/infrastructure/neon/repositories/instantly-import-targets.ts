@@ -12,6 +12,7 @@ export interface InstantImportTarget {
 export interface InstantImportTargetBlock {
   campaignId: string;
   reason: string;
+  expectedProviderCampaignId?: string;
 }
 
 const STRICT_NICHE_TARGETS: Record<string, string> = {
@@ -36,11 +37,17 @@ export function resolveInstantlyImportTargets(
   legacyProviderCampaignId: string,
 ): { targets: InstantImportTarget[]; blockedCampaignIds: string[]; blockedCampaignReasons: InstantImportTargetBlock[] } {
   const candidates: InstantImportTarget[] = [];
-  const blockedReasons = new Map<string, string>();
+  const blockedReasons = new Map<string, InstantImportTargetBlock>();
   const rowCounts = new Map<string, number>();
   for (const row of rows) rowCounts.set(row.campaign_id, (rowCounts.get(row.campaign_id) ?? 0) + 1);
-  const block = (campaignId: string, reason: string) => {
-    if (!blockedReasons.has(campaignId)) blockedReasons.set(campaignId, reason);
+  const block = (campaignId: string, reason: string, expectedProviderCampaignId?: string) => {
+    if (!blockedReasons.has(campaignId)) {
+      blockedReasons.set(campaignId, {
+        campaignId,
+        reason,
+        ...(expectedProviderCampaignId ? { expectedProviderCampaignId } : {}),
+      });
+    }
   };
 
   for (const row of rows) {
@@ -52,16 +59,16 @@ export function resolveInstantlyImportTargets(
       ? row.engine_config as Record<string, unknown>
       : {};
     const hasNiche = Object.hasOwn(config, "niche");
-    if (row.mapping_campaign_id && row.mapping_enabled !== true) {
-      block(row.campaign_id, "mapping_disabled");
-      continue;
-    }
-
     const configuredId = [row.mapped_provider_campaign_id, config.instantlyCampaignId, config.providerCampaignId]
       .find((value): value is string => typeof value === "string" && value.trim().length > 0)?.trim();
     const niche = typeof config.niche === "string" ? config.niche : null;
     const expectedNicheTarget = niche ? STRICT_NICHE_TARGETS[niche] : undefined;
     const strictNicheRoute = hasNiche || (configuredId !== undefined && STRICT_NICHE_TARGET_IDS.has(configuredId));
+    if (row.mapping_campaign_id && row.mapping_enabled !== true) {
+      block(row.campaign_id, "mapping_disabled", expectedNicheTarget);
+      continue;
+    }
+
     if (strictNicheRoute) {
       if (!expectedNicheTarget) {
         block(row.campaign_id, hasNiche ? "unsupported_niche" : "niche_missing");
@@ -138,7 +145,7 @@ export function resolveInstantlyImportTargets(
   return {
     targets: targets.filter((target) => !blockedCampaignIdSet.has(target.campaignId)),
     blockedCampaignIds,
-    blockedCampaignReasons: [...blockedReasons].map(([campaignId, reason]) => ({ campaignId, reason })),
+    blockedCampaignReasons: [...blockedReasons.values()],
   };
 }
 

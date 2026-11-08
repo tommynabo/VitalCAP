@@ -100,6 +100,18 @@ describe("resolveInstantlyImportTargets", () => {
     expect(result.blockedCampaignIds).toEqual(["yoga-campaign", "wellness-campaign"]);
   });
 
+  it("blocks an invalid explicit target instead of falling back to the legacy campaign", () => {
+    const result = resolveInstantlyImportTargets([
+      mappedNicheCampaign("yoga_pilates", "yoga-campaign", "invalid-provider-target"),
+    ], "legacy-target");
+
+    expect(result.targets).toEqual([]);
+    expect(result.blockedCampaignReasons).toEqual([{
+      campaignId: "yoga-campaign",
+      reason: "provider_campaign_id_mismatch",
+    }]);
+  });
+
   it("blocks a colliding niche route without pausing the existing legacy target", () => {
     const result = resolveInstantlyImportTargets([
       campaignRow(),
@@ -166,5 +178,18 @@ describe("resolveInstantlyImportTargets", () => {
 
     expect(result.targets).toEqual([]);
     expect(result.blockedCampaignIds).toEqual(["campaign-1"]);
+  });
+
+  it.each(nicheTargets)("reports the expected $niche target while its mapping is disabled", ({ niche, campaignId, target }) => {
+    const result = resolveInstantlyImportTargets([
+      mappedNicheCampaign(niche, campaignId, target, { mapping_enabled: false }),
+    ], "legacy-target");
+
+    expect(result.targets).toEqual([]);
+    expect(result.blockedCampaignReasons).toEqual([{
+      campaignId,
+      reason: "mapping_disabled",
+      expectedProviderCampaignId: target,
+    }]);
   });
 });

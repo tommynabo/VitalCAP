@@ -7,6 +7,7 @@ import type { OutreachQueueItem, SuppressionEntry } from "@/domain/outreach/type
 import { createInMemoryVerificationCacheStore } from "@/services/verification/email-verification-cache";
 import { processRawCandidate, type CandidateRawPayload } from "@/services/discovery/candidate-processor";
 import { evaluateAccountDedup, type AccountIdentitySignals } from "@/services/deduplication/account-dedup";
+import { canEnterColdOutreach, type RecentOutreachEvent } from "@/services/deduplication/outreach-dedup";
 import { routeAccountToEndpoint } from "@/services/outreach/channel-router";
 import { evaluateProviderHealth } from "@/services/discovery/provider-health";
 import { claimNextJob, failJob } from "@/infrastructure/jobs/job-queue";
@@ -162,6 +163,58 @@ describe("Flow C — Duplicate: same pharmacy via Maps + Google, one account, no
     });
     expect(route.selectedContactPointId).toBeNull();
     expect(route.blockedReason).toBe("concurrent_active_path");
+  });
+});
+
+describe("Cross-niche dedupe — Yoga + Wellness", () => {
+  it("keeps one canonical account and blocks a second niche from owning outreach", () => {
+    const yogaAccount: AccountIdentitySignals = {
+      accountId: "account-yoga",
+      normalizedName: "centro vital wellness",
+      normalizedDomain: "centrovital.example.es",
+      googlePlaceId: "place-centrovital",
+      normalizedPhone: "+34910000000",
+      postalCode: "28001",
+      normalizedAddress: "calle mayor 1",
+      latitude: 40.4168,
+      longitude: -3.7038,
+    };
+    const wellnessCandidate: Omit<AccountIdentitySignals, "accountId"> = {
+      normalizedName: "centro vital wellness yoga",
+      normalizedDomain: "centrovital.example.es",
+      googlePlaceId: "place-centrovital",
+      normalizedPhone: "+34910000000",
+      postalCode: "28001",
+      normalizedAddress: "calle mayor 1",
+      latitude: 40.4168,
+      longitude: -3.7038,
+    };
+    const accountDecision = evaluateAccountDedup(wellnessCandidate, [yogaAccount]);
+    expect(accountDecision).toMatchObject({
+      action: "merge",
+      matches: [{ accountId: "account-yoga", signal: "google_place_id" }],
+    });
+
+    const recentOutreach: RecentOutreachEvent[] = [{
+      contactPointId: "contact-centrovital",
+      accountId: "account-yoga",
+      campaignId: "campaign-yoga",
+      channel: "email",
+      createdAt: "2026-11-08T14:00:00.000Z",
+      state: "sent",
+      deliveryMode: "live",
+      providerConfirmed: true,
+      normalizedEmail: "info@centrovital.example.es",
+    }];
+    const wellnessOutreach = canEnterColdOutreach({
+      contactPointId: "contact-centrovital",
+      accountId: "account-yoga",
+      campaignId: "campaign-wellness",
+      channel: "email",
+      now: "2026-11-08T15:00:00.000Z",
+      normalizedEmail: "info@centrovital.example.es",
+    }, recentOutreach, []);
+    expect(wellnessOutreach).toEqual({ allowed: false, reason: "existing_outreach" });
   });
 });
 
