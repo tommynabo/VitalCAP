@@ -544,6 +544,21 @@ describe("runInstantlyImportTick", () => {
     expect(mocks.addLeadToCampaign).not.toHaveBeenCalled();
   });
 
+  it("keeps one workspace account from being imported again through another niche campaign", async () => {
+    setupWithoutClaimedJobs([candidate({ source_campaign_id: "wellness-campaign" })]);
+    mocks.findImportByAccount.mockResolvedValue({
+      provider_campaign_id: "yoga-provider-campaign",
+      source_campaign_id: "yoga-campaign",
+    });
+
+    const result = await runInstantlyImportTick({ contactPointIds: ["contact-point-1"] });
+
+    expect(result.leadsQueued).toBe(0);
+    expect(result.emailAlreadyRepresented).toBe(1);
+    expect(mocks.enqueueImport).not.toHaveBeenCalled();
+    expect(mocks.addLeadToCampaign).not.toHaveBeenCalled();
+  });
+
   it("keeps suppressed, invalid, and compliance-unapproved contacts out of reconciliation", async () => {
     setupWithoutClaimedJobs([]);
 

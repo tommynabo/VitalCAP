@@ -13,6 +13,29 @@ function campaignRow(overrides: Partial<Parameters<typeof resolveInstantlyImport
   };
 }
 
+const nicheTargets = [
+  { niche: "yoga_pilates", campaignId: "yoga-campaign", target: "7ba53c91-6c8f-4b8a-b260-72eb48f62d07" },
+  { niche: "spas_wellness", campaignId: "wellness-campaign", target: "20013626-0dc5-4bb4-a2bf-c4b99450cdb6" },
+  { niche: "premium_fitness", campaignId: "premium-campaign", target: "5f42f2cf-5ebc-412e-814f-5eca8b1fea71" },
+  { niche: "personal_training", campaignId: "personal-campaign", target: "2413f6f5-2e21-46c2-addc-9b8c2ff90a34" },
+] as const;
+
+function mappedNicheCampaign(
+  niche: string,
+  campaignId: string,
+  target: string,
+  overrides: Partial<Parameters<typeof resolveInstantlyImportTargets>[0][number]> = {},
+) {
+  return campaignRow({
+    campaign_id: campaignId,
+    engine_config: { niche, instantlyCampaignId: "ignored-engine-config-target" },
+    mapping_campaign_id: campaignId,
+    mapping_enabled: true,
+    mapped_provider_campaign_id: target,
+    ...overrides,
+  });
+}
+
 describe("resolveInstantlyImportTargets", () => {
   it("keeps the legacy environment target for unmapped campaigns without a niche", () => {
     expect(resolveInstantlyImportTargets([campaignRow()], "legacy-target")).toMatchObject({
@@ -33,28 +56,34 @@ describe("resolveInstantlyImportTargets", () => {
   });
 
   it("routes each niche only to its explicit enabled mapping", () => {
-    const yoga = campaignRow({
-      campaign_id: "yoga-campaign",
-      engine_config: { niche: "yoga_pilates" },
-      mapping_campaign_id: "yoga-campaign",
-      mapping_enabled: true,
-      mapped_provider_campaign_id: "instantly-yoga",
-    });
-    const wellness = campaignRow({
-      campaign_id: "wellness-campaign",
-      engine_config: { niche: "spas_wellness" },
-      mapping_campaign_id: "wellness-campaign",
-      mapping_enabled: true,
-      mapped_provider_campaign_id: "instantly-wellness",
-    });
+    const result = resolveInstantlyImportTargets(nicheTargets.map(({ niche, campaignId, target }) =>
+      mappedNicheCampaign(niche, campaignId, target)), "legacy-target");
 
-    expect(resolveInstantlyImportTargets([yoga, wellness], "legacy-target").targets.map(({ campaignId, providerCampaignId }) => [campaignId, providerCampaignId]))
-      .toEqual([["yoga-campaign", "instantly-yoga"], ["wellness-campaign", "instantly-wellness"]]);
+    expect(result.targets.map(({ campaignId, providerCampaignId }) => [campaignId, providerCampaignId]))
+      .toEqual(nicheTargets.map(({ campaignId, target }) => [campaignId, target]));
+    expect(result.blockedCampaignIds).toEqual([]);
   });
 
-  it("blocks niche campaigns without a specific target instead of falling back globally", () => {
+  it.each(nicheTargets.flatMap((source) => nicheTargets
+    .filter((target) => target.niche !== source.niche)
+    .map((target) => ({ source, target }))))(
+    "blocks $source.niche mapped to $target.niche target",
+    ({ source, target }) => {
+      const result = resolveInstantlyImportTargets([
+        mappedNicheCampaign(source.niche, source.campaignId, target.target),
+      ], "legacy-target");
+
+      expect(result.targets).toEqual([]);
+      expect(result.blockedCampaignIds).toEqual([source.campaignId]);
+    },
+  );
+
+  it("blocks a niche campaign without an explicit mapping even when engine config has a target", () => {
     const result = resolveInstantlyImportTargets([
-      campaignRow({ campaign_id: "yoga-campaign", engine_config: { niche: "yoga_pilates" } }),
+      campaignRow({
+        campaign_id: "yoga-campaign",
+        engine_config: { niche: "yoga_pilates", instantlyCampaignId: nicheTargets[0].target },
+      }),
     ], "legacy-target");
 
     expect(result.targets).toEqual([]);
@@ -63,24 +92,65 @@ describe("resolveInstantlyImportTargets", () => {
 
   it("blocks a niche route that shares an external target with another campaign", () => {
     const result = resolveInstantlyImportTargets([
-      campaignRow({ engine_config: { niche: "yoga_pilates", instantlyCampaignId: "shared-target" } }),
-      campaignRow({ campaign_id: "wellness-campaign", engine_config: { niche: "spas_wellness", instantlyCampaignId: "shared-target" } }),
+      mappedNicheCampaign("yoga_pilates", "yoga-campaign", "shared-target"),
+      mappedNicheCampaign("spas_wellness", "wellness-campaign", "shared-target"),
     ], "legacy-target");
 
     expect(result.targets).toEqual([]);
-    expect(result.blockedCampaignIds).toEqual(["campaign-1", "wellness-campaign"]);
+    expect(result.blockedCampaignIds).toEqual(["yoga-campaign", "wellness-campaign"]);
   });
 
   it("blocks a colliding niche route without pausing the existing legacy target", () => {
     const result = resolveInstantlyImportTargets([
       campaignRow(),
+      mappedNicheCampaign("yoga_pilates", "yoga-campaign", nicheTargets[0].target),
+    ], nicheTargets[0].target);
+
+    expect(result.targets).toEqual([expect.objectContaining({ campaignId: "campaign-1", legacyFallback: true })]);
+    expect(result.blockedCampaignIds).toEqual(["yoga-campaign"]);
+  });
+
+  it("blocks a known niche target when its campaign has no niche", () => {
+    const result = resolveInstantlyImportTargets([
       campaignRow({
         campaign_id: "yoga-campaign",
-        engine_config: { niche: "yoga_pilates", instantlyCampaignId: "legacy-target" },
+        mapping_campaign_id: "yoga-campaign",
+        mapping_enabled: true,
+        mapped_provider_campaign_id: nicheTargets[0].target,
       }),
     ], "legacy-target");
 
-    expect(result.targets).toEqual([expect.objectContaining({ campaignId: "campaign-1", legacyFallback: true })]);
+    expect(result.targets).toEqual([]);
+    expect(result.blockedCampaignIds).toEqual(["yoga-campaign"]);
+  });
+
+  it("blocks duplicate rows for the same niche mapping as ambiguous", () => {
+    const yoga = mappedNicheCampaign("yoga_pilates", "yoga-campaign", nicheTargets[0].target);
+    const result = resolveInstantlyImportTargets([yoga, yoga], "legacy-target");
+
+    expect(result.targets).toEqual([]);
+    expect(result.blockedCampaignIds).toEqual(["yoga-campaign"]);
+    expect(result.blockedCampaignReasons).toEqual([{ campaignId: "yoga-campaign", reason: "ambiguous_mapping_rows" }]);
+  });
+
+  it("blocks every target when duplicate rows disagree, including an otherwise valid mapping", () => {
+    const correct = mappedNicheCampaign("yoga_pilates", "yoga-campaign", nicheTargets[0].target);
+    const incorrect = mappedNicheCampaign("yoga_pilates", "yoga-campaign", nicheTargets[1].target);
+    const result = resolveInstantlyImportTargets([correct, incorrect], "legacy-target");
+
+    expect(result.targets).toEqual([]);
+    expect(result.blockedCampaignIds).toEqual(["yoga-campaign"]);
+    expect(result.blockedCampaignReasons).toEqual([{ campaignId: "yoga-campaign", reason: "ambiguous_mapping_rows" }]);
+  });
+
+  it("blocks a malformed niche mapping owned by another campaign", () => {
+    const result = resolveInstantlyImportTargets([
+      mappedNicheCampaign("yoga_pilates", "yoga-campaign", nicheTargets[0].target, {
+        mapping_campaign_id: "different-campaign",
+      }),
+    ], "legacy-target");
+
+    expect(result.targets).toEqual([]);
     expect(result.blockedCampaignIds).toEqual(["yoga-campaign"]);
   });
 

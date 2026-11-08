@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { Campaign } from "@/domain/campaigns/types";
 import { buildEngineCapabilities } from "./engine-capability";
 import { getApifyAllocationHealth, resolveApifyDiscoveryWorkMode, evaluateApifyRecovery, evaluateProviderHealth, type ApifyRecoveryRun } from "@/services/discovery/provider-health";
-import { allocateEngineWork, allocateMapsFastRawNeed, MAX_RAW_PER_PLANNING_WINDOW, planApifyRecoveryProbe, planningWindowKey, rerouteEngineOrders, resolvePlanningWindow } from "./target-planner";
+import { allocateEngineWork, allocateMapsFastRawNeed, MAX_RAW_PER_PLANNING_WINDOW, planApifyRecoveryProbe, planningWindowKey, rerouteEngineOrders, resolvePlanningWindow, routeCampaignsToAvailableEngines } from "./target-planner";
 
 function campaign(id: string, target: number, overrides: Partial<Campaign> = {}): Campaign {
   return {
@@ -147,6 +147,57 @@ describe("target planner", () => {
 
     expect(orders.find((order) => order.campaignId === "efficient")?.desiredRawCount)
       .toBeGreaterThan(orders.find((order) => order.campaignId === "expensive")?.desiredRawCount ?? 0);
+  });
+
+  it("uses Google SERP economics after routing a Maps campaign to fallback", () => {
+    const campaigns = [
+      campaign("fallback", 100),
+      campaign("serper-native", 100, { engineType: "google_serp" }),
+    ];
+    const capabilities = [
+      { engineType: "maps_fast" as const, available: false, providerConfigured: true, providerHealthy: false, providerUntested: false, costAllowed: true, campaignCount: 1, reasonUnavailable: "provider_paused" as const, reason: "provider_paused" as const },
+      { engineType: "google_serp" as const, available: true, providerConfigured: true, providerHealthy: true, providerUntested: false, costAllowed: true, campaignCount: 2, reasonUnavailable: null, reason: null },
+    ];
+    const routedCampaigns = routeCampaignsToAvailableEngines(campaigns, capabilities);
+    const orders = allocateEngineWork({
+      workspaceId: "workspace-1",
+      campaigns: routedCampaigns,
+      capabilities,
+      performances: [
+        { campaignId: "fallback", engineType: "maps_fast", yield: 0.9, confirmedImportCount: 10, costPerConfirmedImportUsd: 0.1, queueDepth: 0, seedExhaustion: 0 },
+        { campaignId: "fallback", engineType: "google_serp", yield: 0.1, confirmedImportCount: 10, costPerConfirmedImportUsd: 0.9, queueDepth: 0, seedExhaustion: 0 },
+        { campaignId: "serper-native", engineType: "google_serp", yield: 0.1, confirmedImportCount: 10, costPerConfirmedImportUsd: 0.1, queueDepth: 0, seedExhaustion: 0 },
+      ],
+      rawNeeded: 100,
+      reason: "provider fallback",
+      now: new Date("2025-01-01T13:00:00Z"),
+      timeZone: "Europe/Madrid",
+    });
+
+    expect(routedCampaigns[0]?.engineType).toBe("google_serp");
+    expect(orders.find((order) => order.campaignId === "fallback")?.desiredRawCount)
+      .toBeLessThan(orders.find((order) => order.campaignId === "serper-native")?.desiredRawCount ?? 0);
+  });
+
+  it("routes a Maps niche to Serper only when mature confirmed-import economics are better", () => {
+    const campaigns = [campaign("niche", 100)];
+    const capabilities = ["maps_fast", "google_serp"].map((engineType) => ({
+      engineType: engineType as Campaign["engineType"], available: true, providerConfigured: true,
+      providerHealthy: true, providerUntested: false, costAllowed: true, campaignCount: 1,
+      reasonUnavailable: null, reason: null,
+    }));
+    const performances = [
+      { campaignId: "niche", engineType: "maps_fast" as const, yield: 0.2, confirmedImportCount: 10, costPerConfirmedImportUsd: 0.4, queueDepth: 0, seedExhaustion: 0 },
+      { campaignId: "niche", engineType: "google_serp" as const, yield: 0.1, confirmedImportCount: 10, costPerConfirmedImportUsd: 0.2, queueDepth: 0, seedExhaustion: 0 },
+    ];
+    const economicRoute = routeCampaignsToAvailableEngines(campaigns, capabilities, performances);
+    const immatureRoute = routeCampaignsToAvailableEngines(campaigns, capabilities, performances.map((performance) => ({
+      ...performance,
+      confirmedImportCount: 4,
+    })));
+
+    expect(economicRoute[0]?.engineType).toBe("google_serp");
+    expect(immatureRoute[0]?.engineType).toBe("maps_fast");
   });
 
   it("reduces only a mature expensive engine under provider pressure and preserves the global deficit", () => {

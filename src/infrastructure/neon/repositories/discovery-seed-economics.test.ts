@@ -29,6 +29,19 @@ describe("seed economic performance query", () => {
     expect(query.params).toContain(now.toISOString());
   });
 
+  it("loads Google SERP seed economics from Serper provider runs", () => {
+    const query = new PgDialect().sqlToQuery(buildSeedEconomicPerformanceQuery(
+      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      "google_serp",
+      new Date("2026-10-20T12:00:00.000Z"),
+      new Date("2026-10-27T00:00:00.000Z"),
+      new Date("2026-10-27T12:00:00.000Z"),
+    ));
+
+    expect(query.sql).toContain("run.provider = $2");
+    expect(query.params).toContain("serper");
+  });
+
   it("reports daily actual provider cost and returned items independently of requests", () => {
     const workspaceId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
     const since = new Date("2026-10-27T00:00:00.000Z");

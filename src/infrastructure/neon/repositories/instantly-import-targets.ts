@@ -9,6 +9,19 @@ export interface InstantImportTarget {
   legacyFallback: boolean;
 }
 
+export interface InstantImportTargetBlock {
+  campaignId: string;
+  reason: string;
+}
+
+const STRICT_NICHE_TARGETS: Record<string, string> = {
+  yoga_pilates: "7ba53c91-6c8f-4b8a-b260-72eb48f62d07",
+  spas_wellness: "20013626-0dc5-4bb4-a2bf-c4b99450cdb6",
+  premium_fitness: "5f42f2cf-5ebc-412e-814f-5eca8b1fea71",
+  personal_training: "2413f6f5-2e21-46c2-addc-9b8c2ff90a34",
+};
+const STRICT_NICHE_TARGET_IDS = new Set(Object.values(STRICT_NICHE_TARGETS));
+
 interface CampaignTargetRow {
   campaign_id: string;
   workspace_id: string;
@@ -21,26 +34,77 @@ interface CampaignTargetRow {
 export function resolveInstantlyImportTargets(
   rows: readonly CampaignTargetRow[],
   legacyProviderCampaignId: string,
-): { targets: InstantImportTarget[]; blockedCampaignIds: string[] } {
+): { targets: InstantImportTarget[]; blockedCampaignIds: string[]; blockedCampaignReasons: InstantImportTargetBlock[] } {
   const candidates: InstantImportTarget[] = [];
-  const blockedCampaignIds = new Set<string>();
+  const blockedReasons = new Map<string, string>();
+  const rowCounts = new Map<string, number>();
+  for (const row of rows) rowCounts.set(row.campaign_id, (rowCounts.get(row.campaign_id) ?? 0) + 1);
+  const block = (campaignId: string, reason: string) => {
+    if (!blockedReasons.has(campaignId)) blockedReasons.set(campaignId, reason);
+  };
 
   for (const row of rows) {
+    if ((rowCounts.get(row.campaign_id) ?? 0) > 1) {
+      block(row.campaign_id, "ambiguous_mapping_rows");
+      continue;
+    }
     const config = row.engine_config !== null && typeof row.engine_config === "object" && !Array.isArray(row.engine_config)
       ? row.engine_config as Record<string, unknown>
       : {};
     const hasNiche = Object.hasOwn(config, "niche");
     if (row.mapping_campaign_id && row.mapping_enabled !== true) {
-      blockedCampaignIds.add(row.campaign_id);
+      block(row.campaign_id, "mapping_disabled");
       continue;
     }
 
     const configuredId = [row.mapped_provider_campaign_id, config.instantlyCampaignId, config.providerCampaignId]
       .find((value): value is string => typeof value === "string" && value.trim().length > 0)?.trim();
+    const niche = typeof config.niche === "string" ? config.niche : null;
+    const expectedNicheTarget = niche ? STRICT_NICHE_TARGETS[niche] : undefined;
+    const strictNicheRoute = hasNiche || (configuredId !== undefined && STRICT_NICHE_TARGET_IDS.has(configuredId));
+    if (strictNicheRoute) {
+      if (!expectedNicheTarget) {
+        block(row.campaign_id, hasNiche ? "unsupported_niche" : "niche_missing");
+        continue;
+      }
+      if (!row.mapping_campaign_id) {
+        block(row.campaign_id, "explicit_mapping_missing");
+        continue;
+      }
+      if (row.mapping_campaign_id !== row.campaign_id) {
+        block(row.campaign_id, "mapping_campaign_mismatch");
+        continue;
+      }
+      if (row.mapping_enabled !== true) {
+        block(row.campaign_id, "mapping_disabled");
+        continue;
+      }
+      if (typeof row.mapped_provider_campaign_id !== "string" || row.mapped_provider_campaign_id.trim().length === 0) {
+        block(row.campaign_id, "provider_campaign_id_missing");
+        continue;
+      }
+      if (row.mapped_provider_campaign_id.trim() !== expectedNicheTarget) {
+        block(row.campaign_id, "provider_campaign_id_mismatch");
+        continue;
+      }
+      if (expectedNicheTarget === legacyProviderCampaignId.trim()) {
+        block(row.campaign_id, "legacy_target_collision");
+        continue;
+      }
+
+      candidates.push({
+        campaignId: row.campaign_id,
+        workspaceId: row.workspace_id,
+        providerCampaignId: expectedNicheTarget,
+        legacyFallback: false,
+      });
+      continue;
+    }
+
     const legacyFallback = !configuredId && !hasNiche && Boolean(legacyProviderCampaignId.trim());
     const providerCampaignId = configuredId ?? (legacyFallback ? legacyProviderCampaignId.trim() : null);
     if (!providerCampaignId) {
-      blockedCampaignIds.add(row.campaign_id);
+      block(row.campaign_id, "provider_campaign_id_missing");
       continue;
     }
 
@@ -62,14 +126,20 @@ export function resolveInstantlyImportTargets(
   for (const group of groups.values()) {
     const explicitTargets = group.filter((target) => !target.legacyFallback);
     if (explicitTargets.length > 0 && group.length > 1) {
-      for (const target of explicitTargets) blockedCampaignIds.add(target.campaignId);
+      for (const target of explicitTargets) block(target.campaignId, "shared_provider_campaign_target");
       targets.push(...group.filter((target) => target.legacyFallback));
       continue;
     }
     targets.push(...group);
   }
 
-  return { targets, blockedCampaignIds: [...blockedCampaignIds] };
+  const blockedCampaignIds = [...blockedReasons.keys()];
+  const blockedCampaignIdSet = new Set(blockedCampaignIds);
+  return {
+    targets: targets.filter((target) => !blockedCampaignIdSet.has(target.campaignId)),
+    blockedCampaignIds,
+    blockedCampaignReasons: [...blockedReasons].map(([campaignId, reason]) => ({ campaignId, reason })),
+  };
 }
 
 export async function listInstantlyImportTargets(): Promise<ReturnType<typeof resolveInstantlyImportTargets>> {

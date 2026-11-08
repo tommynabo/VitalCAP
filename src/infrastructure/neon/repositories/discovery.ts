@@ -62,6 +62,7 @@ export async function listSearchSeedsForCampaignEngine(campaignId: string, engin
 }
 
 export function buildSeedEconomicPerformanceQuery(campaignId: string, engineType: EngineType, since: Date, todayStart: Date, now: Date) {
+  const provider = engineType === "maps_fast" || engineType === "maps_deep" ? "apify" : "serper";
   return sql`
     WITH recent_runs AS (
       SELECT run.id, run.started_at, run.campaign_id,
@@ -73,7 +74,7 @@ export function buildSeedEconomicPerformanceQuery(campaignId: string, engineType
           AND NULLIF(run.metadata #>> '{ingestionAccounting,DUPLICATE_EXISTING_RAW}', '') IS NOT NULL) AS has_accounting
       FROM provider_runs run
       WHERE run.campaign_id = ${campaignId}::uuid
-        AND run.provider = 'apify'
+        AND run.provider = ${provider}
         AND run.status IN ('ingested', 'completed')
         AND run.started_at >= ${since.toISOString()}::timestamptz
         AND run.started_at < ${now.toISOString()}::timestamptz
@@ -223,7 +224,7 @@ export async function getSeedEconomicPerformance(
   now = new Date(),
   timeZone = "Europe/Madrid",
 ): Promise<Map<string, SeedEconomicPerformance>> {
-  if (engineType !== "maps_fast" && engineType !== "maps_deep") return new Map();
+  if (engineType !== "maps_fast" && engineType !== "maps_deep" && engineType !== "google_serp") return new Map();
   const since = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
   const todayStart = getDayBounds(timeZone, now).start;
   const result = await getDb().execute(buildSeedEconomicPerformanceQuery(campaignId, engineType, since, todayStart, now));

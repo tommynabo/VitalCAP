@@ -466,13 +466,15 @@ async function executeDiscoveryJob(
     ? candidatePool.find((seed) => seed.query === job.payload.seedQuery && seed.geography === job.payload.seedGeography)
     : undefined;
   const seedCandidates = requestedSeed ? [requestedSeed] : candidatePool;
-  const seedEconomics = provider === "apify"
+  const usesSeedEconomics = provider === "apify" || job.payload.engineType === "google_serp";
+  const seedEconomics = usesSeedEconomics
     ? await getSeedEconomicPerformance(campaign.id, job.payload.engineType, new Date(), campaign.timeZone)
     : new Map();
-  const economicPlan = provider === "apify"
+  const economicPlan = usesSeedEconomics
     ? planSeedBatches({
       seeds: seedCandidates,
       performanceBySeed: seedEconomics,
+      provider,
       rawNeeded: desiredRawCount,
       maxSeeds,
       now: new Date(),
@@ -506,6 +508,7 @@ async function executeDiscoveryJob(
     });
   }
   const boundedSeeds = provider === "apify"
+    || job.payload.engineType === "google_serp"
     ? economicBatches.map((batch) => batch.seed)
     : seedCandidates.slice(0, maxSeeds);
   const economicBatchBySeed = new Map(economicBatches.map((batch) => [batch.seed.id, batch]));
@@ -565,7 +568,7 @@ async function executeDiscoveryJob(
 
   let totalRawCandidates = 0;
   for (const [seedIndex, seed] of boundedSeeds.entries()) {
-    const plannedItems = provider === "apify"
+    const plannedItems = usesSeedEconomics
       ? economicBatchBySeed.get(seed.id)?.requestedItems ?? 0
       : Math.min(MAX_RAW_PER_SEED, Math.max(1, Math.ceil(remainingRaw / (boundedSeeds.length - seedIndex))));
     const requestedItems = provider === "apify"

@@ -3,6 +3,7 @@ import { emailChannelEligibilitySql } from "@/services/compliance/email-channel-
 import { ENGINE_PERFORMANCE_WINDOW_DAYS, selectEnginePerformance, type EnginePerformanceMetric } from "@/services/autopilot/engine-performance";
 import { actualPriorColdOutreachSql } from "./actual-outreach";
 import { getDb } from "../db";
+import type { EngineType } from "@/domain/campaigns/types";
 
 function numberValue(value: unknown): number {
   return Number(value ?? 0);
@@ -16,7 +17,6 @@ export function buildAutopilotEnginePerformanceQuery(workspaceId: string, now: D
       FROM raw_candidates rc
       JOIN campaigns c ON c.id = rc.campaign_id
       WHERE c.workspace_id = ${workspaceId}::uuid
-        AND rc.engine_type = c.engine_type
         AND rc.discovered_at >= ${since.toISOString()}::timestamptz
         AND rc.discovered_at < ${now.toISOString()}::timestamptz
         AND rc.engine_type <> 'hybrid_fill'
@@ -29,14 +29,17 @@ export function buildAutopilotEnginePerformanceQuery(workspaceId: string, now: D
         AND src.discovered_at < ${now.toISOString()}::timestamptz
         AND src.source_type IN ('maps_fast', 'maps_deep', 'google_serp', 'linkedin_owner')
     ), recent_campaign_counts AS (
-      SELECT account_id, count(DISTINCT campaign_id)::int AS campaign_count
+      SELECT account_id,
+        count(DISTINCT campaign_id)::int AS campaign_count,
+        count(DISTINCT (campaign_id, engine_type))::int AS engine_count
       FROM recent_raw
       WHERE account_id IS NOT NULL
       GROUP BY account_id
     ), unambiguous_sources AS (
-      SELECT DISTINCT rr.account_id, rr.campaign_id
+      SELECT DISTINCT rr.account_id, rr.campaign_id, rr.engine_type
       FROM recent_raw rr
-      JOIN recent_campaign_counts rcc ON rcc.account_id = rr.account_id AND rcc.campaign_count = 1
+      JOIN recent_campaign_counts rcc
+        ON rcc.account_id = rr.account_id AND rcc.campaign_count = 1 AND rcc.engine_count = 1
       JOIN recent_engine_sources res ON res.account_id = rr.account_id AND res.source_type = rr.engine_type
       WHERE rr.account_id IS NOT NULL
         AND NOT EXISTS (
@@ -44,7 +47,7 @@ export function buildAutopilotEnginePerformanceQuery(workspaceId: string, now: D
           WHERE competing.account_id = rr.account_id AND competing.source_type <> rr.engine_type
         )
     ), confirmed_imports AS (
-      SELECT source.campaign_id, count(DISTINCT ili.account_id)::int AS confirmed_import_count
+      SELECT source.campaign_id, source.engine_type, count(DISTINCT ili.account_id)::int AS confirmed_import_count
       FROM unambiguous_sources source
       JOIN instantly_lead_imports ili
         ON ili.account_id = source.account_id
@@ -74,10 +77,11 @@ export function buildAutopilotEnginePerformanceQuery(workspaceId: string, now: D
           WHERE se.workspace_id = ili.workspace_id
             AND (se.account_id = ili.account_id OR se.contact_point_id = cp.id)
         )
-      GROUP BY source.campaign_id
+      GROUP BY source.campaign_id, source.engine_type
     ), campaign_metrics AS (
       SELECT
         c.id AS campaign_id,
+        COALESCE(rr.engine_type, c.engine_type) AS engine_type,
         count(rr.id)::int AS raw_count,
         count(DISTINCT rr.account_id) FILTER (WHERE rr.account_id IS NOT NULL AND EXISTS (
           SELECT 1 FROM contact_points cp
@@ -125,20 +129,22 @@ export function buildAutopilotEnginePerformanceQuery(workspaceId: string, now: D
       FROM campaigns c
       LEFT JOIN recent_raw rr ON rr.campaign_id = c.id
       WHERE c.workspace_id = ${workspaceId}::uuid AND c.engine_type <> 'hybrid_fill'
-      GROUP BY c.id
+      GROUP BY c.id, COALESCE(rr.engine_type, c.engine_type)
     ), provider_costs AS (
-      SELECT campaign_id,
+      SELECT run.campaign_id, seed.engine_type,
         CASE WHEN count(*) = 0 THEN NULL ELSE sum(cost_usd) END AS estimated_provider_cost_usd
-      FROM provider_runs
-      WHERE workspace_id = ${workspaceId}::uuid
-        AND provider IN ('apify', 'serper')
-        AND campaign_id IS NOT NULL
-        AND started_at >= ${since.toISOString()}::timestamptz
-        AND started_at < ${now.toISOString()}::timestamptz
-      GROUP BY campaign_id
+      FROM provider_runs run
+      JOIN search_seeds seed ON seed.id = run.seed_id AND seed.campaign_id = run.campaign_id
+      WHERE run.workspace_id = ${workspaceId}::uuid
+        AND run.provider IN ('apify', 'serper')
+        AND run.campaign_id IS NOT NULL
+        AND run.started_at >= ${since.toISOString()}::timestamptz
+        AND run.started_at < ${now.toISOString()}::timestamptz
+      GROUP BY run.campaign_id, seed.engine_type
     )
     SELECT
       metrics.campaign_id,
+      metrics.engine_type,
       metrics.raw_count,
       coalesce(imports.confirmed_import_count, 0)::int AS confirmed_import_count,
       metrics.compliance_eligible_exact_mv_count,
@@ -146,9 +152,15 @@ export function buildAutopilotEnginePerformanceQuery(workspaceId: string, now: D
       metrics.ready_count,
       costs.estimated_provider_cost_usd
     FROM campaign_metrics metrics
-    LEFT JOIN confirmed_imports imports ON imports.campaign_id = metrics.campaign_id
-    LEFT JOIN provider_costs costs ON costs.campaign_id = metrics.campaign_id
+    LEFT JOIN confirmed_imports imports
+      ON imports.campaign_id = metrics.campaign_id AND imports.engine_type = metrics.engine_type
+    LEFT JOIN provider_costs costs
+      ON costs.campaign_id = metrics.campaign_id AND costs.engine_type = metrics.engine_type
   `;
+}
+
+export function autopilotEnginePerformanceKey(campaignId: string, engineType: EngineType): string {
+  return `${campaignId}:${engineType}`;
 }
 
 export async function getAutopilotEnginePerformance(
@@ -159,8 +171,9 @@ export async function getAutopilotEnginePerformance(
   const performanceByCampaign = new Map<string, EnginePerformanceMetric>();
   for (const row of result.rows as Array<Record<string, unknown>>) {
     const campaignId = String(row.campaign_id);
+    const engineType = String(row.engine_type) as EngineType;
     const cost = row.estimated_provider_cost_usd;
-    performanceByCampaign.set(campaignId, selectEnginePerformance({
+    performanceByCampaign.set(autopilotEnginePerformanceKey(campaignId, engineType), selectEnginePerformance({
       rawCount: numberValue(row.raw_count),
       confirmedImportCount: numberValue(row.confirmed_import_count),
       complianceEligibleExactMvCount: numberValue(row.compliance_eligible_exact_mv_count),

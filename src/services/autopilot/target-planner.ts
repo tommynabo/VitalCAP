@@ -26,6 +26,7 @@ export interface MapsFastAllocationInput {
 
 export interface EnginePlanningPerformance {
   campaignId: string;
+  engineType?: EngineType;
   /** Recent end-to-end yield selected from the engine performance hierarchy. */
   yield: number;
   yieldTier?: EngineYieldTier;
@@ -43,6 +44,36 @@ export interface EngineWorkAllocationInput extends Omit<MapsFastAllocationInput,
   capabilities: readonly EngineCapability[];
   performances?: readonly EnginePlanningPerformance[];
   economicPressureByEngine?: Partial<Record<EngineType, boolean>>;
+}
+
+export function routeCampaignsToAvailableEngines(
+  campaigns: readonly Campaign[],
+  capabilities: readonly EngineCapability[],
+  performances: readonly EnginePlanningPerformance[] = [],
+): Campaign[] {
+  const available = new Set(capabilities.filter((capability) => capability.available).map((capability) => capability.engineType));
+  if (!available.has("google_serp")) return [...campaigns];
+  const performanceByCampaignEngine = new Map(performances.map((performance) => [
+    `${performance.campaignId}:${performance.engineType ?? ""}`,
+    performance,
+  ]));
+  return campaigns.map((campaign) => {
+    if (campaign.engineType !== "maps_fast") return campaign;
+    if (!available.has("maps_fast")) return { ...campaign, engineType: "google_serp" };
+
+    const mapsPerformance = performanceByCampaignEngine.get(`${campaign.id}:maps_fast`)
+      ?? performanceByCampaignEngine.get(`${campaign.id}:`);
+    const serpPerformance = performanceByCampaignEngine.get(`${campaign.id}:google_serp`);
+    const mapsCost = mapsPerformance?.costPerConfirmedImportUsd;
+    const serpCost = serpPerformance?.costPerConfirmedImportUsd;
+    const matureCostEvidence = (mapsPerformance?.confirmedImportCount ?? 0) >= MIN_IMPORTS_FOR_COST_WEIGHT
+      && (serpPerformance?.confirmedImportCount ?? 0) >= MIN_IMPORTS_FOR_COST_WEIGHT
+      && mapsCost !== null && mapsCost !== undefined && Number.isFinite(mapsCost) && mapsCost > 0
+      && serpCost !== null && serpCost !== undefined && Number.isFinite(serpCost) && serpCost > 0;
+    return matureCostEvidence && serpCost < mapsCost
+      ? { ...campaign, engineType: "google_serp" }
+      : campaign;
+  });
 }
 
 /**
@@ -155,11 +186,16 @@ export function allocateMapsFastRawNeed(input: MapsFastAllocationInput): Discove
  */
 export function allocateEngineWork(input: EngineWorkAllocationInput): DiscoveryOrder[] {
   const available = new Set(input.capabilities.filter((capability) => capability.available).map((capability) => capability.engineType));
-  const performanceByCampaign = new Map((input.performances ?? []).map((performance) => [performance.campaignId, performance]));
+  const performanceByCampaign = new Map((input.performances ?? []).map((performance) => [
+    `${performance.campaignId}:${performance.engineType ?? ""}`,
+    performance,
+  ]));
+  const performanceFor = (campaign: Campaign) =>
+    performanceByCampaign.get(`${campaign.id}:${campaign.engineType}`) ?? performanceByCampaign.get(`${campaign.id}:`);
   const eligible = input.campaigns.filter((campaign) => campaign.status === "active" && campaign.autopilotEnabled && campaign.engineType !== "hybrid_fill" && campaign.dailySoftTarget > 0 && available.has(campaign.engineType));
   if (input.rawNeeded <= 0 || eligible.length === 0) return [];
   const medianCostPerImport = median(eligible
-    .map((campaign) => performanceByCampaign.get(campaign.id))
+    .map(performanceFor)
     .filter((performance): performance is EnginePlanningPerformance => performance !== undefined
       && (performance.confirmedImportCount ?? 0) >= MIN_IMPORTS_FOR_COST_WEIGHT
       && performance.costPerConfirmedImportUsd !== null
@@ -168,7 +204,7 @@ export function allocateEngineWork(input: EngineWorkAllocationInput): DiscoveryO
     .map((performance) => performance.costPerConfirmedImportUsd!));
 
   const weighted = eligible.map((campaign) => {
-    const performance = performanceByCampaign.get(campaign.id);
+    const performance = performanceFor(campaign);
     const yieldWeight = Math.max(0, Math.min(1, performance?.yield ?? SAFE_ENGINE_YIELD_PRIOR));
     const queuePenalty = Math.min(0.75, (performance?.queueDepth ?? 0) / 1_000);
     const exhaustionPenalty = Math.min(0.75, performance?.seedExhaustion ?? 0);
@@ -192,7 +228,7 @@ export function allocateEngineWork(input: EngineWorkAllocationInput): DiscoveryO
   let totalWeight = weighted.reduce((sum, item) => sum + item.weight, 0);
   if (totalWeight <= 0) {
     for (const item of weighted) {
-      const performance = performanceByCampaign.get(item.campaign.id);
+      const performance = performanceFor(item.campaign);
       const queuePenalty = Math.min(0.75, (performance?.queueDepth ?? 0) / 1_000);
       const exhaustionPenalty = Math.min(0.75, performance?.seedExhaustion ?? 0);
       item.weight = item.campaign.dailySoftTarget * (1 - queuePenalty) * (1 - exhaustionPenalty);

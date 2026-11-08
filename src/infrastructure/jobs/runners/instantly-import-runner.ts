@@ -854,12 +854,12 @@ export async function runInstantlyImportTick(options: {
 
   if (options.contactPointIds?.length === 0) return emptyImportTickResult("ready", await readPipelineMetrics());
 
-  const { targets, blockedCampaignIds } = await listInstantlyImportTargets();
+  const { targets, blockedCampaignIds, blockedCampaignReasons } = await listInstantlyImportTargets();
   if (blockedCampaignIds.length > 0) {
     logEvent("warn", "instantly.import_target_blocked", {
       correlationId: `instantly-targets:${now.toISOString()}`,
       blockedCampaignCount: blockedCampaignIds.length,
-      reason: "missing_or_shared_campaign_target",
+      blockedCampaignReasons,
     });
   }
   if (targets.length === 0) return emptyImportTickResult("missing_configuration", await readPipelineMetrics());

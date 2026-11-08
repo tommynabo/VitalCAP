@@ -10,8 +10,8 @@ import { getWatchdogWorkspaceSignals } from "@/infrastructure/neon/repositories/
 import { enqueueDiscoveryOrdersWithinDailyRawCap } from "@/infrastructure/neon/repositories/daily-raw-request-cap";
 import { bootstrapSearchSeeds, listSearchSeedsForCampaignEngine } from "@/infrastructure/neon/repositories/discovery";
 import { getApifyRecoverySnapshot, getGlobalSerperSpendToday, getLatestProviderEconomicPacingStates, getRecentProviderUsage, getSerperRecoveryState, getTodaySpendUsd, recordProviderRun } from "@/infrastructure/neon/repositories/provider-runs";
-import { allocateEngineWork, MAX_APIFY_RECOVERY_PROBE_RAW, MAX_RAW_PER_PLANNING_WINDOW, planApifyRecoveryProbe, planningWindowKey, rerouteEngineOrders, type EnginePlanningPerformance } from "@/services/autopilot/target-planner";
-import { getAutopilotEnginePerformance } from "@/infrastructure/neon/repositories/autopilot-engine-performance";
+import { allocateEngineWork, MAX_APIFY_RECOVERY_PROBE_RAW, MAX_RAW_PER_PLANNING_WINDOW, planApifyRecoveryProbe, planningWindowKey, rerouteEngineOrders, routeCampaignsToAvailableEngines, type EnginePlanningPerformance } from "@/services/autopilot/target-planner";
+import { autopilotEnginePerformanceKey, getAutopilotEnginePerformance } from "@/infrastructure/neon/repositories/autopilot-engine-performance";
 import { decideHybridFill } from "@/services/discovery/hybrid-fill-decision";
 import { buildEngineCapabilities } from "@/services/autopilot/engine-capability";
 import { createApifyCredentialFingerprint, getApifyAllocationHealth, evaluateProviderHealth } from "@/services/discovery/provider-health";
@@ -254,11 +254,26 @@ export async function runAutopilotCronTick(now: Date = new Date()): Promise<Auto
       costAllowed: pacing.apifyDailyBudgetRemaining > 0 || serperBudgetRemaining >= SERPER_ESTIMATED_COST_PER_QUERY_USD,
       mapsCostAllowed: pacing.apifyDailyBudgetRemaining > 0 && apifyEconomicPacing.discoveryMultiplier > 0,
       serperCostAllowed: serperBudgetRemaining >= SERPER_ESTIMATED_COST_PER_QUERY_USD && serperEconomicPacing.discoveryMultiplier > 0,
-      campaignCounts: Object.fromEntries(allTypes.map((engineType) => [engineType, campaigns.filter((campaign) => campaign.engineType === engineType).length])),
+      campaignCounts: Object.fromEntries(allTypes.map((engineType) => [engineType,
+        campaigns.filter((campaign) => campaign.engineType === engineType).length
+          + (engineType === "google_serp" ? campaigns.filter((campaign) => campaign.engineType === "maps_fast").length : 0),
+      ])),
     });
 
     const concreteCampaigns = campaigns.filter((campaign) => campaign.engineType !== "hybrid_fill");
-    const seedSets = await Promise.all(concreteCampaigns.map((campaign) => listSearchSeedsForCampaignEngine(campaign.id, campaign.engineType)));
+    const performanceEngineTypesByCampaign = concreteCampaigns.map((campaign) => campaign.engineType === "maps_fast"
+      ? [campaign.engineType, "google_serp" as const]
+      : [campaign.engineType]);
+    const seedSets = await Promise.all(concreteCampaigns.flatMap((campaign, index) =>
+      performanceEngineTypesByCampaign[index]!.map((engineType) => listSearchSeedsForCampaignEngine(campaign.id, engineType)),
+    ));
+    const seedSetsByCampaignEngine = new Map<string, typeof seedSets[number]>();
+    let seedSetIndex = 0;
+    concreteCampaigns.forEach((campaign, index) => {
+      for (const engineType of performanceEngineTypesByCampaign[index]!) {
+        seedSetsByCampaignEngine.set(autopilotEnginePerformanceKey(campaign.id, engineType), seedSets[seedSetIndex++] ?? []);
+      }
+    });
     const enginePerformanceByCampaign = await getAutopilotEnginePerformance(workspaceId, now);
     const recentImportSample = [...enginePerformanceByCampaign.values()]
       .reduce((total, performance) => total + performance.confirmedImportCount, 0);
@@ -295,23 +310,27 @@ export async function runAutopilotCronTick(now: Date = new Date()): Promise<Auto
       qualifiedContactabilityBacklog: pacing.qualifiedContactabilityBacklog,
       expectedImportsFromBacklog: pacing.expectedImportsFromBacklog,
     });
-    const performances: EnginePlanningPerformance[] = await Promise.all(concreteCampaigns.map(async (campaign, index) => {
-      const measured = enginePerformanceByCampaign.get(campaign.id);
-      return {
-        campaignId: campaign.id,
-        yield: measured?.yield ?? 0.1,
-        yieldTier: measured?.yieldTier ?? "neutral_prior",
-        rawCount: measured?.rawCount ?? 0,
-        confirmedImportCount: measured?.confirmedImportCount ?? 0,
-        importRawYield: measured?.importRawYield ?? null,
-        estimatedProviderCostUsd: measured?.estimatedProviderCostUsd ?? null,
-        costPerConfirmedImportUsd: measured?.costPerConfirmedImportUsd ?? null,
-        queueDepth: await getCampaignQueueDepth(campaign.id),
-        seedExhaustion: seedSets[index]?.length
-          ? seedSets[index].reduce((sum, seed) => sum + seed.exhaustionScore, 0) / seedSets[index].length
-          : 0,
-      };
-    }));
+    const performances: EnginePlanningPerformance[] = await Promise.all(concreteCampaigns.flatMap((campaign, index) =>
+      performanceEngineTypesByCampaign[index]!.map(async (engineType) => {
+        const measured = enginePerformanceByCampaign.get(autopilotEnginePerformanceKey(campaign.id, engineType));
+        const engineSeeds = seedSetsByCampaignEngine.get(autopilotEnginePerformanceKey(campaign.id, engineType)) ?? [];
+        return {
+          campaignId: campaign.id,
+          engineType,
+          yield: measured?.yield ?? 0.1,
+          yieldTier: measured?.yieldTier ?? "neutral_prior",
+          rawCount: measured?.rawCount ?? 0,
+          confirmedImportCount: measured?.confirmedImportCount ?? 0,
+          importRawYield: measured?.importRawYield ?? null,
+          estimatedProviderCostUsd: measured?.estimatedProviderCostUsd ?? null,
+          costPerConfirmedImportUsd: measured?.costPerConfirmedImportUsd ?? null,
+          queueDepth: await getCampaignQueueDepth(campaign.id),
+          seedExhaustion: engineSeeds.length
+            ? engineSeeds.reduce((sum, seed) => sum + seed.exhaustionScore, 0) / engineSeeds.length
+            : 0,
+        };
+      }),
+    ));
     const recoveryRawNeed = apifyRecovery.recoveryProbeEligible
       ? Math.min(MAX_APIFY_RECOVERY_PROBE_RAW, pacing.rawRequestsRemaining)
       : 0;
@@ -352,8 +371,9 @@ export async function runAutopilotCronTick(now: Date = new Date()): Promise<Auto
       });
     }
     const recoveryProbeRaw = recoveryProbeOrders.reduce((total, order) => total + order.desiredRawCount, 0);
+    const allocationCampaigns = routeCampaignsToAvailableEngines(concreteCampaigns, capabilities, performances);
     let orders = allocateEngineWork({
-      workspaceId, campaigns: concreteCampaigns, capabilities, performances,
+      workspaceId, campaigns: allocationCampaigns, capabilities, performances,
       economicPressureByEngine: {
         maps_fast: apifyEconomicPacing.state === "AHEAD_OF_BUDGET_PACE",
         maps_deep: apifyEconomicPacing.state === "AHEAD_OF_BUDGET_PACE",
@@ -363,12 +383,12 @@ export async function runAutopilotCronTick(now: Date = new Date()): Promise<Auto
       rawNeeded: planningRawLimit - recoveryProbeRaw, reason: pacing.explanation, now, timeZone: settings.timezone, origin: "normal",
     });
     for (const performance of performances) {
-      const order = orders.find((item) => item.campaignId === performance.campaignId);
+      const order = orders.find((item) => item.campaignId === performance.campaignId && item.engineType === performance.engineType);
       logEvent("info", "autopilot.cost_efficiency", {
         correlationId: `${workspaceId}:${performance.campaignId}:${planningWindowKey(now, settings.timezone)}`,
         workspaceId,
         campaignId: performance.campaignId,
-        engineType: concreteCampaigns.find((campaign) => campaign.id === performance.campaignId)?.engineType ?? null,
+        engineType: order?.engineType ?? performance.engineType ?? concreteCampaigns.find((campaign) => campaign.id === performance.campaignId)?.engineType ?? null,
         sampleSize: performance.rawCount ?? 0,
         importYield: performance.importRawYield ?? null,
         costPerImport: performance.costPerConfirmedImportUsd ?? null,
@@ -385,7 +405,7 @@ export async function runAutopilotCronTick(now: Date = new Date()): Promise<Auto
       rawDeficit: Math.floor(pacing.rawNeededToPlan * discoveryBackpressureMultiplier),
       candidates: concreteCampaigns.map((campaign) => {
         const capability = capabilities.find((item) => item.engineType === campaign.engineType);
-        const measured = performances.find((item) => item.campaignId === campaign.id);
+        const measured = performances.find((item) => item.campaignId === campaign.id && item.engineType === campaign.engineType);
         return {
           campaignId: campaign.id,
           engineType: campaign.engineType,

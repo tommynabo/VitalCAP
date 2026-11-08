@@ -292,6 +292,7 @@ function selectWithGeographySpread<T extends { seed: SearchSeed }>(
 export function planSeedBatches(input: {
   seeds: readonly SearchSeed[];
   performanceBySeed: ReadonlyMap<string, SeedEconomicPerformance>;
+  provider?: "apify" | "serper";
   rawNeeded: number;
   maxSeeds: number;
   now: Date;
@@ -354,12 +355,11 @@ export function planSeedBatches(input: {
     : 0;
   const providerMaximum = input.configuredMaxResults ?? APIFY_MAX_RESULTS_PER_SEARCH;
   const batchCostLimitUsd = input.batchCostLimitUsd ?? APIFY_DEFAULT_BATCH_COST_LIMIT_USD;
+  const resolveBatchCapacity = (requestedItems: number) => input.provider === "serper"
+    ? Math.min(Math.max(0, Math.floor(requestedItems)), Math.max(0, Math.floor(providerMaximum)))
+    : resolveApifyMaxResults({ requestedItems, configuredMaxResults: providerMaximum, batchCostLimitUsd });
   const maxExplorationCandidateCapacity = Math.max(0, ...explorationCandidates.map(({ policy }) =>
-    resolveApifyMaxResults({
-      requestedItems: policy.maxResults,
-      configuredMaxResults: providerMaximum,
-      batchCostLimitUsd,
-    }),
+    resolveBatchCapacity(policy.maxResults),
   ));
   const desiredExplorationSlots = Math.min(
     explorationCandidates.length,
@@ -380,11 +380,7 @@ export function planSeedBatches(input: {
     selectedCore.push(candidate);
     selectedCoreIds.add(candidate.seed.id);
     selectedGeographies.add(candidate.seed.geography);
-    selectedCoreCapacity += resolveApifyMaxResults({
-      requestedItems: candidate.policy.maxResults,
-      configuredMaxResults: providerMaximum,
-      batchCostLimitUsd,
-    });
+    selectedCoreCapacity += resolveBatchCapacity(candidate.policy.maxResults);
   }
   const coreTierOrder = economicPressureActive
     ? ["high", "good"] as const
@@ -399,11 +395,7 @@ export function planSeedBatches(input: {
       selectedCoreIds.add(candidate.seed.id);
       selectedGeographies.add(candidate.seed.geography);
       remainingCandidates.splice(remainingCandidates.findIndex(({ seed }) => seed.id === candidate.seed.id), 1);
-      selectedCoreCapacity += resolveApifyMaxResults({
-        requestedItems: candidate.policy.maxResults,
-        configuredMaxResults: providerMaximum,
-        batchCostLimitUsd,
-      });
+      selectedCoreCapacity += resolveBatchCapacity(candidate.policy.maxResults);
     }
   }
   const explorationSlots = Math.min(desiredExplorationSlots, seedLimit - selectedCore.length);
@@ -417,11 +409,7 @@ export function planSeedBatches(input: {
   let coreRemaining = Math.max(0, target - (selectedExploration.length > 0 ? explorationTarget : 0));
   for (const candidate of selectedCore) {
     if (coreRemaining <= 0) break;
-    const maxResults = resolveApifyMaxResults({
-      requestedItems: candidate.policy.maxResults,
-      configuredMaxResults: providerMaximum,
-      batchCostLimitUsd,
-    });
+    const maxResults = resolveBatchCapacity(candidate.policy.maxResults);
     const requestedItems = Math.min(maxResults, coreRemaining);
     if (requestedItems > 0) {
       allocation.set(candidate.seed.id, requestedItems);
@@ -432,11 +420,7 @@ export function planSeedBatches(input: {
   let explorationRemaining = explorationTarget;
   for (const candidate of selectedExploration) {
     if (explorationRemaining <= 0) break;
-    const maxResults = resolveApifyMaxResults({
-      requestedItems: candidate.policy.maxResults,
-      configuredMaxResults: providerMaximum,
-      batchCostLimitUsd,
-    });
+    const maxResults = resolveBatchCapacity(candidate.policy.maxResults);
     const requestedItems = Math.min(maxResults, explorationRemaining);
     if (requestedItems > 0) {
       allocation.set(candidate.seed.id, requestedItems);

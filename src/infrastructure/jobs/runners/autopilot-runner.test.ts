@@ -63,6 +63,7 @@ vi.mock("@/infrastructure/neon/repositories/provider-runs", () => ({
   getSerperRecoveryState: mocks.getSerperRecoveryState,
 }));
 vi.mock("@/infrastructure/neon/repositories/autopilot-engine-performance", () => ({
+  autopilotEnginePerformanceKey: (campaignId: string, engineType: string) => `${campaignId}:${engineType}`,
   getAutopilotEnginePerformance: mocks.getAutopilotEnginePerformance,
 }));
 vi.mock("@/services/autopilot/engine-capability", () => ({ buildEngineCapabilities: mocks.buildEngineCapabilities }));
@@ -87,6 +88,7 @@ vi.mock("@/infrastructure/providers/serp/serper-provider", () => ({ SERPER_ESTIM
 
 import { runAutopilotCronTick } from "./autopilot-runner";
 import { computeAutopilotPacing } from "@/services/autopilot/pacing-service";
+import { MAX_RAW_PER_PLANNING_WINDOW } from "@/services/autopilot/target-planner";
 
 describe("runAutopilotCronTick", () => {
   beforeEach(() => {
@@ -197,6 +199,42 @@ describe("runAutopilotCronTick", () => {
     expect(result.ordersScheduled).toBe(0);
     expect(mocks.enqueueDiscoveryOrdersWithinDailyRawCap).not.toHaveBeenCalled();
     expect(mocks.getAutopilotPacingState).not.toHaveBeenCalled();
+  });
+
+  it("routes the existing Maps Fast niche deficit through healthy Serper when Apify is unavailable", async () => {
+    const now = new Date("2025-06-15T12:00:00Z");
+    const campaigns = ["yoga", "wellness", "premium", "personal"].map((niche) => ({
+      id: `campaign-${niche}`,
+      engineType: "maps_fast",
+      engineConfig: { niche },
+      status: "active",
+      autopilotEnabled: true,
+      dailySoftTarget: 250,
+    }));
+    mocks.listAutopilotEnabledCampaigns.mockResolvedValue(campaigns);
+    mocks.getAutopilotPacingState.mockResolvedValue(computeAutopilotPacing({
+      workspaceId: "workspace-1", timeZone: "Europe/Madrid", targetMetric: "instantly_imported",
+      dailyTarget: 250, targetAchievedToday: 0, instantlyImportedToday: 0, eligibleImportBacklog: 0,
+      expectedImportsFromBacklog: 0, rawRequestedToday: 0, rawReturnedToday: 0, processingInFlight: 0,
+      providerRunsInFlight: 0, expectedQualifiedFromInFlight: 0, apifySpendToday: 0,
+      apifyDailyBudgetRemaining: 9, providerHealth: "paused", availableDiscoveryCapacity: true,
+      estimatedYield: 0.5, yieldSampleSize: 30, now, operatingStartHour: 7, operatingEndHour: 22,
+    }));
+    mocks.buildEngineCapabilities.mockReturnValue([
+      { engineType: "maps_fast", available: false, providerConfigured: true, providerHealthy: false, providerUntested: false, costAllowed: true, campaignCount: 4, reasonUnavailable: "provider_paused", reason: "provider_paused" },
+      { engineType: "google_serp", available: true, providerConfigured: true, providerHealthy: true, providerUntested: false, costAllowed: true, campaignCount: 4, reasonUnavailable: null, reason: null },
+    ]);
+
+    const result = await runAutopilotCronTick(now);
+    const scheduledOrders = mocks.enqueueDiscoveryOrdersWithinDailyRawCap.mock.calls[0]?.[0] ?? [];
+
+    expect(result.ordersScheduled).toBeGreaterThan(0);
+    expect(scheduledOrders).toHaveLength(4);
+    expect(scheduledOrders.map((order: { campaignId: string; payload: { engineType: string } }) => [order.campaignId, order.payload.engineType]))
+      .toEqual(campaigns.map((campaign) => [campaign.id, "google_serp"]));
+    expect(scheduledOrders.reduce((sum: number, order: { payload: { desiredRawCount: number } }) => sum + order.payload.desiredRawCount, 0))
+      .toBeLessThanOrEqual(MAX_RAW_PER_PLANNING_WINDOW);
+    expect(mocks.getGlobalSerperSpendToday).toHaveBeenCalledOnce();
   });
 
   it("avoids new discovery for a zero-import target covered by eligible paid backlog", async () => {
