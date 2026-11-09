@@ -741,7 +741,7 @@ describe("POST /api/admin/discovery/scoped-smoke", () => {
       campaignId,
       type: "process_raw_candidate",
       payload: { rawCandidateId: candidateId },
-      idempotencyKey: `raw_candidate:${candidateId}:niche-reprocess:${smokeExecutionId}:niche-icp-v2`,
+      idempotencyKey: `raw_candidate:${candidateId}:niche-reprocess:${smokeExecutionId}:niche-icp-v3`,
     });
     expect(mocks.runProcessingCronTick).toHaveBeenCalledWith(1, expect.any(Date), expect.objectContaining({
       campaignId,
@@ -765,7 +765,7 @@ describe("POST /api/admin/discovery/scoped-smoke", () => {
           PROVIDER: "apify",
           PROVIDER_CALL_SUCCEEDED: true,
           REPROCESSED_REJECTED_CANDIDATE_IDS: [candidateId],
-          REPROCESSED_CLASSIFIER_VERSION: "niche-icp-v2",
+          REPROCESSED_CLASSIFIER_VERSION: "niche-icp-v3",
         },
       },
       status: "completed",
@@ -866,7 +866,7 @@ describe("POST /api/admin/discovery/scoped-smoke", () => {
     expect(mocks.enqueueProcessingJob).toHaveBeenCalledWith(expect.objectContaining({
       campaignId,
       payload: { rawCandidateId: candidateId },
-      idempotencyKey: `raw_candidate:${candidateId}:niche-reprocess:${smokeExecutionId}:niche-icp-v2`,
+      idempotencyKey: `raw_candidate:${candidateId}:niche-reprocess:${smokeExecutionId}:niche-icp-v3`,
     }));
     expect(mocks.runProviderRunsCronTick).not.toHaveBeenCalled();
     expect(mocks.runDiscoveryCronTick).not.toHaveBeenCalled();

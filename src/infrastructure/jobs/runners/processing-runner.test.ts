@@ -1132,7 +1132,7 @@ describe("runProcessingCronTick", () => {
     expect(context?.niche).toBe("premium_fitness");
     expect(context?.nicheEvidenceFetcher?.fetchPage).toEqual(expect.any(Function));
     expect(mocks.markRawCandidateProcessed).toHaveBeenCalledWith("raw-candidate-id", expect.objectContaining({
-      candidateOutcome: expect.objectContaining({ classifierVersion: "niche-icp-v2" }),
+      candidateOutcome: expect.objectContaining({ classifierVersion: "niche-icp-v3" }),
     }));
     expect(mocks.createSerpDiscoveryProvider).not.toHaveBeenCalled();
   });

@@ -108,6 +108,19 @@ describe("niche-specific business classification", () => {
     expect(classifyNicheBusinessType(name, niche)).toBe("other_retail");
   });
 
+  it.each([
+    ["yoga_pilates", "Yoga Pilates Studio"],
+    ["spas_wellness", "Day Spa Wellness Centre"],
+    ["premium_fitness", "Boutique Strength and Conditioning Gym"],
+    ["personal_training", "Personal Training Studio"],
+  ] as const)("keeps %s evidence within its own niche", (sourceNiche, evidence) => {
+    const niches = ["yoga_pilates", "spas_wellness", "premium_fitness", "personal_training"] as const;
+    for (const niche of niches) {
+      const businessType = classifyNicheBusinessType(evidence, niche);
+      expect(isAcceptedNicheBusinessType(businessType, niche)).toBe(niche === sourceNiche);
+    }
+  });
+
   it("keeps the existing pharmacy classifier independent of niche profiles", () => {
     expect(classifyBusinessType("Farmacia Central")).toBe("pharmacy");
     expect(isAcceptedIcpBusinessType("pharmacy")).toBe(true);

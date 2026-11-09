@@ -1,7 +1,7 @@
 import type { BusinessType } from "@/domain/accounts/types";
 import type { NicheId } from "./niche-profiles";
 
-export const NICHE_CLASSIFIER_VERSION = "niche-icp-v2";
+export const NICHE_CLASSIFIER_VERSION = "niche-icp-v3";
 
 /**
  * Deterministic, rule-based business-type classification (Prompt 2 §2.3:
@@ -40,7 +40,7 @@ const NICHE_RULES: Record<NicheId, { type: BusinessType; include: RegExp; exclud
   },
   premium_fitness: {
     type: "premium_fitness_center",
-    include: /\b(boutique|funcional|fuerza|strength|acondicionamiento|premium|personal training|entrenamiento personal|small group|small[- ]medium|independent|independiente|personalizado)\b/i,
+    include: /\b(boutique|funcional|fuerza|strength|acondicionamiento|premium|small group|small[- ]medium|independent|independiente|personalizado)\b/i,
     exclude: /\b(low[ -]?cost|municipal|p[uú]blic[oa]|alquiler de instalaciones)\b/i,
   },
   personal_training: {
