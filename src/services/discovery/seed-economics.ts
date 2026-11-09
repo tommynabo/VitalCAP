@@ -101,7 +101,7 @@ export function calculateSeedNoveltyRate(insertedNewRaw: number, itemsReturned: 
   return Math.max(0, Math.min(1, insertedNewRaw / itemsReturned));
 }
 
-function isSampleConfident(performance: SeedEconomicPerformance | undefined): boolean {
+export function hasConfidentSeedEconomicEvidence(performance: SeedEconomicPerformance | undefined): boolean {
   return Boolean(performance && (
     performance.recentRuns >= SEED_ECONOMICS_POLICY.minimumRuns
     || performance.itemsReturned >= SEED_ECONOMICS_POLICY.minimumItems
@@ -176,7 +176,7 @@ export function scoreSeedEconomicPerformance(
   medianCostPerConfirmedImport: number | null = null,
   medianCostPerNewRaw: number | null = null,
 ): SeedEconomicPolicyResult {
-  const confident = isSampleConfident(performance);
+  const confident = hasConfidentSeedEconomicEvidence(performance);
   const noveltyRate = clampRate(performance?.noveltyRate);
   const coolingUntil = confident
     ? cooldownUntil(performance) ?? lowEconomicCooldownUntil(performance, noveltyRate)
@@ -312,7 +312,7 @@ export function planSeedBatches(input: {
     .filter((value): value is number => value !== null && value !== undefined && value > 0);
   const medianCost = median(confidentCosts);
   const confidentRawCosts = [...input.performanceBySeed.values()]
-    .filter((item) => isSampleConfident(item))
+    .filter((item) => hasConfidentSeedEconomicEvidence(item))
     .map((item) => item.costPerNewRaw)
     .filter((value): value is number => value !== null && value !== undefined && value > 0);
   const medianCostPerNewRaw = median(confidentRawCosts);
@@ -338,13 +338,13 @@ export function planSeedBatches(input: {
     (input.performanceBySeed.get(seed.id)?.confirmedInstantlyImportsFromSeed ?? 0) > 0,
   );
   const matureSupplyExhausted = !hasMatureImportValue && input.seeds.some((seed) =>
-    isSampleConfident(input.performanceBySeed.get(seed.id)),
+    hasConfidentSeedEconomicEvidence(input.performanceBySeed.get(seed.id)),
   ) && coreCandidates.length === 0;
   const hasProtectedSupply = coreCandidates.some(({ policy }) => policy.tier === "high" || policy.tier === "good");
   const hasMatureWeakSupply = coreCandidates.some(({ seed, policy }) => {
     const performance = input.performanceBySeed.get(seed.id);
     return policy.tier === "marginal" || policy.tier === "low"
-      ? isSampleConfident(performance)
+      ? hasConfidentSeedEconomicEvidence(performance)
       : false;
   });
   const economicPressureActive = Boolean(input.economicPressure && hasProtectedSupply && hasMatureWeakSupply);

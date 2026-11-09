@@ -12,6 +12,7 @@ import {
   failDiscoveryJob,
   enqueueDiscoveryJob,
   enqueueProcessingJob,
+  persistScopedSmokeEvidence,
 } from "@/infrastructure/neon/repositories/job-queue";
 import {
   bootstrapSearchSeeds,
@@ -41,7 +42,13 @@ import { logEvent } from "@/lib/observability/structured-logger";
 import { getApifyFailureClass, getApifyFailureKind } from "@/infrastructure/providers/maps/apify-client";
 import { ApifyClient } from "@/infrastructure/providers/maps/apify-client";
 import { getDayBounds } from "@/lib/time/day-bounds";
-import { planSeedBatches, scoreSeedEconomicPerformance } from "@/services/discovery/seed-economics";
+import {
+  hasConfidentSeedEconomicEvidence,
+  planSeedBatches,
+  scoreSeedEconomicPerformance,
+  type SeedBatchPlan,
+  type SeedEconomicPerformance,
+} from "@/services/discovery/seed-economics";
 import type { EconomicPacingState } from "@/services/autopilot/economic-pacing";
 import { computeProviderBudgetPacing, getElapsedOperatingFraction } from "@/services/autopilot/economic-pacing";
 import {
@@ -53,6 +60,35 @@ import {
 const DISCOVERY_JOB_TYPE = "run_engine_batch";
 const MAX_SEEDS_PER_JOB = 5;
 const MAX_RAW_PER_SEED = 100;
+
+export function resolveScopedColdStartBatches(input: {
+  probeAuthorized: boolean;
+  seed: SearchSeed;
+  performance?: SeedEconomicPerformance;
+  existingBatches: SeedBatchPlan[];
+  desiredRawCount: number;
+  now: Date;
+}): { batches: SeedBatchPlan[]; usedColdStartBypass: boolean; blockedReason: string | null } {
+  if (!input.probeAuthorized || input.existingBatches.length > 0) {
+    return { batches: input.existingBatches, usedColdStartBypass: false, blockedReason: null };
+  }
+  const policy = scoreSeedEconomicPerformance(input.seed, input.performance, input.now);
+  if (!policy.eligible) {
+    return { batches: [], usedColdStartBypass: false, blockedReason: "seed_cooldown_or_policy_block" };
+  }
+  if (hasConfidentSeedEconomicEvidence(input.performance) || !policy.exploration) {
+    return { batches: [], usedColdStartBypass: false, blockedReason: "economic_evidence_mature" };
+  }
+  const requestedItems = Math.min(5, Math.max(0, Math.floor(input.desiredRawCount)), policy.maxResults);
+  if (requestedItems <= 0) {
+    return { batches: [], usedColdStartBypass: false, blockedReason: "probe_candidate_limit_zero" };
+  }
+  return {
+    batches: [{ seed: input.seed, requestedItems, policy }],
+    usedColdStartBypass: true,
+    blockedReason: null,
+  };
+}
 
 function catalogForEngine(campaign: Awaited<ReturnType<typeof getCampaignById>>, engineType: EngineType): SearchSeed[] {
   if (!campaign) return [];
@@ -85,6 +121,11 @@ export async function ensureDiscoveryJobsQueued(workspaceId: string): Promise<nu
 interface DiscoveryJobPayload {
   engineType: EngineType;
   desiredRawCount: number;
+  maxCandidates?: number;
+  maxProviderQueries?: number;
+  probeMode?: boolean;
+  smokeExecutionId?: string;
+  seedId?: string;
   planningWindow?: string;
   reason?: string;
   origin?: "normal" | "rebalance" | "hybrid_fill" | "recovery_probe";
@@ -244,10 +285,34 @@ interface DiscoveryHandoffCounters {
   rawCandidatesDuplicate: number;
 }
 
+export interface ScopedProbeEvidence {
+  jobClaimed: boolean;
+  providerCallAttempted: boolean;
+  providerCallSucceeded: boolean;
+  providerCallErrorClass: string | null;
+  providerQueriesUsed: number;
+  resultsReturned: number;
+  rawCandidatesInserted: number;
+  duplicates: number;
+  candidateCount: number;
+}
+
 async function executeDiscoveryJob(
   job: JobRecord<DiscoveryJobPayload>,
   counters: DiscoveryHandoffCounters,
+  probeAuthorized = false,
+  probeEvidence?: ScopedProbeEvidence,
+  authorizedExecutionId?: string,
 ): Promise<number> {
+  const probeMode = probeAuthorized && job.payload.probeMode === true;
+  if (job.payload.probeMode && !probeMode) {
+    throw new Error("Cold-start probe mode is restricted to the authenticated scoped smoke runner.");
+  }
+  if (probeMode && (job.payload.scopedSmoke !== true || !job.payload.smokeExecutionId
+    || job.payload.smokeExecutionId !== authorizedExecutionId || job.id !== authorizedExecutionId
+    || !job.payload.seedId || job.payload.maxProviderQueries !== 1)) {
+    throw new Error("Scoped cold-start probe payload is incomplete or exceeds its query bound.");
+  }
   if (job.payload.origin === "recovery_probe") {
     const currentCredentialFingerprint = createApifyCredentialFingerprint(getMapsEnv().APIFY_API_TOKEN);
     if (!isCurrentApifyRecoveryCredential(job.payload.recoveryCredentialFingerprint, currentCredentialFingerprint)) {
@@ -445,9 +510,11 @@ async function executeDiscoveryJob(
   // window (5 × 100 raw), still subject to the per-workspace daily raw and
   // spend guards in reserveApifyProviderRun.
   const bootstrapCap = getApifyDiscoveryBatchCap(recoveryProbe, providerHealth);
-  const desiredRawCount = Math.min(bootstrapCap, Math.max(0, Math.floor(job.payload.desiredRawCount)));
+  const desiredRawCount = probeMode
+    ? Math.min(5, Math.max(0, Math.floor(job.payload.maxCandidates ?? job.payload.desiredRawCount)))
+    : Math.min(bootstrapCap, Math.max(0, Math.floor(job.payload.desiredRawCount)));
   if (desiredRawCount <= 0) return 0;
-  const maxSeeds = Math.min(MAX_SEEDS_PER_JOB, Math.max(1, Math.ceil(desiredRawCount / 10)));
+  const maxSeeds = probeMode ? 1 : Math.min(MAX_SEEDS_PER_JOB, Math.max(1, Math.ceil(desiredRawCount / 10)));
   logEvent("info", "discovery.seeds.planning", {
     correlationId: job.id,
     discoveryJobId: job.id,
@@ -469,11 +536,22 @@ async function executeDiscoveryJob(
     plannedSeedCount: seeds.length,
   });
   const requestedSeedSpecified = Boolean(job.payload.seedQuery && job.payload.seedGeography);
-  const candidatePool = provider === "apify" ? persistedSeeds : seeds;
-  const requestedSeed = job.payload.seedQuery && job.payload.seedGeography
+  const probeSeed = probeMode ? persistedSeeds.find((seed) => seed.id === job.payload.seedId) : undefined;
+  if (probeMode && (!probeSeed || probeSeed.campaignId !== campaign.id || probeSeed.engineType !== job.payload.engineType
+    || !probeSeed.query.trim() || !probeSeed.geography.trim()
+    || probeSeed.query !== job.payload.seedQuery || probeSeed.geography !== job.payload.seedGeography)) {
+    throw new Error("Scoped cold-start seed is not owned by the campaign or is incompatible with its engine.");
+  }
+  if (probeMode && probeSeed?.nextEligibleAt && new Date(probeSeed.nextEligibleAt).getTime() > Date.now()) {
+    throw new Error("Scoped cold-start seed is inside its cooldown window.");
+  }
+  const candidatePool = probeMode ? persistedSeeds : provider === "apify" ? persistedSeeds : seeds;
+  const requestedSeed = probeMode
+    ? probeSeed
+    : job.payload.seedQuery && job.payload.seedGeography
     ? candidatePool.find((seed) => seed.query === job.payload.seedQuery && seed.geography === job.payload.seedGeography)
     : undefined;
-  const seedCandidates = requestedSeed ? [requestedSeed] : candidatePool;
+  const seedCandidates = probeMode ? (probeSeed ? [probeSeed] : []) : requestedSeed ? [requestedSeed] : candidatePool;
   const usesSeedEconomics = provider === "apify" || job.payload.engineType === "google_serp";
   const seedEconomics = usesSeedEconomics
     ? await getSeedEconomicPerformance(campaign.id, job.payload.engineType, new Date(), campaign.timeZone)
@@ -492,7 +570,19 @@ async function executeDiscoveryJob(
         || executionEconomicPaceState === "NEAR_DAILY_CAP",
     })
     : null;
-  const economicBatches = economicPlan?.batches ?? [];
+  let economicBatches = economicPlan?.batches ?? [];
+  if (probeMode && probeSeed) {
+    const probePlan = resolveScopedColdStartBatches({
+      probeAuthorized: true,
+      seed: probeSeed,
+      performance: seedEconomics.get(probeSeed.id),
+      existingBatches: economicBatches,
+      desiredRawCount,
+      now: new Date(),
+    });
+    economicBatches = probePlan.batches;
+    if (probePlan.blockedReason) throw new Error(`Cold-start probe blocked: ${probePlan.blockedReason}.`);
+  }
   if (economicPlan) {
     const plannedItems = economicPlan.coreRequestedItems + economicPlan.explorationRequestedItems;
     const tierCounts = Object.fromEntries(["high", "good", "marginal", "low", "zero"].map((tier) => [
@@ -515,7 +605,9 @@ async function executeDiscoveryJob(
       productiveSeedCapacityConstrained: economicPlan.productiveSeedCapacityConstrained,
     });
   }
-  const boundedSeeds = provider === "apify"
+  const boundedSeeds = probeMode
+    ? economicBatches.slice(0, 1).map((batch) => batch.seed)
+    : provider === "apify"
     || job.payload.engineType === "google_serp"
     ? economicBatches.map((batch) => batch.seed)
     : seedCandidates.slice(0, maxSeeds);
@@ -603,13 +695,16 @@ async function executeDiscoveryJob(
     }
     const planningWindow = resolvePlanningWindow(job.payload.planningWindow, startedAt, campaign.timeZone);
     const normalizedQuery = normalizeProviderQuery(`${seed.query} ${seed.geography}`);
+    const requestPlanningWindow = probeMode
+      ? `${planningWindow}:scoped-smoke:${job.payload.smokeExecutionId}`
+      : planningWindow;
     const requestKey = createProviderRequestKey({
       workspaceId: campaign.workspaceId,
       campaignId: campaign.id,
       engineType: job.payload.engineType,
       provider,
       query: normalizedQuery,
-      planningWindow,
+      planningWindow: requestPlanningWindow,
     });
     if (engine.usesAsyncProvider) {
       logEvent("info", "discovery.provider.reserve.request_key_created", {
@@ -742,8 +837,38 @@ async function executeDiscoveryJob(
 
     let result;
     try {
-      result = await engine.executeDiscovery({ seed, dryRun: false, requestKey, maxResults: requestedItems, planningWindow });
+        result = await engine.executeDiscovery({
+          seed,
+          dryRun: false,
+          requestKey,
+          maxResults: probeMode ? Math.min(5, desiredRawCount, requestedItems) : requestedItems,
+          planningWindow,
+          ...(probeMode ? { maxProviderQueries: 1, probeExecutionId: job.payload.smokeExecutionId } : {}),
+        });
+        if (probeMode && probeEvidence) {
+          const providerQueriesUsed = Math.max(0, Math.floor(result.providerCalls));
+          if (providerQueriesUsed > 1) throw new Error("Scoped provider query limit exceeded.");
+          probeEvidence.providerQueriesUsed += providerQueriesUsed;
+          probeEvidence.providerCallAttempted ||= providerQueriesUsed > 0;
+          probeEvidence.providerCallSucceeded = probeEvidence.providerCallAttempted
+            && result.providerCallSucceeded !== false && result.providerErrors === 0;
+          probeEvidence.providerCallErrorClass = result.providerCallErrorClass ?? null;
+          probeEvidence.resultsReturned += Math.max(0, Math.floor(result.resultsReturned ?? result.rawCandidates.length));
+        }
     } catch (error) {
+        if (probeMode && probeEvidence) {
+          const errorQueries = typeof error === "object" && error !== null && "httpAttempts" in error
+            && typeof error.httpAttempts === "number"
+            ? error.httpAttempts
+            : typeof error === "object" && error !== null && "providerCallAttempted" in error
+              && error.providerCallAttempted === true
+              ? 1
+              : 0;
+          probeEvidence.providerQueriesUsed = Math.min(1, Math.max(probeEvidence.providerQueriesUsed, errorQueries));
+          probeEvidence.providerCallAttempted ||= errorQueries > 0;
+          probeEvidence.providerCallSucceeded = false;
+          probeEvidence.providerCallErrorClass = error instanceof Error ? error.constructor.name : typeof error;
+        }
       const message = error instanceof Error ? error.message : String(error);
       counters.providerStartsFailed += 1;
       const normalizedFailureKind = error instanceof ProviderFailureError
@@ -843,16 +968,17 @@ async function executeDiscoveryJob(
       seedId: seed.id,
       startedAt: startedAt.toISOString(),
       finishedAt: finishedAt.toISOString(),
-      rawCount: result.rawCandidates.length,
-      uniqueCount: result.rawCandidates.length,
+      rawCount: probeMode ? Math.min(desiredRawCount, result.rawCandidates.length) : result.rawCandidates.length,
+      uniqueCount: probeMode ? Math.min(desiredRawCount, result.rawCandidates.length) : result.rawCandidates.length,
       readyCount: 0,
       error: result.providerErrors > 0 ? `${result.providerErrors} provider error(s)` : null,
     });
 
+    const rawCandidates = probeMode ? result.rawCandidates.slice(0, desiredRawCount) : result.rawCandidates;
     const insertedIds =
-      result.rawCandidates.length > 0
+      rawCandidates.length > 0
         ? await insertRawCandidates(
-            result.rawCandidates.map((candidate) => ({
+            rawCandidates.map((candidate) => ({
               discoveryJobId: job.id,
               campaignId: campaign.id,
               engineType: candidate.engineType,
@@ -866,7 +992,12 @@ async function executeDiscoveryJob(
           )
         : [];
       counters.rawCandidatesInserted += insertedIds.length;
-      counters.rawCandidatesDuplicate += result.rawCandidates.length - insertedIds.length;
+      counters.rawCandidatesDuplicate += rawCandidates.length - insertedIds.length;
+    if (probeMode && probeEvidence) {
+      probeEvidence.rawCandidatesInserted += insertedIds.length;
+      probeEvidence.duplicates += rawCandidates.length - insertedIds.length;
+      probeEvidence.candidateCount += insertedIds.length;
+    }
 
     for (const rawCandidateId of insertedIds) {
       await enqueueProcessingJob({
@@ -899,6 +1030,7 @@ export interface DiscoveryRunnerResult {
   providerJobsDeferred: number;
   pausedWorkspaces: number;
   emergencyStoppedWorkspaces: number;
+  scopedProbeEvidence?: ScopedProbeEvidence;
 }
 
 /** One bounded batch of discovery work across every workspace: enqueue-if-missing per workspace, then a single global claim+execute loop of up to `maxJobsPerTick` jobs (claims are global — not workspace-scoped — so this must not be called once per workspace). Called once per `/api/cron/discovery` invocation. */
@@ -906,6 +1038,23 @@ export interface ScopedDiscoveryExecution {
   campaignId: string;
   jobId: string;
   allowScopedDraftCampaign: true;
+  probeMode?: true;
+  smokeExecutionId?: string;
+}
+
+export function isAuthorizedScopedProbeExecution(
+  scoped: ScopedDiscoveryExecution | undefined,
+  job: Pick<JobRecord<DiscoveryJobPayload>, "id" | "campaignId" | "payload">,
+): boolean {
+  return scoped?.probeMode === true
+    && scoped.allowScopedDraftCampaign === true
+    && scoped.jobId === job.id
+    && scoped.campaignId === job.campaignId
+    && scoped.smokeExecutionId === job.id
+    && job.payload.probeMode === true
+    && job.payload.scopedSmoke === true
+    && job.payload.smokeExecutionId === job.id
+    && job.payload.maxProviderQueries === 1;
 }
 
 export async function runDiscoveryCronTick(
@@ -918,6 +1067,10 @@ export async function runDiscoveryCronTick(
     throw new Error("Scoped discovery campaign is not allowlisted.");
   }
   const workspaceIds = scoped ? [scopedCampaign!.workspaceId] : await listWorkspaceIds();
+  if (scoped?.probeMode && (!scoped.smokeExecutionId || scoped.jobId !== scoped.smokeExecutionId
+    || !getMultiNicheRolloutEntry(scoped.campaignId))) {
+    throw new Error("Scoped probe authorization must match the allowlisted campaign and execution job.");
+  }
   if (!scoped) {
     for (const workspaceId of workspaceIds) await ensureDiscoveryJobsQueued(workspaceId);
   }
@@ -936,6 +1089,17 @@ export async function runDiscoveryCronTick(
   };
   let pausedWorkspaces = 0;
   let emergencyStoppedWorkspaces = 0;
+  const scopedProbeEvidence: ScopedProbeEvidence | undefined = scoped?.probeMode ? {
+    jobClaimed: false,
+    providerCallAttempted: false,
+    providerCallSucceeded: false,
+    providerCallErrorClass: null,
+    providerQueriesUsed: 0,
+    resultsReturned: 0,
+    rawCandidatesInserted: 0,
+    duplicates: 0,
+    candidateCount: 0,
+  } : undefined;
 
   const jobs = await claimDiscoveryJobs<DiscoveryJobPayload>({
     workerId,
@@ -950,10 +1114,34 @@ export async function runDiscoveryCronTick(
   });
   for (const job of jobs) {
     jobsClaimed += 1;
+    if (scopedProbeEvidence) scopedProbeEvidence.jobClaimed = true;
     try {
-      rawCandidatesProduced += await executeDiscoveryJob(job, handoffCounters);
+      rawCandidatesProduced += await executeDiscoveryJob(
+        job,
+        handoffCounters,
+        isAuthorizedScopedProbeExecution(scoped, job),
+        scopedProbeEvidence,
+        scoped?.smokeExecutionId,
+      );
+      if (scopedProbeEvidence) {
+        scopedProbeEvidence.rawCandidatesInserted = handoffCounters.rawCandidatesInserted;
+        scopedProbeEvidence.duplicates = handoffCounters.rawCandidatesDuplicate;
+        scopedProbeEvidence.candidateCount = handoffCounters.rawCandidatesInserted;
+        await persistScopedSmokeEvidence({ jobId: job.id, workerId, evidence: scopedProbeEvidence });
+      }
       await completeDiscoveryJob({ jobId: job.id, workerId, now });
     } catch (error) {
+      if (scopedProbeEvidence) {
+        scopedProbeEvidence.providerCallErrorClass ??= error instanceof Error ? error.constructor.name : typeof error;
+        try {
+          await persistScopedSmokeEvidence({ jobId: job.id, workerId, evidence: scopedProbeEvidence });
+        } catch {
+          logEvent("error", "discovery.scoped_probe.evidence_persist_failed", {
+            correlationId: job.id,
+            campaignId: job.campaignId,
+          });
+        }
+      }
       const failureKind = error instanceof ProviderFailureError
         ? getApifyFailureKind(error) ?? error.kind
         : error instanceof ProviderBudgetExceededError ? error.budgetKind : undefined;
@@ -995,5 +1183,12 @@ export async function runDiscoveryCronTick(
     if (state === "paused") pausedWorkspaces += 1;
     if (state === "emergency_stopped") emergencyStoppedWorkspaces += 1;
   }
-  return { jobsClaimed, rawCandidatesProduced, ...handoffCounters, pausedWorkspaces, emergencyStoppedWorkspaces };
+  return {
+    jobsClaimed,
+    rawCandidatesProduced,
+    ...handoffCounters,
+    pausedWorkspaces,
+    emergencyStoppedWorkspaces,
+    ...(scopedProbeEvidence ? { scopedProbeEvidence } : {}),
+  };
 }

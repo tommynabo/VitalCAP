@@ -144,11 +144,22 @@ export interface DiscoveryEngine {
     campaignId: string;
     remainingTarget: number;
   }): Promise<{ seeds: SearchSeed[] }>;
-  executeDiscovery(input: { seed: SearchSeed; dryRun: boolean; requestKey?: string; maxResults?: number; planningWindow?: string }): Promise<{
+  executeDiscovery(input: {
+    seed: SearchSeed;
+    dryRun: boolean;
+    requestKey?: string;
+    maxResults?: number;
+    planningWindow?: string;
+    maxProviderQueries?: number;
+    probeExecutionId?: string;
+  }): Promise<{
     rawCandidates: RawCandidate[];
     providerCalls: number;
     providerErrors: number;
     latencyMs: number;
+    resultsReturned?: number;
+    providerCallSucceeded?: boolean;
+    providerCallErrorClass?: string | null;
     providerRun?: AsyncMapsRun;
   }>;
 }

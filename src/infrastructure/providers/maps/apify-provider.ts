@@ -5,6 +5,12 @@ import { buildCompassActorInput, COMPASS_ACTOR_ID, mapCompassItemToPlaceResult }
 import { allowsNewApifyRun } from "@/domain/autopilot/gates";
 import { APIFY_MAX_RESULTS_PER_SEARCH, resolveApifyMaxResults } from "@/services/discovery/apify-request-capacity";
 
+function markProviderCallAttempted(error: unknown): Error & { providerCallAttempted: true } {
+  const providerError = error instanceof Error ? error : new Error(String(error));
+  Object.assign(providerError, { providerCallAttempted: true as const });
+  return providerError as Error & { providerCallAttempted: true };
+}
+
 /** Narrowed to just the two methods this provider calls, so tests can inject a plain fake instead of a real `ApifyClient`. */
 export interface ApifyMapsClient {
   runAndWait(actorId: string, input: Record<string, unknown>, options?: { maxTotalChargeUsd?: number }): Promise<ApifyRun>;
@@ -102,7 +108,12 @@ export class ApifyMapsDiscoveryProvider implements MapsDiscoveryProvider {
     });
     if (maxResults === 0) throw new ApifyCostLimitExceededError("Apify batch budget cannot fund one requested result.");
     const actorInput = buildCompassActorInput(input, maxResults);
-    const run = await startActorRun.call(this.client, this.config.actorId, actorInput, { maxTotalChargeUsd });
+    let run;
+    try {
+      run = await startActorRun.call(this.client, this.config.actorId, actorInput, { maxTotalChargeUsd });
+    } catch (error) {
+      throw markProviderCallAttempted(error);
+    }
     return {
       actorId: this.config.actorId,
       externalRunId: run.id,
@@ -145,7 +156,7 @@ export class ApifyMapsDiscoveryProvider implements MapsDiscoveryProvider {
         costUsd: 0,
         errorMessage: error instanceof Error ? error.message : String(error),
       });
-      throw error;
+      throw markProviderCallAttempted(error);
     }
 
     if (run.status !== "SUCCEEDED") {

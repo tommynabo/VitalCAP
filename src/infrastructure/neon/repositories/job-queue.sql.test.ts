@@ -117,6 +117,21 @@ describe("job queue SQL builders", () => {
     expect(query.params).toContain(jobId);
   });
 
+  it("can restrict scoped processing claims to jobs created during the smoke", () => {
+    const createdSince = new Date("2026-10-18T08:59:00.000Z");
+    const query = dialect.sqlToQuery(buildClaimJobsQuery("processing_jobs", {
+      workerId: "scoped-smoke",
+      batchSize: 1,
+      campaignId: "65b9f85d-4c8b-4e52-99fb-217eb3acac1c",
+      requireAutopilot: false,
+      allowScopedDraftCampaign: true,
+      createdSince,
+    }, claimTime));
+
+    expect(query.sql).toMatch(/j\.created_at >= \$\d+::timestamptz/);
+    expect(query.params).toContain(createdSince.toISOString());
+  });
+
   it("keeps max-attempt recovery jobs ineligible under the shared attempt guard", () => {
     const query = buildDiscoveryClaimQuery();
     const whereClause = query.sql.slice(query.sql.indexOf("WHERE"), query.sql.indexOf("ORDER BY"));

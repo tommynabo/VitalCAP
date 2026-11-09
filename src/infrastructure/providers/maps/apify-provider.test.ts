@@ -86,6 +86,23 @@ describe("ApifyMapsDiscoveryProvider", () => {
     expect(startActorRun).toHaveBeenCalledWith(expect.any(String), expect.any(Object), { maxTotalChargeUsd: 0.1 });
   });
 
+  it("marks an Apify start error as a provider attempt only after the client call begins", async () => {
+    const requestError = new Error("Actor API unavailable");
+    const startActorRun = vi.fn().mockRejectedValue(requestError);
+    const provider = new ApifyMapsDiscoveryProvider({
+      apiToken: "token",
+      actorId: "compass/crawler-google-places",
+      dailyCostLimitUsd: 10,
+      batchCostLimitUsd: 2,
+      getReservedCostUsd: vi.fn().mockResolvedValue(0.1),
+      client: { runAndWait: vi.fn(), startActorRun, getDatasetItems: vi.fn() },
+    });
+
+    await expect(provider.startAsync({ query: "yoga studio", geography: "Madrid", pageToken: null, requestKey: "reservation-key", maxResults: 1 }))
+      .rejects.toMatchObject({ providerCallAttempted: true });
+    expect(startActorRun).toHaveBeenCalledTimes(1);
+  });
+
   it("uses the same hard-capped result count in actor input and async accounting", async () => {
     const startActorRun = vi.fn().mockResolvedValue({ ...SUCCEEDED_RUN, status: "READY", defaultDatasetId: null });
     const provider = new ApifyMapsDiscoveryProvider({

@@ -37,6 +37,9 @@ export class MapsFastEngine implements DiscoveryEngine {
     providerCalls: number;
     providerErrors: number;
     latencyMs: number;
+    resultsReturned: number;
+    providerCallSucceeded: boolean;
+    providerCallErrorClass: string | null;
     providerRun?: import("@/domain/providers/types").AsyncMapsRun;
   }> {
     const start = Date.now();
@@ -45,7 +48,16 @@ export class MapsFastEngine implements DiscoveryEngine {
     // owns the durable reservation and will mark it failed/retryable.
     if (this.provider.startAsync) {
       const providerRun = await this.provider.startAsync(searchInput);
-      return { rawCandidates: [], providerCalls: 1, providerErrors: 0, latencyMs: Date.now() - start, providerRun };
+      return {
+        rawCandidates: [],
+        providerCalls: 1,
+        providerErrors: 0,
+        latencyMs: Date.now() - start,
+        resultsReturned: 0,
+        providerCallSucceeded: true,
+        providerCallErrorClass: null,
+        providerRun,
+      };
     }
     try {
       const output = await this.provider.search(searchInput);
@@ -58,10 +70,26 @@ export class MapsFastEngine implements DiscoveryEngine {
         rawPayload: { kind: "maps", place } satisfies MapsRawPayload,
         discoveredAt: new Date().toISOString(),
       }));
-      return { rawCandidates, providerCalls: 1, providerErrors: 0, latencyMs: Date.now() - start };
+      return {
+        rawCandidates,
+        providerCalls: output.usage.calls,
+        providerErrors: 0,
+        latencyMs: Date.now() - start,
+        resultsReturned: output.results.length,
+        providerCallSucceeded: true,
+        providerCallErrorClass: null,
+      };
     } catch (err) {
       console.error("executeDiscovery caught error:", err);
-      return { rawCandidates: [], providerCalls: 1, providerErrors: 1, latencyMs: Date.now() - start };
+      return {
+        rawCandidates: [],
+        providerCalls: 1,
+        providerErrors: 1,
+        latencyMs: Date.now() - start,
+        resultsReturned: 0,
+        providerCallSucceeded: false,
+        providerCallErrorClass: err instanceof Error ? err.constructor.name : typeof err,
+      };
     }
   }
 }

@@ -26,17 +26,30 @@ export class GoogleSerpEngine implements DiscoveryEngine {
     return { seeds: selectNextSeeds(this.seeds, catalogSize, new Date()) };
   }
 
-  async executeDiscovery(input: { seed: SearchSeed; dryRun: boolean; planningWindow?: string }): Promise<{
+  async executeDiscovery(input: {
+    seed: SearchSeed;
+    dryRun: boolean;
+    planningWindow?: string;
+    maxResults?: number;
+    maxProviderQueries?: number;
+    probeExecutionId?: string;
+  }): Promise<{
     rawCandidates: RawCandidate[];
     providerCalls: number;
     providerErrors: number;
     latencyMs: number;
+    resultsReturned: number;
+    providerCallSucceeded: boolean;
+    providerCallErrorClass: string | null;
   }> {
     const start = Date.now();
+    const maxResults = Math.max(1, Math.min(10, Math.floor(input.maxResults ?? 10)));
     try {
       const output = await this.provider.search({
         query: `${input.seed.query} ${input.seed.geography}`,
-        maxResults: 10,
+        maxResults,
+        ...(input.maxProviderQueries === 1 ? { maxRetries: 0 } : {}),
+        ...(input.probeExecutionId ? { probeExecutionId: input.probeExecutionId } : {}),
         seedId: input.seed.id,
         planningWindow: input.planningWindow,
       });
@@ -51,10 +64,30 @@ export class GoogleSerpEngine implements DiscoveryEngine {
         rawPayload: { kind: "serp", result, geography: input.seed.geography } satisfies SerpRawPayload,
         discoveredAt: new Date().toISOString(),
       }));
-      return { rawCandidates, providerCalls: 1, providerErrors: 0, latencyMs: Date.now() - start };
+      return {
+        rawCandidates,
+        providerCalls: output.usage.calls,
+        providerErrors: 0,
+        latencyMs: Date.now() - start,
+        resultsReturned: output.results.length,
+        providerCallSucceeded: true,
+        providerCallErrorClass: null,
+      };
     } catch (error) {
       if (error instanceof ProviderBudgetExceededError) throw error;
-      return { rawCandidates: [], providerCalls: 1, providerErrors: 1, latencyMs: Date.now() - start };
+      const attempts = typeof error === "object" && error !== null && "httpAttempts" in error
+        && typeof error.httpAttempts === "number"
+        ? error.httpAttempts
+        : 0;
+      return {
+        rawCandidates: [],
+        providerCalls: attempts,
+        providerErrors: 1,
+        latencyMs: Date.now() - start,
+        resultsReturned: 0,
+        providerCallSucceeded: false,
+        providerCallErrorClass: error instanceof Error ? error.constructor.name : typeof error,
+      };
     }
   }
 }

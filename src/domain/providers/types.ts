@@ -78,6 +78,7 @@ export interface SerpSearchInput {
   query: string;
   maxResults: number;
   maxRetries?: number;
+  probeExecutionId?: string;
   seedId?: string;
   planningWindow?: string;
   signal?: AbortSignal;

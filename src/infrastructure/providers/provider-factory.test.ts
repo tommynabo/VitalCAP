@@ -101,6 +101,33 @@ describe("Serper provider run recording", () => {
     expect(mockUpdateProviderRun).toHaveBeenCalledWith("run-1", expect.objectContaining({ status: "completed", itemsReturned: 0 }));
   });
 
+  it("uses one HTTP attempt and a unique request key for each scoped smoke execution ID", async () => {
+    mockSearch.mockResolvedValue({
+      results: [],
+      usage: { calls: 1, items: 0, errors: 0, totalLatencyMs: 1, costUsd: 0.001, quotaRemaining: null },
+    });
+    const provider = createSerpDiscoveryProvider("workspace-1", "google_serp", "campaign-1", "job-1");
+    await provider.search({ query: "pilates Madrid", maxResults: 5, maxRetries: 1 });
+    await provider.search({
+      query: "pilates Madrid",
+      maxResults: 5,
+      maxRetries: 1,
+      probeExecutionId: "c76e780a-b0a2-4e16-a3ec-e5d8a9197c4c",
+    });
+
+    expect(mockSearch).toHaveBeenNthCalledWith(2, expect.objectContaining({
+      maxRetries: 0,
+      probeExecutionId: "c76e780a-b0a2-4e16-a3ec-e5d8a9197c4c",
+    }));
+    const regularKey = mockReserveSerperProviderRun.mock.calls[0]?.[0].requestKey;
+    const probeReservation = mockReserveSerperProviderRun.mock.calls[1]?.[0];
+    expect(probeReservation?.requestKey).not.toBe(regularKey);
+    expect(probeReservation?.metadata).toMatchObject({
+      probeExecutionId: "c76e780a-b0a2-4e16-a3ec-e5d8a9197c4c",
+      maxResults: 5,
+    });
+  });
+
   it("does not make a second paid call for a completed request key", async () => {
     mockGetProviderRunByRequestKey.mockResolvedValue({ id: "run-existing", status: "completed", metadata: {} });
 

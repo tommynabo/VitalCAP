@@ -606,6 +606,7 @@ export function buildClaimJobsQuery(table: QueueTable, input: ClaimJobsInput, no
   const nowIso = now.toISOString();
   const inputCampaignId = input.campaignId ?? null;
   const inputJobId = input.jobId ?? null;
+  const inputCreatedSince = input.createdSince?.toISOString() ?? null;
   const rolloutCampaignIdList = sql.join(MULTI_NICHE_ROLLOUT_CAMPAIGN_IDS.map((campaignId) => sql`${campaignId}::uuid`), sql`, `);
   const scopedDraftCampaign = input.allowScopedDraftCampaign && inputCampaignId !== null
     ? sql`c.id = ${inputCampaignId}::uuid
@@ -694,6 +695,7 @@ export function buildClaimJobsQuery(table: QueueTable, input: ClaimJobsInput, no
               AND (${requireAutopilot} = false OR (c.autopilot_enabled = true AND aps.emergency_stopped = false))
               AND (${inputCampaignId}::uuid IS NULL OR j.campaign_id = ${inputCampaignId}::uuid)
               AND (${inputJobId}::uuid IS NULL OR j.id = ${inputJobId}::uuid)
+              AND (${inputCreatedSince}::timestamptz IS NULL OR j.created_at >= ${inputCreatedSince}::timestamptz)
               AND j.status IN ('pending', 'processing')
               AND (j.next_attempt_at IS NULL OR j.next_attempt_at <= ${nowIso}::timestamptz)
               AND j.attempt_count < j.max_attempts
@@ -729,6 +731,7 @@ export interface ClaimJobsInput {
   requireAutopilot?: boolean;
   allowWatchdogRecovery?: boolean;
   allowScopedDraftCampaign?: boolean;
+  createdSince?: Date;
   now?: Date;
   leaseMs?: number;
 }
@@ -1042,6 +1045,84 @@ export interface EnqueueJobInput {
   payload: Record<string, unknown>;
   maxAttempts?: number;
   idempotencyKey?: string | null;
+}
+
+export interface ScopedSmokeJobSnapshot {
+  id: string;
+  campaignId: string;
+  payload: Record<string, unknown>;
+  status: JobStatus;
+  attemptCount: number;
+  idempotencyKey: string | null;
+  lastError: string | null;
+}
+
+export async function getScopedSmokeJob(jobId: string): Promise<ScopedSmokeJobSnapshot | null> {
+  const [job] = await getDb().select({
+    id: discoveryJobs.id,
+    campaignId: discoveryJobs.campaignId,
+    payload: discoveryJobs.payload,
+    status: discoveryJobs.status,
+    attemptCount: discoveryJobs.attemptCount,
+    idempotencyKey: discoveryJobs.idempotencyKey,
+    lastError: discoveryJobs.lastError,
+  }).from(discoveryJobs).where(eq(discoveryJobs.id, jobId)).limit(1);
+  return job ? { ...job, payload: job.payload as Record<string, unknown>, status: job.status as JobStatus } : null;
+}
+
+export async function enqueueScopedSmokeJob(input: {
+  jobId: string;
+  campaignId: string;
+  payload: Record<string, unknown>;
+}): Promise<{ created: boolean; job: ScopedSmokeJobSnapshot }> {
+  const idempotencyKey = `scoped-smoke:${input.campaignId}:${input.jobId}`;
+  const [inserted] = await getDb().insert(discoveryJobs).values({
+    id: input.jobId,
+    campaignId: input.campaignId,
+    type: "run_engine_batch",
+    payload: input.payload,
+    maxAttempts: 1,
+    idempotencyKey,
+  }).onConflictDoNothing().returning({ id: discoveryJobs.id });
+  const job = await getScopedSmokeJob(input.jobId);
+  if (!job || job.campaignId !== input.campaignId || job.payload.smokeExecutionId !== input.jobId
+    || job.idempotencyKey !== idempotencyKey) {
+    throw new Error("Scoped smoke execution ID is already bound to another job.");
+  }
+  return { created: Boolean(inserted), job };
+}
+
+export async function persistScopedSmokeEvidence(input: {
+  jobId: string;
+  workerId: string;
+  evidence: object;
+}): Promise<void> {
+  const result = await getDb().execute(sql`
+    UPDATE discovery_jobs
+    SET payload = payload || jsonb_build_object('scopedSmokeEvidence', ${JSON.stringify(input.evidence)}::jsonb),
+        updated_at = NOW()
+    WHERE id = ${input.jobId}::uuid
+      AND status = 'processing'
+      AND locked_by = ${input.workerId}
+    RETURNING id;
+  `);
+  if (result.rows.length === 0) throw new LostLeaseError("discovery_jobs", input.jobId, input.workerId);
+}
+
+export async function persistScopedSmokeResult(input: {
+  jobId: string;
+  campaignId: string;
+  result: Record<string, unknown>;
+}): Promise<void> {
+  const updated = await getDb().execute(sql`
+    UPDATE discovery_jobs
+    SET payload = payload || jsonb_build_object('scopedSmokeResult', ${JSON.stringify(input.result)}::jsonb),
+        updated_at = NOW()
+    WHERE id = ${input.jobId}::uuid
+      AND campaign_id = ${input.campaignId}::uuid
+    RETURNING id;
+  `);
+  if (updated.rows.length === 0) throw new Error("Scoped smoke result could not be attached to its exact campaign job.");
 }
 
 async function enqueueDiscovery(input: EnqueueJobInput): Promise<string> {

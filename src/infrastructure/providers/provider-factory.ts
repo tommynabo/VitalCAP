@@ -141,14 +141,20 @@ export function createSerpDiscoveryProvider(workspaceId: string, engineType: Eng
     const query = input.query;
     const normalizedQuery = normalizeProviderQuery(query);
     const maxResults = recoveryProbe ? 1 : input.maxResults;
-    const maxRetries = recoveryProbe ? 0 : MAX_TRANSIENT_RETRIES;
+    const maxRetries = recoveryProbe || input.probeExecutionId
+      ? 0
+      : Math.min(input.maxRetries ?? MAX_TRANSIENT_RETRIES, MAX_TRANSIENT_RETRIES);
     const reserveCostUsd = (maxRetries + 1) * SERPER_ESTIMATED_COST_PER_QUERY_USD;
     const { start: dayStart } = getDayBounds(settings.timezone, now);
     const planningWindow = recoveryProbe
       ? `recovery:${Math.floor(now.getTime() / (60 * 60 * 1000))}`
       : dayStart.toISOString();
     const credentialFingerprint = createHash("sha256").update(apiKey).digest("hex");
-    const requestQuery = recoveryProbe ? `serper-recovery-probe:${credentialFingerprint}` : normalizedQuery;
+    const requestQuery = recoveryProbe
+      ? `serper-recovery-probe:${credentialFingerprint}`
+      : input.probeExecutionId
+        ? `${normalizedQuery}:scoped-smoke:${input.probeExecutionId}`
+        : normalizedQuery;
     const requestKey = createProviderRequestKey({
       workspaceId: recoveryProbe ? "serper-account" : workspaceId,
       campaignId: recoveryProbe ? "serper-recovery" : campaignId,
@@ -174,6 +180,7 @@ export function createSerpDiscoveryProvider(workspaceId: string, engineType: Eng
       recoveryProbe,
       economicPaceState: economicPacing.state,
       ...(discoveryJobId ? { discoveryJobId } : {}),
+      ...(input.probeExecutionId ? { probeExecutionId: input.probeExecutionId } : {}),
     };
     const purposeLimitUsd = purpose === "linkedin_owner_discovery"
       ? Math.min(env.SERPER_DAILY_COST_LIMIT_USD * 0.05, SERPER_LINKEDIN_DAILY_EXPLORATION_LIMIT_USD)

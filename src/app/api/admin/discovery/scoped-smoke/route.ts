@@ -7,17 +7,19 @@ import { getProductionCapacityDiagnostics } from "@/infrastructure/neon/reposito
 import { getScopedInstantlyTargetPreflight } from "@/infrastructure/neon/repositories/instantly-import-targets";
 import { getAutopilotSettings } from "@/infrastructure/neon/repositories/autopilot";
 import { getTodaySpendUsd } from "@/infrastructure/neon/repositories/provider-runs";
-import { getScopedCampaignProviderSpend } from "@/infrastructure/neon/repositories/multi-niche-rollout";
-import { listSearchSeedsForCampaignEngine } from "@/infrastructure/neon/repositories/discovery";
-import { enqueueDiscoveryJob } from "@/infrastructure/neon/repositories/job-queue";
+import { getMultiNicheCampaignInventory, getScopedCampaignProviderSpend } from "@/infrastructure/neon/repositories/multi-niche-rollout";
+import { getSeedEconomicPerformance, listSearchSeedsForCampaignEngine } from "@/infrastructure/neon/repositories/discovery";
+import { enqueueScopedSmokeJob, getScopedSmokeJob, persistScopedSmokeResult } from "@/infrastructure/neon/repositories/job-queue";
 import { runDiscoveryCronTick } from "@/infrastructure/jobs/runners/discovery-runner";
 import { runProviderRunsCronTick } from "@/infrastructure/jobs/runners/provider-runs-runner";
 import { runProcessingCronTick } from "@/infrastructure/jobs/runners/processing-runner";
 import { enqueueVerificationJobs, runVerificationCronTick } from "@/infrastructure/jobs/runners/verification-runner";
 import { buildEngineCapabilities } from "@/services/autopilot/engine-capability";
-import { planningWindowKey, routeCampaignsToAvailableEngines } from "@/services/autopilot/target-planner";
-import { getMultiNicheRolloutEntry } from "@/services/autopilot/multi-niche-rollout";
+import { COLD_START_IMPORT_SAMPLE, planningWindowKey, resolveOperationalEnvelope, routeCampaignsToAvailableEngines } from "@/services/autopilot/target-planner";
+import { getMultiNicheRolloutEntry, MULTI_NICHE_ROLLOUT } from "@/services/autopilot/multi-niche-rollout";
+import { hasConfidentSeedEconomicEvidence, scoreSeedEconomicPerformance } from "@/services/discovery/seed-economics";
 import { getMapsEnv, getSerperEnv, getVerificationEnv } from "@/lib/config/env";
+import { getDayBounds } from "@/lib/time/day-bounds";
 import { AUTO_SEND_ENABLED } from "@/services/setter/autonomy-policy";
 import { getCurrentWorkspaceId, requireCurrentUser, UnauthorizedError } from "@/lib/auth/workspace";
 import { getWorkspaceRole } from "@/infrastructure/neon/repositories/workspace";
@@ -30,9 +32,19 @@ const requestSchema = z.object({
   campaignId: z.uuid(),
   dryRun: z.boolean().default(true),
   maxDiscoveryJobs: z.number().int().min(1).max(1).default(1),
+  maxProviderQueries: z.literal(1).default(1),
   maxCandidates: z.number().int().min(1).max(5).default(3),
+  probeMode: z.boolean().default(false),
+  smokeExecutionId: z.uuid().optional(),
   allowImport: z.literal(false).default(false),
-}).strict();
+}).strict().superRefine((input, context) => {
+  if (!input.dryRun && !input.probeMode) {
+    context.addIssue({ code: "custom", path: ["probeMode"], message: "Real scoped smoke requires probeMode=true." });
+  }
+  if (!input.dryRun && !input.smokeExecutionId) {
+    context.addIssue({ code: "custom", path: ["smokeExecutionId"], message: "Real scoped smoke requires an explicit execution UUID." });
+  }
+});
 
 interface ScopedSmokePlan {
   campaign: Campaign;
@@ -46,6 +58,9 @@ interface ScopedSmokePlan {
   verificationReady: boolean;
   verificationBlockReason: string | null;
   providerAvailable: boolean;
+  operationalEnvelope: ReturnType<typeof resolveOperationalEnvelope>;
+  coldStart: boolean;
+  selectionReason: string;
 }
 
 async function buildScopedSmokePlan(campaignId: string, workspaceId: string): Promise<ScopedSmokePlan> {
@@ -112,13 +127,68 @@ async function buildScopedSmokePlan(campaignId: string, workspaceId: string): Pr
   const providerEngine = routed?.engineType ?? campaign.engineType;
   const selectedCapability = capabilities.find((item) => item.engineType === providerEngine);
   const providerAvailable = Boolean(selectedCapability?.available);
-  const seeds = await listSearchSeedsForCampaignEngine(campaignId, providerEngine);
-  const seed = [...seeds]
-    .filter((item) => !item.nextEligibleAt || new Date(item.nextEligibleAt).getTime() <= Date.now())
-    .sort((left, right) => (left.lastRunAt ?? "").localeCompare(right.lastRunAt ?? "") || left.id.localeCompare(right.id))[0];
+  const seedSelectionTime = new Date();
+  const [seeds, seedPerformance] = await Promise.all([
+    listSearchSeedsForCampaignEngine(campaignId, providerEngine),
+    getSeedEconomicPerformance(campaignId, providerEngine, seedSelectionTime, campaign.timeZone),
+  ]);
+  const eligibleSeeds = seeds.filter((item) => item.campaignId === campaignId && item.engineType === providerEngine
+    && item.query.trim().length > 0 && item.geography.trim().length > 0
+    && (!item.nextEligibleAt || new Date(item.nextEligibleAt).getTime() <= seedSelectionTime.getTime())
+    && scoreSeedEconomicPerformance(item, seedPerformance.get(item.id), seedSelectionTime).eligible);
+  const seed = eligibleSeeds.sort((left, right) => (left.lastRunAt ? 1 : 0) - (right.lastRunAt ? 1 : 0)
+    || (left.lastRunAt ?? "").localeCompare(right.lastRunAt ?? "")
+    || left.id.localeCompare(right.id))[0];
   if (!seed && providerAvailable) {
     throw Object.assign(new Error("No eligible persisted seed exists for the selected provider."), { status: 409 });
   }
+  const coldStart = seed ? !hasConfidentSeedEconomicEvidence(seedPerformance.get(seed.id)) : false;
+  const selectionReason = !providerAvailable
+    ? "no_provider_available"
+    : coldStart
+      ? seed?.lastRunAt ? "insufficient_economic_sample" : "never_run_seed"
+      : "economic_policy_eligible";
+
+  const rolloutCampaigns = await Promise.all(MULTI_NICHE_ROLLOUT.map(async (entry) => {
+    const item = entry.campaignId === campaignId ? campaign : await getCampaignById(entry.campaignId);
+    if (!item || item.workspaceId !== workspaceId || item.engineConfig?.niche !== entry.niche
+      || item.status !== "draft" || item.autopilotEnabled) {
+      throw Object.assign(new Error("The four-campaign rollout scope is incomplete or inconsistent."), { status: 409 });
+    }
+    return item;
+  }));
+  const dayBounds = getDayBounds(settings.timezone);
+  const rolloutStats = await getMultiNicheCampaignInventory(
+    MULTI_NICHE_ROLLOUT.map((entry) => entry.campaignId),
+    dayBounds.start,
+    dayBounds.end,
+  );
+  if (rolloutStats.length !== MULTI_NICHE_ROLLOUT.length) {
+    throw Object.assign(new Error("The shared rollout inventory snapshot is incomplete."), { status: 409 });
+  }
+  const statsByCampaign = new Map(rolloutStats.map((item) => [item.campaignId, item]));
+  const routedRolloutCampaigns = routeCampaignsToAvailableEngines(rolloutCampaigns, capabilities);
+  const routedByCampaign = new Map(routedRolloutCampaigns.map((item) => [item.id, item]));
+  const operationalEnvelope = resolveOperationalEnvelope({
+    businessDailyTarget: settings.globalDailyTarget,
+    safeCapacityTarget: verificationReady ? capacity.operationalTarget.operationalDailyTarget : 0,
+    backlogInventory: rolloutStats.reduce((total, item) => total + item.backlogInventory, 0),
+    rawRequestedToday: rolloutStats.reduce((total, item) => total + item.rawRequestedToday, 0),
+    campaigns: rolloutCampaigns.flatMap((item) => {
+      const entry = getMultiNicheRolloutEntry(item.id);
+      const stats = statsByCampaign.get(item.id);
+      const routedCampaign = routedByCampaign.get(item.id);
+      const providerCapability = capabilities.find((candidate) => candidate.engineType === routedCampaign?.engineType);
+      if (!entry || !stats) return [];
+      return [{
+        campaign: item,
+        confirmedImports: stats.confirmedImports,
+        rawRequestedToday: stats.rawRequestedToday,
+        completedProbeCount: stats.completedProbeCount,
+        providerAvailable: Boolean(providerCapability?.available) && verificationReady,
+      }];
+    }),
+  });
 
   return {
     campaign,
@@ -132,7 +202,64 @@ async function buildScopedSmokePlan(campaignId: string, workspaceId: string): Pr
     verificationReady,
     verificationBlockReason: verificationReady ? null : "MillionVerifier is disabled, unconfigured, or at its daily budget limit.",
     providerAvailable,
+    operationalEnvelope,
+    coldStart,
+    selectionReason,
   };
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+async function replayScopedSmoke(job: Awaited<ReturnType<typeof getScopedSmokeJob>>) {
+  if (!job) throw new Error("Scoped smoke job disappeared before replay.");
+  const savedResult = asRecord(job.payload.scopedSmokeResult);
+  if (savedResult) {
+    return NextResponse.json({ ...savedResult, IDEMPOTENT_REPLAY: true }, {
+      headers: { "Cache-Control": "no-store" },
+    });
+  }
+  const evidence = asRecord(job.payload.scopedSmokeEvidence) ?? {};
+  const startedAt = typeof job.payload.startedAt === "string" ? new Date(job.payload.startedAt) : null;
+  const providerSpendUsd = startedAt && Number.isFinite(startedAt.getTime())
+    ? await getScopedCampaignProviderSpend(job.campaignId, startedAt)
+    : null;
+  const payload = {
+    ok: true,
+    dryRun: false,
+    IDEMPOTENT_REPLAY: true,
+    EXECUTION_STATE: job.status,
+    SMOKE_EXECUTION_ID: job.id,
+    JOB_ID: job.id,
+    JOB_CLAIMED: evidence.jobClaimed === true || job.attemptCount > 0,
+    COLD_START: job.payload.coldStart === true,
+    SELECTION_REASON: job.payload.selectionReason ?? null,
+    PROVIDER: job.payload.provider ?? null,
+    PROVIDER_ENGINE: job.payload.engineType ?? null,
+    PROVIDER_HEALTH: job.payload.providerHealth ?? null,
+    SEED_ID: job.payload.seedId ?? null,
+    SEED_QUERY: job.payload.seedQuery ?? null,
+    GEOGRAPHY: job.payload.seedGeography ?? null,
+    PROVIDER_CALL_ATTEMPTED: evidence.providerCallAttempted === true,
+    PROVIDER_CALL_SUCCEEDED: evidence.providerCallSucceeded === true,
+    PROVIDER_CALL_ERROR_CLASS: evidence.providerCallErrorClass ?? null,
+    PROVIDER_QUERIES_USED: evidence.providerQueriesUsed ?? 0,
+    RESULTS_RETURNED: evidence.resultsReturned ?? 0,
+    RAW_CANDIDATES_INSERTED: evidence.rawCandidatesInserted ?? 0,
+    DUPLICATES: evidence.duplicates ?? 0,
+    CANDIDATE_COUNT: evidence.candidateCount ?? 0,
+    PROVIDER_SPEND_USD: providerSpendUsd,
+    IMPORT_ALLOWED: false,
+    IMPORT_BLOCKED: true,
+    AUTO_SEND_ENABLED,
+  };
+  return NextResponse.json(payload, {
+    status: job.status === "pending" || job.status === "processing" ? 202 : 200,
+    headers: { "Cache-Control": "no-store" },
+  });
 }
 
 export async function POST(request: Request) {
@@ -155,7 +282,32 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: "Invalid scoped smoke request.", details: parsed.error.issues }, { status: 400 });
     }
     const input = parsed.data;
+    let existingJob = null;
+    if (!input.dryRun && input.smokeExecutionId) {
+      existingJob = await getScopedSmokeJob(input.smokeExecutionId);
+      if (existingJob) {
+        if (existingJob.campaignId !== input.campaignId
+          || existingJob.payload.smokeExecutionId !== input.smokeExecutionId) {
+          return NextResponse.json({ error: "Smoke execution ID is already bound to another campaign or request." }, { status: 409 });
+        }
+        if (existingJob.status !== "pending" || existingJob.payload.scopedSmokeEvidence) {
+          return replayScopedSmoke(existingJob);
+        }
+      }
+    }
     const plan = await buildScopedSmokePlan(input.campaignId, workspaceId);
+    if (existingJob && (
+      existingJob.payload.engineType !== plan.providerEngine
+      || existingJob.payload.seedId !== plan.seed?.id
+      || existingJob.payload.seedQuery !== plan.seed?.query
+      || existingJob.payload.seedGeography !== plan.seed?.geography
+      || existingJob.payload.maxCandidates !== input.maxCandidates
+      || existingJob.payload.maxProviderQueries !== input.maxProviderQueries
+      || existingJob.payload.probeMode !== input.probeMode
+      || existingJob.payload.scopedSmoke !== true
+    )) {
+      return NextResponse.json({ error: "Smoke execution ID is bound to different persisted probe options." }, { status: 409 });
+    }
     const base = {
       SOURCE_CAMPAIGN_ID: plan.campaign.id,
       NICHE: plan.niche,
@@ -164,9 +316,27 @@ export async function POST(request: Request) {
       PROVIDER_ENGINE: plan.providerEngine,
       PROVIDER_HEALTH: plan.providerHealth,
       DISCOVERY_PROVIDER_AVAILABLE: plan.providerAvailable,
+      COLD_START: plan.coldStart,
+      SELECTION_REASON: plan.selectionReason,
+      SEED_ID: plan.seed?.id ?? null,
+      SEED_QUERY: plan.seed?.query ?? null,
+      GEOGRAPHY: plan.seed?.geography ?? null,
+      OPERATIONAL_ENVELOPE: {
+        scope: "multi_niche_rollout_global",
+        campaignIds: MULTI_NICHE_ROLLOUT.map((entry) => entry.campaignId),
+        ...plan.operationalEnvelope,
+      },
+      COLD_START_POLICY: {
+        enabled: true,
+        minimumConfirmedImportsBeforeEconomicAllocation: COLD_START_IMPORT_SAMPLE,
+        permanentEqualShare: false,
+      },
+      LEGACY_FALLBACK_USED: false,
+      GLOBAL_SIDE_EFFECTS: false,
       SEED: plan.seed,
       IMPORT_BLOCKED: true,
       IMPORT_BLOCK_REASON: plan.mappingBlockReason,
+      IMPORT_ALLOWED: false,
       VERIFICATION_READY: plan.verificationReady,
       VERIFICATION_BLOCK_REASON: plan.verificationBlockReason,
       AUTO_SEND_ENABLED,
@@ -174,86 +344,158 @@ export async function POST(request: Request) {
       CAMPAIGN_AUTOPILOT_ENABLED: plan.campaign.autopilotEnabled,
     };
     if (input.dryRun) {
-      return NextResponse.json({ ok: true, dryRun: true, ...base, candidateCount: 0, providerSpendUsd: 0 }, {
+      return NextResponse.json({
+        ok: true,
+        dryRun: true,
+        ...base,
+        SMOKE_EXECUTION_ID: input.smokeExecutionId ?? null,
+        JOB_ID: null,
+        JOB_CLAIMED: false,
+        PROVIDER_CALL_ATTEMPTED: false,
+        PROVIDER_CALL_SUCCEEDED: false,
+        PROVIDER_CALL_ERROR_CLASS: null,
+        PROVIDER_QUERIES_USED: 0,
+        RESULTS_RETURNED: 0,
+        RAW_CANDIDATES_INSERTED: 0,
+        DUPLICATES: 0,
+        CANDIDATE_COUNT: 0,
+        candidateCount: 0,
+        PROVIDER_SPEND_USD: 0,
+        providerSpendUsd: 0,
+      }, {
         headers: { "Cache-Control": "no-store" },
       });
     }
+    if (!plan.providerAvailable || !plan.seed) {
+      throw Object.assign(new Error("Scoped smoke is blocked because no healthy provider and eligible persisted seed are available."), { status: 409 });
+    }
     const startedAt = new Date();
-    const discoveryJobId = plan.providerAvailable && plan.seed
-      ? await enqueueDiscoveryJob({
+    const smokeExecutionId = input.smokeExecutionId!;
+    const payload = {
+      engineType: plan.providerEngine,
+      desiredRawCount: input.maxCandidates,
+      maxCandidates: input.maxCandidates,
+      maxProviderQueries: input.maxProviderQueries,
+      probeMode: true,
+      smokeExecutionId,
+      seedId: plan.seed.id,
+      startedAt: startedAt.toISOString(),
+      planningWindow: planningWindowKey(startedAt, plan.campaign.timeZone),
+      reason: "Admin scoped cold-start smoke.",
+      origin: "normal" as const,
+      seedQuery: plan.seed.query,
+      seedGeography: plan.seed.geography,
+      scopedSmoke: true,
+      provider: plan.provider,
+      providerHealth: plan.providerHealth,
+      coldStart: plan.coldStart,
+      selectionReason: plan.selectionReason,
+    };
+    const enqueueResult = existingJob
+      ? { created: false, job: existingJob }
+      : await enqueueScopedSmokeJob({
+        jobId: smokeExecutionId,
         campaignId: plan.campaign.id,
-        type: "run_engine_batch",
-        payload: {
-          engineType: plan.providerEngine,
-          desiredRawCount: input.maxCandidates,
-          planningWindow: planningWindowKey(startedAt, plan.campaign.timeZone),
-          reason: "Admin scoped multi-niche smoke.",
-          origin: "normal",
-          seedQuery: plan.seed.query,
-          seedGeography: plan.seed.geography,
-          scopedSmoke: true,
-        },
-        idempotencyKey: `scoped-smoke:${plan.campaign.id}:multi-niche-rollout-v1`,
-      })
+        payload,
+      });
+    existingJob = enqueueResult.job;
+    if (!enqueueResult.created && (existingJob.status !== "pending" || existingJob.payload.scopedSmokeEvidence)) {
+      return replayScopedSmoke(existingJob);
+    }
+    const discovery = await runDiscoveryCronTick(1, new Date(), {
+      campaignId: plan.campaign.id,
+      jobId: smokeExecutionId,
+      allowScopedDraftCampaign: true,
+      probeMode: true,
+      smokeExecutionId,
+    });
+    const evidence = discovery.scopedProbeEvidence;
+    if (!evidence?.jobClaimed) {
+      const currentJob = await getScopedSmokeJob(smokeExecutionId);
+      return replayScopedSmoke(currentJob);
+    }
+    const providerRuns = evidence.providerCallAttempted && evidence.providerCallSucceeded && plan.provider === "apify"
+      ? await runProviderRunsCronTick(1, { campaignId: plan.campaign.id, discoveryJobId: smokeExecutionId })
       : null;
-    const discovery = discoveryJobId
-      ? await runDiscoveryCronTick(1, startedAt, {
+    const returnedResults = Math.max(evidence.resultsReturned, providerRuns?.itemsReturned ?? 0);
+    const insertedFromProviderRun = providerRuns?.candidatesInserted ?? 0;
+    const candidateCount = Math.min(input.maxCandidates, evidence.rawCandidatesInserted + insertedFromProviderRun);
+    const duplicates = evidence.duplicates + (providerRuns?.ingestionAccounting?.DUPLICATE_EXISTING_RAW ?? 0);
+    const processing = candidateCount > 0
+      ? await runProcessingCronTick(Math.min(input.maxCandidates, candidateCount), startedAt, {
         campaignId: plan.campaign.id,
-        jobId: discoveryJobId,
         allowScopedDraftCampaign: true,
+        createdSince: startedAt,
+        enrichContacts: true,
+        timeBudgetMs: 60_000,
       })
       : null;
-    const providerRuns = discoveryJobId && plan.provider === "apify"
-      ? await runProviderRunsCronTick(1, { campaignId: plan.campaign.id, discoveryJobId })
+    const verification = candidateCount > 0
+      ? await (async () => {
+        await enqueueVerificationJobs({
+          campaignId: plan.campaign.id,
+          allowScopedDraftCampaign: true,
+          createdSince: startedAt,
+          batchSize: Math.min(input.maxCandidates, candidateCount),
+        });
+        return runVerificationCronTick(Math.min(input.maxCandidates, candidateCount), {
+          campaignId: plan.campaign.id,
+          allowScopedDraftCampaign: true,
+          createdSince: startedAt,
+          skipInstantlyImport: true,
+        });
+      })()
       : null;
-    const processing = await runProcessingCronTick(input.maxCandidates, startedAt, {
-      campaignId: plan.campaign.id,
-      allowScopedDraftCampaign: true,
-      enrichContacts: true,
-      timeBudgetMs: 60_000,
-    });
-    await enqueueVerificationJobs({
-      campaignId: plan.campaign.id,
-      allowScopedDraftCampaign: true,
-      createdSince: startedAt,
-      batchSize: input.maxCandidates,
-    });
-    const verification = await runVerificationCronTick(input.maxCandidates, {
-      campaignId: plan.campaign.id,
-      allowScopedDraftCampaign: true,
-      skipInstantlyImport: true,
-    });
     const providerSpendUsd = await getScopedCampaignProviderSpend(plan.campaign.id, startedAt);
     logEvent("info", "admin.scoped_multi_niche_smoke.completed", {
-      correlationId: discoveryJobId ?? `scoped-smoke:${plan.campaign.id}:backlog`,
+      correlationId: smokeExecutionId,
       workspaceId,
       campaignId: plan.campaign.id,
       niche: plan.niche,
       provider: plan.provider,
       providerEngine: plan.providerEngine,
-      seedId: plan.seed?.id ?? null,
+      seedId: plan.seed.id,
       discoveryJobsClaimed: discovery?.jobsClaimed ?? 0,
       candidatesInserted: discovery?.rawCandidatesInserted ?? 0,
       providerRunsChecked: providerRuns?.runsChecked ?? 0,
       providerRunsIngested: providerRuns?.runsIngested ?? 0,
-      processingJobsCompleted: processing.jobsCompleted,
-      verificationJobsClaimed: verification.jobsClaimed,
+      processingJobsCompleted: processing?.jobsCompleted ?? 0,
+      verificationJobsClaimed: verification?.jobsClaimed ?? 0,
       importsAllowed: false,
       autoSendEnabled: AUTO_SEND_ENABLED,
     });
-    return NextResponse.json({
+    const responsePayload = {
       ok: true,
       dryRun: false,
       ...base,
-      discoveryJobId,
+      SMOKE_EXECUTION_ID: smokeExecutionId,
+      JOB_ID: smokeExecutionId,
+      JOB_CLAIMED: evidence.jobClaimed,
+      PROVIDER_CALL_ATTEMPTED: evidence.providerCallAttempted,
+      PROVIDER_CALL_SUCCEEDED: evidence.providerCallSucceeded,
+      PROVIDER_CALL_ERROR_CLASS: evidence.providerCallErrorClass,
+      PROVIDER_QUERIES_USED: Math.min(1, evidence.providerQueriesUsed),
+      RESULTS_RETURNED: returnedResults,
+      RAW_CANDIDATES_INSERTED: candidateCount,
+      DUPLICATES: duplicates,
+      CANDIDATE_COUNT: candidateCount,
+      IMPORT_ALLOWED: false,
+      discoveryJobId: smokeExecutionId,
       discovery,
       providerRuns,
       processing,
       verification,
-      candidateCount: discovery?.rawCandidatesInserted ?? 0,
-      discoverySkippedReason: plan.providerAvailable ? null : "No discovery provider is available; scoped backlog processing and verification still ran.",
+      candidateCount,
+      discoverySkippedReason: evidence.providerCallAttempted ? null : evidence.providerCallErrorClass ?? "No provider call was attempted.",
+      PROVIDER_SPEND_USD: providerSpendUsd,
       providerSpendUsd,
-    }, { headers: { "Cache-Control": "no-store" } });
+    };
+    await persistScopedSmokeResult({
+      jobId: smokeExecutionId,
+      campaignId: plan.campaign.id,
+      result: responsePayload,
+    });
+    return NextResponse.json(responsePayload, { headers: { "Cache-Control": "no-store" } });
   } catch (error) {
     if (error instanceof UnauthorizedError) {
       return NextResponse.json({ error: "Authentication required." }, { status: 401 });

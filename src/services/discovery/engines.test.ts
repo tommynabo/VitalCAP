@@ -111,6 +111,36 @@ describe("GoogleSerpEngine", () => {
     expect(provider.search).toHaveBeenCalledWith(expect.objectContaining({ seedId: "seed_1", planningWindow: "2026-10-03T11:00" }));
   });
 
+  it("makes one bounded query for an explicit probe and treats zero results as success", async () => {
+    const search = vi.fn().mockResolvedValue({
+      results: [],
+      usage: { calls: 1, items: 0, errors: 0, totalLatencyMs: 1, costUsd: 0.001, quotaRemaining: null },
+    });
+    const engine = new GoogleSerpEngine({ providerName: "serper", search });
+
+    const result = await engine.executeDiscovery({
+      seed: seed({ engineType: "google_serp" }),
+      dryRun: false,
+      maxResults: 5,
+      maxProviderQueries: 1,
+      probeExecutionId: "c76e780a-b0a2-4e16-a3ec-e5d8a9197c4c",
+    });
+
+    expect(search).toHaveBeenCalledOnce();
+    expect(search).toHaveBeenCalledWith(expect.objectContaining({
+      maxResults: 5,
+      maxRetries: 0,
+      probeExecutionId: "c76e780a-b0a2-4e16-a3ec-e5d8a9197c4c",
+    }));
+    expect(result).toMatchObject({
+      providerCalls: 1,
+      providerErrors: 0,
+      resultsReturned: 0,
+      providerCallSucceeded: true,
+      rawCandidates: [],
+    });
+  });
+
   it("excludes linkedin.com domains from its results", async () => {
     const engine = new GoogleSerpEngine(new MockSerpDiscoveryProvider());
     const result = await engine.executeDiscovery({ seed: seed({ engineType: "google_serp", query: "titular farmacéutico" }), dryRun: true });
