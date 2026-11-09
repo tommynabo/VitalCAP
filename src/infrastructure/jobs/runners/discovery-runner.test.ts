@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { WATCHDOG_QUEUE_PAUSE_REASON } from "@/services/autopilot/watchdog-pause-policy";
-import { canExecuteWatchdogRecoveryJob, getApifyDiscoveryBatchCap, getApifyStartupCostPatch, isAuthorizedScopedProbeExecution, mergeApifyProviderRunMetadata, resolveScopedColdStartBatches } from "./discovery-runner";
+import { canExecuteWatchdogRecoveryJob, getApifyDiscoveryBatchCap, getApifyStartupCostPatch, isAuthorizedScopedProbeExecution, isProviderRunReplayWithoutResults, mergeApifyProviderRunMetadata, resolveScopedColdStartBatches } from "./discovery-runner";
 import type { SearchSeed } from "@/domain/discovery/types";
 import type { SeedEconomicPerformance } from "@/services/discovery/seed-economics";
 
@@ -18,6 +18,23 @@ describe("watchdog recovery discovery execution", () => {
     expect(canExecuteWatchdogRecoveryJob({ ...watchdogPausedSettings, systemPauseReason: "operator_hold" }, { watchdogRecovery: true })).toBe(false);
     expect(canExecuteWatchdogRecoveryJob({ ...watchdogPausedSettings, emergencyStopped: true }, { watchdogRecovery: true })).toBe(false);
     expect(canExecuteWatchdogRecoveryJob({ ...watchdogPausedSettings, enabled: false }, { watchdogRecovery: true })).toBe(false);
+  });
+});
+
+describe("Serper idempotent discovery replay", () => {
+  it("does not account an existing provider run as a new empty ingestion", () => {
+    expect(isProviderRunReplayWithoutResults({
+      providerRunId: "completed-run",
+      providerCalls: 0,
+      resultsReturned: 0,
+      rawCandidates: [],
+    })).toBe(true);
+    expect(isProviderRunReplayWithoutResults({
+      providerRunId: "completed-run",
+      providerCalls: 1,
+      resultsReturned: 0,
+      rawCandidates: [],
+    })).toBe(false);
   });
 });
 

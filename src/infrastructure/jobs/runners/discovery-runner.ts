@@ -966,6 +966,7 @@ async function executeDiscoveryJob(
     }
 
     if (result.providerErrors > 0) throw new Error(`${result.providerErrors} provider error(s) while executing discovery.`);
+    if (isProviderRunReplayWithoutResults(result)) continue;
 
     const completedSeedRunId = await insertSearchSeedRun({
       seedId: seed.id,
@@ -1084,6 +1085,18 @@ export function isAuthorizedScopedProbeExecution(
     && job.payload.scopedSmoke === true
     && job.payload.smokeExecutionId === job.id
     && job.payload.maxProviderQueries === 1;
+}
+
+export function isProviderRunReplayWithoutResults(result: {
+  providerRunId?: string;
+  providerCalls: number;
+  resultsReturned?: number;
+  rawCandidates: unknown[];
+}): boolean {
+  return Boolean(result.providerRunId)
+    && result.providerCalls === 0
+    && (result.resultsReturned ?? result.rawCandidates.length) === 0
+    && result.rawCandidates.length === 0;
 }
 
 export async function runDiscoveryCronTick(
