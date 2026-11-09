@@ -51,6 +51,8 @@ const NICHE_RULES: Record<NicheId, { type: BusinessType; include: RegExp; exclud
 const WELLNESS_CORE = /\b(spa|wellness|bienestar)\b/i;
 const WELLNESS_BEAUTY_ONLY = /\b(sal[oó]n de belleza|beauty salon|centro de est[eé]tica|sal[oó]n de est[eé]tica)\b/i;
 const PREMIUM_FITNESS_CONTEXT = /\b(gimnasio|gym|fitness|entrenamiento|training|centro deportivo|reformer|conditioning|acondicionamiento)\b/i;
+const PERSONAL_TRAINING_REMOTE = /\b(online|a domicilio|en casa|freelance|freelancer)\b/i;
+const PERSONAL_TRAINING_PHYSICAL = /\b(estudio|centro|studio|gimnasio|gym)\b/i;
 
 export function classifyNicheBusinessType(text: string | null | undefined, niche: NicheId): BusinessType {
   const value = text?.trim() ?? "";
@@ -59,7 +61,11 @@ export function classifyNicheBusinessType(text: string | null | undefined, niche
     && WELLNESS_BEAUTY_ONLY.test(value)
     && !WELLNESS_CORE.test(value);
   const missingPremiumFitnessContext = niche === "premium_fitness" && !PREMIUM_FITNESS_CONTEXT.test(value);
-  return value && !rule.exclude.test(value) && !unrelatedBeautyOnly && !missingPremiumFitnessContext && rule.include.test(value)
+  const remoteOnlyPersonalTraining = niche === "personal_training"
+    && PERSONAL_TRAINING_REMOTE.test(value)
+    && !PERSONAL_TRAINING_PHYSICAL.test(value);
+  const excluded = niche === "personal_training" ? remoteOnlyPersonalTraining : rule.exclude.test(value);
+  return value && !excluded && !unrelatedBeautyOnly && !missingPremiumFitnessContext && rule.include.test(value)
     ? rule.type
     : "other_retail";
 }

@@ -83,6 +83,7 @@ describe("niche-specific business classification", () => {
     ["Centro de entrenador personal"],
     ["Centro pequeño de personal training"],
     ["Entrenamiento personal en estudio de fuerza"],
+    ["Centro boutique con entrenamiento personal y opción online"],
   ])("accepts personal training ICP evidence: %s", (evidence) => {
     expect(classifyNicheBusinessType(evidence, "personal_training")).toBe("personal_training_studio");
   });
