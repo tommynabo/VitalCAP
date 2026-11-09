@@ -901,6 +901,29 @@ export async function getScopedSmokeProviderRunDiagnostics(discoveryJobId: strin
   };
 }
 
+export async function getScopedSmokeCandidateReprocessDiagnostics(candidateId: string): Promise<Record<string, unknown> | null> {
+  const result = await getDb().execute(sql`
+    SELECT raw_candidates.id AS candidate_id, raw_candidates.campaign_id,
+      raw_candidates.provider_run_id, raw_candidates.discovery_job_id, raw_candidates.processed,
+      raw_candidates.processing_metrics->'candidateOutcome'->>'icpQualified' AS icp_qualified,
+      raw_candidates.processing_metrics->'candidateOutcome'->>'physicalPresenceVerdict' AS physical_presence_verdict,
+      membership.stage AS campaign_membership_stage,
+      provider_runs.provider, provider_runs.operation, provider_runs.status AS provider_run_status,
+      provider_runs.metadata->>'discoveryJobId' AS smoke_execution_id,
+      provider_runs.metadata->>'niche' AS metadata_niche,
+      campaigns.engine_config->>'niche' AS campaign_niche
+    FROM raw_candidates
+    JOIN provider_runs ON provider_runs.id = raw_candidates.provider_run_id
+    JOIN campaigns ON campaigns.id = raw_candidates.campaign_id
+    LEFT JOIN campaign_memberships membership
+      ON membership.account_id = raw_candidates.account_id
+      AND membership.campaign_id = raw_candidates.campaign_id
+    WHERE raw_candidates.id = ${candidateId}::uuid
+    LIMIT 1
+  `);
+  return result.rows[0] as Record<string, unknown> | undefined ?? null;
+}
+
 export function buildApifyPollingDuePredicate(now = new Date()) {
   return sql`(metadata->>'pollRetryAt' IS NULL OR (metadata->>'pollRetryAt')::timestamptz <= ${now.toISOString()}::timestamptz)`;
 }

@@ -10,6 +10,7 @@ const mocks = vi.hoisted(() => ({
   getScopedInstantlyTargetPreflight: vi.fn(),
   getAutopilotSettings: vi.fn(),
   getTodaySpendUsd: vi.fn(),
+  getScopedSmokeCandidateReprocessDiagnostics: vi.fn(),
   getScopedSmokeProviderRunDiagnostics: vi.fn(),
   getMultiNicheCampaignInventory: vi.fn(),
   getScopedCampaignProviderSpend: vi.fn(),
@@ -47,6 +48,7 @@ vi.mock("@/infrastructure/neon/repositories/instantly-import-targets", () => ({ 
 vi.mock("@/infrastructure/neon/repositories/autopilot", () => ({ getAutopilotSettings: mocks.getAutopilotSettings }));
 vi.mock("@/infrastructure/neon/repositories/provider-runs", () => ({
   getTodaySpendUsd: mocks.getTodaySpendUsd,
+  getScopedSmokeCandidateReprocessDiagnostics: mocks.getScopedSmokeCandidateReprocessDiagnostics,
   getScopedSmokeProviderRunDiagnostics: mocks.getScopedSmokeProviderRunDiagnostics,
 }));
 vi.mock("@/infrastructure/neon/repositories/multi-niche-rollout", () => ({
@@ -170,6 +172,7 @@ describe("POST /api/admin/discovery/scoped-smoke", () => {
     });
     mocks.getAutopilotSettings.mockResolvedValue({ timezone: "Europe/Madrid", globalDailyTarget: 250 });
     mocks.getTodaySpendUsd.mockResolvedValue(0);
+    mocks.getScopedSmokeCandidateReprocessDiagnostics.mockResolvedValue(null);
     mocks.getScopedSmokeProviderRunDiagnostics.mockResolvedValue({ runs: [], candidates: [] });
     mocks.getMultiNicheCampaignInventory.mockResolvedValue(MULTI_NICHE_ROLLOUT.map((entry) => ({
       campaignId: entry.campaignId,
@@ -787,6 +790,86 @@ describe("POST /api/admin/discovery/scoped-smoke", () => {
     expect(retryPayload.REPROCESSED_REJECTED_CANDIDATE_IDS).toEqual([candidateId]);
     expect(mocks.enqueueProcessingJob).toHaveBeenCalledTimes(1);
     expect(mocks.runProcessingCronTick).toHaveBeenCalledTimes(1);
+  });
+
+  it("resolves an approved candidate's exact persisted smoke execution before reprocessing", async () => {
+    const campaignId = MULTI_NICHE_ROLLOUT[2].campaignId;
+    const smokeExecutionId = "a9d4378f-28d0-4b6f-9f31-cfbe9627539c";
+    const candidateId = "98fd0b30-6dc1-4491-9b43-776065669e1e";
+    const candidate = {
+      id: candidateId,
+      campaign_id: campaignId,
+      provider_run_id: "provider-run-1",
+      source_fingerprint: "entity-fingerprint-1",
+      processed: true,
+      campaign_membership_stage: "rejected",
+      processing_outcome: { icpQualified: false, physicalPresenceVerdict: "verified" },
+    };
+    mocks.getScopedSmokeCandidateReprocessDiagnostics.mockResolvedValueOnce({
+      candidate_id: candidateId,
+      campaign_id: campaignId,
+      provider_run_id: "provider-run-1",
+      discovery_job_id: smokeExecutionId,
+      processed: true,
+      icp_qualified: "false",
+      physical_presence_verdict: "verified",
+      campaign_membership_stage: "rejected",
+      provider: "apify",
+      operation: "maps_search",
+      provider_run_status: "ingested",
+      smoke_execution_id: smokeExecutionId,
+      metadata_niche: "premium_fitness",
+      campaign_niche: "premium_fitness",
+    });
+    mocks.getScopedSmokeJob.mockResolvedValueOnce({
+      id: smokeExecutionId,
+      campaignId,
+      payload: {
+        scopedSmoke: true,
+        smokeExecutionId,
+        provider: "apify",
+        maxCandidates: 1,
+        scopedSmokeResult: { PROVIDER: "apify", PROVIDER_CALL_SUCCEEDED: true },
+      },
+      status: "completed",
+      attemptCount: 1,
+      idempotencyKey: `scoped-smoke:${campaignId}:${smokeExecutionId}`,
+      lastError: null,
+    });
+    mocks.getScopedSmokeProviderRunDiagnostics
+      .mockResolvedValueOnce(apifyRunDiagnostics({ campaignId, smokeExecutionId, status: "ingested", itemsReturned: 1, candidates: [candidate] }))
+      .mockResolvedValueOnce(apifyRunDiagnostics({
+        campaignId,
+        smokeExecutionId,
+        status: "ingested",
+        itemsReturned: 1,
+        candidates: [{ ...candidate, campaign_membership_stage: "qualified", processing_outcome: { icpQualified: true } }],
+      }));
+    mocks.runProcessingCronTick.mockResolvedValueOnce({ jobsCompleted: 1 });
+
+    const response = await POST(request({
+      campaignId,
+      dryRun: false,
+      maxCandidates: 1,
+      probeMode: true,
+      reprocessRejectedCandidates: true,
+      reprocessCandidateIds: [candidateId],
+      allowImport: false,
+    }));
+    const payload = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(mocks.getScopedSmokeCandidateReprocessDiagnostics).toHaveBeenCalledWith(candidateId);
+    expect(mocks.getScopedSmokeJob).toHaveBeenCalledWith(smokeExecutionId);
+    expect(payload.REPROCESSED_REJECTED_CANDIDATE_IDS).toEqual([candidateId]);
+    expect(mocks.enqueueProcessingJob).toHaveBeenCalledWith(expect.objectContaining({
+      campaignId,
+      payload: { rawCandidateId: candidateId },
+      idempotencyKey: `raw_candidate:${candidateId}:niche-reprocess:${smokeExecutionId}`,
+    }));
+    expect(mocks.runProviderRunsCronTick).not.toHaveBeenCalled();
+    expect(mocks.runDiscoveryCronTick).not.toHaveBeenCalled();
+    expect(mocks.runVerificationCronTick).not.toHaveBeenCalled();
   });
 
   it("replays a pending run to ingested without creating a job or provider run", async () => {

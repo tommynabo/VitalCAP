@@ -6,7 +6,7 @@ import { getCampaignById } from "@/infrastructure/neon/repositories/campaigns";
 import { getProductionCapacityDiagnostics } from "@/infrastructure/neon/repositories/production-capacity-diagnostics";
 import { getScopedInstantlyTargetPreflight } from "@/infrastructure/neon/repositories/instantly-import-targets";
 import { getAutopilotSettings } from "@/infrastructure/neon/repositories/autopilot";
-import { getScopedSmokeProviderRunDiagnostics, getTodaySpendUsd } from "@/infrastructure/neon/repositories/provider-runs";
+import { getScopedSmokeCandidateReprocessDiagnostics, getScopedSmokeProviderRunDiagnostics, getTodaySpendUsd } from "@/infrastructure/neon/repositories/provider-runs";
 import { getMultiNicheCampaignInventory, getScopedCampaignProviderSpend } from "@/infrastructure/neon/repositories/multi-niche-rollout";
 import { getSeedEconomicPerformance, listSearchSeedsForCampaignEngine } from "@/infrastructure/neon/repositories/discovery";
 import { enqueueProcessingJob, enqueueScopedSmokeJob, getScopedSmokeJob, persistScopedSmokeResult } from "@/infrastructure/neon/repositories/job-queue";
@@ -51,16 +51,23 @@ const requestSchema = z.object({
   probeMode: z.boolean().default(false),
   smokeExecutionId: z.uuid().optional(),
   reprocessRejectedCandidates: z.boolean().default(false),
+  reprocessCandidateIds: z.array(z.uuid()).length(1).optional(),
   allowImport: z.literal(false).default(false),
 }).strict().superRefine((input, context) => {
   if (!input.dryRun && !input.probeMode) {
     context.addIssue({ code: "custom", path: ["probeMode"], message: "Real scoped smoke requires probeMode=true." });
   }
-  if (!input.dryRun && !input.smokeExecutionId) {
+  if (!input.dryRun && !input.smokeExecutionId && !input.reprocessCandidateIds) {
     context.addIssue({ code: "custom", path: ["smokeExecutionId"], message: "Real scoped smoke requires an explicit execution UUID." });
   }
-  if (input.reprocessRejectedCandidates && (input.dryRun || !input.smokeExecutionId)) {
+  if (input.reprocessRejectedCandidates && (input.dryRun || (!input.smokeExecutionId && !input.reprocessCandidateIds))) {
     context.addIssue({ code: "custom", path: ["reprocessRejectedCandidates"], message: "Rejected candidates can only be reprocessed from an existing real smoke execution." });
+  }
+  if (input.reprocessCandidateIds && !input.reprocessRejectedCandidates) {
+    context.addIssue({ code: "custom", path: ["reprocessCandidateIds"], message: "Exact candidate IDs require rejected-candidate reprocessing." });
+  }
+  if (input.reprocessCandidateIds && input.maxCandidates !== 1) {
+    context.addIssue({ code: "custom", path: ["maxCandidates"], message: "Exact candidate reprocessing requires maxCandidates=1." });
   }
   if (input.reprocessRejectedCandidates && input.maxCandidates > 3) {
     context.addIssue({ code: "custom", path: ["maxCandidates"], message: "Rejected candidate reprocessing is limited to three candidates." });
@@ -235,7 +242,11 @@ function asRecord(value: unknown): Record<string, unknown> | null {
     : null;
 }
 
-async function replayScopedSmoke(job: Awaited<ReturnType<typeof getScopedSmokeJob>>, reprocessRejectedCandidates = false) {
+async function replayScopedSmoke(
+  job: Awaited<ReturnType<typeof getScopedSmokeJob>>,
+  reprocessRejectedCandidates = false,
+  requestedCandidateIds?: readonly string[],
+) {
   if (!job) throw new Error("Scoped smoke job disappeared before replay.");
   const savedResult = asRecord(job.payload.scopedSmokeResult);
   const evidence = asRecord(job.payload.scopedSmokeEvidence) ?? {};
@@ -270,6 +281,7 @@ async function replayScopedSmoke(job: Awaited<ReturnType<typeof getScopedSmokeJo
         const approved = APPROVED_REPROCESS_CANDIDATES[candidateId];
         return approved?.campaignId === job.campaignId
           && approved.niche === rollout?.niche
+          && (!requestedCandidateIds || requestedCandidateIds.includes(candidateId))
           && !previouslyReprocessedCandidateIds.includes(candidateId);
       })
       : progress.unprocessedCandidateIds)
@@ -348,6 +360,44 @@ async function replayScopedSmoke(job: Awaited<ReturnType<typeof getScopedSmokeJo
     status: progress.response.PROBE_STATUS === "PENDING" || job.status === "pending" || job.status === "processing" ? 202 : 200,
     headers: { "Cache-Control": "no-store" },
   });
+}
+
+async function reprocessApprovedCandidate(candidateId: string, campaignId: string, workspaceId: string) {
+  const approved = APPROVED_REPROCESS_CANDIDATES[candidateId];
+  if (!approved || approved.campaignId !== campaignId) {
+    return NextResponse.json({ error: "Candidate ID is not allowlisted for this campaign." }, { status: 409 });
+  }
+
+  const candidate = await getScopedSmokeCandidateReprocessDiagnostics(candidateId);
+  const smokeExecutionId = typeof candidate?.smoke_execution_id === "string" ? candidate.smoke_execution_id : null;
+  if (!candidate || candidate.candidate_id !== candidateId
+    || candidate.campaign_id !== approved.campaignId
+    || candidate.provider !== "apify"
+    || candidate.operation !== "maps_search"
+    || candidate.provider_run_status !== "ingested"
+    || candidate.metadata_niche !== approved.niche
+    || candidate.campaign_niche !== approved.niche
+    || candidate.discovery_job_id !== smokeExecutionId
+    || candidate.processed !== true
+    || candidate.physical_presence_verdict !== "verified"
+    || candidate.campaign_membership_stage !== "rejected"
+    || candidate.icp_qualified !== "false"
+    || !smokeExecutionId) {
+    return NextResponse.json({ error: "Candidate does not match the approved rejected-ICP smoke evidence." }, { status: 409 });
+  }
+
+  const job = await getScopedSmokeJob(smokeExecutionId);
+  if (!job || job.campaignId !== approved.campaignId
+    || job.payload.smokeExecutionId !== smokeExecutionId
+    || job.payload.scopedSmoke !== true
+    || job.status === "pending" || job.status === "processing") {
+    return NextResponse.json({ error: "Candidate smoke execution is not a completed exact campaign run." }, { status: 409 });
+  }
+  const campaign = await getCampaignById(job.campaignId);
+  if (!campaign || campaign.workspaceId !== workspaceId) {
+    return NextResponse.json({ error: "Candidate smoke execution was not found in the current workspace." }, { status: 404 });
+  }
+  return replayScopedSmoke(job, true, [candidateId]);
 }
 
 const POLLABLE_PROVIDER_RUN_STATUSES = new Set(["starting", "queued", "running", "succeeded"]);
@@ -533,6 +583,10 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: "Invalid scoped smoke request.", details: parsed.error.issues }, { status: 400 });
     }
     const input = parsed.data;
+    const reprocessCandidateId = input.reprocessCandidateIds?.[0];
+    if (reprocessCandidateId) {
+      return reprocessApprovedCandidate(reprocessCandidateId, input.campaignId, workspaceId);
+    }
     let existingJob = null;
     if (!input.dryRun && input.smokeExecutionId) {
       existingJob = await getScopedSmokeJob(input.smokeExecutionId);
