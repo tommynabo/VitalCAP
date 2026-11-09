@@ -6,14 +6,13 @@ import { getCampaignById } from "@/infrastructure/neon/repositories/campaigns";
 import { getProductionCapacityDiagnostics } from "@/infrastructure/neon/repositories/production-capacity-diagnostics";
 import { getScopedInstantlyTargetPreflight } from "@/infrastructure/neon/repositories/instantly-import-targets";
 import { getAutopilotSettings } from "@/infrastructure/neon/repositories/autopilot";
-import { getTodaySpendUsd } from "@/infrastructure/neon/repositories/provider-runs";
+import { getScopedSmokeProviderRunDiagnostics, getTodaySpendUsd } from "@/infrastructure/neon/repositories/provider-runs";
 import { getMultiNicheCampaignInventory, getScopedCampaignProviderSpend } from "@/infrastructure/neon/repositories/multi-niche-rollout";
 import { getSeedEconomicPerformance, listSearchSeedsForCampaignEngine } from "@/infrastructure/neon/repositories/discovery";
 import { enqueueScopedSmokeJob, getScopedSmokeJob, persistScopedSmokeResult } from "@/infrastructure/neon/repositories/job-queue";
 import { runDiscoveryCronTick } from "@/infrastructure/jobs/runners/discovery-runner";
 import { runProviderRunsCronTick } from "@/infrastructure/jobs/runners/provider-runs-runner";
 import { runProcessingCronTick } from "@/infrastructure/jobs/runners/processing-runner";
-import { enqueueVerificationJobs, runVerificationCronTick } from "@/infrastructure/jobs/runners/verification-runner";
 import { buildEngineCapabilities } from "@/services/autopilot/engine-capability";
 import { COLD_START_IMPORT_SAMPLE, planningWindowKey, resolveOperationalEnvelope, routeCampaignsToAvailableEngines } from "@/services/autopilot/target-planner";
 import { getMultiNicheRolloutEntry, MULTI_NICHE_ROLLOUT } from "@/services/autopilot/multi-niche-rollout";
@@ -217,49 +216,226 @@ function asRecord(value: unknown): Record<string, unknown> | null {
 async function replayScopedSmoke(job: Awaited<ReturnType<typeof getScopedSmokeJob>>) {
   if (!job) throw new Error("Scoped smoke job disappeared before replay.");
   const savedResult = asRecord(job.payload.scopedSmokeResult);
-  if (savedResult) {
-    return NextResponse.json({ ...savedResult, IDEMPOTENT_REPLAY: true }, {
-      headers: { "Cache-Control": "no-store" },
-    });
-  }
   const evidence = asRecord(job.payload.scopedSmokeEvidence) ?? {};
   const startedAt = typeof job.payload.startedAt === "string" ? new Date(job.payload.startedAt) : null;
-  const providerSpendUsd = startedAt && Number.isFinite(startedAt.getTime())
+  const providerSpendUsd = savedResult?.PROVIDER_SPEND_USD ?? (startedAt && Number.isFinite(startedAt.getTime())
     ? await getScopedCampaignProviderSpend(job.campaignId, startedAt)
-    : null;
+    : null);
+  const provider = String(savedResult?.PROVIDER ?? job.payload.provider ?? "unknown");
+  const rollout = getMultiNicheRolloutEntry(job.campaignId);
+  let progress = await getScopedSmokeProgress({
+    campaignId: job.campaignId,
+    smokeExecutionId: job.id,
+    niche: rollout?.niche ?? null,
+    provider,
+    providerCallAttempted: savedResult?.PROVIDER_CALL_ATTEMPTED === true || evidence.providerCallAttempted === true,
+    providerCallSucceeded: savedResult?.PROVIDER_CALL_SUCCEEDED === true || evidence.providerCallSucceeded === true,
+    fallbackCandidatesInserted: savedResult?.RAW_CANDIDATES_INSERTED ?? evidence.rawCandidatesInserted,
+      fallbackResultsReturned: savedResult?.RESULTS_RETURNED ?? evidence.resultsReturned,
+    pollExistingRun: true,
+  });
+  let processing = null;
+  const pendingCandidateIds = progress.ownershipExact
+    ? progress.unprocessedCandidateIds.slice(0, Number(job.payload.maxCandidates ?? 5))
+    : [];
+  if (progress.resultsFinal && pendingCandidateIds.length > 0) {
+    processing = await runProcessingCronTick(pendingCandidateIds.length, startedAt ?? new Date(), {
+      campaignId: job.campaignId,
+      allowScopedDraftCampaign: true,
+      rawCandidateIds: pendingCandidateIds,
+      enrichContacts: false,
+      allowMapsFastWebsiteRecovery: false,
+      correlationId: job.id,
+      timeBudgetMs: 60_000,
+    });
+    progress = await getScopedSmokeProgress({
+      campaignId: job.campaignId,
+      smokeExecutionId: job.id,
+      niche: rollout?.niche ?? null,
+      provider,
+      providerCallAttempted: savedResult?.PROVIDER_CALL_ATTEMPTED === true || evidence.providerCallAttempted === true,
+      providerCallSucceeded: savedResult?.PROVIDER_CALL_SUCCEEDED === true || evidence.providerCallSucceeded === true,
+      fallbackResultsReturned: savedResult?.RESULTS_RETURNED ?? evidence.resultsReturned,
+      fallbackCandidatesInserted: savedResult?.RAW_CANDIDATES_INSERTED ?? evidence.rawCandidatesInserted,
+      pollExistingRun: false,
+    });
+  }
   const payload = {
+    ...(savedResult ?? {}),
     ok: true,
     dryRun: false,
     IDEMPOTENT_REPLAY: true,
     EXECUTION_STATE: job.status,
     SMOKE_EXECUTION_ID: job.id,
     JOB_ID: job.id,
-    JOB_CLAIMED: evidence.jobClaimed === true || job.attemptCount > 0,
-    COLD_START: job.payload.coldStart === true,
-    SELECTION_REASON: job.payload.selectionReason ?? null,
-    PROVIDER: job.payload.provider ?? null,
+    JOB_CLAIMED: evidence.jobClaimed === true || savedResult?.JOB_CLAIMED === true || job.attemptCount > 0,
+    COLD_START: job.payload.coldStart === true || savedResult?.COLD_START === true,
+    SELECTION_REASON: job.payload.selectionReason ?? savedResult?.SELECTION_REASON ?? null,
     PROVIDER_ENGINE: job.payload.engineType ?? null,
     PROVIDER_HEALTH: job.payload.providerHealth ?? null,
     SEED_ID: job.payload.seedId ?? null,
     SEED_QUERY: job.payload.seedQuery ?? null,
     GEOGRAPHY: job.payload.seedGeography ?? null,
-    PROVIDER_CALL_ATTEMPTED: evidence.providerCallAttempted === true,
-    PROVIDER_CALL_SUCCEEDED: evidence.providerCallSucceeded === true,
-    PROVIDER_CALL_ERROR_CLASS: evidence.providerCallErrorClass ?? null,
-    PROVIDER_QUERIES_USED: evidence.providerQueriesUsed ?? 0,
-    RESULTS_RETURNED: evidence.resultsReturned ?? 0,
-    RAW_CANDIDATES_INSERTED: evidence.rawCandidatesInserted ?? 0,
-    DUPLICATES: evidence.duplicates ?? 0,
-    CANDIDATE_COUNT: evidence.candidateCount ?? 0,
+    PROVIDER_CALL_ATTEMPTED: savedResult?.PROVIDER_CALL_ATTEMPTED === true || evidence.providerCallAttempted === true,
+    PROVIDER_CALL_SUCCEEDED: savedResult?.PROVIDER_CALL_SUCCEEDED === true || evidence.providerCallSucceeded === true,
+    PROVIDER_CALL_ERROR_CLASS: evidence.providerCallErrorClass ?? savedResult?.PROVIDER_CALL_ERROR_CLASS ?? null,
+    PROVIDER_QUERIES_USED: evidence.providerQueriesUsed ?? savedResult?.PROVIDER_QUERIES_USED ?? 0,
+    ...progress.response,
+    DUPLICATES: Number(evidence.duplicates ?? 0) + Number(progress.response.DUPLICATE_COUNT ?? 0),
+    CANDIDATE_COUNT: progress.response.RAW_CANDIDATES_INSERTED,
+    processing,
+    PROCESSING_STATUS: processing
+      ? processing.jobsCompleted > 0 ? "COMPLETED" : "CLAIMED_NONE"
+      : progress.response.PROCESSING_STATUS,
     PROVIDER_SPEND_USD: providerSpendUsd,
     IMPORT_ALLOWED: false,
     IMPORT_BLOCKED: true,
     AUTO_SEND_ENABLED,
   };
+  await persistScopedSmokeResult({ jobId: job.id, campaignId: job.campaignId, result: payload });
   return NextResponse.json(payload, {
-    status: job.status === "pending" || job.status === "processing" ? 202 : 200,
+    status: progress.response.PROBE_STATUS === "PENDING" || job.status === "pending" || job.status === "processing" ? 202 : 200,
     headers: { "Cache-Control": "no-store" },
   });
+}
+
+const POLLABLE_PROVIDER_RUN_STATUSES = new Set(["starting", "queued", "running", "succeeded"]);
+const PENDING_PROVIDER_RUN_STATUSES = new Set([...POLLABLE_PROVIDER_RUN_STATUSES, "ingesting"]);
+const ROLLOUT_CAMPAIGN_IDS = new Set<string>(MULTI_NICHE_ROLLOUT.map((entry) => entry.campaignId));
+
+async function getScopedSmokeProgress(input: {
+  campaignId: string;
+  smokeExecutionId: string;
+  niche: string | null;
+  provider: string;
+  providerCallAttempted: boolean;
+  providerCallSucceeded: boolean;
+  fallbackCandidatesInserted: unknown;
+  fallbackResultsReturned?: unknown;
+  pollExistingRun: boolean;
+}) {
+  let diagnostics = await getScopedSmokeProviderRunDiagnostics(input.smokeExecutionId);
+  const oneRun = diagnostics.runs.length === 1 ? diagnostics.runs[0] : null;
+  const initialRunStatus = typeof oneRun?.status === "string" ? oneRun.status : null;
+  if (input.pollExistingRun && input.provider === "apify" && oneRun
+    && oneRun.campaign_id === input.campaignId
+    && oneRun.discovery_job_id === input.smokeExecutionId
+    && initialRunStatus && POLLABLE_PROVIDER_RUN_STATUSES.has(initialRunStatus)) {
+    await runProviderRunsCronTick(1, { campaignId: input.campaignId, discoveryJobId: input.smokeExecutionId });
+    diagnostics = await getScopedSmokeProviderRunDiagnostics(input.smokeExecutionId);
+  }
+
+  const runs = diagnostics.runs;
+  const run = runs.length === 1 ? runs[0] : null;
+  const providerRunStatus = typeof run?.status === "string" ? run.status : null;
+  const candidateCampaignIds = new Set(diagnostics.candidates.map((candidate) => String(candidate.campaign_id)));
+  const ownershipErrors = runs.filter((item) => item.campaign_id !== input.campaignId).length
+    + diagnostics.candidates.filter((candidate) => candidate.campaign_id !== input.campaignId
+      || (run && candidate.provider_run_id !== run.provider_run_id)).length;
+  const legacyLeakageErrors = runs.filter((item) => !ROLLOUT_CAMPAIGN_IDS.has(String(item.campaign_id))).length
+    + diagnostics.candidates.filter((candidate) => !ROLLOUT_CAMPAIGN_IDS.has(String(candidate.campaign_id))).length;
+  const metadataNiche = typeof run?.metadata_niche === "string" ? run.metadata_niche : null;
+  const campaignNiche = typeof run?.campaign_niche === "string" ? run.campaign_niche : null;
+  const nicheMismatch = (metadataNiche !== null && input.niche !== null && metadataNiche !== input.niche)
+    || (campaignNiche !== null && input.niche !== null && campaignNiche !== input.niche);
+  const ownershipExact = runs.length === 1
+    ? ownershipErrors === 0 && legacyLeakageErrors === 0 && !nicheMismatch
+    : runs.length === 0 && diagnostics.candidates.length === 0 && input.provider !== "apify";
+  const resultIsFinal = input.provider === "apify"
+    ? providerRunStatus === "ingested"
+    : input.providerCallAttempted && input.providerCallSucceeded;
+  const providerRunFailure = providerRunStatus === "failed" || providerRunStatus === "aborted"
+    || providerRunStatus === "timed_out" || providerRunStatus === "manual_reconciliation_required";
+  const probeStatus = runs.length > 1 || ownershipErrors > 0 || legacyLeakageErrors > 0 || nicheMismatch
+    ? "FAILED"
+    : providerRunStatus === "budget_blocked"
+      ? "BUDGET_BLOCKED"
+      : providerRunFailure
+        ? "FAILED"
+        : input.provider === "apify" && !run && input.providerCallSucceeded
+          ? "PENDING"
+          : input.provider === "apify" && PENDING_PROVIDER_RUN_STATUSES.has(providerRunStatus ?? "")
+            ? "PENDING"
+            : resultIsFinal
+              ? input.provider === "apify" && Number(run?.items_returned ?? 0) === 0 ? "FINAL_ZERO_RESULTS" : "INGESTED"
+              : input.providerCallAttempted && !input.providerCallSucceeded ? "FAILED" : "QUEUED";
+  const accounting = asRecord(run?.ingestion_accounting) ?? {};
+  const insertedFromAccounting = Number(accounting.INSERTED_NEW_RAW);
+  const resultsReturned = resultIsFinal
+    ? input.provider === "apify" ? Number(run?.items_returned ?? 0) : Number(input.fallbackResultsReturned ?? 0)
+    : input.provider === "apify" ? null : Number(input.fallbackResultsReturned ?? 0);
+  const rawCandidatesInserted = input.provider === "apify"
+    ? Number.isFinite(insertedFromAccounting) ? insertedFromAccounting : 0
+    : Number(input.fallbackCandidatesInserted ?? 0);
+  const unprocessedCandidateIds = diagnostics.candidates
+    .filter((candidate) => candidate.campaign_id === input.campaignId
+      && (!run || candidate.provider_run_id === run.provider_run_id)
+      && candidate.processed !== true)
+    .map((candidate) => String(candidate.id));
+    const accountIds = diagnostics.candidates
+      .map((candidate) => typeof candidate.account_id === "string" ? candidate.account_id : null)
+      .filter((accountId): accountId is string => accountId !== null);
+    const duplicateAccountCount = accountIds.length - new Set(accountIds).size;
+  const response = {
+    SOURCE_CAMPAIGN_ID: input.campaignId,
+    NICHE: input.niche,
+    PROVIDER: input.provider,
+    PROVIDER_RUN_ID: run?.provider_run_id ?? null,
+    EXTERNAL_PROVIDER_RUN_ID: run?.external_run_id ?? null,
+    PROVIDER_DATASET_ID: run?.external_dataset_id ?? null,
+    PROVIDER_RUN_STARTED_AT: run?.started_at ?? null,
+    PROVIDER_SEED_ID: run?.metadata_seed_id ?? run?.seed_id ?? null,
+    PROVIDER_RUN_CAMPAIGN_ID: run?.campaign_id ?? null,
+    PROVIDER_RUN_NICHE: metadataNiche ?? campaignNiche,
+    PROVIDER_RUN_NICHE_METADATA: metadataNiche,
+    PROVIDER_CAMPAIGN_NICHE: campaignNiche,
+    PROVIDER_RUN_STATUS: providerRunStatus,
+    PROVIDER_FINAL_STATUS: providerRunStatus && !PENDING_PROVIDER_RUN_STATUSES.has(providerRunStatus)
+      ? providerRunStatus
+      : null,
+    PROBE_STATUS: probeStatus,
+    RESULTS_FINAL: resultIsFinal,
+    RESULTS_RETURNED: resultsReturned,
+    DATASET_ITEMS: resultIsFinal && input.provider === "apify" ? Number(run?.items_returned ?? 0) : null,
+    RAW_CANDIDATES_INSERTED: rawCandidatesInserted,
+    RAW_CANDIDATES_LINKED: diagnostics.candidates.length,
+      RAW_CANDIDATE_IDS: diagnostics.candidates.map((candidate) => candidate.id),
+      CANDIDATE_CLASSIFICATION: diagnostics.candidates.map((candidate) => {
+        const outcome = asRecord(candidate.processing_outcome) ?? {};
+        return {
+          candidateId: candidate.id,
+          campaignId: candidate.campaign_id,
+          providerRunId: candidate.provider_run_id,
+          businessType: outcome.businessType ?? candidate.business_type ?? null,
+          physicalPresenceVerdict: outcome.physicalPresenceVerdict ?? null,
+          icpQualified: outcome.icpQualified ?? null,
+          duplicate: outcome.duplicate ?? null,
+          matchedExistingAccount: outcome.matchedExistingAccount ?? null,
+          countryCode: candidate.account_country_code ?? null,
+          hasPostalCode: Boolean(candidate.account_postal_code),
+          hasCoordinates: candidate.has_coordinates === true,
+          processed: candidate.processed === true,
+          campaignMembershipStage: candidate.campaign_membership_stage ?? null,
+          qualified: candidate.campaign_membership_stage === "qualified"
+            || candidate.campaign_membership_stage === "ready",
+        };
+      }),
+    RAW_CANDIDATE_CAMPAIGNS: [...candidateCampaignIds].map((campaignId) => ({
+      campaignId,
+      count: diagnostics.candidates.filter((candidate) => String(candidate.campaign_id) === campaignId).length,
+    })),
+    ENTITY_FINGERPRINTS: diagnostics.candidates.map((candidate) => candidate.source_fingerprint),
+    CROSS_CAMPAIGN_OWNERSHIP_ERRORS: ownershipErrors + (nicheMismatch ? 1 : 0),
+    LEGACY_LEAKAGE_ERRORS: legacyLeakageErrors,
+    PROCESSING_STATUS: diagnostics.candidates.length === 0
+      ? "NOT_STARTED"
+      : diagnostics.candidates.every((candidate) => candidate.processed === true) ? "COMPLETED" : "PENDING",
+    QUALIFIED_COUNT: diagnostics.candidates.filter((candidate) => candidate.campaign_membership_stage === "qualified"
+      || candidate.campaign_membership_stage === "ready").length,
+    DUPLICATE_COUNT: Number(accounting.DUPLICATE_EXISTING_RAW ?? 0) + duplicateAccountCount,
+    OWNERSHIP_EXACT: ownershipExact,
+  };
+  return { response, ownershipExact, unprocessedCandidateIds, resultsFinal: resultIsFinal };
 }
 
 export async function POST(request: Request) {
@@ -289,6 +465,10 @@ export async function POST(request: Request) {
         if (existingJob.campaignId !== input.campaignId
           || existingJob.payload.smokeExecutionId !== input.smokeExecutionId) {
           return NextResponse.json({ error: "Smoke execution ID is already bound to another campaign or request." }, { status: 409 });
+        }
+        const existingCampaign = await getCampaignById(existingJob.campaignId);
+        if (!existingCampaign || existingCampaign.workspaceId !== workspaceId) {
+          return NextResponse.json({ error: "Smoke execution was not found in the current workspace." }, { status: 404 });
         }
         if (existingJob.status !== "pending" || existingJob.payload.scopedSmokeEvidence) {
           return replayScopedSmoke(existingJob);
@@ -417,35 +597,47 @@ export async function POST(request: Request) {
     const providerRuns = evidence.providerCallAttempted && evidence.providerCallSucceeded && plan.provider === "apify"
       ? await runProviderRunsCronTick(1, { campaignId: plan.campaign.id, discoveryJobId: smokeExecutionId })
       : null;
-    const returnedResults = Math.max(evidence.resultsReturned, providerRuns?.itemsReturned ?? 0);
-    const insertedFromProviderRun = providerRuns?.candidatesInserted ?? 0;
-    const candidateCount = Math.min(input.maxCandidates, evidence.rawCandidatesInserted + insertedFromProviderRun);
-    const duplicates = evidence.duplicates + (providerRuns?.ingestionAccounting?.DUPLICATE_EXISTING_RAW ?? 0);
-    const processing = candidateCount > 0
-      ? await runProcessingCronTick(Math.min(input.maxCandidates, candidateCount), startedAt, {
+    let progress = await getScopedSmokeProgress({
+      campaignId: plan.campaign.id,
+      smokeExecutionId,
+      niche: plan.niche,
+      provider: plan.provider,
+      providerCallAttempted: evidence.providerCallAttempted,
+      providerCallSucceeded: evidence.providerCallSucceeded,
+      fallbackResultsReturned: evidence.resultsReturned,
+      fallbackCandidatesInserted: evidence.rawCandidatesInserted,
+      pollExistingRun: false,
+    });
+    const pendingCandidateIds = progress.ownershipExact
+      ? progress.unprocessedCandidateIds.slice(0, input.maxCandidates)
+      : [];
+    const processing = progress.response.RESULTS_FINAL && pendingCandidateIds.length > 0
+      ? await runProcessingCronTick(pendingCandidateIds.length, startedAt, {
         campaignId: plan.campaign.id,
         allowScopedDraftCampaign: true,
-        createdSince: startedAt,
-        enrichContacts: true,
+        rawCandidateIds: pendingCandidateIds,
+        enrichContacts: false,
+        allowMapsFastWebsiteRecovery: false,
+        correlationId: smokeExecutionId,
         timeBudgetMs: 60_000,
       })
       : null;
-    const verification = candidateCount > 0
-      ? await (async () => {
-        await enqueueVerificationJobs({
-          campaignId: plan.campaign.id,
-          allowScopedDraftCampaign: true,
-          createdSince: startedAt,
-          batchSize: Math.min(input.maxCandidates, candidateCount),
-        });
-        return runVerificationCronTick(Math.min(input.maxCandidates, candidateCount), {
-          campaignId: plan.campaign.id,
-          allowScopedDraftCampaign: true,
-          createdSince: startedAt,
-          skipInstantlyImport: true,
-        });
-      })()
-      : null;
+    if (processing) {
+      progress = await getScopedSmokeProgress({
+        campaignId: plan.campaign.id,
+        smokeExecutionId,
+        niche: plan.niche,
+        provider: plan.provider,
+        providerCallAttempted: evidence.providerCallAttempted,
+        providerCallSucceeded: evidence.providerCallSucceeded,
+        fallbackResultsReturned: evidence.resultsReturned,
+        fallbackCandidatesInserted: evidence.rawCandidatesInserted,
+        pollExistingRun: false,
+      });
+    }
+    const candidateCount = Math.min(input.maxCandidates, progress.response.RAW_CANDIDATES_INSERTED);
+    const duplicates = evidence.duplicates + progress.response.DUPLICATE_COUNT;
+    const returnedResults = progress.response.RESULTS_RETURNED;
     const providerSpendUsd = await getScopedCampaignProviderSpend(plan.campaign.id, startedAt);
     logEvent("info", "admin.scoped_multi_niche_smoke.completed", {
       correlationId: smokeExecutionId,
@@ -460,7 +652,7 @@ export async function POST(request: Request) {
       providerRunsChecked: providerRuns?.runsChecked ?? 0,
       providerRunsIngested: providerRuns?.runsIngested ?? 0,
       processingJobsCompleted: processing?.jobsCompleted ?? 0,
-      verificationJobsClaimed: verification?.jobsClaimed ?? 0,
+      verificationJobsClaimed: 0,
       importsAllowed: false,
       autoSendEnabled: AUTO_SEND_ENABLED,
     });
@@ -475,8 +667,9 @@ export async function POST(request: Request) {
       PROVIDER_CALL_SUCCEEDED: evidence.providerCallSucceeded,
       PROVIDER_CALL_ERROR_CLASS: evidence.providerCallErrorClass,
       PROVIDER_QUERIES_USED: Math.min(1, evidence.providerQueriesUsed),
+      ...progress.response,
       RESULTS_RETURNED: returnedResults,
-      RAW_CANDIDATES_INSERTED: candidateCount,
+      RAW_CANDIDATES_INSERTED: progress.response.RAW_CANDIDATES_INSERTED,
       DUPLICATES: duplicates,
       CANDIDATE_COUNT: candidateCount,
       IMPORT_ALLOWED: false,
@@ -484,7 +677,11 @@ export async function POST(request: Request) {
       discovery,
       providerRuns,
       processing,
-      verification,
+      PROCESSING_STATUS: processing
+        ? processing.jobsCompleted > 0 ? "COMPLETED" : "CLAIMED_NONE"
+        : progress.response.PROCESSING_STATUS,
+      verification: null,
+      VERIFICATION_SKIPPED_REASON: "Scoped async discovery does not trigger email verification.",
       candidateCount,
       discoverySkippedReason: evidence.providerCallAttempted ? null : evidence.providerCallErrorClass ?? "No provider call was attempted.",
       PROVIDER_SPEND_USD: providerSpendUsd,
@@ -495,7 +692,10 @@ export async function POST(request: Request) {
       campaignId: plan.campaign.id,
       result: responsePayload,
     });
-    return NextResponse.json(responsePayload, { headers: { "Cache-Control": "no-store" } });
+    return NextResponse.json(responsePayload, {
+      status: progress.response.PROBE_STATUS === "PENDING" ? 202 : 200,
+      headers: { "Cache-Control": "no-store" },
+    });
   } catch (error) {
     if (error instanceof UnauthorizedError) {
       return NextResponse.json({ error: "Authentication required." }, { status: 401 });

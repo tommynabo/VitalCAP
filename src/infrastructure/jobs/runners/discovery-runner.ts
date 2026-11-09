@@ -737,6 +737,7 @@ async function executeDiscoveryJob(
           recoveryProbe,
           metadata: {
             engineType: job.payload.engineType,
+            niche: typeof campaign.engineConfig?.niche === "string" ? campaign.engineConfig.niche : null,
             seedId: seed.id,
             ...(provider === "apify" && economicBatchBySeed.get(seed.id) ? {
               seedEconomicTier: economicBatchBySeed.get(seed.id)!.policy.tier,
@@ -932,6 +933,7 @@ async function executeDiscoveryJob(
           result.providerRun.metadata,
           {
             engineType: job.payload.engineType,
+            niche: typeof campaign.engineConfig?.niche === "string" ? campaign.engineConfig.niche : null,
             seedId: seed.id,
             seedRunId,
             discoveryJobId: job.id,

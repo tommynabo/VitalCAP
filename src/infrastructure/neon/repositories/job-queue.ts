@@ -607,6 +607,9 @@ export function buildClaimJobsQuery(table: QueueTable, input: ClaimJobsInput, no
   const inputCampaignId = input.campaignId ?? null;
   const inputJobId = input.jobId ?? null;
   const inputCreatedSince = input.createdSince?.toISOString() ?? null;
+  const rawCandidateIdFilter = input.rawCandidateIds?.length
+    ? sql`j.payload->>'rawCandidateId' IN (${sql.join(input.rawCandidateIds.map((id) => sql`${id}`), sql`, `)})`
+    : sql`true`;
   const rolloutCampaignIdList = sql.join(MULTI_NICHE_ROLLOUT_CAMPAIGN_IDS.map((campaignId) => sql`${campaignId}::uuid`), sql`, `);
   const scopedDraftCampaign = input.allowScopedDraftCampaign && inputCampaignId !== null
     ? sql`c.id = ${inputCampaignId}::uuid
@@ -696,6 +699,7 @@ export function buildClaimJobsQuery(table: QueueTable, input: ClaimJobsInput, no
               AND (${inputCampaignId}::uuid IS NULL OR j.campaign_id = ${inputCampaignId}::uuid)
               AND (${inputJobId}::uuid IS NULL OR j.id = ${inputJobId}::uuid)
               AND (${inputCreatedSince}::timestamptz IS NULL OR j.created_at >= ${inputCreatedSince}::timestamptz)
+              AND ${rawCandidateIdFilter}
               AND j.status IN ('pending', 'processing')
               AND (j.next_attempt_at IS NULL OR j.next_attempt_at <= ${nowIso}::timestamptz)
               AND j.attempt_count < j.max_attempts
@@ -728,6 +732,7 @@ export interface ClaimJobsInput {
   batchSize: number;
   campaignId?: string;
   jobId?: string;
+  rawCandidateIds?: string[];
   requireAutopilot?: boolean;
   allowWatchdogRecovery?: boolean;
   allowScopedDraftCampaign?: boolean;

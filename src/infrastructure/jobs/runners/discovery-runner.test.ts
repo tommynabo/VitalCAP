@@ -36,7 +36,7 @@ describe("Apify discovery reservation state", () => {
         credentialFingerprint: "provider-returned-other-fingerprint",
         configurationFingerprint: "provider-returned-other-configuration",
       },
-      { engineType: "maps_fast", seedId: "seed-id", seedRunId: "seed-run-id", discoveryJobId: "job-id" },
+      { engineType: "maps_fast", niche: "yoga_pilates", seedId: "seed-id", seedRunId: "seed-run-id", discoveryJobId: "job-id" },
     );
 
     expect(metadata).toMatchObject({
@@ -46,6 +46,7 @@ describe("Apify discovery reservation state", () => {
       normalizedQuery: "cafes madrid",
       planningWindow: "2026-10-24T13:30",
       engineType: "maps_fast",
+      niche: "yoga_pilates",
       seedId: "seed-id",
       seedRunId: "seed-run-id",
       discoveryJobId: "job-id",

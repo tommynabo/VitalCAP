@@ -163,6 +163,25 @@ describe("evaluateStructuredWebsiteLocation", () => {
   });
 });
 
+describe("scoped processing candidate filter", () => {
+  it("passes exact raw candidate IDs to the processing-job claim", async () => {
+    const rawCandidateIds = ["raw-candidate-1", "raw-candidate-2"];
+    mocks.claimProcessingJobs.mockResolvedValueOnce([]);
+    await runProcessingCronTick(2, new Date(), {
+      campaignId: "campaign-id",
+      allowScopedDraftCampaign: true,
+      rawCandidateIds,
+      enrichContacts: false,
+    });
+
+    expect(mocks.claimProcessingJobs).toHaveBeenCalledWith(expect.objectContaining({
+      campaignId: "campaign-id",
+      allowScopedDraftCampaign: true,
+      rawCandidateIds,
+    }));
+  });
+});
+
 describe("processing write failure diagnostics", () => {
   it("logs only safe nested PostgreSQL conflict metadata and the write stage", async () => {
     const nestedError = Object.assign(new Error("private database message"), {
@@ -1073,6 +1092,15 @@ describe("runProcessingCronTick", () => {
 
     expect(mocks.createSerpDiscoveryProvider).not.toHaveBeenCalled();
     expect(mocks.markRawCandidateProcessed).toHaveBeenCalledTimes(1);
+    expect(mocks.markRawCandidateProcessed).toHaveBeenCalledWith("raw-candidate-id", expect.objectContaining({
+      candidateOutcome: {
+        businessType: "pharmacy",
+        physicalPresenceVerdict: "needs_review",
+        icpQualified: true,
+        duplicate: false,
+        matchedExistingAccount: false,
+      },
+    }));
     expect(mocks.completeProcessingJob).toHaveBeenCalledWith(expect.objectContaining({ jobId: "maps-fast-recovery" }));
   });
 

@@ -66,6 +66,8 @@ export interface ProcessingRunnerOptions {
   campaignId?: string;
   allowScopedDraftCampaign?: true;
   createdSince?: Date;
+  rawCandidateIds?: string[];
+  allowMapsFastWebsiteRecovery?: boolean;
   correlationId?: string;
   timeBudgetMs?: number;
   perJobBudgetMs?: number;
@@ -106,6 +108,19 @@ function resolveMembershipStage(processed: ProcessedCandidateResult): { stage: C
   if (!processed.icpQualified) return { stage: "rejected", rejectionReason: processed.rejectionReason };
   if (processed.spainVerdict === "needs_review") return { stage: "discovered", rejectionReason: processed.rejectionReason };
   return { stage: "qualified", rejectionReason: processed.rejectionReason };
+}
+
+function addCandidateOutcome(processed: ProcessedCandidateResult): CandidateProcessingMetrics {
+  return {
+    ...processed.processingMetrics,
+    candidateOutcome: {
+      businessType: processed.businessType,
+      physicalPresenceVerdict: processed.spainVerdict,
+      icpQualified: processed.icpQualified,
+      duplicate: processed.isDuplicate,
+      matchedExistingAccount: processed.matchedAccountKey !== null,
+    },
+  };
 }
 
 function mergeWebsiteEmailSource(
@@ -348,7 +363,8 @@ async function executeProcessingJob(
     deferVerification: true,
     existingProcessingMetrics,
     niche: getNicheId(campaign.engineConfig?.niche) ?? undefined,
-    ...(raw.engineType === "maps_fast" && payload.kind === "maps" && !job.payload.skipMapsFastWebsiteRecovery ? {
+    ...(raw.engineType === "maps_fast" && payload.kind === "maps"
+      && !job.payload.skipMapsFastWebsiteRecovery && options.allowMapsFastWebsiteRecovery !== false ? {
       recoverMapsFastWebsite: async (place) => {
         const query = buildMapsFastWebsiteRecoveryQuery(place);
         if (!query) return { status: "blocked" as const };
@@ -510,7 +526,7 @@ async function executeProcessingJob(
 
   if (canonicalResolution.kind === "needsReview") {
     finishWebsiteAttribution(processed.processingMetrics);
-    await runProcessingWriteStage(diagnostics, "MARK_RAW_PROCESSED", () => markRawCandidateProcessed(raw.id, processed.processingMetrics));
+    await runProcessingWriteStage(diagnostics, "MARK_RAW_PROCESSED", () => markRawCandidateProcessed(raw.id, addCandidateOutcome(processed)));
     return;
   }
 
@@ -601,7 +617,7 @@ async function executeProcessingJob(
     contactPointsCreated: 0,
     verificationQueued: 0,
   };
-  const processingMetrics: CandidateProcessingMetrics = { ...processed.processingMetrics };
+  const processingMetrics = addCandidateOutcome(processed);
   const currentWebsiteEmailFacts = new Map<string, WebsiteEvidenceFact>();
 
   // --- WEBSITE ENRICHMENT ---
@@ -974,6 +990,7 @@ export async function runProcessingCronTick(
             requireAutopilot: options.campaignId === undefined,
             allowScopedDraftCampaign: options.allowScopedDraftCampaign,
             createdSince: options.createdSince,
+            rawCandidateIds: options.rawCandidateIds,
           }),
           cronDeadline.signal,
         )));

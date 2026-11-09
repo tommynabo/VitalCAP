@@ -132,6 +132,22 @@ describe("job queue SQL builders", () => {
     expect(query.params).toContain(createdSince.toISOString());
   });
 
+  it("restricts scoped processing claims to the exact raw candidate IDs", () => {
+    const rawCandidateIds = ["raw-candidate-1", "raw-candidate-2"];
+    const query = dialect.sqlToQuery(buildClaimJobsQuery("processing_jobs", {
+      workerId: "scoped-smoke",
+      batchSize: 2,
+      campaignId: "65b9f85d-4c8b-4e52-99fb-217eb3acac1c",
+      requireAutopilot: false,
+      allowScopedDraftCampaign: true,
+      rawCandidateIds,
+    }, claimTime));
+
+    expect(query.sql).toMatch(/j\.payload->>'rawCandidateId' IN \(\$\d+, \$\d+\)/);
+    expect(query.params).toContain("raw-candidate-1");
+    expect(query.params).toContain("raw-candidate-2");
+  });
+
   it("keeps max-attempt recovery jobs ineligible under the shared attempt guard", () => {
     const query = buildDiscoveryClaimQuery();
     const whereClause = query.sql.slice(query.sql.indexOf("WHERE"), query.sql.indexOf("ORDER BY"));

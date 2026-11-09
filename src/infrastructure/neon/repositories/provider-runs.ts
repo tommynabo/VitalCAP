@@ -840,6 +840,56 @@ export async function getProviderRunByRequestKey(requestKey: string) {
   return row ?? null;
 }
 
+export async function getScopedSmokeProviderRunDiagnostics(discoveryJobId: string): Promise<{
+  runs: Array<Record<string, unknown>>;
+  candidates: Array<Record<string, unknown>>;
+}> {
+  const db = getDb();
+  const [runs, candidates] = await Promise.all([
+    db.execute(sql`
+      SELECT p.id AS provider_run_id, p.campaign_id, p.provider, p.operation, p.actor_id,
+        p.external_run_id, p.external_dataset_id, p.status, p.items_requested, p.items_returned,
+        p.cost_usd, p.seed_id, p.seed_run_id, p.started_at, p.finished_at, p.ingested_at,
+        p.metadata->>'engineType' AS engine_type, p.metadata->>'niche' AS metadata_niche,
+        p.metadata->>'seedId' AS metadata_seed_id, p.metadata->>'discoveryJobId' AS discovery_job_id,
+        p.metadata->>'query' AS provider_query, p.metadata->>'geography' AS geography,
+        p.metadata->'ingestionAccounting' AS ingestion_accounting,
+        c.engine_config->>'niche' AS campaign_niche
+      FROM provider_runs p
+      LEFT JOIN campaigns c ON c.id = p.campaign_id
+      WHERE p.provider = 'apify'
+        AND p.operation = 'maps_search'
+        AND p.metadata->>'discoveryJobId' = ${discoveryJobId}
+      ORDER BY p.started_at ASC, p.id ASC
+    `),
+    db.execute(sql`
+      SELECT raw_candidates.id, raw_candidates.discovery_job_id, raw_candidates.campaign_id,
+        raw_candidates.provider_run_id, raw_candidates.source_fingerprint,
+        raw_candidates.processed, raw_candidates.account_id,
+        raw_candidates.processing_metrics->'candidateOutcome' AS processing_outcome, a.business_type,
+        a.country_code AS account_country_code, a.postal_code AS account_postal_code,
+        (a.latitude IS NOT NULL AND a.longitude IS NOT NULL) AS has_coordinates,
+        membership.stage AS campaign_membership_stage,
+        membership.qualified_at AS campaign_qualified_at
+      FROM raw_candidates
+      LEFT JOIN accounts a ON a.id = raw_candidates.account_id
+      LEFT JOIN campaign_memberships membership
+        ON membership.account_id = a.id AND membership.campaign_id = raw_candidates.campaign_id
+      WHERE discovery_job_id = ${discoveryJobId}::uuid
+        OR provider_run_id IN (
+          SELECT id FROM provider_runs
+          WHERE provider = 'apify' AND operation = 'maps_search'
+            AND metadata->>'discoveryJobId' = ${discoveryJobId}
+        )
+      ORDER BY raw_candidates.discovered_at ASC, raw_candidates.id ASC
+    `),
+  ]);
+  return {
+    runs: runs.rows as Array<Record<string, unknown>>,
+    candidates: candidates.rows as Array<Record<string, unknown>>,
+  };
+}
+
 export function buildApifyPollingDuePredicate(now = new Date()) {
   return sql`(metadata->>'pollRetryAt' IS NULL OR (metadata->>'pollRetryAt')::timestamptz <= ${now.toISOString()}::timestamptz)`;
 }

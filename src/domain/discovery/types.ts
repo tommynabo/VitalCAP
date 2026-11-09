@@ -6,6 +6,8 @@
  */
 
 import type { EngineType } from "@/domain/campaigns/types";
+import type { BusinessType } from "@/domain/accounts/types";
+import type { SpainEligibilityVerdict } from "@/lib/geography/spain-eligibility";
 import type { AsyncMapsRun, SerpResult } from "@/domain/providers/types";
 
 export type JobStatus =
@@ -18,6 +20,13 @@ export type JobStatus =
 export type WebsiteEmailSource = "literal" | "deobfuscated" | "other_enrichment" | "mixed" | "none" | "unattributed";
 
 export interface CandidateProcessingMetrics {
+  candidateOutcome?: {
+    businessType: BusinessType;
+    physicalPresenceVerdict: SpainEligibilityVerdict;
+    icpQualified: boolean;
+    duplicate: boolean;
+    matchedExistingAccount: boolean;
+  };
   homepageFetchAttempted: number;
   homepageFetchSucceeded: number;
   homepageFetchFailed: number;
