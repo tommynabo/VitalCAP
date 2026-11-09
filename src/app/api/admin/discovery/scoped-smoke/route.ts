@@ -9,7 +9,7 @@ import { getAutopilotSettings } from "@/infrastructure/neon/repositories/autopil
 import { getScopedSmokeProviderRunDiagnostics, getTodaySpendUsd } from "@/infrastructure/neon/repositories/provider-runs";
 import { getMultiNicheCampaignInventory, getScopedCampaignProviderSpend } from "@/infrastructure/neon/repositories/multi-niche-rollout";
 import { getSeedEconomicPerformance, listSearchSeedsForCampaignEngine } from "@/infrastructure/neon/repositories/discovery";
-import { enqueueScopedSmokeJob, getScopedSmokeJob, persistScopedSmokeResult } from "@/infrastructure/neon/repositories/job-queue";
+import { enqueueProcessingJob, enqueueScopedSmokeJob, getScopedSmokeJob, persistScopedSmokeResult } from "@/infrastructure/neon/repositories/job-queue";
 import { runDiscoveryCronTick } from "@/infrastructure/jobs/runners/discovery-runner";
 import { runProviderRunsCronTick } from "@/infrastructure/jobs/runners/provider-runs-runner";
 import { runProcessingCronTick } from "@/infrastructure/jobs/runners/processing-runner";
@@ -27,6 +27,21 @@ import { logEvent } from "@/lib/observability/structured-logger";
 export const dynamic = "force-dynamic";
 export const maxDuration = 300;
 
+const APPROVED_REPROCESS_CANDIDATES: Record<string, { campaignId: string; niche: string }> = {
+  "3ae42ff7-a316-4041-9d5a-6bf7d5b0a69f": {
+    campaignId: "5e109452-2df2-4b1b-9afc-7baa1b67fc42",
+    niche: "spas_wellness",
+  },
+  "98fd0b30-6dc1-4491-9b43-776065669e1e": {
+    campaignId: "47fce807-aac6-4a8a-90f9-6ad3bbbf4ca7",
+    niche: "premium_fitness",
+  },
+  "15ee1bd3-480b-46c4-b25e-a2b19915cea7": {
+    campaignId: "53f56788-99d9-4d6a-8c71-ab2ffe075d85",
+    niche: "personal_training",
+  },
+};
+
 const requestSchema = z.object({
   campaignId: z.uuid(),
   dryRun: z.boolean().default(true),
@@ -35,6 +50,7 @@ const requestSchema = z.object({
   maxCandidates: z.number().int().min(1).max(5).default(3),
   probeMode: z.boolean().default(false),
   smokeExecutionId: z.uuid().optional(),
+  reprocessRejectedCandidates: z.boolean().default(false),
   allowImport: z.literal(false).default(false),
 }).strict().superRefine((input, context) => {
   if (!input.dryRun && !input.probeMode) {
@@ -42,6 +58,12 @@ const requestSchema = z.object({
   }
   if (!input.dryRun && !input.smokeExecutionId) {
     context.addIssue({ code: "custom", path: ["smokeExecutionId"], message: "Real scoped smoke requires an explicit execution UUID." });
+  }
+  if (input.reprocessRejectedCandidates && (input.dryRun || !input.smokeExecutionId)) {
+    context.addIssue({ code: "custom", path: ["reprocessRejectedCandidates"], message: "Rejected candidates can only be reprocessed from an existing real smoke execution." });
+  }
+  if (input.reprocessRejectedCandidates && input.maxCandidates > 3) {
+    context.addIssue({ code: "custom", path: ["maxCandidates"], message: "Rejected candidate reprocessing is limited to three candidates." });
   }
 });
 
@@ -213,7 +235,7 @@ function asRecord(value: unknown): Record<string, unknown> | null {
     : null;
 }
 
-async function replayScopedSmoke(job: Awaited<ReturnType<typeof getScopedSmokeJob>>) {
+async function replayScopedSmoke(job: Awaited<ReturnType<typeof getScopedSmokeJob>>, reprocessRejectedCandidates = false) {
   if (!job) throw new Error("Scoped smoke job disappeared before replay.");
   const savedResult = asRecord(job.payload.scopedSmokeResult);
   const evidence = asRecord(job.payload.scopedSmokeEvidence) ?? {};
@@ -223,6 +245,13 @@ async function replayScopedSmoke(job: Awaited<ReturnType<typeof getScopedSmokeJo
     : null);
   const provider = String(savedResult?.PROVIDER ?? job.payload.provider ?? "unknown");
   const rollout = getMultiNicheRolloutEntry(job.campaignId);
+  const previouslyReprocessedCandidateIds = Array.isArray(savedResult?.REPROCESSED_REJECTED_CANDIDATE_IDS)
+    ? savedResult.REPROCESSED_REJECTED_CANDIDATE_IDS.filter((candidateId): candidateId is string => {
+      if (typeof candidateId !== "string") return false;
+      const approved = APPROVED_REPROCESS_CANDIDATES[candidateId];
+      return approved?.campaignId === job.campaignId && approved.niche === rollout?.niche;
+    })
+    : [];
   let progress = await getScopedSmokeProgress({
     campaignId: job.campaignId,
     smokeExecutionId: job.id,
@@ -235,16 +264,35 @@ async function replayScopedSmoke(job: Awaited<ReturnType<typeof getScopedSmokeJo
     pollExistingRun: true,
   });
   let processing = null;
-  const pendingCandidateIds = progress.ownershipExact
-    ? progress.unprocessedCandidateIds.slice(0, Number(job.payload.maxCandidates ?? 5))
+  const candidateIdsToProcess = progress.ownershipExact
+    ? (reprocessRejectedCandidates
+      ? progress.rejectedCandidateIds.filter((candidateId) => {
+        const approved = APPROVED_REPROCESS_CANDIDATES[candidateId];
+        return approved?.campaignId === job.campaignId
+          && approved.niche === rollout?.niche
+          && !previouslyReprocessedCandidateIds.includes(candidateId);
+      })
+      : progress.unprocessedCandidateIds)
+      .slice(0, reprocessRejectedCandidates ? 3 : Number(job.payload.maxCandidates ?? 5))
     : [];
-  if (progress.resultsFinal && pendingCandidateIds.length > 0) {
-    processing = await runProcessingCronTick(pendingCandidateIds.length, new Date(), {
+  if (progress.resultsFinal && candidateIdsToProcess.length > 0) {
+    if (reprocessRejectedCandidates) {
+      for (const rawCandidateId of candidateIdsToProcess) {
+        await enqueueProcessingJob({
+          campaignId: job.campaignId,
+          type: "process_raw_candidate",
+          payload: { rawCandidateId },
+          idempotencyKey: `raw_candidate:${rawCandidateId}:niche-reprocess:${job.id}`,
+        });
+      }
+    }
+    processing = await runProcessingCronTick(candidateIdsToProcess.length, new Date(), {
       campaignId: job.campaignId,
       allowScopedDraftCampaign: true,
-      rawCandidateIds: pendingCandidateIds,
+      rawCandidateIds: candidateIdsToProcess,
       enrichContacts: false,
       allowMapsFastWebsiteRecovery: false,
+      allowNicheWebsiteClassificationEvidence: reprocessRejectedCandidates,
       correlationId: job.id,
       timeBudgetMs: 60_000,
     });
@@ -265,6 +313,9 @@ async function replayScopedSmoke(job: Awaited<ReturnType<typeof getScopedSmokeJo
     ok: true,
     dryRun: false,
     IDEMPOTENT_REPLAY: true,
+    REPROCESSED_REJECTED_CANDIDATE_IDS: reprocessRejectedCandidates
+      ? [...new Set([...previouslyReprocessedCandidateIds, ...candidateIdsToProcess])]
+      : [],
     EXECUTION_STATE: job.status,
     SMOKE_EXECUTION_ID: job.id,
     JOB_ID: job.id,
@@ -372,6 +423,17 @@ async function getScopedSmokeProgress(input: {
       && (!run || candidate.provider_run_id === run.provider_run_id)
       && candidate.processed !== true)
     .map((candidate) => String(candidate.id));
+  const scopedProviderRunId = run?.provider_run_id ?? null;
+  const rejectedCandidateIds = diagnostics.candidates
+    .filter((candidate) => {
+      const outcome = asRecord(candidate.processing_outcome);
+      return candidate.campaign_id === input.campaignId
+        && scopedProviderRunId !== null
+        && candidate.provider_run_id === scopedProviderRunId
+        && candidate.campaign_membership_stage === "rejected"
+        && outcome?.icpQualified === false;
+    })
+    .map((candidate) => String(candidate.id));
     const accountIds = diagnostics.candidates
       .map((candidate) => typeof candidate.account_id === "string" ? candidate.account_id : null)
       .filter((accountId): accountId is string => accountId !== null);
@@ -417,6 +479,7 @@ async function getScopedSmokeProgress(input: {
           icpQualified: outcome.icpQualified ?? null,
           duplicate: outcome.duplicate ?? null,
           matchedExistingAccount: outcome.matchedExistingAccount ?? null,
+          classifierEvidenceSource: outcome.classifierEvidenceSource ?? null,
           countryCode: candidate.account_country_code ?? null,
           hasPostalCode: Boolean(candidate.account_postal_code),
           hasCoordinates: candidate.has_coordinates === true,
@@ -447,7 +510,7 @@ async function getScopedSmokeProgress(input: {
     DUPLICATE_COUNT: Number(accounting.DUPLICATE_EXISTING_RAW ?? 0) + duplicateAccountCount,
     OWNERSHIP_EXACT: ownershipExact,
   };
-  return { response, ownershipExact, unprocessedCandidateIds, resultsFinal: resultIsFinal };
+  return { response, ownershipExact, unprocessedCandidateIds, rejectedCandidateIds, resultsFinal: resultIsFinal };
 }
 
 export async function POST(request: Request) {
@@ -482,10 +545,22 @@ export async function POST(request: Request) {
         if (!existingCampaign || existingCampaign.workspaceId !== workspaceId) {
           return NextResponse.json({ error: "Smoke execution was not found in the current workspace." }, { status: 404 });
         }
+        if (input.reprocessRejectedCandidates) {
+          if (existingJob.status === "pending" && !existingJob.payload.scopedSmokeEvidence) {
+            return NextResponse.json({ error: "Rejected candidates can only be reprocessed after the existing smoke has completed." }, { status: 409 });
+          }
+          return replayScopedSmoke(existingJob, true);
+        }
         if (existingJob.status !== "pending" || existingJob.payload.scopedSmokeEvidence) {
           return replayScopedSmoke(existingJob);
         }
       }
+    }
+    if (input.reprocessRejectedCandidates) {
+      if (!Object.values(APPROVED_REPROCESS_CANDIDATES).some((approved) => approved.campaignId === input.campaignId)) {
+        return NextResponse.json({ error: "This campaign is not allowlisted for rejected candidate reprocessing." }, { status: 409 });
+      }
+      return NextResponse.json({ error: "Rejected candidate reprocessing requires an existing smoke execution." }, { status: 409 });
     }
     const plan = await buildScopedSmokePlan(input.campaignId, workspaceId);
     if (existingJob && (

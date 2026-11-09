@@ -26,6 +26,7 @@ export interface CandidateProcessingMetrics {
     icpQualified: boolean;
     duplicate: boolean;
     matchedExistingAccount: boolean;
+    classifierEvidenceSource?: "maps_name_category" | "maps_and_website";
   };
   homepageFetchAttempted: number;
   homepageFetchSucceeded: number;

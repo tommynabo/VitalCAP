@@ -36,6 +36,7 @@ import { enqueueVerificationJob } from "@/infrastructure/neon/repositories/verif
 import { getVerificationEnv } from "@/lib/config/env";
 import { processRawCandidate, createInitialCandidateProcessingMetrics, deriveIncomingIdentitySignals, hasLinkedInEmployerAccount, type CandidateRawPayload, type ProcessedCandidateResult } from "@/services/discovery/candidate-processor";
 import { getNicheId } from "@/services/discovery/niche-profiles";
+import { getMultiNicheRolloutEntry } from "@/services/autopilot/multi-niche-rollout";
 import { mergeMissingAccountFields, type IncomingAccountFields } from "@/services/accounts/account-enrichment-merge";
 import { realWebsiteFetcher, providerLabelForEngine } from "./engine-factory";
 import { WebsiteEnrichmentService, type WebsiteEvidenceFact } from "@/services/enrichment/website-enrichment-service";
@@ -68,6 +69,7 @@ export interface ProcessingRunnerOptions {
   createdSince?: Date;
   rawCandidateIds?: string[];
   allowMapsFastWebsiteRecovery?: boolean;
+  allowNicheWebsiteClassificationEvidence?: boolean;
   correlationId?: string;
   timeBudgetMs?: number;
   perJobBudgetMs?: number;
@@ -119,6 +121,7 @@ function addCandidateOutcome(processed: ProcessedCandidateResult): CandidateProc
       icpQualified: processed.icpQualified,
       duplicate: processed.isDuplicate,
       matchedExistingAccount: processed.matchedAccountKey !== null,
+      classifierEvidenceSource: processed.nicheEvidenceWebsiteFetched ? "maps_and_website" : "maps_name_category",
     },
   };
 }
@@ -318,6 +321,11 @@ async function executeProcessingJob(
 
   const campaign = await getCampaignById(job.campaignId);
   if (!campaign) throw new Error(`Campaign not found: ${job.campaignId}`);
+  const rolloutEntry = getMultiNicheRolloutEntry(job.campaignId);
+  const configuredNiche = getNicheId(campaign.engineConfig?.niche);
+  if (rolloutEntry && configuredNiche !== rolloutEntry.niche) {
+    throw new Error(`Campaign niche configuration mismatch for ${job.campaignId}.`);
+  }
 
   const payload = raw.rawPayload as unknown as CandidateRawPayload;
   let existingProcessingMetrics = raw.processingMetrics;
@@ -356,13 +364,14 @@ async function executeProcessingJob(
   const processed = await processRawCandidate(payload, raw.engineType, {
     existingAccounts,
     websiteFetcher: options.enrichContacts === false ? smokeWebsiteFetcher : cachedFetcher,
+    nicheEvidenceFetcher: options.allowNicheWebsiteClassificationEvidence === true ? cachedFetcher : undefined,
     signal: options.signal,
     verificationProvider: smokeVerificationProvider,
     verificationCacheStore: createInMemoryVerificationCacheStore(),
     now: new Date(),
     deferVerification: true,
     existingProcessingMetrics,
-    niche: getNicheId(campaign.engineConfig?.niche) ?? undefined,
+    niche: configuredNiche ?? undefined,
     ...(raw.engineType === "maps_fast" && payload.kind === "maps"
       && !job.payload.skipMapsFastWebsiteRecovery && options.allowMapsFastWebsiteRecovery !== false ? {
       recoverMapsFastWebsite: async (place) => {

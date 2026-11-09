@@ -254,10 +254,14 @@ const mapsFastRecoveryPlace: MapsPlaceResult = {
   sourceUrl: "https://maps.example/place/maps-fast-recovery-place",
 };
 
-function prepareMapsFastRecoveryJob(processedOverride: Partial<ProcessedCandidateResult> = {}, payloadExtras: Record<string, unknown> = {}): void {
+function prepareMapsFastRecoveryJob(
+  processedOverride: Partial<ProcessedCandidateResult> = {},
+  payloadExtras: Record<string, unknown> = {},
+  campaignId = "campaign-id",
+): void {
   mocks.getRawCandidateById.mockResolvedValue({
     id: "raw-candidate-id",
-    campaignId: "campaign-id",
+    campaignId,
     engineType: "maps_fast",
     sourceExternalId: mapsFastRecoveryPlace.externalPlaceId,
     sourceUrl: mapsFastRecoveryPlace.sourceUrl,
@@ -266,10 +270,11 @@ function prepareMapsFastRecoveryJob(processedOverride: Partial<ProcessedCandidat
     accountId: null,
     searchSeedRunId: null,
   });
-  mocks.getCampaignById.mockResolvedValue({ id: "campaign-id", workspaceId: "workspace-id" });
+  mocks.getCampaignById.mockResolvedValue({ id: campaignId, workspaceId: "workspace-id" });
   mocks.deriveIncomingIdentitySignals.mockReturnValue({ normalizedName: "farmacia ejemplo", normalizedDomain: null });
   mocks.claimProcessingJobs.mockResolvedValueOnce([{
     ...makeJob("maps-fast-recovery"),
+    campaignId,
     type: "process_raw_candidate",
     payload: { rawCandidateId: "raw-candidate-id", ...payloadExtras },
   }]).mockResolvedValueOnce([]);
@@ -1099,9 +1104,57 @@ describe("runProcessingCronTick", () => {
         icpQualified: true,
         duplicate: false,
         matchedExistingAccount: false,
+        classifierEvidenceSource: "maps_name_category",
       },
     }));
     expect(mocks.completeProcessingJob).toHaveBeenCalledWith(expect.objectContaining({ jobId: "maps-fast-recovery" }));
+  });
+
+  it("propagates the campaign niche and opt-in website evidence fetcher to candidate classification", async () => {
+    const campaignId = "47fce807-aac6-4a8a-90f9-6ad3bbbf4ca7";
+    prepareMapsFastRecoveryJob({}, { skipMapsFastWebsiteRecovery: true }, campaignId);
+    mocks.getCampaignById.mockResolvedValue({
+      id: campaignId,
+      workspaceId: "workspace-id",
+      engineConfig: { niche: "premium_fitness" },
+    });
+
+    await runProcessingCronTick(1, new Date(), {
+      campaignId,
+      allowScopedDraftCampaign: true,
+      rawCandidateIds: ["raw-candidate-id"],
+      enrichContacts: false,
+      allowMapsFastWebsiteRecovery: false,
+      allowNicheWebsiteClassificationEvidence: true,
+    });
+
+    const context = mocks.processRawCandidate.mock.calls[0]?.[2] as ProcessingContext | undefined;
+    expect(context?.niche).toBe("premium_fitness");
+    expect(context?.nicheEvidenceFetcher?.fetchPage).toEqual(expect.any(Function));
+    expect(mocks.createSerpDiscoveryProvider).not.toHaveBeenCalled();
+  });
+
+  it("fails closed when an allowlisted niche campaign is missing its configured niche", async () => {
+    const campaignId = "47fce807-aac6-4a8a-90f9-6ad3bbbf4ca7";
+    prepareMapsFastRecoveryJob({}, { skipMapsFastWebsiteRecovery: true }, campaignId);
+    mocks.getCampaignById.mockResolvedValue({
+      id: campaignId,
+      workspaceId: "workspace-id",
+      engineConfig: { niche: "spas_wellness" },
+    });
+
+    await runProcessingCronTick(1, new Date(), {
+      campaignId,
+      allowScopedDraftCampaign: true,
+      rawCandidateIds: ["raw-candidate-id"],
+      enrichContacts: false,
+      allowMapsFastWebsiteRecovery: false,
+    });
+
+    expect(mocks.processRawCandidate).not.toHaveBeenCalled();
+    expect(mocks.failProcessingJob).toHaveBeenCalledWith(expect.objectContaining({
+      error: expect.objectContaining({ message: expect.stringContaining("Campaign niche configuration mismatch") }),
+    }));
   });
 
   it("marks a recovered candidate incomplete when its email contact point already existed", async () => {

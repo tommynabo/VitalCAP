@@ -16,6 +16,7 @@ const mocks = vi.hoisted(() => ({
   listSearchSeedsForCampaignEngine: vi.fn(),
   getSeedEconomicPerformance: vi.fn(),
   enqueueDiscoveryJob: vi.fn(),
+  enqueueProcessingJob: vi.fn(),
   enqueueScopedSmokeJob: vi.fn(),
   getScopedSmokeJob: vi.fn(),
   persistScopedSmokeResult: vi.fn(),
@@ -58,6 +59,7 @@ vi.mock("@/infrastructure/neon/repositories/discovery", () => ({
 }));
 vi.mock("@/infrastructure/neon/repositories/job-queue", () => ({
   enqueueDiscoveryJob: mocks.enqueueDiscoveryJob,
+  enqueueProcessingJob: mocks.enqueueProcessingJob,
   enqueueScopedSmokeJob: mocks.enqueueScopedSmokeJob,
   getScopedSmokeJob: mocks.getScopedSmokeJob,
   persistScopedSmokeResult: mocks.persistScopedSmokeResult,
@@ -188,6 +190,7 @@ describe("POST /api/admin/discovery/scoped-smoke", () => {
       lastRunAt: null,
     }]);
     mocks.enqueueDiscoveryJob.mockResolvedValue("job-1");
+    mocks.enqueueProcessingJob.mockResolvedValue("processing-job-1");
     mocks.enqueueScopedSmokeJob.mockImplementation(async ({ jobId, campaignId, payload }: { jobId: string; campaignId: string; payload: Record<string, unknown> }) => ({
       created: true,
       job: (() => {
@@ -672,6 +675,118 @@ describe("POST /api/admin/discovery/scoped-smoke", () => {
     expect(mocks.getScopedSmokeProviderRunDiagnostics).not.toHaveBeenCalled();
     expect(mocks.runProviderRunsCronTick).not.toHaveBeenCalled();
     expect(mocks.runProcessingCronTick).not.toHaveBeenCalled();
+  });
+
+  it("reprocesses only exact owned candidates rejected by ICP and uses niche website evidence", async () => {
+    const campaignId = MULTI_NICHE_ROLLOUT[2].campaignId;
+    const smokeExecutionId = "a9d4378f-28d0-4b6f-9f31-cfbe9627539c";
+    const candidateId = "98fd0b30-6dc1-4491-9b43-776065669e1e";
+    const candidate = {
+      id: candidateId,
+      campaign_id: campaignId,
+      provider_run_id: "provider-run-1",
+      source_fingerprint: "entity-fingerprint-1",
+      processed: true,
+      campaign_membership_stage: "rejected",
+      processing_outcome: { icpQualified: false, classifierEvidenceSource: "maps_name_category" },
+    };
+    mocks.getScopedSmokeJob.mockResolvedValueOnce({
+      id: smokeExecutionId,
+      campaignId,
+      payload: {
+        smokeExecutionId,
+        provider: "apify",
+        maxCandidates: 1,
+        scopedSmokeResult: { PROVIDER: "apify", PROVIDER_CALL_SUCCEEDED: true },
+      },
+      status: "completed",
+      attemptCount: 1,
+      idempotencyKey: `scoped-smoke:${campaignId}:${smokeExecutionId}`,
+      lastError: null,
+    });
+    mocks.getScopedSmokeProviderRunDiagnostics
+      .mockResolvedValueOnce(apifyRunDiagnostics({
+        campaignId,
+        smokeExecutionId,
+        status: "ingested",
+        itemsReturned: 2,
+        candidates: [candidate, {
+          ...candidate,
+          id: "raw-candidate-not-approved",
+        }],
+      }))
+      .mockResolvedValueOnce(apifyRunDiagnostics({
+        campaignId,
+        smokeExecutionId,
+        status: "ingested",
+        itemsReturned: 1,
+        candidates: [{ ...candidate, processed: true, processing_outcome: { icpQualified: true } }],
+      }));
+    mocks.runProcessingCronTick.mockResolvedValueOnce({ jobsCompleted: 1 });
+
+    const response = await POST(realSmokeRequest(campaignId, {
+      maxCandidates: 3,
+      smokeExecutionId,
+      reprocessRejectedCandidates: true,
+    }));
+    const payload = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(payload.REPROCESSED_REJECTED_CANDIDATE_IDS).toEqual([candidateId]);
+    expect(mocks.enqueueProcessingJob).toHaveBeenCalledTimes(1);
+    expect(mocks.enqueueProcessingJob).toHaveBeenCalledWith({
+      campaignId,
+      type: "process_raw_candidate",
+      payload: { rawCandidateId: candidateId },
+      idempotencyKey: `raw_candidate:${candidateId}:niche-reprocess:${smokeExecutionId}`,
+    });
+    expect(mocks.runProcessingCronTick).toHaveBeenCalledWith(1, expect.any(Date), expect.objectContaining({
+      campaignId,
+      rawCandidateIds: [candidateId],
+      enrichContacts: false,
+      allowMapsFastWebsiteRecovery: false,
+      allowNicheWebsiteClassificationEvidence: true,
+    }));
+    expect(mocks.runProviderRunsCronTick).not.toHaveBeenCalled();
+    expect(mocks.runDiscoveryCronTick).not.toHaveBeenCalled();
+    expect(mocks.runVerificationCronTick).not.toHaveBeenCalled();
+
+    mocks.getScopedSmokeJob.mockResolvedValueOnce({
+      id: smokeExecutionId,
+      campaignId,
+      payload: {
+        smokeExecutionId,
+        provider: "apify",
+        maxCandidates: 3,
+        scopedSmokeResult: {
+          PROVIDER: "apify",
+          PROVIDER_CALL_SUCCEEDED: true,
+          REPROCESSED_REJECTED_CANDIDATE_IDS: [candidateId],
+        },
+      },
+      status: "completed",
+      attemptCount: 1,
+      idempotencyKey: `scoped-smoke:${campaignId}:${smokeExecutionId}`,
+      lastError: null,
+    });
+    mocks.getScopedSmokeProviderRunDiagnostics.mockResolvedValueOnce(apifyRunDiagnostics({
+      campaignId,
+      smokeExecutionId,
+      status: "ingested",
+      itemsReturned: 2,
+      candidates: [candidate, { ...candidate, id: "raw-candidate-not-approved" }],
+    }));
+
+    const retryResponse = await POST(realSmokeRequest(campaignId, {
+      maxCandidates: 3,
+      smokeExecutionId,
+      reprocessRejectedCandidates: true,
+    }));
+    const retryPayload = await retryResponse.json();
+
+    expect(retryPayload.REPROCESSED_REJECTED_CANDIDATE_IDS).toEqual([candidateId]);
+    expect(mocks.enqueueProcessingJob).toHaveBeenCalledTimes(1);
+    expect(mocks.runProcessingCronTick).toHaveBeenCalledTimes(1);
   });
 
   it("replays a pending run to ingested without creating a job or provider run", async () => {

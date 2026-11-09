@@ -142,6 +142,71 @@ describe("processRawCandidate — maps candidates", () => {
     expect(legacyCampaign).toMatchObject({ businessType: "other_retail", icpQualified: false });
   });
 
+  it("uses public website strength-class evidence for a physical boutique fitness center", async () => {
+    const fetchPage = vi.fn(async (url: string) => ({
+      url,
+      status: 200,
+      contentType: "text/html",
+      body: "Flow Strength reformer classes with up to 16 participants.",
+    }));
+    const nicheEvidenceFetcher: WebsiteFetcher = { fetchPage };
+    const result = await processRawCandidate(
+      mapsPayload({
+        name: "Flow Training Badajoz",
+        category: "Centro deportivo",
+        address: "Calle Mayor 1",
+        websiteUrl: "https://flowtraining.example",
+      }),
+      "maps_fast",
+      baseContext({ niche: "premium_fitness", nicheEvidenceFetcher, deferVerification: true }),
+    );
+
+    expect(result).toMatchObject({
+      businessType: "premium_fitness_center",
+      icpQualified: true,
+      nicheEvidenceWebsiteFetched: true,
+    });
+    expect(fetchPage).toHaveBeenCalledTimes(1);
+  });
+
+  it("uses public website center and personal-training evidence without changing the legacy profile", async () => {
+    const fetchPage = vi.fn(async (url: string) => ({
+      url,
+      status: 200,
+      contentType: "text/html",
+      body: "Entrenamiento personal en nuestro centro boutique.",
+    }));
+    const nicheEvidenceFetcher: WebsiteFetcher = { fetchPage };
+    const result = await processRawCandidate(
+      mapsPayload({
+        name: "BST Basque Sport Trainers",
+        category: "Gimnasio",
+        address: "Calle Mayor 1",
+        websiteUrl: "https://basque-trainers.example",
+      }),
+      "maps_fast",
+      baseContext({ niche: "personal_training", nicheEvidenceFetcher, deferVerification: true }),
+    );
+    const legacy = await processRawCandidate(
+      mapsPayload({
+        name: "BST Basque Sport Trainers",
+        category: "Gimnasio",
+        address: "Calle Mayor 1",
+        websiteUrl: "https://basque-trainers.example",
+      }),
+      "maps_fast",
+      baseContext({ nicheEvidenceFetcher, deferVerification: true }),
+    );
+
+    expect(result).toMatchObject({
+      businessType: "personal_training_studio",
+      icpQualified: true,
+      nicheEvidenceWebsiteFetched: true,
+    });
+    expect(legacy).toMatchObject({ businessType: "other_retail", icpQualified: false });
+    expect(fetchPage).toHaveBeenCalledTimes(1);
+  });
+
   it("does not call Serper when a Maps Fast source website already exists", async () => {
     const recoverMapsFastWebsite = vi.fn();
     const result = await processRawCandidate(

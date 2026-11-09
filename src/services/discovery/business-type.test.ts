@@ -29,13 +29,72 @@ describe("niche-specific business classification", () => {
   it.each([
     ["Estudio Yoga Norte", "yoga_pilates", "yoga_pilates_studio"],
     ["Pilates Studio Centro", "yoga_pilates", "yoga_pilates_studio"],
-    ["Spa Wellness Madrid", "spas_wellness", "spa_wellness_center"],
-    ["Boutique de entrenamiento funcional", "premium_fitness", "premium_fitness_center"],
-    ["Estudio de entrenamiento personal", "personal_training", "personal_training_studio"],
   ] as const)("classifies %s only in its declared niche", (name, niche, expected) => {
     const type = classifyNicheBusinessType(name, niche);
     expect(type).toBe(expected);
     expect(isAcceptedNicheBusinessType(type, niche)).toBe(true);
+  });
+
+  it.each([
+    ["Spa Madrid"],
+    ["Day spa centro urbano"],
+    ["Wellness centre"],
+    ["Centro de bienestar"],
+    ["Centro de masajes y bienestar"],
+  ])("accepts wellness ICP evidence: %s", (evidence) => {
+    expect(classifyNicheBusinessType(evidence, "spas_wellness")).toBe("spa_wellness_center");
+  });
+
+  it.each([
+    ["Hotel general con spa"],
+    ["Resort wellness"],
+    ["Salón de belleza con masajes"],
+    ["Centro de estética"],
+    ["Masajes a domicilio"],
+  ])("rejects non-wellness evidence: %s", (evidence) => {
+    expect(classifyNicheBusinessType(evidence, "spas_wellness")).toBe("other_retail");
+  });
+
+  it.each([
+    ["Gimnasio boutique"],
+    ["Centro de entrenamiento funcional"],
+    ["Strength and conditioning center"],
+    ["Centro de fuerza y acondicionamiento"],
+    ["Independent small-medium gym"],
+  ])("accepts premium fitness ICP evidence: %s", (evidence) => {
+    expect(classifyNicheBusinessType(evidence, "premium_fitness")).toBe("premium_fitness_center");
+  });
+
+  it.each([
+    ["Gimnasio low-cost"],
+    ["Gimnasio municipal"],
+    ["Gimnasio público"],
+    ["Alquiler de instalaciones de fuerza"],
+    ["Centro deportivo general"],
+    ["Boutique de ropa premium"],
+    ["Hotel premium"],
+  ])("rejects non-premium fitness evidence: %s", (evidence) => {
+    expect(classifyNicheBusinessType(evidence, "premium_fitness")).toBe("other_retail");
+  });
+
+  it.each([
+    ["Personal training studio"],
+    ["Estudio de entrenamiento personal"],
+    ["Centro de entrenador personal"],
+    ["Centro pequeño de personal training"],
+    ["Entrenamiento personal en estudio de fuerza"],
+  ])("accepts personal training ICP evidence: %s", (evidence) => {
+    expect(classifyNicheBusinessType(evidence, "personal_training")).toBe("personal_training_studio");
+  });
+
+  it.each([
+    ["Entrenador personal online"],
+    ["Entrenador personal a domicilio"],
+    ["Personal trainer en casa"],
+    ["Personal trainer freelance"],
+    ["Entrenador personal en gimnasio de terceros"],
+  ])("rejects non-studio personal training evidence: %s", (evidence) => {
+    expect(classifyNicheBusinessType(evidence, "personal_training")).toBe("other_retail");
   });
 
   it.each([

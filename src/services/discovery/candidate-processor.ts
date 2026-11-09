@@ -81,6 +81,7 @@ export interface ProcessedCandidateResult {
   icpQualified: boolean;
   contactPoints: ProcessedContactPoint[];
   processingMetrics: CandidateProcessingMetrics;
+  nicheEvidenceWebsiteFetched?: boolean;
   serperEmailRecovery: SerperEmailRecoveryDiagnostics;
   readyForOutreach: boolean;
   rejectionReason: string | null;
@@ -96,6 +97,7 @@ export interface ProcessingContext {
   verificationCacheStore: EmailVerificationCacheStore;
   now: Date;
   existingProcessingMetrics?: CandidateProcessingMetrics | null;
+  nicheEvidenceFetcher?: WebsiteFetcher;
   recoverMapsFastWebsite?: (place: MapsPlaceResult) => Promise<MapsFastWebsiteRecoveryOutcome>;
   verificationPolicy?: VerificationAcceptancePolicy;
   deferVerification?: boolean;
@@ -316,10 +318,23 @@ export async function processRawCandidate(
   const matchedAccountKey = isDuplicate ? dedupDecision.matches[0]?.accountId ?? null : null;
 
   const spainResult = evaluateSpainEligibility(spainInput);
-  const classificationText = context.niche ? `${businessNameGuess} ${categoryText}` : categoryText;
-  const businessType = context.niche
+  let classificationText = context.niche ? `${businessNameGuess} ${categoryText}` : categoryText;
+  let businessType = context.niche
     ? classifyNicheBusinessType(classificationText, context.niche)
     : classifyBusinessType(categoryText);
+  let nicheEvidenceWebsiteFetched = false;
+  if (context.niche && businessType === "other_retail" && payload.kind === "maps"
+    && spainResult.verdict === "verified" && Boolean(payload.place.address?.trim())
+    && websiteUrl && context.nicheEvidenceFetcher) {
+    try {
+      const websiteEvidence = await context.nicheEvidenceFetcher.fetchPage(websiteUrl, { signal: context.signal });
+      classificationText = `${classificationText} ${websiteEvidence.body}`;
+      businessType = classifyNicheBusinessType(classificationText, context.niche);
+      nicheEvidenceWebsiteFetched = true;
+    } catch (error) {
+      if (context.signal?.aborted) throw context.signal.reason ?? error;
+    }
+  }
 
   if (spainResult.verdict === "rejected") {
     return {
@@ -331,6 +346,7 @@ export async function processRawCandidate(
       spainVerdict: spainResult.verdict,
       businessType,
       icpQualified: false,
+      nicheEvidenceWebsiteFetched,
       contactPoints: [],
       processingMetrics: initialProcessingMetrics(engineType, payload, websiteUrl, context.existingProcessingMetrics, context.now),
       serperEmailRecovery: { candidatesFound: 0, candidatesRelevant: 0, duplicateCandidatesSkipped: 0 },
@@ -356,6 +372,7 @@ export async function processRawCandidate(
       spainVerdict: spainResult.verdict,
       businessType,
       icpQualified: false,
+      nicheEvidenceWebsiteFetched,
       contactPoints: [],
       processingMetrics: initialProcessingMetrics(engineType, payload, websiteUrl, context.existingProcessingMetrics, context.now),
       serperEmailRecovery: { candidatesFound: 0, candidatesRelevant: 0, duplicateCandidatesSkipped: 0 },
@@ -600,6 +617,7 @@ export async function processRawCandidate(
     spainVerdict: spainResult.verdict,
     businessType,
     icpQualified: true,
+    nicheEvidenceWebsiteFetched,
     contactPoints,
     processingMetrics,
     serperEmailRecovery,
