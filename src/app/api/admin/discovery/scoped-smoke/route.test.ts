@@ -697,6 +697,61 @@ describe("POST /api/admin/discovery/scoped-smoke", () => {
     expect(mocks.getScopedCampaignProviderSpend).not.toHaveBeenCalled();
   });
 
+  it("uses the current time when processing candidates from a historical smoke replay", async () => {
+    const campaignId = MULTI_NICHE_ROLLOUT[0].campaignId;
+    const smokeExecutionId = "c76e780a-b0a2-4e16-a3ec-e5d8a9197c4c";
+    const oldStartedAt = "2026-10-14T08:00:00.000Z";
+    const candidateId = "raw-candidate-1";
+    const candidate = {
+      id: candidateId,
+      campaign_id: campaignId,
+      provider_run_id: "provider-run-1",
+      source_fingerprint: "entity-fingerprint-1",
+      processed: false,
+    };
+    mocks.getScopedSmokeJob.mockResolvedValueOnce({
+      id: smokeExecutionId,
+      campaignId,
+      payload: {
+        smokeExecutionId,
+        startedAt: oldStartedAt,
+        provider: "apify",
+        maxCandidates: 1,
+        scopedSmokeResult: { PROVIDER: "apify", PROVIDER_CALL_SUCCEEDED: true },
+      },
+      status: "completed",
+      attemptCount: 1,
+      idempotencyKey: `scoped-smoke:${campaignId}:${smokeExecutionId}`,
+      lastError: null,
+    });
+    mocks.getScopedSmokeProviderRunDiagnostics.mockResolvedValue(apifyRunDiagnostics({
+      campaignId,
+      smokeExecutionId,
+      status: "ingested",
+      itemsReturned: 1,
+      candidates: [candidate],
+    }));
+    mocks.runProcessingCronTick.mockResolvedValueOnce({ jobsCompleted: 1 });
+    const beforeProcessing = Date.now();
+
+    const response = await POST(realSmokeRequest(campaignId));
+
+    const afterProcessing = Date.now();
+    const processingNow = mocks.runProcessingCronTick.mock.calls[0]?.[1];
+    expect(response.status).toBe(200);
+    expect(processingNow).toBeInstanceOf(Date);
+    expect(processingNow.getTime()).toBeGreaterThanOrEqual(beforeProcessing);
+    expect(processingNow.getTime()).toBeLessThanOrEqual(afterProcessing);
+    expect(processingNow).not.toEqual(new Date(oldStartedAt));
+    expect(mocks.runProviderRunsCronTick).not.toHaveBeenCalled();
+    expect(mocks.runProcessingCronTick).toHaveBeenCalledWith(1, processingNow, expect.objectContaining({
+      campaignId,
+      rawCandidateIds: [candidateId],
+      enrichContacts: false,
+      allowMapsFastWebsiteRecovery: false,
+    }));
+  });
+
   it("reports scoped provider spend when replaying evidence without a saved final result", async () => {
     const campaignId = MULTI_NICHE_ROLLOUT[0].campaignId;
     const smokeExecutionId = "c76e780a-b0a2-4e16-a3ec-e5d8a9197c4c";

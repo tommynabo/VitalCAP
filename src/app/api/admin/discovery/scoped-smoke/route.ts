@@ -239,7 +239,7 @@ async function replayScopedSmoke(job: Awaited<ReturnType<typeof getScopedSmokeJo
     ? progress.unprocessedCandidateIds.slice(0, Number(job.payload.maxCandidates ?? 5))
     : [];
   if (progress.resultsFinal && pendingCandidateIds.length > 0) {
-    processing = await runProcessingCronTick(pendingCandidateIds.length, startedAt ?? new Date(), {
+    processing = await runProcessingCronTick(pendingCandidateIds.length, new Date(), {
       campaignId: job.campaignId,
       allowScopedDraftCampaign: true,
       rawCandidateIds: pendingCandidateIds,
