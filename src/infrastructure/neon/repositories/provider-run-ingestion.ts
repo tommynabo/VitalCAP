@@ -41,8 +41,10 @@ export function buildProviderRunIngestionAccounting(input: {
   candidatesTotal: number;
   candidatesInserted: number;
   invalidOrUnmappableItems: number;
+  filteredByPolicyItems?: number;
 }): ProviderRunIngestionAccounting {
-  const accountedItems = input.candidatesTotal + input.invalidOrUnmappableItems;
+  const filteredByPolicyItems = input.filteredByPolicyItems ?? 0;
+  const accountedItems = input.candidatesTotal + input.invalidOrUnmappableItems + filteredByPolicyItems;
   if (accountedItems !== input.itemsReturned || input.candidatesInserted > input.candidatesTotal) {
     throw new Error("Provider items do not reconcile to ingestion outcomes.");
   }
@@ -52,7 +54,7 @@ export function buildProviderRunIngestionAccounting(input: {
     DUPLICATE_EXISTING_RAW: input.candidatesTotal - input.candidatesInserted,
     CANONICAL_DEDUPE: 0,
     INVALID_OR_UNMAPPABLE: input.invalidOrUnmappableItems,
-    FILTERED_BY_POLICY: 0,
+    FILTERED_BY_POLICY: filteredByPolicyItems,
     FAILED_INSERT: 0,
     UNKNOWN: 0,
   };

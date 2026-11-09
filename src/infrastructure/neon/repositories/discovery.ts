@@ -63,16 +63,21 @@ export async function listSearchSeedsForCampaignEngine(campaignId: string, engin
 
 export function buildSeedEconomicPerformanceQuery(campaignId: string, engineType: EngineType, since: Date, todayStart: Date, now: Date) {
   const provider = engineType === "maps_fast" || engineType === "maps_deep" ? "apify" : "serper";
+  const since24h = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+  const since72h = new Date(now.getTime() - 72 * 60 * 60 * 1000);
   return sql`
     WITH recent_runs AS (
       SELECT run.id, run.started_at, run.campaign_id,
         COALESCE(run.seed_id, NULLIF(run.metadata->>'seedId', '')::uuid) AS seed_id,
         run.items_returned, run.cost_usd,
-        NULLIF(run.metadata #>> '{ingestionAccounting,INSERTED_NEW_RAW}', '')::int AS new_raw,
-        NULLIF(run.metadata #>> '{ingestionAccounting,DUPLICATE_EXISTING_RAW}', '')::int AS duplicates,
-        (NULLIF(run.metadata #>> '{ingestionAccounting,INSERTED_NEW_RAW}', '') IS NOT NULL
-          AND NULLIF(run.metadata #>> '{ingestionAccounting,DUPLICATE_EXISTING_RAW}', '') IS NOT NULL) AS has_accounting
+        COALESCE(NULLIF(run.metadata #>> '{ingestionAccounting,INSERTED_NEW_RAW}', '')::int, seed_run.unique_count) AS new_raw,
+        COALESCE(NULLIF(run.metadata #>> '{ingestionAccounting,DUPLICATE_EXISTING_RAW}', '')::int,
+          GREATEST(seed_run.raw_count - seed_run.unique_count, 0)) AS duplicates,
+        ((NULLIF(run.metadata #>> '{ingestionAccounting,INSERTED_NEW_RAW}', '') IS NOT NULL
+          AND NULLIF(run.metadata #>> '{ingestionAccounting,DUPLICATE_EXISTING_RAW}', '') IS NOT NULL)
+          OR seed_run.id IS NOT NULL) AS has_accounting
       FROM provider_runs run
+      LEFT JOIN search_seed_runs seed_run ON seed_run.id = run.seed_run_id
       WHERE run.campaign_id = ${campaignId}::uuid
         AND run.provider = ${provider}
         AND run.status IN ('ingested', 'completed')
@@ -93,7 +98,15 @@ export function buildSeedEconomicPerformanceQuery(campaignId: string, engineType
         COALESCE(SUM(duplicates) FILTER (WHERE has_accounting), 0)::int AS duplicates,
         COALESCE(SUM(cost_usd) FILTER (WHERE has_accounting), 0)::float AS provider_cost_usd,
         COALESCE(SUM(cost_usd) FILTER (WHERE has_accounting AND started_at >= ${todayStart.toISOString()}::timestamptz), 0)::float AS provider_cost_today_usd,
-        COALESCE(SUM(items_returned) FILTER (WHERE started_at >= ${todayStart.toISOString()}::timestamptz), 0)::int AS items_returned_today,
+        COALESCE(SUM(items_returned) FILTER (WHERE has_accounting AND started_at >= ${since24h.toISOString()}::timestamptz), 0)::int AS items_returned_24h,
+        COALESCE(SUM(new_raw) FILTER (WHERE has_accounting AND started_at >= ${since24h.toISOString()}::timestamptz), 0)::int AS new_raw_24h,
+        COALESCE(SUM(duplicates) FILTER (WHERE has_accounting AND started_at >= ${since24h.toISOString()}::timestamptz), 0)::int AS duplicates_24h,
+        COALESCE(SUM(cost_usd) FILTER (WHERE has_accounting AND started_at >= ${since24h.toISOString()}::timestamptz), 0)::float AS provider_cost_24h_usd,
+        COALESCE(SUM(items_returned) FILTER (WHERE has_accounting AND started_at >= ${since72h.toISOString()}::timestamptz), 0)::int AS items_returned_72h,
+        COALESCE(SUM(new_raw) FILTER (WHERE has_accounting AND started_at >= ${since72h.toISOString()}::timestamptz), 0)::int AS new_raw_72h,
+        COALESCE(SUM(duplicates) FILTER (WHERE has_accounting AND started_at >= ${since72h.toISOString()}::timestamptz), 0)::int AS duplicates_72h,
+        COALESCE(SUM(cost_usd) FILTER (WHERE has_accounting AND started_at >= ${since72h.toISOString()}::timestamptz), 0)::float AS provider_cost_72h_usd,
+        COALESCE(SUM(items_returned) FILTER (WHERE has_accounting AND started_at >= ${todayStart.toISOString()}::timestamptz), 0)::int AS items_returned_today,
         COALESCE(SUM(new_raw) FILTER (WHERE has_accounting AND started_at >= ${todayStart.toISOString()}::timestamptz), 0)::int AS new_raw_today,
         COALESCE(SUM(duplicates) FILTER (WHERE has_accounting AND started_at >= ${todayStart.toISOString()}::timestamptz), 0)::int AS duplicates_today,
         COUNT(*) FILTER (WHERE has_accounting AND items_returned > 0 AND new_raw = 0 AND zero_streak_boundary = 0)::int AS zero_novelty_run_streak,
@@ -257,6 +270,14 @@ export async function getSeedEconomicPerformance(
       itemsReturnedToday: economicCount(row.items_returned_today),
       newRawToday: economicCount(row.new_raw_today),
       duplicatesToday: economicCount(row.duplicates_today),
+      itemsReturned24h: economicCount(row.items_returned_24h),
+      newRaw24h: economicCount(row.new_raw_24h),
+      duplicates24h: economicCount(row.duplicates_24h),
+      providerCost24hUsd: economicCount(row.provider_cost_24h_usd),
+      itemsReturned72h: economicCount(row.items_returned_72h),
+      newRaw72h: economicCount(row.new_raw_72h),
+      duplicates72h: economicCount(row.duplicates_72h),
+      providerCost72hUsd: economicCount(row.provider_cost_72h_usd),
       costPerNewRaw: newRaw > 0 ? providerCostUsd / newRaw : null,
       qualifiedFromSeed,
       websiteFromSeed,

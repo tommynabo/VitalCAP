@@ -42,6 +42,14 @@ export interface SeedEconomicPerformance {
   noveltyRate: number | null;
   providerCostUsd: number;
   providerCostTodayUsd: number;
+  itemsReturned24h?: number;
+  newRaw24h?: number;
+  duplicates24h?: number;
+  providerCost24hUsd?: number;
+  itemsReturned72h?: number;
+  newRaw72h?: number;
+  duplicates72h?: number;
+  providerCost72hUsd?: number;
   outcomeAttributionComplete: boolean;
   outcomeAttributionCoverage?: number | null;
   itemsReturnedToday: number;

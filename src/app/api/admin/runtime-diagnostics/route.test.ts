@@ -296,7 +296,7 @@ describe("GET /api/admin/runtime-diagnostics recovery errors", () => {
       id,
       campaignId: "campaign-1",
       engineType: "maps_fast",
-      query: "query",
+      query: "farmacia independiente",
       geography: "Madrid",
       lastRunAt: null,
       totalRaw: 10,
@@ -353,6 +353,11 @@ describe("GET /api/admin/runtime-diagnostics recovery errors", () => {
     });
     expect(body.discoveryEconomics.bySeed[0]).toMatchObject({
       outcomeAttributionComplete: false,
+      query: "farmacia independiente",
+      geography: "Madrid",
+      classification: "COLD_START",
+      providerResults7d: 10,
+      dbNewRaw7d: 10,
       qualifiedYield: null,
     });
   });
@@ -390,6 +395,14 @@ describe("GET /api/admin/runtime-diagnostics recovery errors", () => {
       noveltyRate: 0.8,
       providerCostUsd: 0.1,
       providerCostTodayUsd: 0.1,
+      itemsReturned24h: 10,
+      newRaw24h: 8,
+      duplicates24h: 2,
+      providerCost24hUsd: 0.1,
+      itemsReturned72h: 10,
+      newRaw72h: 8,
+      duplicates72h: 2,
+      providerCost72hUsd: 0.1,
       outcomeAttributionComplete: true,
       itemsReturnedToday: 10,
       newRawToday: 8,
@@ -417,6 +430,14 @@ describe("GET /api/admin/runtime-diagnostics recovery errors", () => {
     const body = await (await GET()).json();
 
     expect(body.discoveryEconomics.byEngine[0]).toMatchObject({ costPerValidEmail: 0.05 });
-    expect(body.discoveryEconomics.bySeed[0]).toMatchObject({ costPerValidEmail: 0.05 });
+    expect(body.discoveryEconomics.bySeed[0]).toMatchObject({
+      costPerValidEmail: 0.05,
+      providerResults24h: 10,
+      dbNewRaw24h: 8,
+      dbDuplicates24h: 2,
+      providerResults72h: 10,
+      dbNewRaw72h: 8,
+      dbDuplicates72h: 2,
+    });
   });
 });

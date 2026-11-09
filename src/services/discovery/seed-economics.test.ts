@@ -66,6 +66,7 @@ describe("seed economics", () => {
 
   it("defines novelty as newly inserted raw divided by provider results returned", () => {
     expect(calculateSeedNoveltyRate(3, 10)).toBe(0.3);
+    expect(calculateSeedNoveltyRate(0, 10)).toBe(0);
     expect(calculateSeedNoveltyRate(0, 0)).toBeNull();
   });
 

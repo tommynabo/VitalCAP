@@ -25,7 +25,8 @@ import {
   getSeedEconomicPerformance,
   updateSearchSeedRun,
 } from "@/infrastructure/neon/repositories/discovery";
-import { getApifyRecoverySnapshot, getApifyReservationFailureDetails, getLatestProviderEconomicPacingStates, getRecentProviderUsage, getSerperRecoveryState, getTodaySpendUsd, recordProviderRun, reserveApifyProviderRun, updateProviderRun } from "@/infrastructure/neon/repositories/provider-runs";
+import { getApifyRecoverySnapshot, getApifyReservationFailureDetails, getLatestProviderEconomicPacingStates, getProviderRunByRequestKey, getRecentProviderUsage, getSerperRecoveryState, getTodaySpendUsd, recordProviderRun, reserveApifyProviderRun, updateProviderRun } from "@/infrastructure/neon/repositories/provider-runs";
+import { buildProviderRunIngestionAccounting } from "@/infrastructure/neon/repositories/provider-run-ingestion";
 import { getAutopilotSettings } from "@/infrastructure/neon/repositories/autopilot";
 import { getEffectiveAutopilotState } from "@/domain/autopilot/types";
 import { getMultiNicheRolloutEntry } from "@/services/autopilot/multi-niche-rollout";
@@ -971,7 +972,7 @@ async function executeDiscoveryJob(
       startedAt: startedAt.toISOString(),
       finishedAt: finishedAt.toISOString(),
       rawCount: probeMode ? Math.min(desiredRawCount, result.rawCandidates.length) : result.rawCandidates.length,
-      uniqueCount: probeMode ? Math.min(desiredRawCount, result.rawCandidates.length) : result.rawCandidates.length,
+      uniqueCount: 0,
       readyCount: 0,
       error: result.providerErrors > 0 ? `${result.providerErrors} provider error(s)` : null,
     });
@@ -993,6 +994,32 @@ async function executeDiscoveryJob(
             })),
           )
         : [];
+      await updateSearchSeedRun(completedSeedRunId, { uniqueCount: insertedIds.length });
+      const providerRun = await getProviderRunByRequestKey(requestKey);
+      if (providerRun) {
+        const providerResultsReturned = result.resultsReturned ?? result.rawCandidates.length;
+        const filteredByPolicyItems = Math.min(
+          providerResultsReturned - rawCandidates.length,
+          (result.filteredByPolicyResults ?? 0) + result.rawCandidates.length - rawCandidates.length,
+        );
+        const ingestionAccounting = buildProviderRunIngestionAccounting({
+          itemsReturned: providerResultsReturned,
+          candidatesTotal: rawCandidates.length,
+          candidatesInserted: insertedIds.length,
+          invalidOrUnmappableItems: providerResultsReturned - rawCandidates.length - filteredByPolicyItems,
+          filteredByPolicyItems,
+        });
+        await updateProviderRun(providerRun.id, {
+          seedRunId: completedSeedRunId,
+          metadata: {
+            ...(providerRun.metadata as Record<string, unknown>),
+            engineType: job.payload.engineType,
+            seedId: seed.id,
+            seedRunId: completedSeedRunId,
+            ingestionAccounting,
+          },
+        });
+      }
       counters.rawCandidatesInserted += insertedIds.length;
       counters.rawCandidatesDuplicate += rawCandidates.length - insertedIds.length;
     if (probeMode && probeEvidence) {

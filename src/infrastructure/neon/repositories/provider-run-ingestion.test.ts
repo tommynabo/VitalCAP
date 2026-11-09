@@ -22,6 +22,24 @@ describe("provider run ingestion accounting", () => {
     expect(Object.values(accounting).reduce((total, count) => total + count, 0)).toBe(12);
   });
 
+  it("keeps provider results distinct from DB inserts and policy-filtered items", () => {
+    expect(buildProviderRunIngestionAccounting({
+      itemsReturned: 10,
+      candidatesTotal: 9,
+      candidatesInserted: 0,
+      invalidOrUnmappableItems: 0,
+      filteredByPolicyItems: 1,
+    })).toEqual({
+      INSERTED_NEW_RAW: 0,
+      DUPLICATE_EXISTING_RAW: 9,
+      CANONICAL_DEDUPE: 0,
+      INVALID_OR_UNMAPPABLE: 0,
+      FILTERED_BY_POLICY: 1,
+      FAILED_INSERT: 0,
+      UNKNOWN: 0,
+    });
+  });
+
   it("rejects an unexplained provider item", () => {
     expect(() => buildProviderRunIngestionAccounting({
       itemsReturned: 12,

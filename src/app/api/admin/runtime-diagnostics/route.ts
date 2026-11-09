@@ -410,7 +410,25 @@ export async function GET() {
           seedId: item.seed.id,
           campaignId: item.campaignId,
           engineType: item.engineType,
+          query: item.seed.query,
+          geography: item.seed.geography,
+          classification: item.policy.tier === "high" || item.policy.tier === "good"
+            ? "PRODUCTIVE"
+            : item.policy.tier === "marginal" || item.policy.tier === "low"
+              ? "MARGINAL"
+              : item.policy.tier === "zero" ? "SATURATED" : "COLD_START",
           sampleSize: item.performance.sampleSize,
+          providerResults7d: item.performance.itemsReturned,
+          dbNewRaw7d: item.performance.newRaw,
+          dbDuplicates7d: item.performance.duplicates,
+          providerResults24h: item.performance.itemsReturned24h,
+          dbNewRaw24h: item.performance.newRaw24h,
+          dbDuplicates24h: item.performance.duplicates24h,
+          providerCost24hUsd: item.performance.providerCost24hUsd,
+          providerResults72h: item.performance.itemsReturned72h,
+          dbNewRaw72h: item.performance.newRaw72h,
+          dbDuplicates72h: item.performance.duplicates72h,
+          providerCost72hUsd: item.performance.providerCost72hUsd,
           recentRuns: item.performance.recentRuns,
           noveltyRate: item.performance.noveltyRate,
           providerCostUsd: item.performance.providerCostUsd,

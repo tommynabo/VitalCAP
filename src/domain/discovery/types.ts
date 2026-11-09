@@ -170,6 +170,7 @@ export interface DiscoveryEngine {
     resultsReturned?: number;
     providerCallSucceeded?: boolean;
     providerCallErrorClass?: string | null;
+    filteredByPolicyResults?: number;
     providerRun?: AsyncMapsRun;
   }>;
 }

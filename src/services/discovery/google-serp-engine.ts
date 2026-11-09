@@ -41,6 +41,7 @@ export class GoogleSerpEngine implements DiscoveryEngine {
     resultsReturned: number;
     providerCallSucceeded: boolean;
     providerCallErrorClass: string | null;
+    filteredByPolicyResults: number;
   }> {
     const start = Date.now();
     const maxResults = Math.max(1, Math.min(10, Math.floor(input.maxResults ?? 10)));
@@ -54,6 +55,7 @@ export class GoogleSerpEngine implements DiscoveryEngine {
         planningWindow: input.planningWindow,
       });
       const businessResults = output.results.filter((result) => result.domain !== "linkedin.com");
+      const filteredByPolicyResults = output.results.length - businessResults.length;
       const rawCandidates: RawCandidate[] = businessResults.map((result, index) => ({
         id: `raw_${input.seed.id}_${index}_${result.domain ?? "unknown"}`,
         campaignId: input.seed.campaignId,
@@ -70,6 +72,7 @@ export class GoogleSerpEngine implements DiscoveryEngine {
         providerErrors: 0,
         latencyMs: Date.now() - start,
         resultsReturned: output.results.length,
+        filteredByPolicyResults,
         providerCallSucceeded: true,
         providerCallErrorClass: null,
       };
@@ -87,6 +90,7 @@ export class GoogleSerpEngine implements DiscoveryEngine {
         resultsReturned: 0,
         providerCallSucceeded: false,
         providerCallErrorClass: error instanceof Error ? error.constructor.name : typeof error,
+        filteredByPolicyResults: 0,
       };
     }
   }

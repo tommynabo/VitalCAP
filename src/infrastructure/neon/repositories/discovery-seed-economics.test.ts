@@ -40,6 +40,11 @@ describe("seed economic performance query", () => {
 
     expect(query.sql).toContain("run.provider = $2");
     expect(query.params).toContain("serper");
+    expect(query.sql).toContain("LEFT JOIN search_seed_runs seed_run ON seed_run.id = run.seed_run_id");
+    expect(query.sql).toContain("seed_run.unique_count");
+    expect(query.sql).toContain("seed_run.raw_count - seed_run.unique_count");
+    expect(query.sql).toContain("items_returned_24h");
+    expect(query.sql).toContain("items_returned_72h");
   });
 
   it("reports daily actual provider cost and returned items independently of requests", () => {
