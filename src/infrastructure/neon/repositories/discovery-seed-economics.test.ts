@@ -45,6 +45,8 @@ describe("seed economic performance query", () => {
     expect(query.sql).toContain("seed_run.raw_count - seed_run.unique_count");
     expect(query.sql).toContain("items_returned_24h");
     expect(query.sql).toContain("items_returned_72h");
+    expect(query.sql).toContain("COALESCE(rollup.items_returned_24h, 0)::int AS items_returned_24h");
+    expect(query.sql).toContain("COALESCE(rollup.provider_cost_72h_usd, 0)::float AS provider_cost_72h_usd");
   });
 
   it("reports daily actual provider cost and returned items independently of requests", () => {
