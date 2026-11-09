@@ -25,7 +25,7 @@ import {
   getSeedEconomicPerformance,
   updateSearchSeedRun,
 } from "@/infrastructure/neon/repositories/discovery";
-import { getApifyRecoverySnapshot, getApifyReservationFailureDetails, getLatestProviderEconomicPacingStates, getProviderRunByRequestKey, getRecentProviderUsage, getSerperRecoveryState, getTodaySpendUsd, recordProviderRun, reserveApifyProviderRun, updateProviderRun } from "@/infrastructure/neon/repositories/provider-runs";
+import { getApifyRecoverySnapshot, getApifyReservationFailureDetails, getLatestProviderEconomicPacingStates, getProviderRunById, getRecentProviderUsage, getSerperRecoveryState, getTodaySpendUsd, recordProviderRun, reserveApifyProviderRun, updateProviderRun } from "@/infrastructure/neon/repositories/provider-runs";
 import { buildProviderRunIngestionAccounting } from "@/infrastructure/neon/repositories/provider-run-ingestion";
 import { getAutopilotSettings } from "@/infrastructure/neon/repositories/autopilot";
 import { getEffectiveAutopilotState } from "@/domain/autopilot/types";
@@ -995,7 +995,7 @@ async function executeDiscoveryJob(
           )
         : [];
       await updateSearchSeedRun(completedSeedRunId, { uniqueCount: insertedIds.length });
-      const providerRun = await getProviderRunByRequestKey(requestKey);
+      const providerRun = result.providerRunId ? await getProviderRunById(result.providerRunId) : null;
       if (providerRun) {
         const providerResultsReturned = result.resultsReturned ?? result.rawCandidates.length;
         const filteredByPolicyItems = Math.min(

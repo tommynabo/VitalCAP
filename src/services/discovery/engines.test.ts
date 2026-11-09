@@ -108,6 +108,7 @@ describe("GoogleSerpEngine", () => {
     });
 
     expect(result.rawCandidates[0]?.providerRunId).toBe("serper-run-1");
+    expect(result.providerRunId).toBe("serper-run-1");
     expect(provider.search).toHaveBeenCalledWith(expect.objectContaining({ seedId: "seed_1", planningWindow: "2026-10-03T11:00" }));
   });
 

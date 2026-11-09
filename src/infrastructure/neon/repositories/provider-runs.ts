@@ -840,6 +840,12 @@ export async function getProviderRunByRequestKey(requestKey: string) {
   return row ?? null;
 }
 
+export async function getProviderRunById(id: string) {
+  const db = getDb();
+  const [row] = await db.select().from(providerRuns).where(eq(providerRuns.id, id)).limit(1);
+  return row ?? null;
+}
+
 export async function getScopedSmokeProviderRunDiagnostics(discoveryJobId: string): Promise<{
   runs: Array<Record<string, unknown>>;
   candidates: Array<Record<string, unknown>>;

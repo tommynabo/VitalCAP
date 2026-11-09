@@ -42,6 +42,7 @@ export class GoogleSerpEngine implements DiscoveryEngine {
     providerCallSucceeded: boolean;
     providerCallErrorClass: string | null;
     filteredByPolicyResults: number;
+    providerRunId?: string;
   }> {
     const start = Date.now();
     const maxResults = Math.max(1, Math.min(10, Math.floor(input.maxResults ?? 10)));
@@ -73,6 +74,7 @@ export class GoogleSerpEngine implements DiscoveryEngine {
         latencyMs: Date.now() - start,
         resultsReturned: output.results.length,
         filteredByPolicyResults,
+        providerRunId: output.providerRunId,
         providerCallSucceeded: true,
         providerCallErrorClass: null,
       };
