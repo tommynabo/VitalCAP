@@ -872,6 +872,48 @@ describe("POST /api/admin/discovery/scoped-smoke", () => {
     expect(mocks.runVerificationCronTick).not.toHaveBeenCalled();
   });
 
+  it("fails closed and returns boolean diagnostics when the persisted niche metadata differs", async () => {
+    const campaignId = MULTI_NICHE_ROLLOUT[2].campaignId;
+    const candidateId = "98fd0b30-6dc1-4491-9b43-776065669e1e";
+    mocks.getScopedSmokeCandidateReprocessDiagnostics.mockResolvedValueOnce({
+      candidate_id: candidateId,
+      campaign_id: campaignId,
+      discovery_job_id: "a9d4378f-28d0-4b6f-9f31-cfbe9627539c",
+      processed: true,
+      icp_qualified: "false",
+      physical_presence_verdict: "verified",
+      campaign_membership_stage: "rejected",
+      provider: "apify",
+      operation: "maps_search",
+      provider_run_status: "ingested",
+      smoke_execution_id: "a9d4378f-28d0-4b6f-9f31-cfbe9627539c",
+      metadata_niche: "spas_wellness",
+      campaign_niche: "premium_fitness",
+    });
+
+    const response = await POST(request({
+      campaignId,
+      dryRun: false,
+      maxCandidates: 1,
+      probeMode: true,
+      reprocessRejectedCandidates: true,
+      reprocessCandidateIds: [candidateId],
+      allowImport: false,
+    }));
+    const payload = await response.json();
+
+    expect(response.status).toBe(409);
+    expect(payload.evidenceChecks).toMatchObject({
+      candidateFound: true,
+      metadataNicheMatches: false,
+      campaignNicheMatches: true,
+      membershipRejected: true,
+      icpRejected: true,
+    });
+    expect(mocks.getScopedSmokeJob).not.toHaveBeenCalled();
+    expect(mocks.runProcessingCronTick).not.toHaveBeenCalled();
+  });
+
   it("replays a pending run to ingested without creating a job or provider run", async () => {
     const campaignId = MULTI_NICHE_ROLLOUT[0].campaignId;
     const smokeExecutionId = "c76e780a-b0a2-4e16-a3ec-e5d8a9197c4c";

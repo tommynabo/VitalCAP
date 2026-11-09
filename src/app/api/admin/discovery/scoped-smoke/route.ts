@@ -370,20 +370,28 @@ async function reprocessApprovedCandidate(candidateId: string, campaignId: strin
 
   const candidate = await getScopedSmokeCandidateReprocessDiagnostics(candidateId);
   const smokeExecutionId = typeof candidate?.smoke_execution_id === "string" ? candidate.smoke_execution_id : null;
-  if (!candidate || candidate.candidate_id !== candidateId
-    || candidate.campaign_id !== approved.campaignId
-    || candidate.provider !== "apify"
-    || candidate.operation !== "maps_search"
-    || candidate.provider_run_status !== "ingested"
-    || candidate.metadata_niche !== approved.niche
-    || candidate.campaign_niche !== approved.niche
-    || candidate.discovery_job_id !== smokeExecutionId
-    || candidate.processed !== true
-    || candidate.physical_presence_verdict !== "verified"
-    || candidate.campaign_membership_stage !== "rejected"
-    || candidate.icp_qualified !== "false"
-    || !smokeExecutionId) {
-    return NextResponse.json({ error: "Candidate does not match the approved rejected-ICP smoke evidence." }, { status: 409 });
+  const evidenceChecks = {
+    candidateFound: candidate !== null,
+    candidateIdMatches: candidate?.candidate_id === candidateId,
+    campaignMatches: candidate?.campaign_id === approved.campaignId,
+    providerIsApifyMaps: candidate?.provider === "apify" && candidate.operation === "maps_search",
+    providerRunIngested: candidate?.provider_run_status === "ingested",
+    metadataNicheMatches: candidate?.metadata_niche == null || candidate.metadata_niche === approved.niche,
+    campaignNicheMatches: candidate?.campaign_niche === approved.niche,
+    smokeExecutionMatches: Boolean(smokeExecutionId) && candidate?.discovery_job_id === smokeExecutionId,
+    candidateProcessed: candidate?.processed === true,
+    physicalPresenceVerified: candidate?.physical_presence_verdict === "verified",
+    membershipRejected: candidate?.campaign_membership_stage === "rejected",
+    icpRejected: candidate?.icp_qualified === "false",
+  };
+  if (Object.values(evidenceChecks).some((passed) => !passed)) {
+    return NextResponse.json({
+      error: "Candidate does not match the approved rejected-ICP smoke evidence.",
+      evidenceChecks,
+    }, { status: 409 });
+  }
+  if (!smokeExecutionId) {
+    return NextResponse.json({ error: "Candidate has no linked smoke execution." }, { status: 409 });
   }
 
   const job = await getScopedSmokeJob(smokeExecutionId);
