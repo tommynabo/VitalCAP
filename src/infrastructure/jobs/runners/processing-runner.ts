@@ -37,6 +37,7 @@ import { getVerificationEnv } from "@/lib/config/env";
 import { processRawCandidate, createInitialCandidateProcessingMetrics, deriveIncomingIdentitySignals, hasLinkedInEmployerAccount, type CandidateRawPayload, type ProcessedCandidateResult } from "@/services/discovery/candidate-processor";
 import { getNicheId } from "@/services/discovery/niche-profiles";
 import { getMultiNicheRolloutEntry } from "@/services/autopilot/multi-niche-rollout";
+import { NICHE_CLASSIFIER_VERSION } from "@/services/discovery/business-type";
 import { mergeMissingAccountFields, type IncomingAccountFields } from "@/services/accounts/account-enrichment-merge";
 import { realWebsiteFetcher, providerLabelForEngine } from "./engine-factory";
 import { WebsiteEnrichmentService, type WebsiteEvidenceFact } from "@/services/enrichment/website-enrichment-service";
@@ -112,7 +113,7 @@ function resolveMembershipStage(processed: ProcessedCandidateResult): { stage: C
   return { stage: "qualified", rejectionReason: processed.rejectionReason };
 }
 
-function addCandidateOutcome(processed: ProcessedCandidateResult): CandidateProcessingMetrics {
+function addCandidateOutcome(processed: ProcessedCandidateResult, niche?: string | null): CandidateProcessingMetrics {
   return {
     ...processed.processingMetrics,
     candidateOutcome: {
@@ -122,6 +123,7 @@ function addCandidateOutcome(processed: ProcessedCandidateResult): CandidateProc
       duplicate: processed.isDuplicate,
       matchedExistingAccount: processed.matchedAccountKey !== null,
       classifierEvidenceSource: processed.nicheEvidenceWebsiteFetched ? "maps_and_website" : "maps_name_category",
+      ...(niche ? { classifierVersion: NICHE_CLASSIFIER_VERSION } : {}),
     },
   };
 }
@@ -535,7 +537,7 @@ async function executeProcessingJob(
 
   if (canonicalResolution.kind === "needsReview") {
     finishWebsiteAttribution(processed.processingMetrics);
-    await runProcessingWriteStage(diagnostics, "MARK_RAW_PROCESSED", () => markRawCandidateProcessed(raw.id, addCandidateOutcome(processed)));
+    await runProcessingWriteStage(diagnostics, "MARK_RAW_PROCESSED", () => markRawCandidateProcessed(raw.id, addCandidateOutcome(processed, configuredNiche)));
     return;
   }
 
@@ -626,7 +628,7 @@ async function executeProcessingJob(
     contactPointsCreated: 0,
     verificationQueued: 0,
   };
-  const processingMetrics = addCandidateOutcome(processed);
+  const processingMetrics = addCandidateOutcome(processed, configuredNiche);
   const currentWebsiteEmailFacts = new Map<string, WebsiteEvidenceFact>();
 
   // --- WEBSITE ENRICHMENT ---

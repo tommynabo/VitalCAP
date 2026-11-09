@@ -1,6 +1,8 @@
 import type { BusinessType } from "@/domain/accounts/types";
 import type { NicheId } from "./niche-profiles";
 
+export const NICHE_CLASSIFIER_VERSION = "niche-icp-v2";
+
 /**
  * Deterministic, rule-based business-type classification (Prompt 2 §2.3:
  * "no expensive LLM call for an obviously-a-pharmacy result — deterministic

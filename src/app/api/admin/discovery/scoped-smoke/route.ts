@@ -17,6 +17,7 @@ import { buildEngineCapabilities } from "@/services/autopilot/engine-capability"
 import { COLD_START_IMPORT_SAMPLE, planningWindowKey, resolveOperationalEnvelope, routeCampaignsToAvailableEngines } from "@/services/autopilot/target-planner";
 import { getMultiNicheRolloutEntry, MULTI_NICHE_ROLLOUT } from "@/services/autopilot/multi-niche-rollout";
 import { hasConfidentSeedEconomicEvidence, scoreSeedEconomicPerformance } from "@/services/discovery/seed-economics";
+import { NICHE_CLASSIFIER_VERSION } from "@/services/discovery/business-type";
 import { getMapsEnv, getSerperEnv, getVerificationEnv } from "@/lib/config/env";
 import { getDayBounds } from "@/lib/time/day-bounds";
 import { AUTO_SEND_ENABLED } from "@/services/setter/autonomy-policy";
@@ -256,7 +257,8 @@ async function replayScopedSmoke(
     : null);
   const provider = String(savedResult?.PROVIDER ?? job.payload.provider ?? "unknown");
   const rollout = getMultiNicheRolloutEntry(job.campaignId);
-  const previouslyReprocessedCandidateIds = Array.isArray(savedResult?.REPROCESSED_REJECTED_CANDIDATE_IDS)
+  const previouslyReprocessedCandidateIds = savedResult?.REPROCESSED_CLASSIFIER_VERSION === NICHE_CLASSIFIER_VERSION
+    && Array.isArray(savedResult.REPROCESSED_REJECTED_CANDIDATE_IDS)
     ? savedResult.REPROCESSED_REJECTED_CANDIDATE_IDS.filter((candidateId): candidateId is string => {
       if (typeof candidateId !== "string") return false;
       const approved = APPROVED_REPROCESS_CANDIDATES[candidateId];
@@ -294,7 +296,7 @@ async function replayScopedSmoke(
           campaignId: job.campaignId,
           type: "process_raw_candidate",
           payload: { rawCandidateId },
-          idempotencyKey: `raw_candidate:${rawCandidateId}:niche-reprocess:${job.id}`,
+          idempotencyKey: `raw_candidate:${rawCandidateId}:niche-reprocess:${job.id}:${NICHE_CLASSIFIER_VERSION}`,
         });
       }
     }
@@ -328,6 +330,7 @@ async function replayScopedSmoke(
     REPROCESSED_REJECTED_CANDIDATE_IDS: reprocessRejectedCandidates
       ? [...new Set([...previouslyReprocessedCandidateIds, ...candidateIdsToProcess])]
       : [],
+    ...(reprocessRejectedCandidates ? { REPROCESSED_CLASSIFIER_VERSION: NICHE_CLASSIFIER_VERSION } : {}),
     EXECUTION_STATE: job.status,
     SMOKE_EXECUTION_ID: job.id,
     JOB_ID: job.id,

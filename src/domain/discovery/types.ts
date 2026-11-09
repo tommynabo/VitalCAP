@@ -27,6 +27,7 @@ export interface CandidateProcessingMetrics {
     duplicate: boolean;
     matchedExistingAccount: boolean;
     classifierEvidenceSource?: "maps_name_category" | "maps_and_website";
+    classifierVersion?: string;
   };
   homepageFetchAttempted: number;
   homepageFetchSucceeded: number;

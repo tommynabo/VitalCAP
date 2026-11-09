@@ -1131,6 +1131,9 @@ describe("runProcessingCronTick", () => {
     const context = mocks.processRawCandidate.mock.calls[0]?.[2] as ProcessingContext | undefined;
     expect(context?.niche).toBe("premium_fitness");
     expect(context?.nicheEvidenceFetcher?.fetchPage).toEqual(expect.any(Function));
+    expect(mocks.markRawCandidateProcessed).toHaveBeenCalledWith("raw-candidate-id", expect.objectContaining({
+      candidateOutcome: expect.objectContaining({ classifierVersion: "niche-icp-v2" }),
+    }));
     expect(mocks.createSerpDiscoveryProvider).not.toHaveBeenCalled();
   });
 
