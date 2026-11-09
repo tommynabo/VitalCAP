@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { resolveInstantlyImportTargets } from "./instantly-import-targets";
+import {
+  resolveInstantlyImportTargets,
+  resolveScopedDraftInstantlyImportTarget,
+  type ScopedDraftInstantlyTargetRow,
+} from "./instantly-import-targets";
 
 function campaignRow(overrides: Partial<Parameters<typeof resolveInstantlyImportTargets>[0][number]> = {}) {
   return {
@@ -191,5 +195,57 @@ describe("resolveInstantlyImportTargets", () => {
       reason: "mapping_disabled",
       expectedProviderCampaignId: target,
     }]);
+  });
+});
+
+describe("resolveScopedDraftInstantlyImportTarget", () => {
+  const campaignId = "65b9f85d-4c8b-4e52-99fb-217eb3acac1c";
+  const workspaceId = "workspace-1";
+  const row: ScopedDraftInstantlyTargetRow = {
+    campaign_id: campaignId,
+    workspace_id: workspaceId,
+    campaign_status: "draft",
+    autopilot_enabled: false,
+    niche: "yoga_pilates",
+    mapping_count: 1,
+    mapping_campaign_id: campaignId,
+    mapping_workspace_id: workspaceId,
+    mapping_provider: "instantly",
+    mapping_enabled: false,
+    mapped_provider_campaign_id: "7ba53c91-6c8f-4b8a-b260-72eb48f62d07",
+  };
+
+  it("resolves the persisted disabled mapping for an allowlisted Draft campaign", () => {
+    expect(resolveScopedDraftInstantlyImportTarget(row, campaignId, workspaceId)).toEqual({
+      target: {
+        campaignId,
+        workspaceId,
+        providerCampaignId: "7ba53c91-6c8f-4b8a-b260-72eb48f62d07",
+        legacyFallback: false,
+      },
+      blockReason: null,
+    });
+  });
+
+  it.each([
+    [{ ...row, mapping_count: 0, mapping_campaign_id: null, mapping_provider: null, mapping_enabled: null, mapped_provider_campaign_id: null }, "mapping_missing"],
+    [{ ...row, mapping_count: 2 }, "ambiguous_mapping_rows"],
+    [{ ...row, mapped_provider_campaign_id: "wrong-target" }, "provider_campaign_id_mismatch"],
+    [{ ...row, campaign_status: "active" }, "campaign_not_draft"],
+    [{ ...row, autopilot_enabled: true }, "campaign_autopilot_enabled"],
+    [{ ...row, mapping_enabled: true }, "mapping_must_remain_disabled"],
+    [{ ...row, mapping_workspace_id: "different-workspace" }, "mapping_workspace_mismatch"],
+  ] as const)("fails closed for %s", (invalidRow, blockReason) => {
+    expect(resolveScopedDraftInstantlyImportTarget(invalidRow, campaignId, workspaceId)).toEqual({
+      target: null,
+      blockReason,
+    });
+  });
+
+  it("rejects legacy campaigns", () => {
+    expect(resolveScopedDraftInstantlyImportTarget(row, "legacy-campaign", workspaceId)).toEqual({
+      target: null,
+      blockReason: "campaign_not_allowlisted",
+    });
   });
 });

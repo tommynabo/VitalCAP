@@ -65,10 +65,13 @@ interface ProcessingJobPayload {
 
 export interface ProcessingRunnerOptions {
   enrichContacts?: boolean;
+  requireQualifiedForContactEnrichment?: boolean;
   campaignId?: string;
   allowScopedDraftCampaign?: true;
   createdSince?: Date;
+  jobId?: string;
   rawCandidateIds?: string[];
+  jobTypes?: readonly string[];
   allowMapsFastWebsiteRecovery?: boolean;
   allowNicheWebsiteClassificationEvidence?: boolean;
   correlationId?: string;
@@ -136,6 +139,19 @@ function mergeWebsiteEmailSource(
   if (!current || current === "none") return next;
   if (current === "mixed") return current;
   return current === next ? current : "mixed";
+}
+
+export function shouldEnrichCandidateContacts(input: {
+  websiteUrl?: string | null;
+  normalizedDomain?: string | null;
+  enrichContacts?: boolean;
+  requireQualifiedForContactEnrichment?: boolean;
+  icpQualified: boolean;
+  physicalPresenceVerdict: ProcessedCandidateResult["spainVerdict"];
+}): boolean {
+  if (!input.websiteUrl || !input.normalizedDomain || input.enrichContacts === false) return false;
+  return !input.requireQualifiedForContactEnrichment
+    || (input.icpQualified && input.physicalPresenceVerdict === "verified");
 }
 
 function updateRecoveredFetchSummary(metrics: CandidateProcessingMetrics): void {
@@ -633,7 +649,14 @@ async function executeProcessingJob(
 
   // --- WEBSITE ENRICHMENT ---
   const normalizedDomain = accountIdentity.normalizedDomain;
-  if (accountFields.websiteUrl && normalizedDomain && options.enrichContacts !== false) {
+  if (shouldEnrichCandidateContacts({
+    websiteUrl: accountFields.websiteUrl,
+    normalizedDomain,
+    enrichContacts: options.enrichContacts,
+    requireQualifiedForContactEnrichment: options.requireQualifiedForContactEnrichment,
+    icpQualified: processed.icpQualified,
+    physicalPresenceVerdict: processed.spainVerdict,
+  }) && accountFields.websiteUrl && normalizedDomain) {
     const cache = await getWebsiteEnrichmentStatus(accountId, normalizedDomain);
     const now = new Date();
     const transientCacheFailure = cache?.status === "timeout" || cache?.status === "transient_error";
@@ -998,10 +1021,12 @@ export async function runProcessingCronTick(
             batchSize: 1,
             now,
             campaignId: options.campaignId,
+            jobId: options.jobId,
             requireAutopilot: options.campaignId === undefined,
             allowScopedDraftCampaign: options.allowScopedDraftCampaign,
             createdSince: options.createdSince,
             rawCandidateIds: options.rawCandidateIds,
+            jobTypes: options.jobTypes,
           }),
           cronDeadline.signal,
         )));

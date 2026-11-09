@@ -610,6 +610,9 @@ export function buildClaimJobsQuery(table: QueueTable, input: ClaimJobsInput, no
   const rawCandidateIdFilter = input.rawCandidateIds?.length
     ? sql`j.payload->>'rawCandidateId' IN (${sql.join(input.rawCandidateIds.map((id) => sql`${id}`), sql`, `)})`
     : sql`true`;
+  const jobTypeFilter = input.jobTypes?.length
+    ? sql`j.type IN (${sql.join(input.jobTypes.map((type) => sql`${type}`), sql`, `)})`
+    : sql`true`;
   const rolloutCampaignIdList = sql.join(MULTI_NICHE_ROLLOUT_CAMPAIGN_IDS.map((campaignId) => sql`${campaignId}::uuid`), sql`, `);
   const scopedDraftCampaign = input.allowScopedDraftCampaign && inputCampaignId !== null
     ? sql`c.id = ${inputCampaignId}::uuid
@@ -700,6 +703,7 @@ export function buildClaimJobsQuery(table: QueueTable, input: ClaimJobsInput, no
               AND (${inputJobId}::uuid IS NULL OR j.id = ${inputJobId}::uuid)
               AND (${inputCreatedSince}::timestamptz IS NULL OR j.created_at >= ${inputCreatedSince}::timestamptz)
               AND ${rawCandidateIdFilter}
+              AND ${jobTypeFilter}
               AND j.status IN ('pending', 'processing')
               AND (j.next_attempt_at IS NULL OR j.next_attempt_at <= ${nowIso}::timestamptz)
               AND j.attempt_count < j.max_attempts
@@ -733,6 +737,7 @@ export interface ClaimJobsInput {
   campaignId?: string;
   jobId?: string;
   rawCandidateIds?: string[];
+  jobTypes?: readonly string[];
   requireAutopilot?: boolean;
   allowWatchdogRecovery?: boolean;
   allowScopedDraftCampaign?: boolean;
@@ -1194,6 +1199,39 @@ export async function enqueueDiscoveryJob(input: EnqueueJobInput): Promise<strin
 
 export async function enqueueProcessingJob(input: EnqueueJobInput): Promise<string> {
   return enqueueProcessing(input);
+}
+
+export async function enqueueAdminScopedProcessingJob(input: {
+  executionId: string;
+  campaignId: string;
+  rawCandidateId: string;
+}): Promise<{ jobId: string; status: string; created: boolean }> {
+  const db = getDb();
+  const idempotencyKey = `admin-multi-niche-e2e:${input.campaignId}:${input.rawCandidateId}:${input.executionId}:process`;
+  const [inserted] = await db.insert(processingJobs).values({
+    id: input.executionId,
+    campaignId: input.campaignId,
+    type: "process_raw_candidate",
+    payload: { rawCandidateId: input.rawCandidateId, skipMapsFastWebsiteRecovery: true },
+    maxAttempts: 1,
+    idempotencyKey,
+  }).onConflictDoNothing().returning({ id: processingJobs.id });
+  const [existing] = await db.select({
+    id: processingJobs.id,
+    campaignId: processingJobs.campaignId,
+    type: processingJobs.type,
+    payload: processingJobs.payload,
+    status: processingJobs.status,
+    idempotencyKey: processingJobs.idempotencyKey,
+  }).from(processingJobs).where(eq(processingJobs.id, input.executionId)).limit(1);
+  const existingPayload = existing?.payload !== null && typeof existing?.payload === "object" && !Array.isArray(existing.payload)
+    ? existing.payload as Record<string, unknown>
+    : {};
+  if (!existing || existing.campaignId !== input.campaignId || existing.type !== "process_raw_candidate"
+    || existingPayload.rawCandidateId !== input.rawCandidateId || existing.idempotencyKey !== idempotencyKey) {
+    throw new Error("Admin E2E execution ID is already bound to another processing job.");
+  }
+  return { jobId: existing.id, status: existing.status, created: Boolean(inserted) };
 }
 
 export async function deadLetterExpiredJobs(table: QueueTable, leaseMs: number = JOB_LEASE_MS, message: string = "Max attempts exceeded via watchdog"): Promise<number> {

@@ -162,6 +162,32 @@ describe("runVerificationCronTick eligibility recheck", () => {
     expect(claimQuery.text).toContain("FOR UPDATE OF candidate SKIP LOCKED");
   });
 
+  it("claims only the exact contact point when scoped verification is requested", async () => {
+    mocks.execute.mockReset().mockResolvedValueOnce({ rows: [] });
+
+    const result = await runVerificationCronTick(1, {
+      campaignId: "campaign-1",
+      contactPointIds: ["contact-point-exact"],
+      skipInstantlyImport: true,
+    });
+
+    const claimQuery = sqlParts(mocks.execute.mock.calls[0]?.[0]);
+    expect(claimQuery.text).toContain("candidate.contact_point_id");
+    expect(claimQuery.values).toContain("contact-point-exact");
+    expect(result.jobsClaimed).toBe(0);
+    expect(mocks.runInstantlyImportTick).not.toHaveBeenCalled();
+  });
+
+  it("rejects scoped verification requests with zero or multiple contact points", async () => {
+    await expect(runVerificationCronTick(1, { contactPointIds: [] })).rejects.toThrow(
+      "Scoped verification requires exactly one contact point.",
+    );
+    await expect(runVerificationCronTick(1, { contactPointIds: ["one", "two"] })).rejects.toThrow(
+      "Scoped verification requires exactly one contact point.",
+    );
+    expect(mocks.execute).not.toHaveBeenCalled();
+  });
+
   it("dead-letters only expired verification locks that exhausted all attempts", () => {
     const now = new Date("2026-11-08T09:00:00.000Z");
     const query = sqlParts(buildDeadLetterExhaustedVerificationJobsQuery(now));

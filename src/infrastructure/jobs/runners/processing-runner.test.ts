@@ -138,6 +138,7 @@ import {
   evaluateStructuredWebsiteLocation,
   PROCESSING_MAX_JOBS_PER_TICK,
   runProcessingCronTick,
+  shouldEnrichCandidateContacts,
 } from "./processing-runner";
 
 describe("evaluateStructuredWebsiteLocation", () => {
@@ -163,6 +164,29 @@ describe("evaluateStructuredWebsiteLocation", () => {
   });
 });
 
+describe("shouldEnrichCandidateContacts", () => {
+  const base = {
+    websiteUrl: "https://example.com",
+    normalizedDomain: "example.com",
+    requireQualifiedForContactEnrichment: true,
+    icpQualified: true,
+    physicalPresenceVerdict: "verified" as const,
+  };
+
+  it("requires both ICP qualification and verified physical presence for scoped enrichment", () => {
+    expect(shouldEnrichCandidateContacts(base)).toBe(true);
+    expect(shouldEnrichCandidateContacts({ ...base, icpQualified: false })).toBe(false);
+    expect(shouldEnrichCandidateContacts({ ...base, physicalPresenceVerdict: "needs_review" })).toBe(false);
+    expect(shouldEnrichCandidateContacts({ ...base, physicalPresenceVerdict: "rejected" })).toBe(false);
+  });
+
+  it("honors the explicit no-enrichment and missing-website gates", () => {
+    expect(shouldEnrichCandidateContacts({ ...base, enrichContacts: false })).toBe(false);
+    expect(shouldEnrichCandidateContacts({ ...base, websiteUrl: null })).toBe(false);
+    expect(shouldEnrichCandidateContacts({ ...base, normalizedDomain: null })).toBe(false);
+  });
+});
+
 describe("scoped processing candidate filter", () => {
   it("passes exact raw candidate IDs to the processing-job claim", async () => {
     const rawCandidateIds = ["raw-candidate-1", "raw-candidate-2"];
@@ -178,6 +202,23 @@ describe("scoped processing candidate filter", () => {
       campaignId: "campaign-id",
       allowScopedDraftCampaign: true,
       rawCandidateIds,
+    }));
+  });
+
+  it("passes the exact processing job ID and type filter to the claim", async () => {
+    mocks.claimProcessingJobs.mockResolvedValueOnce([]);
+    await runProcessingCronTick(1, new Date(), {
+      campaignId: "campaign-id",
+      allowScopedDraftCampaign: true,
+      jobId: "job-id",
+      jobTypes: ["process_raw_candidate"],
+      rawCandidateIds: ["raw-candidate-id"],
+    });
+
+    expect(mocks.claimProcessingJobs).toHaveBeenCalledWith(expect.objectContaining({
+      jobId: "job-id",
+      jobTypes: ["process_raw_candidate"],
+      rawCandidateIds: ["raw-candidate-id"],
     }));
   });
 });

@@ -63,7 +63,7 @@ export interface InstantlyLeadImportOutcome {
   diagnostic: string | null;
 }
 
-type InstantlyEndpointCategory = "leads" | "leads/list" | "leads/add" | "workspace-billing/plan-details" | "campaigns/analytics";
+type InstantlyEndpointCategory = "leads" | "leads/list" | "leads/add" | "workspace-billing/plan-details" | "campaigns" | "campaigns/analytics";
 
 export class InstantlyApiError extends Error {
   constructor(readonly details: {
@@ -134,6 +134,11 @@ interface InstantlyPlanResponse {
 
 interface InstantlyCampaignAnalytics {
   emails_sent_count?: number;
+}
+
+interface InstantlyCampaignStatusResponse {
+  id?: string;
+  status?: number;
 }
 
 function nonEmptyVariables(variables: Record<string, string>): Record<string, string> {
@@ -274,6 +279,23 @@ export class InstantlyEmailDeliveryProvider implements EmailDeliveryProvider {
       throw new Error("Instantly monthly usage response did not include sent email counts");
     }
     return { emailsSent: data.reduce((total, campaign) => total + (campaign.emails_sent_count ?? 0), 0) };
+  }
+
+  async getCampaignStatus(providerCampaignId: string): Promise<number> {
+    this.ensureConfigured();
+    const { data } = await this.requestJson<InstantlyCampaignStatusResponse>(
+      "campaigns",
+      `${INSTANTLY_API_BASE_URL}/campaigns/${encodeURIComponent(providerCampaignId)}`,
+      {
+        method: "GET",
+        headers: { Authorization: `Bearer ${this.apiKey}` },
+        signal: AbortSignal.timeout(10_000),
+      },
+    );
+    if (data.id !== providerCampaignId || !Number.isInteger(data.status)) {
+      throw new Error("Instantly campaign status response did not confirm the requested campaign and status.");
+    }
+    return data.status!;
   }
 
   async findLeadInCampaign(providerCampaignId: string, email: string): Promise<string | null> {

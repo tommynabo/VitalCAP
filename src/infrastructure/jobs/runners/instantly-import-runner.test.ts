@@ -25,6 +25,8 @@ const mocks = vi.hoisted(() => ({
   findLeadInCampaign: vi.fn(),
   findLeadsByEmail: vi.fn(),
   listImportTargets: vi.fn(),
+  getScopedDraftImportTarget: vi.fn(),
+  getCampaignStatus: vi.fn(),
 }));
 
 vi.mock("@/infrastructure/neon/db", () => ({ getDb: () => ({ execute: mocks.execute }) }));
@@ -34,6 +36,7 @@ vi.mock("@/infrastructure/neon/repositories/actual-outreach", () => ({
 }));
 vi.mock("@/infrastructure/neon/repositories/instantly-import-targets", () => ({
   listInstantlyImportTargets: mocks.listImportTargets,
+  getScopedDraftInstantlyImportTarget: mocks.getScopedDraftImportTarget,
 }));
 vi.mock("@/infrastructure/neon/repositories/instantly-lead-imports", () => ({
   acquireInstantlyImportLock: mocks.acquireLock,
@@ -52,6 +55,7 @@ vi.mock("@/infrastructure/providers/instantly/provider", () => ({
   InstantlyEmailDeliveryProvider: class {
     getPlanUsage = mocks.getPlanUsage;
     getMonthlyEmailUsage = mocks.getMonthlyEmailUsage;
+    getCampaignStatus = mocks.getCampaignStatus;
     addLeads = mocks.addLeads;
     addLeadToCampaign = mocks.addLeadToCampaign;
     findLeadInCampaign = mocks.findLeadInCampaign;
@@ -59,9 +63,12 @@ vi.mock("@/infrastructure/providers/instantly/provider", () => ({
   },
 }));
 
-import { runInstantlyImportTick } from "./instantly-import-runner";
+import { runAdminScopedDraftInstantlyImport, runInstantlyImportTick } from "./instantly-import-runner";
 
 const campaignId = "055534c5-c3e3-414f-b140-f4770b293c00";
+const scopedDraftCampaignId = "65b9f85d-4c8b-4e52-99fb-217eb3acac1c";
+const scopedDraftProviderCampaignId = "7ba53c91-6c8f-4b8a-b260-72eb48f62d07";
+const scopedWorkspaceId = "9cbd4033-86ae-4682-9a2e-c60751fc6aaa";
 const metricRow = { awaiting_verification: 3, verification_valid: 8, verification_blocked: 2 };
 const readySchemaRows = [{ imports_ready: true, locks_ready: true }];
 
@@ -148,6 +155,7 @@ beforeEach(() => {
   mocks.updateImport.mockResolvedValue(undefined);
   mocks.getPlanUsage.mockResolvedValue({ currentLeadCount: 10, totalLeadLimit: 5000 });
   mocks.getMonthlyEmailUsage.mockResolvedValue({ emailsSent: 100 });
+  mocks.getCampaignStatus.mockResolvedValue(0);
   mocks.addLeads.mockResolvedValue({
     outcomes: [{ index: 0, providerLeadId: "provider-lead-1", status: "added", diagnostic: null }],
     usage: { calls: 1, items: 1, errors: 0, totalLatencyMs: 1, costUsd: 0, quotaRemaining: 999 },
@@ -170,6 +178,15 @@ beforeEach(() => {
     }],
     blockedCampaignIds: [],
   });
+  mocks.getScopedDraftImportTarget.mockResolvedValue({
+    target: {
+      campaignId: scopedDraftCampaignId,
+      workspaceId: scopedWorkspaceId,
+      providerCampaignId: scopedDraftProviderCampaignId,
+      legacyFallback: false,
+    },
+    blockReason: null,
+  });
 });
 
 afterEach(() => {
@@ -179,6 +196,92 @@ afterEach(() => {
 });
 
 describe("runInstantlyImportTick", () => {
+  it("blocks scoped Draft import when the external campaign is not Draft", async () => {
+    mocks.getCampaignStatus.mockResolvedValue(1);
+
+    const result = await runAdminScopedDraftInstantlyImport({
+      campaignId: scopedDraftCampaignId,
+      workspaceId: scopedWorkspaceId,
+      contactPointId: "contact-point-1",
+    });
+
+    expect(result).toEqual({ status: "blocked", reason: "external_campaign_not_draft" });
+    expect(mocks.getCampaignStatus).toHaveBeenCalledWith(scopedDraftProviderCampaignId);
+    expect(mocks.acquireLock).not.toHaveBeenCalled();
+    expect(mocks.addLeadToCampaign).not.toHaveBeenCalled();
+  });
+
+  it("blocks scoped Draft import when external status cannot be read", async () => {
+    mocks.getCampaignStatus.mockRejectedValue(new Error("unavailable"));
+
+    const result = await runAdminScopedDraftInstantlyImport({
+      campaignId: scopedDraftCampaignId,
+      workspaceId: scopedWorkspaceId,
+      contactPointId: "contact-point-1",
+    });
+
+    expect(result).toEqual({ status: "blocked", reason: "external_campaign_status_unverifiable" });
+    expect(mocks.acquireLock).not.toHaveBeenCalled();
+    expect(mocks.addLeadToCampaign).not.toHaveBeenCalled();
+  });
+
+  it("imports at most the exact selected contact after external Draft verification", async () => {
+    const scopedCandidate = candidate({
+      source_campaign_id: scopedDraftCampaignId,
+      workspace_id: scopedWorkspaceId,
+    });
+    configureDbResults([metricReads(), [scopedCandidate], metricReads(), [scopedCandidate], metricReads()]);
+    mocks.claimImports.mockResolvedValue([{
+      id: "import-1",
+      account_id: "account-1",
+      contact_point_id: "contact-point-1",
+      attempt_count: 1,
+      max_attempts: 8,
+    }]);
+
+    const result = await runAdminScopedDraftInstantlyImport({
+      campaignId: scopedDraftCampaignId,
+      workspaceId: scopedWorkspaceId,
+      contactPointId: "contact-point-1",
+    });
+
+    expect(result.status).toBe("complete");
+    if (result.status !== "complete") throw new Error("Scoped import unexpectedly blocked.");
+    expect(result.result.leadsAdded).toBe(1);
+    expect(mocks.claimImports).toHaveBeenCalledWith(1, expect.any(Date), ["contact-point-1"], scopedDraftProviderCampaignId, scopedDraftCampaignId);
+    expect(mocks.getCampaignStatus).toHaveBeenCalledTimes(2);
+    expect(mocks.addLeadToCampaign).toHaveBeenCalledOnce();
+  });
+
+  it("defers the exact job if Draft status changes before the provider write", async () => {
+    const scopedCandidate = candidate({
+      source_campaign_id: scopedDraftCampaignId,
+      workspace_id: scopedWorkspaceId,
+    });
+    configureDbResults([metricReads(), [scopedCandidate], metricReads(), [scopedCandidate], metricReads()]);
+    mocks.claimImports.mockResolvedValue([{
+      id: "import-1",
+      account_id: "account-1",
+      contact_point_id: "contact-point-1",
+      attempt_count: 1,
+      max_attempts: 8,
+    }]);
+    mocks.getCampaignStatus.mockResolvedValueOnce(0).mockResolvedValueOnce(1);
+
+    const result = await runAdminScopedDraftInstantlyImport({
+      campaignId: scopedDraftCampaignId,
+      workspaceId: scopedWorkspaceId,
+      contactPointId: "contact-point-1",
+    });
+
+    expect(result.status).toBe("complete");
+    if (result.status !== "complete") throw new Error("Scoped import unexpectedly blocked.");
+    expect(result.result.leadsAttempted).toBe(0);
+    expect(result.result.leadsDeferred).toBe(1);
+    expect(mocks.addLeadToCampaign).not.toHaveBeenCalled();
+    expect(mocks.updateImport).toHaveBeenCalledWith("import-1", expect.objectContaining({ status: "deferred" }));
+  });
+
   it("does not start import work until both migration tables exist", async () => {
     configureDbResults([[{ imports_ready: false, locks_ready: false }]]);
 

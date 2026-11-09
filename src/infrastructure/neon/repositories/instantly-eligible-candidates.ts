@@ -33,6 +33,7 @@ export interface InstantEligibleCandidateQueryOptions {
   contactPointIds?: readonly string[];
   backfillAll?: boolean;
   forEnqueue?: boolean;
+  allowScopedDraftCampaign?: boolean;
   projection?: "candidate" | "identity";
   limit?: number | null;
 }
@@ -70,6 +71,9 @@ export function buildInstantEligibleCandidatesQuery(options: InstantEligibleCand
           AND ili.provider_campaign_id = ${options.providerCampaignId}
       )`
     : sql``;
+    const campaignStatusFilter = options.allowScopedDraftCampaign
+      ? sql`c.status = 'draft' AND c.autopilot_enabled = false`
+      : sql`c.status = 'active'`;
   const identityProjection = options.projection === "identity";
   const projection = identityProjection
     ? sql`a.workspace_id,
@@ -114,7 +118,7 @@ export function buildInstantEligibleCandidatesQuery(options: InstantEligibleCand
     JOIN contact_points cp ON cp.id = cm.selected_contact_point_id
       AND cp.account_id = a.id AND cp.workspace_id = a.workspace_id
     ${contactJoin}
-    WHERE c.status = 'active'
+    WHERE ${campaignStatusFilter}
       AND cm.stage = 'ready'
       AND cp.type = 'email'
       AND TRIM(cp.normalized_value) <> ''

@@ -72,6 +72,24 @@ describe("InstantlyEmailDeliveryProvider", () => {
     }));
   });
 
+  it("reads status only after confirming the exact campaign ID", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(jsonResponse({ id: "campaign-1", status: 0 }));
+    const provider = new InstantlyEmailDeliveryProvider({ apiKey: "secret-test-key", fetchImpl });
+
+    await expect(provider.getCampaignStatus("campaign-1")).resolves.toBe(0);
+    expect(fetchImpl).toHaveBeenCalledWith("https://api.instantly.ai/api/v2/campaigns/campaign-1", expect.objectContaining({
+      method: "GET",
+      headers: { Authorization: "Bearer secret-test-key" },
+    }));
+  });
+
+  it("rejects campaign status responses that do not match the requested ID", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(jsonResponse({ id: "other-campaign", status: 0 }));
+    const provider = new InstantlyEmailDeliveryProvider({ apiKey: "secret-test-key", fetchImpl });
+
+    await expect(provider.getCampaignStatus("campaign-1")).rejects.toThrow("did not confirm the requested campaign");
+  });
+
   it("lists exact workspace email matches without a campaign filter or writes", async () => {
     const fetchImpl = vi.fn().mockResolvedValue(jsonResponse({ items: [
       { id: "workspace-lead-1", email: "person@example.com", campaign: "other-campaign" },

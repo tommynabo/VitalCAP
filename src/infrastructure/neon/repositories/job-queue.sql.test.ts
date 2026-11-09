@@ -148,6 +148,23 @@ describe("job queue SQL builders", () => {
     expect(query.params).toContain("raw-candidate-2");
   });
 
+  it("can restrict a scoped processing claim to an exact job type", () => {
+    const query = dialect.sqlToQuery(buildClaimJobsQuery("processing_jobs", {
+      workerId: "admin-harness",
+      batchSize: 1,
+      campaignId: "65b9f85d-4c8b-4e52-99fb-217eb3acac1c",
+      requireAutopilot: false,
+      allowScopedDraftCampaign: true,
+      rawCandidateIds: ["raw-candidate-1"],
+      jobTypes: ["process_raw_candidate"],
+    }, claimTime));
+
+    expect(query.sql).toContain("j.payload->>'rawCandidateId' IN (");
+    expect(query.sql).toContain("j.type IN (");
+    expect(query.params).toContain("raw-candidate-1");
+    expect(query.params).toContain("process_raw_candidate");
+  });
+
   it("keeps max-attempt recovery jobs ineligible under the shared attempt guard", () => {
     const query = buildDiscoveryClaimQuery();
     const whereClause = query.sql.slice(query.sql.indexOf("WHERE"), query.sql.indexOf("ORDER BY"));

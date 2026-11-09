@@ -725,10 +725,15 @@ export async function runVerificationCronTick(
     backfillAll?: boolean;
     skipInstantlyImport?: boolean;
     campaignId?: string;
+    contactPointIds?: readonly string[];
     allowScopedDraftCampaign?: true;
     onStage?: (stage: VerificationExecutionStage) => void;
   } = {},
 ): Promise<VerificationRunnerResult> {
+  if (options.contactPointIds && options.contactPointIds.length !== 1) {
+    throw new Error("Scoped verification requires exactly one contact point.");
+  }
+
   const db = getDb();
   const now = new Date();
   const lockExpiry = new Date(now.getTime() - LOCK_TIMEOUT_MINUTES * 60000);
@@ -758,6 +763,8 @@ export async function runVerificationCronTick(
           WHERE scoped_cp.id = candidate.contact_point_id
             AND scoped_cm.campaign_id = ${options.campaignId ?? null}::uuid
         ))
+        AND (${options.contactPointIds?.[0] ?? null}::uuid IS NULL
+          OR candidate.contact_point_id = ${options.contactPointIds?.[0] ?? null}::uuid)
         AND (
           candidate.status <> 'failed'
           OR NOT EXISTS (

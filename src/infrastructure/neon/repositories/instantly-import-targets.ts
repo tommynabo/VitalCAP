@@ -1,6 +1,7 @@
 import { sql } from "drizzle-orm";
 import { getDb } from "@/infrastructure/neon/db";
 import { getDeliveryEnv } from "@/lib/config/env";
+import { getMultiNicheRolloutEntry } from "@/services/autopilot/multi-niche-rollout";
 
 export interface InstantImportTarget {
   campaignId: string;
@@ -31,6 +32,59 @@ export interface ScopedInstantlyTargetPreflight {
   mappingEnabled: boolean;
   importReady: boolean;
   blockReason: string | null;
+}
+
+export interface ScopedDraftInstantlyTargetRow {
+  campaign_id: string;
+  workspace_id: string;
+  campaign_status: string;
+  autopilot_enabled: boolean;
+  niche: string | null;
+  mapping_count: number;
+  mapping_campaign_id: string | null;
+  mapping_workspace_id: string | null;
+  mapping_provider: string | null;
+  mapping_enabled: boolean | null;
+  mapped_provider_campaign_id: string | null;
+}
+
+export interface ScopedDraftInstantlyTargetResolution {
+  target: InstantImportTarget | null;
+  blockReason: string | null;
+}
+
+export function resolveScopedDraftInstantlyImportTarget(
+  row: ScopedDraftInstantlyTargetRow | null,
+  campaignId: string,
+  workspaceId: string,
+): ScopedDraftInstantlyTargetResolution {
+  const rollout = getMultiNicheRolloutEntry(campaignId);
+  if (!rollout) return { target: null, blockReason: "campaign_not_allowlisted" };
+  if (!row || row.campaign_id !== campaignId || row.workspace_id !== workspaceId) {
+    return { target: null, blockReason: "campaign_not_found" };
+  }
+  if (row.campaign_status !== "draft") return { target: null, blockReason: "campaign_not_draft" };
+  if (row.autopilot_enabled) return { target: null, blockReason: "campaign_autopilot_enabled" };
+  if (row.niche !== rollout.niche) return { target: null, blockReason: "campaign_niche_mismatch" };
+  if (row.mapping_count > 1) return { target: null, blockReason: "ambiguous_mapping_rows" };
+  if (row.mapping_count !== 1 || row.mapping_campaign_id !== campaignId || row.mapping_provider !== "instantly") {
+    return { target: null, blockReason: "mapping_missing" };
+  }
+  if (row.mapping_workspace_id !== workspaceId) return { target: null, blockReason: "mapping_workspace_mismatch" };
+  if (row.mapping_enabled !== false) return { target: null, blockReason: "mapping_must_remain_disabled" };
+  if (row.mapped_provider_campaign_id !== rollout.expectedTarget) {
+    return { target: null, blockReason: "provider_campaign_id_mismatch" };
+  }
+
+  return {
+    target: {
+      campaignId,
+      workspaceId,
+      providerCampaignId: rollout.expectedTarget,
+      legacyFallback: false,
+    },
+    blockReason: null,
+  };
 }
 
 interface CampaignTargetRow {
@@ -209,4 +263,32 @@ export async function getScopedInstantlyTargetPreflight(
     importReady: resolved.targets.some((target) => target.campaignId === campaignId),
     blockReason: block?.reason ?? null,
   };
+}
+
+export async function getScopedDraftInstantlyImportTarget(
+  campaignId: string,
+  workspaceId: string,
+): Promise<ScopedDraftInstantlyTargetResolution> {
+  const result = await getDb().execute(sql`
+    SELECT c.id AS campaign_id, c.workspace_id, c.status AS campaign_status,
+      c.autopilot_enabled, c.engine_config->>'niche' AS niche,
+      (COUNT(mapping.id) OVER ())::int AS mapping_count,
+      mapping.campaign_id AS mapping_campaign_id,
+      mapping.workspace_id AS mapping_workspace_id,
+      mapping.provider AS mapping_provider,
+      mapping.enabled AS mapping_enabled,
+      mapping.provider_campaign_id AS mapped_provider_campaign_id
+    FROM campaigns c
+    LEFT JOIN campaign_provider_mappings mapping
+      ON mapping.campaign_id = c.id AND mapping.provider = 'instantly'
+    WHERE c.id = ${campaignId}::uuid
+      AND c.workspace_id = ${workspaceId}::uuid
+    GROUP BY c.id, mapping.id
+  `);
+  const rows = result.rows as unknown as ScopedDraftInstantlyTargetRow[];
+  if (rows.length === 0) return resolveScopedDraftInstantlyImportTarget(null, campaignId, workspaceId);
+  if (rows.length > 1) {
+    return resolveScopedDraftInstantlyImportTarget({ ...rows[0]!, mapping_count: rows.length }, campaignId, workspaceId);
+  }
+  return resolveScopedDraftInstantlyImportTarget(rows[0]!, campaignId, workspaceId);
 }

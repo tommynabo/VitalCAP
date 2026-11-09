@@ -27,4 +27,29 @@ describe("buildInstantEligibleCandidatesQuery campaign routing", () => {
 
     expect(query.sql).not.toContain("cm.campaign_id =");
   });
+
+  it("allows Draft only through the explicit scoped option and keeps autopilot off", () => {
+    const activeOnly = new PgDialect().sqlToQuery(buildInstantEligibleCandidatesQuery({
+      providerCampaignId: "instantly-yoga",
+      campaignId: "internal-yoga",
+    }));
+    const scopedDraft = new PgDialect().sqlToQuery(buildInstantEligibleCandidatesQuery({
+      providerCampaignId: "instantly-yoga",
+      campaignId: "internal-yoga",
+      workspaceId: "workspace-yoga",
+      contactPointIds: ["contact-point-yoga"],
+      allowScopedDraftCampaign: true,
+    }));
+
+    expect(activeOnly.sql).toContain("WHERE c.status = 'active'");
+    expect(activeOnly.sql).not.toContain("c.status = 'draft'");
+    expect(scopedDraft.sql).toContain("WHERE c.status = 'draft' AND c.autopilot_enabled = false");
+    expect(scopedDraft.sql).not.toContain("c.status = 'active'");
+    expect(scopedDraft.sql).toContain("c.workspace_id =");
+    expect(scopedDraft.sql).toContain("cm.campaign_id =");
+    expect(scopedDraft.sql).toContain("cp.id IN");
+    expect(scopedDraft.params).toContain("workspace-yoga");
+    expect(scopedDraft.params).toContain("internal-yoga");
+    expect(scopedDraft.params).toContain("contact-point-yoga");
+  });
 });

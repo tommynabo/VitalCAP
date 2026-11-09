@@ -19,11 +19,16 @@ import {
 } from "@/infrastructure/neon/repositories/instantly-lead-imports";
 import { hasActualPriorColdOutreach } from "@/infrastructure/neon/repositories/actual-outreach";
 import { buildInstantEligibleCandidatesQuery, type InstantEligibleCandidateRow } from "@/infrastructure/neon/repositories/instantly-eligible-candidates";
-import { listInstantlyImportTargets, type InstantImportTarget } from "@/infrastructure/neon/repositories/instantly-import-targets";
+import {
+  getScopedDraftInstantlyImportTarget,
+  listInstantlyImportTargets,
+  type InstantImportTarget,
+} from "@/infrastructure/neon/repositories/instantly-import-targets";
 import { evaluateInstantlyLeadEligibility } from "@/services/verification/instantly-lead-eligibility";
 import { logEvent } from "@/lib/observability/structured-logger";
 import { isEmailChannelEligible } from "@/services/compliance/email-channel-policy";
 import type { ChannelEligibilityStatus } from "@/domain/contacts/types";
+import { getMultiNicheRolloutEntry } from "@/services/autopilot/multi-niche-rollout";
 
 const IMPORT_BATCH_SIZE = 50;
 const MAX_INSTANTLY_WRITE_CONCURRENCY = 2;
@@ -73,6 +78,8 @@ async function listEligibleCandidates(options: {
   contactPointIds?: readonly string[];
   backfillAll?: boolean;
   forEnqueue?: boolean;
+  workspaceId?: string;
+  allowScopedDraftCampaign?: boolean;
 }): Promise<CandidateRow[]> {
   if (options.contactPointIds?.length === 0) return [];
   const db = getDb();
@@ -371,6 +378,8 @@ async function runInstantlyImportTargetTick(options: {
   reconcileEligible?: boolean;
   maxJobs?: number;
   now?: Date;
+  workspaceId?: string;
+  allowScopedDraftCampaign?: boolean;
 }, target: InstantImportTarget, now: Date): Promise<InstantlyImportTickResult> {
   const env = getDeliveryEnv();
   const db = getDb();
@@ -415,6 +424,8 @@ async function runInstantlyImportTargetTick(options: {
       contactPointIds: reconcileEligible ? undefined : options.contactPointIds,
       backfillAll: reconcileEligible || options.backfillAll,
       forEnqueue: true,
+      workspaceId: options.workspaceId,
+      allowScopedDraftCampaign: options.allowScopedDraftCampaign,
     });
     result.candidatesFound = candidates.length;
     const enqueueResult = await enqueueCandidates(candidates, providerCampaignId);
@@ -507,8 +518,10 @@ async function runInstantlyImportTargetTick(options: {
     const currentCandidates = jobs.length > 0 ? await listEligibleCandidates({
       providerCampaignId,
       campaignId,
-        contactPointIds: jobs.map((job) => String(job.contact_point_id)),
-      }) : [];
+      contactPointIds: jobs.map((job) => String(job.contact_point_id)),
+      workspaceId: options.workspaceId,
+      allowScopedDraftCampaign: options.allowScopedDraftCampaign,
+    }) : [];
     const candidateByContactPoint = new Map(currentCandidates.map((candidate) => [candidate.contact_point_id, candidate]));
     const eligibleJobs: Array<{ job: Record<string, unknown>; candidate: CandidateRow }> = [];
     for (const job of jobs) {
@@ -660,7 +673,28 @@ async function runInstantlyImportTargetTick(options: {
       result.instantlyLeadImportReady = false;
     }
 
-    if (importableJobs.length > 0 && !reconciliationAuthFailure) {
+    let scopedDraftWriteAllowed = true;
+    if (options.allowScopedDraftCampaign && importableJobs.length > 0 && !reconciliationAuthFailure) {
+      try {
+        scopedDraftWriteAllowed = await provider.getCampaignStatus(providerCampaignId) === 0;
+      } catch {
+        scopedDraftWriteAllowed = false;
+      }
+      if (!scopedDraftWriteAllowed) {
+        for (const { job } of importableJobs) {
+          await updateInstantlyLeadImport(String(job.id), {
+            status: "deferred",
+            now,
+            nextAttemptAt: now,
+            lastError: "Instantly Draft status could not be reconfirmed before import.",
+            decrementAttemptCount: true,
+          });
+          result.leadsDeferred++;
+        }
+      }
+    }
+
+    if (importableJobs.length > 0 && !reconciliationAuthFailure && scopedDraftWriteAllowed) {
       try {
         const direct = await importLeadsDirect(
           provider,
@@ -831,6 +865,50 @@ function combineImportTickResults(results: readonly InstantlyImportTickResult[])
     }
   }
   return combined;
+}
+
+export async function runAdminScopedDraftInstantlyImport(input: {
+  campaignId: string;
+  workspaceId: string;
+  contactPointId: string;
+  now?: Date;
+}): Promise<
+  | { status: "blocked"; reason: string }
+  | { status: "complete"; result: InstantlyImportTickResult }
+> {
+  const rollout = getMultiNicheRolloutEntry(input.campaignId);
+  if (!rollout) return { status: "blocked", reason: "campaign_not_allowlisted" };
+
+  const env = getDeliveryEnv();
+  if (env.EMAIL_DELIVERY_PROVIDER !== "instantly" || !env.INSTANTLY_API_KEY) {
+    return { status: "blocked", reason: "instantly_not_configured" };
+  }
+
+  const targetResolution = await getScopedDraftInstantlyImportTarget(input.campaignId, input.workspaceId);
+  const target = targetResolution.target;
+  if (!target || target.campaignId !== input.campaignId || target.workspaceId !== input.workspaceId
+    || target.providerCampaignId !== rollout.expectedTarget) {
+    return { status: "blocked", reason: targetResolution.blockReason ?? "persisted_mapping_preflight_failed" };
+  }
+
+  const now = input.now ?? new Date();
+  const provider = new InstantlyEmailDeliveryProvider({ apiKey: env.INSTANTLY_API_KEY });
+  let externalStatus: number;
+  try {
+    externalStatus = await provider.getCampaignStatus(target.providerCampaignId);
+  } catch {
+    return { status: "blocked", reason: "external_campaign_status_unverifiable" };
+  }
+  if (externalStatus !== 0) return { status: "blocked", reason: "external_campaign_not_draft" };
+
+  const result = await runInstantlyImportTargetTick({
+    workspaceId: input.workspaceId,
+    contactPointIds: [input.contactPointId],
+    maxJobs: 1,
+    now,
+    allowScopedDraftCampaign: true,
+  }, target, now);
+  return { status: "complete", result };
 }
 
 export async function runInstantlyImportTick(options: {
