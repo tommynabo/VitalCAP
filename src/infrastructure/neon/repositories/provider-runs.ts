@@ -867,14 +867,25 @@ export async function getScopedSmokeProviderRunDiagnostics(discoveryJobId: strin
         raw_candidates.provider_run_id, raw_candidates.source_fingerprint,
         raw_candidates.processed, raw_candidates.account_id,
         raw_candidates.processing_metrics->'candidateOutcome' AS processing_outcome, a.business_type,
+        a.canonical_name AS account_canonical_name, a.normalized_domain AS account_normalized_domain,
+        a.website_url AS account_website_url,
         a.country_code AS account_country_code, a.postal_code AS account_postal_code,
         (a.latitude IS NOT NULL AND a.longitude IS NOT NULL) AS has_coordinates,
         membership.stage AS campaign_membership_stage,
-        membership.qualified_at AS campaign_qualified_at
+        membership.qualified_at AS campaign_qualified_at, membership.rejection_reason AS membership_rejection_reason,
+        raw_candidates.raw_payload #>> '{place,name}' AS maps_name,
+        raw_candidates.raw_payload #>> '{place,category}' AS maps_category,
+        raw_candidates.raw_payload #>> '{place,websiteUrl}' AS source_website_url,
+        raw_candidates.raw_payload #>> '{place,province}' AS source_province,
+        raw_candidates.raw_payload #>> '{place,city}' AS source_city,
+        (NULLIF(raw_candidates.raw_payload #>> '{place,address}', '') IS NOT NULL) AS has_physical_address,
+        seed.query AS persisted_seed_query, seed.geography AS persisted_seed_geography
       FROM raw_candidates
       LEFT JOIN accounts a ON a.id = raw_candidates.account_id
       LEFT JOIN campaign_memberships membership
         ON membership.account_id = a.id AND membership.campaign_id = raw_candidates.campaign_id
+      LEFT JOIN search_seed_runs seed_run ON seed_run.id = raw_candidates.search_seed_run_id
+      LEFT JOIN search_seeds seed ON seed.id = seed_run.seed_id
       WHERE discovery_job_id = ${discoveryJobId}::uuid
         OR provider_run_id IN (
           SELECT id FROM provider_runs
