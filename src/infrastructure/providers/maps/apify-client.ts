@@ -15,6 +15,7 @@
  */
 
 import { ProviderAuthenticationError, ProviderBillingError, ProviderConfigurationError, ProviderFailureError, ProviderTransientError } from "@/domain/providers/errors";
+import { assertNotVercelPreview } from "@/lib/security/preview-runtime";
 
 const APIFY_API_BASE_URL = "https://api.apify.com/v2";
 
@@ -164,6 +165,7 @@ export class ApifyClient {
   }
 
   private async fetch(url: string, init: RequestInit): Promise<Response> {
+    assertNotVercelPreview("Apify requests");
     try {
       return await this.fetchImpl(url, init);
     } catch (error) {

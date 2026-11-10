@@ -1,5 +1,6 @@
 import type { SerpDiscoveryProvider, SerpResult, SerpSearchInput, SerpSearchOutput } from "@/domain/providers/types";
 import { ProviderFailureError } from "@/domain/providers/errors";
+import { assertNotVercelPreview } from "@/lib/security/preview-runtime";
 
 const SERPER_SEARCH_URL = "https://google.serper.dev/search";
 /** Serper's lowest published rate ($50 / 50k credits, 1 credit/query) — used only as a cost estimate, not billed truth. */
@@ -112,6 +113,7 @@ export class SerperDiscoveryProvider implements SerpDiscoveryProvider {
   }
 
   async search(input: SerpSearchInput): Promise<SerpSearchOutput> {
+    assertNotVercelPreview("Serper requests");
     const key = this.cacheKey(input);
     const cached = this.cache.get(key);
     if (cached) {

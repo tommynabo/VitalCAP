@@ -3,6 +3,7 @@ import { zodOutputFormat } from "@anthropic-ai/sdk/helpers/zod";
 import type { LLMProvider, SetterClassificationOutput, SetterPromptContext } from "@/domain/providers/types";
 import { emptyProviderUsageStats } from "@/domain/providers/types";
 import { setterOutputSchema } from "@/services/setter/setter-output-schema";
+import { assertNotVercelPreview } from "@/lib/security/preview-runtime";
 
 export class AnthropicSetterProvider implements LLMProvider {
   readonly providerName = "anthropic-setter";
@@ -13,6 +14,7 @@ export class AnthropicSetterProvider implements LLMProvider {
   ) {}
 
   async classifyAndDraft(context: SetterPromptContext): ReturnType<LLMProvider["classifyAndDraft"]> {
+    assertNotVercelPreview("Anthropic requests");
     const startedAt = Date.now();
     const response = await this.client.messages.create({
       model: this.model,

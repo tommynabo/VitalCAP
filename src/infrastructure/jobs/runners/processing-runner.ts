@@ -36,6 +36,7 @@ import { enqueueVerificationJob } from "@/infrastructure/neon/repositories/verif
 import { getVerificationEnv } from "@/lib/config/env";
 import { processRawCandidate, createInitialCandidateProcessingMetrics, deriveIncomingIdentitySignals, hasLinkedInEmployerAccount, type CandidateRawPayload, type ProcessedCandidateResult } from "@/services/discovery/candidate-processor";
 import { getNicheId } from "@/services/discovery/niche-profiles";
+import { businessIdentityDomain } from "@/services/deduplication/account-dedup";
 import { getMultiNicheRolloutEntry } from "@/services/autopilot/multi-niche-rollout";
 import { NICHE_CLASSIFIER_VERSION } from "@/services/discovery/business-type";
 import { mergeMissingAccountFields, type IncomingAccountFields } from "@/services/accounts/account-enrichment-merge";
@@ -494,7 +495,7 @@ async function executeProcessingJob(
 
   const accountFields = extractAccountFields(payload);
   const accountIdentity = processed.recoveredWebsite
-    ? { ...incoming, normalizedDomain: processed.recoveredWebsite.domain }
+    ? { ...incoming, normalizedDomain: businessIdentityDomain(processed.recoveredWebsite.domain) }
     : incoming;
   const accountIdentityCandidates = accountIdentity.normalizedDomain === incoming.normalizedDomain
     ? existingAccounts
@@ -742,7 +743,7 @@ async function executeProcessingJob(
         await runProcessingWriteStage(diagnostics, "INSERT_WEBSITE_EVIDENCE", () => insertWebsiteEvidence({
           workspaceId: campaign.workspaceId,
           accountId,
-          normalizedDomain: incoming.normalizedDomain!,
+          normalizedDomain,
           sourceUrl: fact.sourceUrl,
           evidenceType: fact.evidenceType,
           value: fact.value,

@@ -68,31 +68,35 @@ beforeEach(() => {
 });
 
 describe("canonical account domain reconciliation", () => {
-  it("selects the exact domain owner when Place ID resolves to another row", () => {
+  it("selects the exact Place ID owner before a conflicting domain owner", () => {
     expect(selectCanonicalAccountMatch(incoming, [placeIdMatch, domainOwner])).toEqual({
       kind: "existingAccount",
-      existingAccountId: "account-b",
-      matchedSignal: "normalized_domain",
+      existingAccountId: "account-a",
+      matchedSignal: "google_place_id",
     });
   });
 
-  it("orders the database resolver's exact domain match before its Place ID match", async () => {
+  it("orders the database resolver's Place ID match before domain and flags contradictions", async () => {
     neonMocks.transaction.mockResolvedValueOnce([[], [{
       resolution: "existingAccount",
-      account_id: "account-b",
-      matched_signal: "normalized_domain",
+      account_id: "account-a",
+      matched_signal: "google_place_id",
     }]]);
 
     await expect(resolveCanonicalAccount("workspace-id", incoming, accountInput)).resolves.toEqual({
       kind: "existingAccount",
-      existingAccountId: "account-b",
-      matchedSignal: "normalized_domain",
+      existingAccountId: "account-a",
+      matchedSignal: "google_place_id",
     });
 
     const query = neonMocks.transaction.mock.calls[0]?.[0]?.[1] as { strings: string[] };
     const text = query.strings.join("?");
-    expect(text.indexOf("THEN 'normalized_domain'")).toBeLessThan(text.indexOf("THEN 'google_place_id'"));
-    expect(text.indexOf("WHEN matched_signal = 'normalized_domain'")).toBeLessThan(text.indexOf("WHEN matched_signal = 'google_place_id'"));
+    expect(text.indexOf("THEN 'google_place_id'")).toBeLessThan(text.indexOf("THEN 'normalized_domain'"));
+    expect(text.indexOf("WHEN matched_signal = 'normalized_domain'")).toBeLessThan(text.indexOf("WHEN matched_signal = 'normalized_phone'"));
+    expect(text).toContain("THEN 'conflicting_normalized_domain'");
+    expect(text).toContain("THEN 'conflicting_normalized_phone'");
+    expect(text).toContain("has_place_id_conflict");
+    expect(text.indexOf("WHEN matched_signal = 'google_place_id'")).toBeLessThan(text.indexOf("WHEN matched_signal = 'normalized_domain'"));
   });
 
   it("orders exact identity candidates before fuzzy candidates in the bounded lookup", async () => {
@@ -121,15 +125,15 @@ describe("canonical account domain reconciliation", () => {
 
     const order = builder.orderBy.mock.calls[0]?.[0] as SQL;
     const orderSql = new PgDialect().sqlToQuery(order).sql;
-    expect(orderSql.indexOf("normalized_domain")).toBeLessThan(orderSql.indexOf("google_place_id"));
+    expect(orderSql.indexOf("google_place_id")).toBeLessThan(orderSql.indexOf("normalized_domain"));
+    expect(orderSql.indexOf("normalized_domain")).toBeLessThan(orderSql.indexOf("normalized_phone"));
     expect(builder.limit).toHaveBeenCalledWith(20);
   });
 
   it("flags impossible duplicate domain owners instead of choosing one", () => {
-    expect(selectCanonicalAccountMatch(incoming, [domainOwner, { ...domainOwner, accountId: "account-c" }])).toEqual({
+    expect(selectCanonicalAccountMatch(incoming, [domainOwner, { ...domainOwner, accountId: "account-c" }])).toMatchObject({
       kind: "needsReview",
-      matchedAccountId: null,
-      matchedSignal: "ambiguous_normalized_domain",
+      matchedSignal: "normalized_domain",
     });
   });
 
@@ -141,6 +145,82 @@ describe("canonical account domain reconciliation", () => {
     });
   });
 
+  it("does not resolve unrelated businesses through a shared Facebook host", () => {
+    const result = selectCanonicalAccountMatch({
+      normalizedName: "c2 relajacion recuperacion sanat",
+      googlePlaceId: "place-wellness",
+      normalizedDomain: "facebook.com",
+      normalizedPhone: "+34947000002",
+      normalizedAddress: "calle burgos 2",
+    }, [{
+      accountId: "farmacia-punal",
+      normalizedName: "farmacia punal",
+      googlePlaceId: "place-pharmacy",
+      normalizedDomain: "facebook.com",
+      normalizedPhone: "+34967000001",
+      normalizedAddress: "calle albacete 1",
+    }]);
+
+    expect(result).toBeNull();
+  });
+
+  it("stores shared platform hosts as null identity domains without colliding with the unique index", async () => {
+    neonMocks.transaction.mockResolvedValueOnce([[], [{
+      resolution: "createNewAccount",
+      account_id: "account-new",
+      matched_signal: null,
+    }]]);
+
+    await expect(resolveCanonicalAccount("workspace-id", {
+      normalizedName: "c2 relajacion recuperacion sanat",
+      googlePlaceId: "place-wellness",
+      normalizedDomain: "facebook.com",
+    }, {
+      ...accountInput,
+      canonicalName: "c2 Relajación & Recuperación",
+      normalizedName: "c2 relajacion recuperacion sanat",
+      normalizedDomain: "facebook.com",
+      websiteUrl: "https://www.facebook.com/sanart",
+      googlePlaceId: "place-wellness",
+    })).resolves.toEqual({ kind: "createNewAccount", accountId: "account-new" });
+
+    const query = neonMocks.transaction.mock.calls[0]?.[0]?.[1] as { values: unknown[] };
+    expect(query.values).not.toContain("facebook.com");
+  });
+
+  it("re-resolves a concurrent first-party domain collision to review", async () => {
+    neonMocks.transaction.mockResolvedValueOnce([[], []]);
+    const conflictingOwner = {
+      id: "account-b",
+      normalizedName: "farmacia central",
+      googlePlaceId: "place-b",
+      normalizedDomain: "farmacia-central.es",
+      normalizedPhone: null,
+      postalCode: null,
+      normalizedAddress: null,
+      latitude: null,
+      longitude: null,
+    };
+    const builder = {
+      select: vi.fn().mockReturnThis(),
+      from: vi.fn().mockReturnThis(),
+      where: vi.fn().mockReturnThis(),
+      orderBy: vi.fn().mockReturnThis(),
+      limit: vi.fn().mockResolvedValue([conflictingOwner]),
+    };
+    neonMocks.getDb.mockReturnValue(builder);
+
+    await expect(resolveCanonicalAccount("workspace-id", incoming, accountInput)).resolves.toEqual({
+      kind: "needsReview",
+      matchedAccountId: "account-b",
+      matchedSignal: "normalized_domain",
+    });
+
+    const transactionQueries = neonMocks.transaction.mock.calls[0]?.[0] as Array<{ strings: string[] }>;
+    expect(transactionQueries[0]?.strings.join("?")).toContain("pg_advisory_xact_lock");
+    expect(transactionQueries[1]?.strings.join("?")).toContain("ON CONFLICT DO NOTHING");
+  });
+
   it("does not copy a unique identity value already owned by another account", () => {
     expect(omitIdentityValuesOwnedByOtherAccounts("account-b", {
       normalizedDomain: "farmacia-central.es",
@@ -150,6 +230,12 @@ describe("canonical account domain reconciliation", () => {
       normalizedDomain: "farmacia-central.es",
       city: "Madrid",
     });
+  });
+
+  it("does not copy a shared platform host into a canonical identity domain", () => {
+    expect(omitIdentityValuesOwnedByOtherAccounts("account-new", {
+      normalizedDomain: "facebook.com",
+    }, [])).toEqual({});
   });
 
   it("recognizes only the normalized-domain unique violation, including wrapped errors", () => {

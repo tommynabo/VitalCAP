@@ -8,6 +8,7 @@ import { zodResponseFormat } from "openai/helpers/zod";
 import { getDayBounds } from "@/lib/time/day-bounds";
 import { getAutopilotSettings } from "@/infrastructure/neon/repositories/autopilot";
 import { randomUUID } from "node:crypto";
+import { assertNotVercelPreview } from "@/lib/security/preview-runtime";
 
 const CURRENT_PROMPT_VERSION = "v1.2.0";
 const MAX_ANALYSIS_ATTEMPTS = 2;
@@ -30,6 +31,7 @@ export class OpenAIProspectAnalyzer {
   private provider: string;
 
   constructor() {
+    assertNotVercelPreview("OpenAI prospect analysis");
     const env = getIntelligenceEnv();
     this.provider = env.LLM_PROVIDER;
 

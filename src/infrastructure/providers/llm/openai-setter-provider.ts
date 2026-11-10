@@ -3,6 +3,7 @@ import { zodTextFormat } from "openai/helpers/zod";
 import type { LLMProvider, SetterClassificationOutput, SetterPromptContext } from "@/domain/providers/types";
 import { emptyProviderUsageStats } from "@/domain/providers/types";
 import { setterOutputSchema } from "@/services/setter/setter-output-schema";
+import { assertNotVercelPreview } from "@/lib/security/preview-runtime";
 
 export class OpenAISetterProvider implements LLMProvider {
   readonly providerName = "openai-setter";
@@ -13,6 +14,7 @@ export class OpenAISetterProvider implements LLMProvider {
   ) {}
 
   async classifyAndDraft(context: SetterPromptContext): ReturnType<LLMProvider["classifyAndDraft"]> {
+    assertNotVercelPreview("OpenAI requests");
     const startedAt = Date.now();
     const response = await this.client.responses.create({
       model: this.model,

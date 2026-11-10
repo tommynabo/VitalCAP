@@ -5,6 +5,7 @@ import type { LLMProvider, SetterPromptContext } from "@/domain/providers/types"
 import { MockLLMProvider } from "./mock-provider";
 import { OpenAISetterProvider } from "./openai-setter-provider";
 import { AnthropicSetterProvider } from "./anthropic-setter-provider";
+import { assertNotVercelPreview } from "@/lib/security/preview-runtime";
 
 export interface SetterLLMConfig {
   LLM_PROVIDER: "openai" | "anthropic" | "disabled" | "mock";
@@ -24,6 +25,7 @@ export function createSetterLLMProvider(
     if (appEnv === "production") throw new Error("LLM_PROVIDER=mock is forbidden in production.");
     return new MockLLMProvider();
   }
+  assertNotVercelPreview("Paid LLM provider initialization");
   if (config.LLM_PROVIDER === "anthropic") {
     if (!config.CLAUDE_API_KEY || !config.CLAUDE_WORKSPACE_ID) {
       throw new Error("LLM_PROVIDER=anthropic requires CLAUDE_API_KEY and CLAUDE_WORKSPACE_ID.");

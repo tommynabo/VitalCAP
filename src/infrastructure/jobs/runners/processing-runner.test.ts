@@ -1127,6 +1127,65 @@ describe("runProcessingCronTick", () => {
     }));
   });
 
+  it("stores recovered website evidence under its first-party domain when the source URL is shared", async () => {
+    const sharedWebsiteUrl = "https://www.facebook.com/farmacia-ejemplo";
+    mocks.getRawCandidateById.mockResolvedValue({
+      id: "raw-candidate-id",
+      campaignId: "campaign-id",
+      engineType: "maps_fast",
+      sourceExternalId: mapsFastRecoveryPlace.externalPlaceId,
+      sourceUrl: mapsFastRecoveryPlace.sourceUrl,
+      rawPayload: { kind: "maps", place: { ...mapsFastRecoveryPlace, websiteUrl: sharedWebsiteUrl } },
+      processingMetrics: null,
+      accountId: null,
+      searchSeedRunId: null,
+    });
+    mocks.getCampaignById.mockResolvedValue({ id: "campaign-id", workspaceId: "workspace-id" });
+    mocks.deriveIncomingIdentitySignals.mockReturnValue({
+      normalizedName: "farmacia ejemplo",
+      googlePlaceId: mapsFastRecoveryPlace.externalPlaceId,
+      normalizedDomain: null,
+    });
+    mocks.processRawCandidate.mockResolvedValueOnce({
+      engineType: "maps_fast",
+      accountKey: "place:maps-fast-recovery-place",
+      businessNameGuess: "Farmacia Ejemplo",
+      isDuplicate: false,
+      matchedAccountKey: null,
+      spainVerdict: "needs_review",
+      businessType: "pharmacy",
+      icpQualified: true,
+      contactPoints: [],
+      processingMetrics: { homepageFetchAttempted: 0, homepageFetchSucceeded: 0, homepageFetchFailed: 0, emailRejectedFormat: 0, emailDuplicate: 0 },
+      serperEmailRecovery: { candidatesFound: 0, candidatesRelevant: 0, duplicateCandidatesSkipped: 0 },
+      readyForOutreach: false,
+      rejectionReason: "Awaiting Spain eligibility review",
+      recoveredWebsite,
+    });
+    mocks.enrichWebsite.mockResolvedValue({
+      status: "completed",
+      pagesFetched: 1,
+      contentHash: "recovered-content-hash",
+      evidence: [{
+        evidenceType: "email",
+        value: "info@farmacia-ejemplo.es",
+        normalizedValue: "info@farmacia-ejemplo.es",
+        snippet: "Contact information",
+        sourceUrl: recoveredWebsite.evidence.url,
+        isGeneric: true,
+      }],
+    });
+    mocks.claimProcessingJobs.mockResolvedValueOnce([{ ...makeJob("recovered-shared-source"), type: "process_raw_candidate" }])
+      .mockResolvedValueOnce([]);
+
+    await runProcessingCronTick(1);
+
+    expect(mocks.insertWebsiteEvidence).toHaveBeenCalledWith(expect.objectContaining({
+      normalizedDomain: recoveredWebsite.domain,
+      sourceUrl: recoveredWebsite.evidence.url,
+    }));
+  });
+
   it("completes a bounded raw recovery attempt without invoking the Maps Fast Serper fallback", async () => {
     prepareMapsFastRecoveryJob({}, {
       recoveryAttempt: 1,
@@ -1985,5 +2044,42 @@ describe("runProcessingCronTick", () => {
       nextAttemptAt: new Date("2026-01-01T00:00:00.000Z"),
     }));
     expect(mocks.completeProcessingJob).not.toHaveBeenCalled();
+  });
+
+  it("does not link raw candidates or contacts when canonical identity requires review", async () => {
+    prepareMapsFastRecoveryJob({}, { skipMapsFastWebsiteRecovery: true });
+    mocks.deriveIncomingIdentitySignals.mockReturnValue({
+      normalizedName: "c2 relajacion recuperacion sanat",
+      googlePlaceId: "place-wellness",
+      normalizedDomain: null,
+      normalizedPhone: "+34947000002",
+      normalizedAddress: "calle burgos 2",
+    });
+    mocks.findCandidateAccountMatches.mockResolvedValue([{
+      accountId: "farmacia-punal",
+      normalizedName: "farmacia punal",
+      googlePlaceId: "place-pharmacy",
+      normalizedDomain: "facebook.com",
+      normalizedPhone: "+34967000001",
+      normalizedAddress: "calle albacete 1",
+    }]);
+    mocks.resolveCanonicalAccount.mockResolvedValue({
+      kind: "needsReview",
+      matchedAccountId: "farmacia-punal",
+      matchedSignal: "normalized_domain",
+    });
+
+    await runProcessingCronTick(1);
+
+    expect(mocks.resolveCanonicalAccount).toHaveBeenCalledOnce();
+    expect(mocks.markRawCandidateProcessed).toHaveBeenCalledOnce();
+    expect(mocks.updateRawCandidateAccountId).not.toHaveBeenCalled();
+    expect(mocks.insertAccountSource).not.toHaveBeenCalled();
+    expect(mocks.insertContactPoint).not.toHaveBeenCalled();
+    expect(mocks.insertContactPointWithStatus).not.toHaveBeenCalled();
+    expect(mocks.upsertCampaignMembership).not.toHaveBeenCalled();
+    expect(mocks.enqueueVerificationJob).not.toHaveBeenCalled();
+    expect(mocks.updateAccountFields).not.toHaveBeenCalled();
+    expect(mocks.failProcessingJob).not.toHaveBeenCalled();
   });
 });

@@ -1,3 +1,4 @@
+import { assertNotVercelPreview } from "@/lib/security/preview-runtime";
 const INSTANTLY_API_BASE_URL = "https://api.instantly.ai/api/v2";
 export const INSTANTLY_REPLY_ENDPOINT = "POST /api/v2/emails/reply";
 
@@ -35,6 +36,7 @@ function firstString(...values: unknown[]): string | null {
 
 export class InstantlyReplyProvider {
   constructor(private readonly apiKey: string, private readonly fetchImpl: typeof fetch = fetch) {
+      assertNotVercelPreview("Instantly reply access");
     if (!apiKey) throw new Error("Instantly API key is not configured.");
   }
 

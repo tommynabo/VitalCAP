@@ -9,6 +9,7 @@ import {
 } from "@/domain/providers/types";
 import { getCoreEnv, getDeliveryEnv } from "@/lib/config/env";
 import { logEvent } from "@/lib/observability/structured-logger";
+import { assertNotVercelPreview } from "@/lib/security/preview-runtime";
 
 const INSTANTLY_API_BASE_URL = "https://api.instantly.ai/api/v2";
 
@@ -205,6 +206,7 @@ export class InstantlyEmailDeliveryProvider implements EmailDeliveryProvider {
     url: string | URL,
     init: RequestInit,
   ): Promise<{ data: T; requestId: string }> {
+    assertNotVercelPreview("Instantly requests");
     let response: Response;
     try {
       response = await this.fetchImpl(url, init);

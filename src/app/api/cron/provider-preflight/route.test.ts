@@ -21,6 +21,7 @@ vi.mock("../_lib/cron-http", () => ({
 }));
 
 import { GET } from "./route";
+import { isDeployedVercelPreview } from "@/lib/security/preview-runtime";
 
 const migrationFilenames = [
   "0013_global_deduplication.sql",
@@ -121,6 +122,7 @@ function configureReadyPreflight(
 describe("GET /api/cron/provider-preflight", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
     vi.restoreAllMocks();
   });
 
@@ -130,6 +132,20 @@ describe("GET /api/cron/provider-preflight", () => {
 
     expect(response.status).toBe(401);
     expect(mocks.sql).not.toHaveBeenCalled();
+  });
+
+  it("rejects Preview before touching providers or the database", async () => {
+    vi.stubEnv("VERCEL", "1");
+    vi.stubEnv("VERCEL_ENV", "preview");
+    mocks.authorized.mockImplementation(() => !isDeployedVercelPreview());
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const response = await GET(new Request("https://vitalcap.test/api/cron/provider-preflight") as never);
+
+    expect(response.status).toBe(401);
+    expect(mocks.sql).not.toHaveBeenCalled();
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it("performs non-consuming provider checks and reports migration state without secrets", async () => {

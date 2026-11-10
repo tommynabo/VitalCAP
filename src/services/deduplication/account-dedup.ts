@@ -1,4 +1,5 @@
 import type { AccountDedupSignal } from "@/domain/accounts/types";
+import { normalizeDomain } from "@/lib/normalization";
 
 export interface AccountIdentitySignals {
   accountId: string;
@@ -31,6 +32,28 @@ export interface AccountDedupOptions {
   fuzzyMergeThreshold: number;
   /** Max distance (meters) for the name+geo-proximity composite signal. */
   geoProximityMeters: number;
+}
+
+const NON_IDENTITY_DOMAIN_GROUPS = {
+  socialPlatform: ["facebook.com", "instagram.com", "tiktok.com", "linkedin.com", "youtube.com", "linktr.ee"],
+  siteBuilder: ["sites.google.com", "wixsite.com", "wordpress.com", "blogspot.com"],
+  directory: ["google.com", "yelp.com", "tripadvisor.com", "paginasamarillas.es", "cylex.es", "infobel.com"],
+} as const;
+
+export type BusinessIdentityDomainClass = keyof typeof NON_IDENTITY_DOMAIN_GROUPS | "first_party_candidate";
+
+export function classifyBusinessIdentityDomain(domain: string | null | undefined): BusinessIdentityDomainClass | null {
+  const normalized = normalizeDomain(domain);
+  if (!normalized) return null;
+
+  for (const [classification, roots] of Object.entries(NON_IDENTITY_DOMAIN_GROUPS) as Array<[BusinessIdentityDomainClass, readonly string[]]>) {
+    if (roots.some((root) => normalized === root || normalized.endsWith(`.${root}`))) return classification;
+  }
+  return "first_party_candidate";
+}
+
+export function businessIdentityDomain(domain: string | null | undefined): string | null {
+  return classifyBusinessIdentityDomain(domain) === "first_party_candidate" ? normalizeDomain(domain) : null;
 }
 
 const DEFAULT_OPTIONS: AccountDedupOptions = {
@@ -76,61 +99,92 @@ export function evaluateAccountDedup(
   options: Partial<AccountDedupOptions> = {},
 ): AccountDedupDecision {
   const opts = { ...DEFAULT_OPTIONS, ...options };
-  const strongSignals: Array<{
-    incomingValue: string | null | undefined;
-    signal: AccountDedupSignal;
-    confidence: number;
-    valueFor: (candidate: AccountIdentitySignals) => string | null | undefined;
-  }> = [
-    { incomingValue: incoming.googlePlaceId, signal: "google_place_id", confidence: STRONG_SIGNAL_CONFIDENCE.google_place_id!, valueFor: (candidate) => candidate.googlePlaceId },
-    { incomingValue: incoming.normalizedDomain, signal: "normalized_domain", confidence: STRONG_SIGNAL_CONFIDENCE.normalized_domain!, valueFor: (candidate) => candidate.normalizedDomain },
-    { incomingValue: incoming.normalizedPhone, signal: "normalized_phone", confidence: STRONG_SIGNAL_CONFIDENCE.normalized_phone!, valueFor: (candidate) => candidate.normalizedPhone },
-  ];
-
-  for (const strongSignal of strongSignals) {
-    if (!strongSignal.incomingValue) continue;
-    const matches = existing
-      .filter((candidate) => strongSignal.valueFor(candidate) === strongSignal.incomingValue)
-      .map((candidate) => ({ accountId: candidate.accountId, signal: strongSignal.signal, confidence: strongSignal.confidence }));
-    if (matches.length > 0) {
-      return {
-        action: matches.length === 1 ? "merge" : "flag_for_review",
-        matches,
-        confidence: strongSignal.confidence,
-      };
-    }
+  const identityDomain = businessIdentityDomain(incoming.normalizedDomain);
+  const placeMatches = incoming.googlePlaceId
+    ? existing.filter((candidate) => candidate.googlePlaceId === incoming.googlePlaceId)
+    : [];
+  if (placeMatches.length > 0) {
+    const matches = placeMatches.map((candidate) => ({
+      accountId: candidate.accountId,
+      signal: "google_place_id" as const,
+      confidence: STRONG_SIGNAL_CONFIDENCE.google_place_id!,
+    }));
+    return { action: matches.length === 1 ? "merge" : "flag_for_review", matches, confidence: STRONG_SIGNAL_CONFIDENCE.google_place_id! };
   }
 
+  const domainMatches = identityDomain
+    ? existing.filter((candidate) => businessIdentityDomain(candidate.normalizedDomain) === identityDomain)
+    : [];
+  const phoneMatches = incoming.normalizedPhone
+    ? existing.filter((candidate) => candidate.normalizedPhone === incoming.normalizedPhone)
+    : [];
   const sameName = existing.filter((candidate) => incoming.normalizedName && incoming.normalizedName === candidate.normalizedName);
+  const nameAddressMatches = sameName.filter((candidate) => incoming.normalizedAddress && incoming.normalizedAddress === candidate.normalizedAddress);
+  const namePostalMatches = sameName.filter((candidate) => incoming.postalCode && incoming.postalCode === candidate.postalCode);
+  const nameGeoMatches = sameName.filter((candidate) =>
+    typeof incoming.latitude === "number" && typeof incoming.longitude === "number"
+    && typeof candidate.latitude === "number" && typeof candidate.longitude === "number"
+    && distanceMeters(
+      { latitude: incoming.latitude, longitude: incoming.longitude },
+      { latitude: candidate.latitude, longitude: candidate.longitude },
+    ) <= opts.geoProximityMeters,
+  );
+
+  const placeIdConflicts = existing.filter((candidate) =>
+    Boolean(incoming.googlePlaceId && candidate.googlePlaceId && incoming.googlePlaceId !== candidate.googlePlaceId)
+    && (domainMatches.includes(candidate) || phoneMatches.includes(candidate)
+      || nameAddressMatches.includes(candidate) || namePostalMatches.includes(candidate) || nameGeoMatches.includes(candidate)),
+  );
+  if (placeIdConflicts.length > 0) {
+    const matches: AccountDedupMatch[] = placeIdConflicts.map((candidate) => {
+      const signal: AccountDedupSignal = domainMatches.includes(candidate) ? "normalized_domain"
+        : phoneMatches.includes(candidate) ? "normalized_phone"
+          : nameAddressMatches.includes(candidate) ? "name_address"
+            : namePostalMatches.includes(candidate) ? "name_postal_code" : "name_geo_proximity";
+      const confidence = domainMatches.includes(candidate) ? STRONG_SIGNAL_CONFIDENCE.normalized_domain!
+        : phoneMatches.includes(candidate) ? STRONG_SIGNAL_CONFIDENCE.normalized_phone!
+          : nameAddressMatches.includes(candidate) ? FUZZY_SIGNAL_CONFIDENCE.name_address!
+            : namePostalMatches.includes(candidate) ? FUZZY_SIGNAL_CONFIDENCE.name_postal_code! : FUZZY_SIGNAL_CONFIDENCE.name_geo_proximity!;
+      return { accountId: candidate.accountId, signal, confidence };
+    });
+    return { action: "flag_for_review", matches, confidence: Math.max(...matches.map((match) => match.confidence)) };
+  }
+
+  if (domainMatches.length > 0) {
+    const matches = domainMatches.map((candidate) => ({
+      accountId: candidate.accountId,
+      signal: "normalized_domain" as const,
+      confidence: STRONG_SIGNAL_CONFIDENCE.normalized_domain!,
+    }));
+    return { action: matches.length === 1 ? "merge" : "flag_for_review", matches, confidence: STRONG_SIGNAL_CONFIDENCE.normalized_domain! };
+  }
+
+  if (phoneMatches.length > 0) {
+    const matches = phoneMatches.map((candidate) => ({
+      accountId: candidate.accountId,
+      signal: "normalized_phone" as const,
+      confidence: STRONG_SIGNAL_CONFIDENCE.normalized_phone!,
+    }));
+    return { action: matches.length === 1 ? "merge" : "flag_for_review", matches, confidence: STRONG_SIGNAL_CONFIDENCE.normalized_phone! };
+  }
+
   const compositeSignals: Array<{ signal: AccountDedupSignal; confidence: number; matches: AccountDedupMatch[] }> = [
     {
       signal: "name_address",
       confidence: FUZZY_SIGNAL_CONFIDENCE.name_address!,
-      matches: sameName
-        .filter((candidate) => incoming.normalizedAddress && incoming.normalizedAddress === candidate.normalizedAddress)
+      matches: nameAddressMatches
         .map((candidate) => ({ accountId: candidate.accountId, signal: "name_address", confidence: FUZZY_SIGNAL_CONFIDENCE.name_address! })),
     },
     {
       signal: "name_postal_code",
       confidence: FUZZY_SIGNAL_CONFIDENCE.name_postal_code!,
-      matches: sameName
-        .filter((candidate) => incoming.postalCode && incoming.postalCode === candidate.postalCode)
+      matches: namePostalMatches
         .map((candidate) => ({ accountId: candidate.accountId, signal: "name_postal_code", confidence: FUZZY_SIGNAL_CONFIDENCE.name_postal_code! })),
     },
     {
       signal: "name_geo_proximity",
       confidence: FUZZY_SIGNAL_CONFIDENCE.name_geo_proximity!,
-      matches: sameName
-        .filter((candidate) =>
-          typeof incoming.latitude === "number" &&
-          typeof incoming.longitude === "number" &&
-          typeof candidate.latitude === "number" &&
-          typeof candidate.longitude === "number" &&
-          distanceMeters(
-            { latitude: incoming.latitude, longitude: incoming.longitude },
-            { latitude: candidate.latitude, longitude: candidate.longitude },
-          ) <= opts.geoProximityMeters,
-        )
+      matches: nameGeoMatches
         .map((candidate) => ({ accountId: candidate.accountId, signal: "name_geo_proximity", confidence: FUZZY_SIGNAL_CONFIDENCE.name_geo_proximity! })),
     },
   ];
