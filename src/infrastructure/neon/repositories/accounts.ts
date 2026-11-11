@@ -669,6 +669,47 @@ export async function resolveCanonicalAccount(
             ))) <= 150
           )
         )
+        AND NOT (
+          ${incoming.googlePlaceId ?? null}::text IS NOT NULL
+          AND a.google_place_id IS NOT NULL
+          AND a.google_place_id <> ${incoming.googlePlaceId ?? null}
+          AND (
+            (
+              ${incoming.normalizedAddress ?? null}::text IS NOT NULL
+              AND a.normalized_address IS NOT NULL
+              AND a.normalized_address <> ${incoming.normalizedAddress ?? null}
+              AND ${incoming.postalCode ?? null}::text IS NOT NULL
+              AND a.postal_code IS NOT NULL
+              AND a.postal_code <> ${incoming.postalCode ?? null}
+            )
+            OR (
+              ${incoming.normalizedAddress ?? null}::text IS NOT NULL
+              AND a.normalized_address IS NOT NULL
+              AND a.normalized_address <> ${incoming.normalizedAddress ?? null}
+              AND ${incoming.latitude ?? null}::double precision IS NOT NULL
+              AND ${incoming.longitude ?? null}::double precision IS NOT NULL
+              AND a.latitude IS NOT NULL AND a.longitude IS NOT NULL
+              AND 6371000 * 2 * asin(sqrt(least(1,
+                sin(radians(a.latitude - ${incoming.latitude ?? null}::double precision) / 2)^2
+                + cos(radians(${incoming.latitude ?? null}::double precision)) * cos(radians(a.latitude))
+                * sin(radians(a.longitude - ${incoming.longitude ?? null}::double precision) / 2)^2
+              ))) > 150
+            )
+            OR (
+              ${incoming.postalCode ?? null}::text IS NOT NULL
+              AND a.postal_code IS NOT NULL
+              AND a.postal_code <> ${incoming.postalCode ?? null}
+              AND ${incoming.latitude ?? null}::double precision IS NOT NULL
+              AND ${incoming.longitude ?? null}::double precision IS NOT NULL
+              AND a.latitude IS NOT NULL AND a.longitude IS NOT NULL
+              AND 6371000 * 2 * asin(sqrt(least(1,
+                sin(radians(a.latitude - ${incoming.latitude ?? null}::double precision) / 2)^2
+                + cos(radians(${incoming.latitude ?? null}::double precision)) * cos(radians(a.latitude))
+                * sin(radians(a.longitude - ${incoming.longitude ?? null}::double precision) / 2)^2
+              ))) > 150
+            )
+          )
+        )
     ),
     matched AS MATERIALIZED (
       SELECT
@@ -698,7 +739,18 @@ export async function resolveCanonicalAccount(
       SELECT
         ${account.workspaceId}::uuid, ${account.canonicalName}, ${account.normalizedName}, ${account.businessType}, ${account.countryCode},
         ${account.region}, ${account.province}, ${account.city}, ${account.postalCode}, ${account.addressLine}, ${account.normalizedAddress},
-        ${account.latitude}, ${account.longitude}, ${account.phone}, ${account.normalizedPhone}, ${account.websiteUrl}, ${accountDomain},
+        ${account.latitude}, ${account.longitude}, ${account.phone},
+        CASE WHEN ${account.normalizedPhone ?? null}::text IS NOT NULL AND EXISTS (
+          SELECT 1 FROM accounts existing
+          WHERE existing.workspace_id = ${workspaceId}::uuid
+            AND existing.normalized_phone = ${account.normalizedPhone ?? null}
+        ) THEN NULL ELSE ${account.normalizedPhone ?? null} END,
+        ${account.websiteUrl},
+        CASE WHEN ${accountDomain}::text IS NOT NULL AND EXISTS (
+          SELECT 1 FROM accounts existing
+          WHERE existing.workspace_id = ${workspaceId}::uuid
+            AND existing.normalized_domain = ${accountDomain}
+        ) THEN NULL ELSE ${accountDomain} END,
         ${account.googlePlaceId}, ${account.mapsUrl}, ${account.rating}, ${account.reviewCount}, ${account.status}
       WHERE NOT EXISTS (SELECT 1 FROM matched)
         AND ${options.allowCreate !== false}

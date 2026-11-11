@@ -96,6 +96,11 @@ describe("canonical account domain reconciliation", () => {
     expect(text).toContain("THEN 'conflicting_normalized_domain'");
     expect(text).toContain("THEN 'conflicting_normalized_phone'");
     expect(text).toContain("has_place_id_conflict");
+    expect(text).toContain("AND NOT (");
+    expect(text).toContain("a.normalized_address <>");
+    expect(text).toContain("a.postal_code <>");
+    expect(text).toContain("existing.normalized_phone");
+    expect(text).toContain("existing.normalized_domain");
     expect(text.indexOf("WHEN matched_signal = 'google_place_id'")).toBeLessThan(text.indexOf("WHEN matched_signal = 'normalized_domain'"));
   });
 
@@ -135,6 +140,29 @@ describe("canonical account domain reconciliation", () => {
       kind: "needsReview",
       matchedSignal: "normalized_domain",
     });
+  });
+
+  it("does not match a confirmed separate Place ID location through shared domain and phone", () => {
+    expect(selectCanonicalAccountMatch({
+      normalizedName: "farmacia central burgos",
+      googlePlaceId: "place-branch-b",
+      normalizedDomain: "farmacia-central.es",
+      normalizedPhone: "+34944112233",
+      postalCode: "09001",
+      normalizedAddress: "calle mayor 2",
+      latitude: 42.3439,
+      longitude: -3.6969,
+    }, [{
+      accountId: "account-a",
+      normalizedName: "farmacia central albacete",
+      googlePlaceId: "place-branch-a",
+      normalizedDomain: "farmacia-central.es",
+      normalizedPhone: "+34944112233",
+      postalCode: "02001",
+      normalizedAddress: "calle mayor 1",
+      latitude: 38.9943,
+      longitude: -1.8585,
+    }])).toBeNull();
   });
 
   it("retains existing strong-signal priority when there is no domain owner", () => {

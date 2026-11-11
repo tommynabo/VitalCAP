@@ -20,9 +20,39 @@ describe("evaluateAccountDedup — strong signals", () => {
     expect(classifyBusinessIdentityDomain("sites.google.com")).toBe("siteBuilder");
     expect(classifyBusinessIdentityDomain("my.wixsite.com")).toBe("siteBuilder");
     expect(classifyBusinessIdentityDomain("yelp.com")).toBe("directory");
+    expect(classifyBusinessIdentityDomain("portal.farmaciascerca.es")).toBe("pharmacyDirectory");
+    expect(classifyBusinessIdentityDomain("sensafarma.es")).toBe("sharedPharmacyPlatform");
     expect(classifyBusinessIdentityDomain("farmaciacentral.example.es")).toBe("first_party_candidate");
     expect(businessIdentityDomain("www.facebook.com/farmacia-punal")).toBeNull();
+    expect(businessIdentityDomain("sensafarma.es")).toBeNull();
     expect(businessIdentityDomain("farmaciacentral.example.es")).toBe("farmaciacentral.example.es");
+  });
+
+  it("does not match unrelated businesses through verified pharmacy directories", () => {
+    const directoryDomains = [
+      "farmaciainfo7.com", "solofarmacias.es", "mapafarmacias.com", "sensafarma.es", "farmaciascerca.es",
+      "guiadefarmacias.es", "topdoctors.es", "farmacias365.com", "tofarmacias.com", "farmacias.wiki",
+      "farmaciasymedicamentos.com",
+    ];
+
+    for (const [index, normalizedDomain] of directoryDomains.entries()) {
+      const existing = {
+        ...base,
+        googlePlaceId: `directory-place-${index}`,
+        normalizedDomain,
+        normalizedPhone: `+34944000${String(index).padStart(3, "0")}`,
+      };
+      const decision = evaluateAccountDedup({
+        normalizedName: `unrelated pharmacy ${index}`,
+        googlePlaceId: `unrelated-place-${index}`,
+        normalizedDomain,
+        normalizedPhone: `+34945000${String(index).padStart(3, "0")}`,
+        normalizedAddress: `different street ${index}`,
+        postalCode: `9${String(index).padStart(4, "0")}`,
+      }, [existing]);
+
+      expect(decision.action, normalizedDomain).toBe("no_match");
+    }
   });
 
   it("merges on exact Google Place ID", () => {
@@ -114,7 +144,35 @@ describe("evaluateAccountDedup — strong signals", () => {
       longitude: -3.6969,
     }, [branchA]);
 
-    expect(branchB).toMatchObject({ action: "flag_for_review", matches: [{ accountId: branchA.accountId, signal: "normalized_domain" }] });
+    expect(branchB).toMatchObject({ action: "no_match", matches: [] });
+  });
+
+  it("keeps observed first-party chain domains eligible for location-aware identity matching", () => {
+    const chainDomains = ["arenal.com", "druni.es", "herbolarionavarro.es", "laventananatural.com", "primor.eu"];
+
+    for (const [index, normalizedDomain] of chainDomains.entries()) {
+      expect(classifyBusinessIdentityDomain(normalizedDomain), normalizedDomain).toBe("first_party_candidate");
+      const decision = evaluateAccountDedup({
+        normalizedName: `chain location ${index} burgos`,
+        googlePlaceId: `chain-place-b-${index}`,
+        normalizedDomain,
+        postalCode: "09001",
+        normalizedAddress: "calle cadena 2",
+        latitude: 42.3439,
+        longitude: -3.6969,
+      }, [{
+        ...base,
+        googlePlaceId: `chain-place-a-${index}`,
+        normalizedDomain,
+        normalizedPhone: null,
+        postalCode: "02001",
+        normalizedAddress: "calle cadena 1",
+        latitude: 38.9943,
+        longitude: -1.8585,
+      }]);
+
+      expect(decision.action, normalizedDomain).toBe("no_match");
+    }
   });
 
   it("flags an exact phone match when Place IDs conflict", () => {

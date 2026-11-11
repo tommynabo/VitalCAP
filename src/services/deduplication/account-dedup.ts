@@ -34,10 +34,17 @@ export interface AccountDedupOptions {
   geoProximityMeters: number;
 }
 
+// Finite verified roots only; unknown domains remain first-party candidates until reviewed.
 const NON_IDENTITY_DOMAIN_GROUPS = {
   socialPlatform: ["facebook.com", "instagram.com", "tiktok.com", "linkedin.com", "youtube.com", "linktr.ee"],
   siteBuilder: ["sites.google.com", "wixsite.com", "wordpress.com", "blogspot.com"],
   directory: ["google.com", "yelp.com", "tripadvisor.com", "paginasamarillas.es", "cylex.es", "infobel.com"],
+  pharmacyDirectory: [
+    "farmaciainfo7.com", "solofarmacias.es", "mapafarmacias.com", "farmaciascerca.es",
+    "guiadefarmacias.es", "topdoctors.es", "farmacias365.com", "tofarmacias.com", "farmacias.wiki",
+    "farmaciasymedicamentos.com",
+  ],
+  sharedPharmacyPlatform: ["sensafarma.es"],
 } as const;
 
 export type BusinessIdentityDomainClass = keyof typeof NON_IDENTITY_DOMAIN_GROUPS | "first_party_candidate";
@@ -85,6 +92,29 @@ function distanceMeters(a: { latitude: number; longitude: number }, b: { latitud
   return 2 * R * Math.asin(Math.sqrt(h));
 }
 
+function hasDistinctPlaceLocation(
+  incoming: Omit<AccountIdentitySignals, "accountId">,
+  candidate: AccountIdentitySignals,
+  geoProximityMeters: number,
+): boolean {
+  if (!incoming.googlePlaceId || !candidate.googlePlaceId || incoming.googlePlaceId === candidate.googlePlaceId) return false;
+
+  const addressConflict = Boolean(incoming.normalizedAddress && candidate.normalizedAddress
+    && incoming.normalizedAddress !== candidate.normalizedAddress);
+  const postalConflict = Boolean(incoming.postalCode && candidate.postalCode
+    && incoming.postalCode !== candidate.postalCode);
+  const geographicallySeparate = typeof incoming.latitude === "number" && typeof incoming.longitude === "number"
+    && typeof candidate.latitude === "number" && typeof candidate.longitude === "number"
+    && distanceMeters(
+      { latitude: incoming.latitude, longitude: incoming.longitude },
+      { latitude: candidate.latitude, longitude: candidate.longitude },
+    ) > geoProximityMeters;
+
+  return (addressConflict && postalConflict)
+    || (addressConflict && geographicallySeparate)
+    || (postalConflict && geographicallySeparate);
+}
+
 /**
  * Evaluates whether `incoming` matches any `existing` account (Prompt 1
  * §1.2). Strong signals (Place ID / domain / phone) always win outright.
@@ -100,6 +130,7 @@ export function evaluateAccountDedup(
 ): AccountDedupDecision {
   const opts = { ...DEFAULT_OPTIONS, ...options };
   const identityDomain = businessIdentityDomain(incoming.normalizedDomain);
+  const comparableExisting = existing.filter((candidate) => !hasDistinctPlaceLocation(incoming, candidate, opts.geoProximityMeters));
   const placeMatches = incoming.googlePlaceId
     ? existing.filter((candidate) => candidate.googlePlaceId === incoming.googlePlaceId)
     : [];
@@ -113,12 +144,12 @@ export function evaluateAccountDedup(
   }
 
   const domainMatches = identityDomain
-    ? existing.filter((candidate) => businessIdentityDomain(candidate.normalizedDomain) === identityDomain)
+    ? comparableExisting.filter((candidate) => businessIdentityDomain(candidate.normalizedDomain) === identityDomain)
     : [];
   const phoneMatches = incoming.normalizedPhone
-    ? existing.filter((candidate) => candidate.normalizedPhone === incoming.normalizedPhone)
+    ? comparableExisting.filter((candidate) => candidate.normalizedPhone === incoming.normalizedPhone)
     : [];
-  const sameName = existing.filter((candidate) => incoming.normalizedName && incoming.normalizedName === candidate.normalizedName);
+  const sameName = comparableExisting.filter((candidate) => incoming.normalizedName && incoming.normalizedName === candidate.normalizedName);
   const nameAddressMatches = sameName.filter((candidate) => incoming.normalizedAddress && incoming.normalizedAddress === candidate.normalizedAddress);
   const namePostalMatches = sameName.filter((candidate) => incoming.postalCode && incoming.postalCode === candidate.postalCode);
   const nameGeoMatches = sameName.filter((candidate) =>

@@ -499,6 +499,268 @@ if (!integrationReady) {
       });
     });
 
+    it("G: keeps unrelated pharmacies separate through a shared directory domain", async () => {
+      const first = makePlace({
+        externalPlaceId: "itest-directory-pharmacy-one",
+        name: "Farmacia Directorio Uno",
+        websiteUrl: "https://farmaciascerca.es/farmacia/uno",
+        phone: "+34 967 000 701",
+      });
+      const second = makePlace({
+        externalPlaceId: "itest-directory-pharmacy-two",
+        name: "Farmacia Directorio Dos",
+        address: "Calle de prueba 22",
+        postalCode: "09022",
+        province: "Burgos",
+        city: "Burgos",
+        latitude: 42.3439,
+        longitude: -3.6969,
+        websiteUrl: "https://www.farmaciascerca.es/farmacia/dos",
+        phone: "+34 947 000 702",
+      });
+      const firstRaw = await enqueuePlace(fixture.campaignId, first, randomUUID());
+      const secondRaw = await enqueuePlace(fixture.campaignId, second, randomUUID());
+      await processPlace(fixture.campaignId, firstRaw);
+      await processPlace(fixture.campaignId, secondRaw);
+
+      const rows = await db.execute(sql`
+        SELECT id, google_place_id, normalized_domain, website_url
+        FROM accounts
+        WHERE workspace_id = ${fixture.workspaceId}::uuid
+          AND google_place_id IN ('itest-directory-pharmacy-one', 'itest-directory-pharmacy-two')
+        ORDER BY google_place_id
+      `);
+      expect(rows.rows).toHaveLength(2);
+      expect(rows.rows.map((row) => (row as { normalized_domain: string | null }).normalized_domain)).toEqual([null, null]);
+      expect(rows.rows.map((row) => (row as { website_url: string }).website_url)).toEqual([
+        "https://farmaciascerca.es/farmacia/uno",
+        "https://www.farmaciascerca.es/farmacia/dos",
+      ]);
+      const memberships = await db.execute(sql`
+        SELECT cm.account_id FROM campaign_memberships cm
+        JOIN accounts a ON a.id = cm.account_id
+        WHERE cm.campaign_id = ${fixture.campaignId}::uuid
+          AND a.google_place_id IN ('itest-directory-pharmacy-one', 'itest-directory-pharmacy-two')
+      `);
+      expect(memberships.rows).toHaveLength(2);
+      reportScenarioResult("G", { separateAccounts: rows.rows.length, preservedWebsites: rows.rows.length, campaignMemberships: memberships.rows.length });
+    });
+
+    it("H: isolates new directory-domain locations from a contaminated legacy account", async () => {
+      const legacyPlace = makePlace({
+        externalPlaceId: "itest-legacy-directory-place",
+        name: "Legacy Directorio Farmacia",
+        websiteUrl: "https://farmaciascerca.es/farmacia/legacy",
+        phone: "+34 967 000 801",
+      });
+      const legacyRows = await db.execute(sql`
+        INSERT INTO accounts (
+          workspace_id, canonical_name, normalized_name, business_type, country_code, province, city,
+          postal_code, address_line, phone, normalized_phone, website_url, normalized_domain, google_place_id
+        ) VALUES (
+          ${fixture.workspaceId}::uuid, ${legacyPlace.name}, 'legacy directorio farmacia', 'pharmacy', 'ES',
+          'Albacete', 'Albacete', '02001', 'Calle legacy 8', ${legacyPlace.phone}, '+34967000801',
+          ${legacyPlace.websiteUrl}, 'farmaciascerca.es', ${legacyPlace.externalPlaceId}
+        ) RETURNING id
+      `);
+      const legacyAccountId = (legacyRows.rows[0] as { id: string }).id;
+      await db.execute(sql`
+        INSERT INTO contacts (workspace_id, account_id, full_name)
+        VALUES (${fixture.workspaceId}::uuid, ${legacyAccountId}::uuid, 'Synthetic directory legacy contact')
+      `);
+      await db.execute(sql`
+        INSERT INTO campaign_memberships (campaign_id, account_id, stage)
+        VALUES (${fixture.campaignId}::uuid, ${legacyAccountId}::uuid, 'discovered')
+      `);
+
+      const newPlace = makePlace({
+        externalPlaceId: "itest-new-directory-place",
+        name: "Nueva Farmacia Directorio",
+        address: "Calle nueva 9",
+        postalCode: "09009",
+        province: "Burgos",
+        city: "Burgos",
+        latitude: 42.3439,
+        longitude: -3.6969,
+        websiteUrl: "https://www.farmaciascerca.es/farmacia/nueva",
+        phone: "+34 947 000 802",
+      });
+      const rawId = await enqueuePlace(fixture.campaignId, newPlace, randomUUID());
+      await processPlace(fixture.campaignId, rawId);
+
+      const legacyAfter = await db.execute(sql`
+        SELECT id, normalized_domain, google_place_id FROM accounts WHERE id = ${legacyAccountId}::uuid
+      `);
+      expect(legacyAfter.rows[0]).toMatchObject({
+        id: legacyAccountId,
+        normalized_domain: "farmaciascerca.es",
+        google_place_id: "itest-legacy-directory-place",
+      });
+      const newRows = await db.execute(sql`
+        SELECT id, normalized_domain, website_url FROM accounts
+        WHERE workspace_id = ${fixture.workspaceId}::uuid AND google_place_id = 'itest-new-directory-place'
+      `);
+      expect(newRows.rows).toHaveLength(1);
+      expect(newRows.rows[0]).toMatchObject({
+        normalized_domain: null,
+        website_url: newPlace.websiteUrl,
+      });
+      const contactRows = await db.execute(sql`
+        SELECT account_id FROM contacts
+        WHERE workspace_id = ${fixture.workspaceId}::uuid
+          AND account_id IN (${legacyAccountId}::uuid, ${(newRows.rows[0] as { id: string }).id}::uuid)
+      `);
+      expect(contactRows.rows).toEqual([{ account_id: legacyAccountId }]);
+      const membershipRows = await db.execute(sql`
+        SELECT account_id FROM campaign_memberships
+        WHERE campaign_id = ${fixture.campaignId}::uuid
+          AND account_id IN (${legacyAccountId}::uuid, ${(newRows.rows[0] as { id: string }).id}::uuid)
+      `);
+      expect(membershipRows.rows).toHaveLength(2);
+      reportScenarioResult("H", {
+        legacyAccountPreserved: legacyAfter.rows.length === 1,
+        newAccountWebsitePreserved: (newRows.rows[0] as { website_url: string }).website_url === newPlace.websiteUrl,
+        contactsKeptOnLegacy: contactRows.rows.length === 1,
+        isolatedMemberships: membershipRows.rows.length,
+      });
+    });
+
+    it("I: concurrently creates distinct chain locations while preserving shared source fields", async () => {
+      const first = makePlace({
+        externalPlaceId: "itest-chain-location-one",
+        name: "Herbolario Cadena Albacete",
+        address: "Calle cadena 1",
+        postalCode: "02011",
+        websiteUrl: "https://www.herbolarionavarro.es/tiendas/albacete",
+        phone: "+34 967 000 901",
+      });
+      const second = makePlace({
+        externalPlaceId: "itest-chain-location-two",
+        name: "Herbolario Cadena Burgos",
+        address: "Calle cadena 2",
+        postalCode: "09012",
+        province: "Burgos",
+        city: "Burgos",
+        latitude: 42.3439,
+        longitude: -3.6969,
+        websiteUrl: "https://herbolarionavarro.es/tiendas/burgos",
+        phone: "+34 967 000 901",
+      });
+      const firstIdentity = identityFor(fixture.workspaceId, first);
+      const secondIdentity = identityFor(fixture.workspaceId, second);
+      const results = await Promise.all([
+        accountRepository.resolveCanonicalAccount(fixture.workspaceId, firstIdentity.incoming, firstIdentity.account),
+        accountRepository.resolveCanonicalAccount(fixture.workspaceId, secondIdentity.incoming, secondIdentity.account),
+      ]);
+      expect(results.map((result) => result.kind)).toEqual(["createNewAccount", "createNewAccount"]);
+
+      const rows = await db.execute(sql`
+        SELECT google_place_id, normalized_domain, normalized_phone, website_url, phone
+        FROM accounts
+        WHERE workspace_id = ${fixture.workspaceId}::uuid
+          AND google_place_id IN ('itest-chain-location-one', 'itest-chain-location-two')
+        ORDER BY google_place_id
+      `);
+      expect(rows.rows).toHaveLength(2);
+      expect(rows.rows.filter((row) => (row as { normalized_domain: string | null }).normalized_domain !== null)).toHaveLength(1);
+      expect(rows.rows.filter((row) => (row as { normalized_phone: string | null }).normalized_phone !== null)).toHaveLength(1);
+      expect(rows.rows.every((row) => Boolean((row as { website_url: string | null }).website_url))).toBe(true);
+      expect(rows.rows.every((row) => Boolean((row as { phone: string | null }).phone))).toBe(true);
+      reportScenarioResult("I", {
+        concurrentCreateOutcomes: results.map((result) => result.kind),
+        canonicalDomainOwners: rows.rows.filter((row) => (row as { normalized_domain: string | null }).normalized_domain !== null).length,
+        canonicalPhoneOwners: rows.rows.filter((row) => (row as { normalized_phone: string | null }).normalized_phone !== null).length,
+        sourceFieldsRetained: rows.rows.every((row) => Boolean((row as { website_url: string | null; phone: string | null }).website_url && (row as { phone: string | null }).phone)),
+      });
+    });
+
+    it("J: routes a conflicting Place ID with a shared phone and no location evidence to review", async () => {
+      const owner = makePlace({
+        externalPlaceId: "itest-phone-conflict-owner",
+        name: "Farmacia Telefono Propio",
+        websiteUrl: "https://phone-owner.example.es",
+        phone: "+34 967 000 951",
+      });
+      const conflicting = makePlace({
+        externalPlaceId: "itest-phone-conflict-other",
+        name: "Farmacia Telefono Distinto",
+        websiteUrl: "https://phone-other.example.es",
+        phone: owner.phone,
+      });
+      const ownerIdentity = identityFor(fixture.workspaceId, owner);
+      const conflictingIdentity = identityFor(fixture.workspaceId, conflicting);
+      const first = await accountRepository.resolveCanonicalAccount(fixture.workspaceId, ownerIdentity.incoming, ownerIdentity.account);
+      expect(first.kind).toBe("createNewAccount");
+      await expect(accountRepository.resolveCanonicalAccount(
+        fixture.workspaceId,
+        conflictingIdentity.incoming,
+        conflictingIdentity.account,
+      )).resolves.toMatchObject({ kind: "needsReview", matchedSignal: "conflicting_normalized_phone" });
+
+      const rows = await db.execute(sql`
+        SELECT google_place_id FROM accounts
+        WHERE workspace_id = ${fixture.workspaceId}::uuid
+          AND google_place_id IN ('itest-phone-conflict-owner', 'itest-phone-conflict-other')
+      `);
+      expect(rows.rows).toEqual([{ google_place_id: "itest-phone-conflict-owner" }]);
+      reportScenarioResult("J", { ownerRows: rows.rows.length, conflictingPlaceAutomaticallyCreated: false });
+    });
+
+    it("K: preserves a true first-party single-location domain match", async () => {
+      const owner = makePlace({
+        externalPlaceId: "itest-first-party-owner-place",
+        name: "Farmacia First Party Owner",
+        websiteUrl: "https://single-location-pharmacy.example.es",
+        phone: "+34 967 000 961",
+      });
+      const ownerIdentity = identityFor(fixture.workspaceId, owner);
+      const created = await accountRepository.resolveCanonicalAccount(
+        fixture.workspaceId,
+        ownerIdentity.incoming,
+        ownerIdentity.account,
+      );
+      expect(created.kind).toBe("createNewAccount");
+
+      const domainOnlyIncoming = {
+        ...ownerIdentity.incoming,
+        normalizedName: "pharmacy listing without place identity",
+        googlePlaceId: null,
+        normalizedPhone: null,
+        normalizedAddress: null,
+        postalCode: null,
+        latitude: null,
+        longitude: null,
+      };
+      const domainOnlyAccount = {
+        ...ownerIdentity.account,
+        canonicalName: "Pharmacy Listing Without Place Identity",
+        normalizedName: domainOnlyIncoming.normalizedName,
+        googlePlaceId: null,
+        normalizedPhone: null,
+        normalizedAddress: null,
+        postalCode: null,
+        latitude: null,
+        longitude: null,
+      };
+      await expect(accountRepository.resolveCanonicalAccount(
+        fixture.workspaceId,
+        domainOnlyIncoming,
+        domainOnlyAccount,
+      )).resolves.toMatchObject({
+        kind: "existingAccount",
+        existingAccountId: (created as { accountId: string }).accountId,
+        matchedSignal: "normalized_domain",
+      });
+
+      const rows = await db.execute(sql`
+        SELECT id FROM accounts
+        WHERE workspace_id = ${fixture.workspaceId}::uuid
+          AND normalized_domain = 'single-location-pharmacy.example.es'
+      `);
+      expect(rows.rows).toHaveLength(1);
+      reportScenarioResult("K", { canonicalAccountRows: rows.rows.length, domainMatchResolved: true });
+    });
+
     it("F: concurrent real resolver transactions converge on one canonical account", async () => {
       const place = makePlace({
         externalPlaceId: "itest-concurrent-place-id",
