@@ -48,6 +48,8 @@ const mocks = vi.hoisted(() => ({
   enrichWebsite: vi.fn(),
   createSerpDiscoveryProvider: vi.fn(),
   getAutopilotSettings: vi.fn(),
+  buildProspectContext: vi.fn(),
+  enqueueIntelligenceJob: vi.fn(),
 }));
 
 vi.mock("@/infrastructure/neon/repositories/job-queue", () => ({
@@ -132,6 +134,18 @@ vi.mock("@/infrastructure/jobs/runners/engine-factory", () => ({
 
 vi.mock("@/lib/config/env", () => ({
   getVerificationEnv: mocks.getVerificationEnv,
+}));
+
+vi.mock("@/services/intelligence/prospect-context-builder", () => ({
+  ProspectContextBuilder: class {
+    buildContext(campaignId: string, accountId: string) {
+      return mocks.buildProspectContext(campaignId, accountId);
+    }
+  },
+}));
+
+vi.mock("@/infrastructure/neon/repositories/intelligence-queue", () => ({
+  enqueueIntelligenceJob: mocks.enqueueIntelligenceJob,
 }));
 
 import {
@@ -442,6 +456,8 @@ beforeEach(() => {
   mocks.updateRawCandidateProcessingMetrics.mockResolvedValue(undefined);
   mocks.getAutopilotSettings.mockResolvedValue({ enabled: true, systemPaused: false, emergencyStopped: false, timezone: "Europe/Madrid" });
   mocks.createSerpDiscoveryProvider.mockReturnValue({ providerName: "mock", search: vi.fn() });
+  mocks.buildProspectContext.mockResolvedValue(null);
+  mocks.enqueueIntelligenceJob.mockResolvedValue(true);
 });
 
 afterEach(() => {
@@ -1847,6 +1863,9 @@ describe("runProcessingCronTick", () => {
 
     await runProcessingCronTick(3);
 
+    expect(mocks.buildProspectContext).toHaveBeenCalledWith("campaign-id", "canonical-account-id");
+    expect(mocks.completeProcessingJob).toHaveBeenCalledWith(expect.objectContaining({ jobId: "serper-jsonld-job" }));
+    expect(mocks.failProcessingJob).not.toHaveBeenCalled();
     expect(mocks.insertWebsiteEvidence).toHaveBeenCalledTimes(4);
     expect(mocks.insertWebsiteEvidence).toHaveBeenCalledWith(expect.objectContaining({
       evidenceType: "location_postal_code",
