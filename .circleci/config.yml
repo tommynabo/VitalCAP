@@ -43,4 +43,7 @@ jobs:
 workflows:
   vitalcap-ci:
     jobs:
-      - checks
+      - checks:
+          filters:
+            tags:
+              ignore: /.*/
