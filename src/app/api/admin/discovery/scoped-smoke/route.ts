@@ -24,6 +24,7 @@ import { AUTO_SEND_ENABLED } from "@/services/setter/autonomy-policy";
 import { getCurrentWorkspaceId, requireCurrentUser, UnauthorizedError } from "@/lib/auth/workspace";
 import { getWorkspaceRole } from "@/infrastructure/neon/repositories/workspace";
 import { logEvent } from "@/lib/observability/structured-logger";
+import { acquirePilotRunPermit, getPilotControlState, isPilotRunPermitActive } from "@/infrastructure/neon/repositories/pilot-control";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 300;
@@ -152,8 +153,10 @@ async function buildScopedSmokePlan(campaignId: string, workspaceId: string): Pr
     serperCostAllowed: capacity.providerHealth.serper.budgetAllowed,
     campaignCounts: { maps_fast: 1, google_serp: 1 },
   });
-  const routed = routeCampaignsToAvailableEngines([campaign], capabilities)[0];
-  const providerEngine = routed?.engineType ?? campaign.engineType;
+  if (campaign.engineType !== "maps_fast" && campaign.engineType !== "maps_deep") {
+    throw Object.assign(new Error("Isolated pilot smoke requires a Maps campaign; Serper fallback is disabled."), { status: 409 });
+  }
+  const providerEngine = campaign.engineType;
   const selectedCapability = capabilities.find((item) => item.engineType === providerEngine);
   const providerAvailable = Boolean(selectedCapability?.available);
   const seedSelectionTime = new Date();
@@ -594,6 +597,14 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: "Invalid scoped smoke request.", details: parsed.error.issues }, { status: 400 });
     }
     const input = parsed.data;
+    const pilot = await getPilotControlState();
+    const isReprocess = input.reprocessRejectedCandidates || Boolean(input.reprocessCandidateIds);
+    if (pilot.status === "active" && (pilot.workspaceId !== workspaceId || isReprocess)) {
+      return NextResponse.json({ error: "Historical candidate reprocessing is blocked during isolated pilot mode." }, { status: 409 });
+    }
+    if (!input.dryRun && !isReprocess && (pilot.status !== "active" || !input.probeMode || input.allowImport)) {
+      return NextResponse.json({ error: "A real smoke requires an active isolated pilot session and cannot import." }, { status: 409 });
+    }
     const reprocessCandidateId = input.reprocessCandidateIds?.[0];
     if (reprocessCandidateId) {
       return reprocessApprovedCandidate(reprocessCandidateId, input.campaignId, workspaceId);
@@ -722,6 +733,8 @@ export async function POST(request: Request) {
       providerHealth: plan.providerHealth,
       coldStart: plan.coldStart,
       selectionReason: plan.selectionReason,
+      pilotSessionId: pilot.sessionId,
+      pilotRunKey: plan.campaign.id,
     };
     const enqueueResult = existingJob
       ? { created: false, job: existingJob }
@@ -731,6 +744,23 @@ export async function POST(request: Request) {
         payload,
       });
     existingJob = enqueueResult.job;
+    if (!pilot.sessionId || !await acquirePilotRunPermit({
+      runKey: plan.campaign.id,
+      runType: "scoped_smoke",
+      sessionId: pilot.sessionId,
+      workspaceId,
+      campaignId: plan.campaign.id,
+      discoveryJobId: smokeExecutionId,
+      actorUserId: user.userId,
+    }) && !await isPilotRunPermitActive({
+      runKey: plan.campaign.id,
+      sessionId: pilot.sessionId,
+      workspaceId,
+      campaignId: plan.campaign.id,
+      discoveryJobId: smokeExecutionId,
+    })) {
+      return NextResponse.json({ error: "The campaign pilot permit is unavailable or already consumed." }, { status: 409 });
+    }
     if (!enqueueResult.created && (existingJob.status !== "pending" || existingJob.payload.scopedSmokeEvidence)) {
       return replayScopedSmoke(existingJob);
     }
@@ -740,6 +770,8 @@ export async function POST(request: Request) {
       allowScopedDraftCampaign: true,
       probeMode: true,
       smokeExecutionId,
+      pilotSessionId: pilot.sessionId,
+      pilotRunKey: plan.campaign.id,
     });
     const evidence = discovery.scopedProbeEvidence;
     if (!evidence?.jobClaimed) {
@@ -747,7 +779,7 @@ export async function POST(request: Request) {
       return replayScopedSmoke(currentJob);
     }
     const providerRuns = evidence.providerCallAttempted && evidence.providerCallSucceeded && plan.provider === "apify"
-      ? await runProviderRunsCronTick(1, { campaignId: plan.campaign.id, discoveryJobId: smokeExecutionId })
+      ? await runProviderRunsCronTick(1, { campaignId: plan.campaign.id, discoveryJobId: smokeExecutionId, pilotSessionId: pilot.sessionId, pilotRunKey: plan.campaign.id, workspaceId })
       : null;
     let progress = await getScopedSmokeProgress({
       campaignId: plan.campaign.id,
@@ -768,6 +800,8 @@ export async function POST(request: Request) {
         campaignId: plan.campaign.id,
         allowScopedDraftCampaign: true,
         rawCandidateIds: pendingCandidateIds,
+        pilotSessionId: pilot.sessionId,
+        pilotRunKey: plan.campaign.id,
         enrichContacts: false,
         allowMapsFastWebsiteRecovery: false,
         correlationId: smokeExecutionId,

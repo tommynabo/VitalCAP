@@ -34,6 +34,9 @@ const mocks = vi.hoisted(() => ({
   getVerificationEnv: vi.fn(),
   getEffectiveAutopilotState: vi.fn(),
   logEvent: vi.fn(),
+  getPilotControlState: vi.fn(),
+  acquirePilotRunPermit: vi.fn(),
+  isPilotRunPermitActive: vi.fn(),
 }));
 
 vi.mock("@/lib/auth/workspace", () => ({
@@ -42,6 +45,11 @@ vi.mock("@/lib/auth/workspace", () => ({
   requireCurrentUser: mocks.requireCurrentUser,
 }));
 vi.mock("@/infrastructure/neon/repositories/workspace", () => ({ getWorkspaceRole: mocks.getWorkspaceRole }));
+vi.mock("@/infrastructure/neon/repositories/pilot-control", () => ({
+  getPilotControlState: mocks.getPilotControlState,
+  acquirePilotRunPermit: mocks.acquirePilotRunPermit,
+  isPilotRunPermitActive: mocks.isPilotRunPermitActive,
+}));
 vi.mock("@/infrastructure/neon/repositories/campaigns", () => ({ getCampaignById: mocks.getCampaignById }));
 vi.mock("@/infrastructure/neon/repositories/production-capacity-diagnostics", () => ({ getProductionCapacityDiagnostics: mocks.getProductionCapacityDiagnostics }));
 vi.mock("@/infrastructure/neon/repositories/instantly-import-targets", () => ({ getScopedInstantlyTargetPreflight: mocks.getScopedInstantlyTargetPreflight }));
@@ -79,7 +87,12 @@ vi.mock("@/services/autopilot/target-planner", async (importOriginal) => {
     routeCampaignsToAvailableEngines: mocks.routeCampaignsToAvailableEngines,
   };
 });
-vi.mock("@/lib/config/env", () => ({ getMapsEnv: mocks.getMapsEnv, getSerperEnv: mocks.getSerperEnv, getVerificationEnv: mocks.getVerificationEnv }));
+vi.mock("@/lib/config/env", async (importOriginal) => ({
+  ...await importOriginal<typeof import("@/lib/config/env")>(),
+  getMapsEnv: mocks.getMapsEnv,
+  getSerperEnv: mocks.getSerperEnv,
+  getVerificationEnv: mocks.getVerificationEnv,
+}));
 vi.mock("@/domain/autopilot/types", () => ({ getEffectiveAutopilotState: mocks.getEffectiveAutopilotState }));
 vi.mock("@/lib/observability/structured-logger", () => ({ logEvent: mocks.logEvent }));
 
@@ -140,11 +153,15 @@ describe("POST /api/admin/discovery/scoped-smoke", () => {
     mocks.requireCurrentUser.mockResolvedValue({ userId: "admin-1" });
     mocks.getCurrentWorkspaceId.mockResolvedValue("workspace-1");
     mocks.getWorkspaceRole.mockResolvedValue("admin");
+    mocks.getPilotControlState.mockResolvedValue({ status: "active", sessionId: "pilot-session", workspaceId: "workspace-1", enabledAt: null, endedAt: null });
+    mocks.acquirePilotRunPermit.mockResolvedValue(true);
+    mocks.isPilotRunPermitActive.mockResolvedValue(true);
     mocks.getCampaignById.mockImplementation(async (campaignId: string) => {
       const entry = MULTI_NICHE_ROLLOUT.find((item) => item.campaignId === campaignId)!;
       return {
         id: entry.campaignId,
         workspaceId: "workspace-1",
+        engineType: "maps_fast",
         createdAt: "2026-01-01T00:00:00.000Z",
         status: "draft",
         autopilotEnabled: false,
@@ -407,9 +424,17 @@ describe("POST /api/admin/discovery/scoped-smoke", () => {
       allowScopedDraftCampaign: true,
       probeMode: true,
       smokeExecutionId: "c76e780a-b0a2-4e16-a3ec-e5d8a9197c4c",
+      pilotSessionId: "pilot-session",
+      pilotRunKey: campaignId,
     });
     expect(mocks.runDiscoveryCronTick.mock.calls[0]?.[1].getTime()).toBeGreaterThanOrEqual(mocks.lastEnqueueTimestamp);
-    expect(mocks.runProviderRunsCronTick).toHaveBeenCalledWith(1, { campaignId, discoveryJobId: "c76e780a-b0a2-4e16-a3ec-e5d8a9197c4c" });
+    expect(mocks.runProviderRunsCronTick).toHaveBeenCalledWith(1, {
+      campaignId,
+      discoveryJobId: "c76e780a-b0a2-4e16-a3ec-e5d8a9197c4c",
+      pilotSessionId: "pilot-session",
+      pilotRunKey: campaignId,
+      workspaceId: "workspace-1",
+    });
     expect(mocks.runProcessingCronTick).not.toHaveBeenCalled();
     expect(mocks.enqueueVerificationJobs).not.toHaveBeenCalled();
     expect(mocks.runVerificationCronTick).not.toHaveBeenCalled();
@@ -681,6 +706,7 @@ describe("POST /api/admin/discovery/scoped-smoke", () => {
   });
 
   it("reprocesses only exact owned candidates rejected by ICP and uses niche website evidence", async () => {
+    mocks.getPilotControlState.mockResolvedValue({ status: "disabled", sessionId: null, workspaceId: null, enabledAt: null, endedAt: null });
     const campaignId = MULTI_NICHE_ROLLOUT[2].campaignId;
     const smokeExecutionId = "a9d4378f-28d0-4b6f-9f31-cfbe9627539c";
     const candidateId = "98fd0b30-6dc1-4491-9b43-776065669e1e";
@@ -794,6 +820,7 @@ describe("POST /api/admin/discovery/scoped-smoke", () => {
   });
 
   it("resolves an approved candidate's exact persisted smoke execution before reprocessing", async () => {
+    mocks.getPilotControlState.mockResolvedValue({ status: "disabled", sessionId: null, workspaceId: null, enabledAt: null, endedAt: null });
     const campaignId = MULTI_NICHE_ROLLOUT[2].campaignId;
     const smokeExecutionId = "a9d4378f-28d0-4b6f-9f31-cfbe9627539c";
     const candidateId = "98fd0b30-6dc1-4491-9b43-776065669e1e";
@@ -874,6 +901,7 @@ describe("POST /api/admin/discovery/scoped-smoke", () => {
   });
 
   it("fails closed and returns boolean diagnostics when the persisted niche metadata differs", async () => {
+    mocks.getPilotControlState.mockResolvedValue({ status: "disabled", sessionId: null, workspaceId: null, enabledAt: null, endedAt: null });
     const campaignId = MULTI_NICHE_ROLLOUT[2].campaignId;
     const candidateId = "98fd0b30-6dc1-4491-9b43-776065669e1e";
     mocks.getScopedSmokeCandidateReprocessDiagnostics.mockResolvedValueOnce({

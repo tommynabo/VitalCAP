@@ -9,6 +9,7 @@ import { ProviderFailureError } from "@/domain/providers/errors";
 import { createApifyConfigurationFingerprint, createApifyCredentialFingerprint } from "@/services/discovery/provider-health";
 import { wakeProviderDeferredMapsDiscoveryJobs } from "@/infrastructure/neon/repositories/job-queue";
 import { logEvent } from "@/lib/observability/structured-logger";
+import { getPilotControlState, isPilotRunPermitActive } from "@/infrastructure/neon/repositories/pilot-control";
 
 const MONITORED_PROVIDERS = ["apify", "serper", "email_verification"] as const;
 const MAX_RUNS_PER_TICK = 20;
@@ -68,8 +69,22 @@ export interface ProviderRunsCronResult {
 /** Polls a bounded number of durable Compass runs; it never waits for an Actor. */
 export async function runProviderRunsCronTick(
   maxRuns = MAX_RUNS_PER_TICK,
-  options: { campaignId?: string; discoveryJobId?: string } = {},
+  options: { campaignId?: string; discoveryJobId?: string; pilotSessionId?: string; pilotRunKey?: string; workspaceId?: string } = {},
 ): Promise<ProviderRunsCronResult> {
+  const pilot = await getPilotControlState();
+  if (pilot.status === "active") {
+    if (!options.pilotSessionId || !options.pilotRunKey || !options.workspaceId
+      || options.pilotSessionId !== pilot.sessionId || !options.campaignId || !options.discoveryJobId
+      || !await isPilotRunPermitActive({
+        runKey: options.pilotRunKey,
+        sessionId: options.pilotSessionId,
+        workspaceId: options.workspaceId,
+        campaignId: options.campaignId,
+        discoveryJobId: options.discoveryJobId,
+      })) {
+      return { runsChecked: 0, runsIngested: 0, candidatesInserted: 0, itemsReturned: 0, ingestionAccounting: emptyIngestionAccounting(), warnings: ["pilot_mode_blocks_unpermitted_provider_poll"] };
+    }
+  }
   const env = getMapsEnv();
   if (!env.APIFY_API_TOKEN) return { runsChecked: 0, runsIngested: 0, candidatesInserted: 0, itemsReturned: 0, ingestionAccounting: emptyIngestionAccounting(), warnings: ["APIFY_API_TOKEN is not configured."] };
 

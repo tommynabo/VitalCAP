@@ -541,6 +541,24 @@ export function buildReserveApifyProviderRunQuery(
         AND safety.requested_today + safety.additional_raw_requests <= ${maxRequests}
         AND safety.reservation_cost_usd > 0
         AND (${input.recoveryProbe ?? false} = false OR safety.recovery_probe_count = 0)
+        AND (
+          NOT EXISTS (SELECT 1 FROM pilot_control WHERE id = true AND status = 'active')
+          OR EXISTS (
+            SELECT 1
+            FROM pilot_control control
+            JOIN autopilot_settings settings ON settings.workspace_id = control.workspace_id
+              AND settings.emergency_stopped = false
+            JOIN pilot_run_permits permit ON permit.session_id = control.session_id
+              AND permit.run_key = ${typeof input.metadata?.pilotRunKey === "string" ? input.metadata.pilotRunKey : ""}
+              AND permit.campaign_id = ${input.campaignId}::uuid
+              AND permit.discovery_job_id = ${typeof input.metadata?.discoveryJobId === "string" ? input.metadata.discoveryJobId : ""}::uuid
+              AND permit.status IN ('reserved', 'running')
+            WHERE control.id = true
+              AND control.status = 'active'
+              AND control.session_id = ${typeof input.metadata?.pilotSessionId === "string" ? input.metadata.pilotSessionId : ""}::uuid
+              AND control.workspace_id = ${input.workspaceId}::uuid
+          )
+        )
       ON CONFLICT (request_key) WHERE request_key IS NOT NULL DO NOTHING
       RETURNING *
     ),

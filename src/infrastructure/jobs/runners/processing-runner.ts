@@ -47,6 +47,7 @@ import { getWebsiteEnrichmentStatus, upsertWebsiteEnrichmentStatus, insertWebsit
 import { DomainFetchCache } from "@/lib/security/safe-fetch";
 import { normalizeDomain } from "@/lib/normalization";
 import { getAutopilotSettings } from "@/infrastructure/neon/repositories/autopilot";
+import { getPilotControlState } from "@/infrastructure/neon/repositories/pilot-control";
 import { buildMapsFastWebsiteRecoveryQuery, selectMapsFastRecoveredWebsite } from "@/services/discovery/maps-fast-website-recovery";
 import { createDeadlineSignal, DeadlineExceededError, raceWithAbort, runWithDeadlineSignal } from "@/lib/async/deadline";
 import {
@@ -76,6 +77,8 @@ export interface ProcessingRunnerOptions {
   allowMapsFastWebsiteRecovery?: boolean;
   allowNicheWebsiteClassificationEvidence?: boolean;
   correlationId?: string;
+  pilotSessionId?: string;
+  pilotRunKey?: string;
   timeBudgetMs?: number;
   perJobBudgetMs?: number;
   signal?: AbortSignal;
@@ -977,6 +980,12 @@ export async function runProcessingCronTick(
   now: Date = new Date(),
   options: ProcessingRunnerOptions = {},
 ): Promise<ProcessingRunnerResult> {
+  const pilot = await getPilotControlState();
+  if (pilot.status === "active" && (!options.pilotSessionId || !options.pilotRunKey
+    || options.pilotSessionId !== pilot.sessionId || !options.campaignId || !options.rawCandidateIds?.length
+    || options.enrichContacts !== false || options.allowMapsFastWebsiteRecovery !== false)) {
+    return { jobsClaimed: 0, jobsCompleted: 0, jobsTimedOut: 0, cleanupFailures: 0, recoveryCandidatesFound: 0, recoveryJobsEnqueued: 0, durationMs: 0 };
+  }
   const workerId = `cron-process-${randomUUID()}`;
   const diagnostics = createProcessingCronDiagnosticsContext(options.correlationId ?? randomUUID());
   const startedAt = performance.now();
@@ -1028,6 +1037,8 @@ export async function runProcessingCronTick(
             createdSince: options.createdSince,
             rawCandidateIds: options.rawCandidateIds,
             jobTypes: options.jobTypes,
+            pilotSessionId: options.pilotSessionId,
+            pilotRunKey: options.pilotRunKey,
           }),
           cronDeadline.signal,
         )));

@@ -48,6 +48,7 @@ const mocks = vi.hoisted(() => ({
   enrichWebsite: vi.fn(),
   createSerpDiscoveryProvider: vi.fn(),
   getAutopilotSettings: vi.fn(),
+  getPilotControlState: vi.fn(),
   buildProspectContext: vi.fn(),
   enqueueIntelligenceJob: vi.fn(),
 }));
@@ -105,6 +106,9 @@ vi.mock("@/infrastructure/neon/repositories/verification-queue", () => ({
 
 vi.mock("@/infrastructure/neon/repositories/autopilot", () => ({
   getAutopilotSettings: mocks.getAutopilotSettings,
+}));
+vi.mock("@/infrastructure/neon/repositories/pilot-control", () => ({
+  getPilotControlState: mocks.getPilotControlState,
 }));
 
 vi.mock("@/infrastructure/providers/provider-factory", () => ({
@@ -368,6 +372,7 @@ const recoveredWebsite = {
 
 beforeEach(() => {
   vi.resetAllMocks();
+  mocks.getPilotControlState.mockResolvedValue({ status: "disabled", sessionId: null, workspaceId: null, enabledAt: null, endedAt: null });
   vi.spyOn(performance, "now").mockReturnValue(0);
   mocks.completeProcessingJob.mockResolvedValue(undefined);
   mocks.deferProcessingJob.mockResolvedValue(undefined);

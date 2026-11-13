@@ -585,6 +585,8 @@ async function claim<T>(
   allowWatchdogRecovery = false,
   jobId?: string,
   allowScopedDraftCampaign = false,
+  pilotSessionId?: string,
+  pilotRunKey?: string,
 ): Promise<JobRecord<T>[]> {
   const db = getDb();
   const result = await db.execute(buildClaimJobsQuery(table, {
@@ -595,6 +597,8 @@ async function claim<T>(
     requireAutopilot,
     allowWatchdogRecovery,
     allowScopedDraftCampaign,
+    pilotSessionId,
+    pilotRunKey,
     now,
     leaseMs,
   }, now));
@@ -607,9 +611,14 @@ export function buildClaimJobsQuery(table: QueueTable, input: ClaimJobsInput, no
   const inputCampaignId = input.campaignId ?? null;
   const inputJobId = input.jobId ?? null;
   const inputCreatedSince = input.createdSince?.toISOString() ?? null;
+  const pilotSessionId = input.pilotSessionId ?? null;
+  const pilotRunKey = input.pilotRunKey ?? null;
   const rawCandidateIdFilter = input.rawCandidateIds?.length
     ? sql`j.payload->>'rawCandidateId' IN (${sql.join(input.rawCandidateIds.map((id) => sql`${id}`), sql`, `)})`
     : sql`true`;
+  const pilotRawCandidateIdFilter = input.rawCandidateIds?.length
+    ? sql`candidate.id::text IN (${sql.join(input.rawCandidateIds.map((id) => sql`${id}`), sql`, `)})`
+    : sql`false`;
   const jobTypeFilter = input.jobTypes?.length
     ? sql`j.type IN (${sql.join(input.jobTypes.map((type) => sql`${type}`), sql`, `)})`
     : sql`true`;
@@ -646,12 +655,37 @@ export function buildClaimJobsQuery(table: QueueTable, input: ClaimJobsInput, no
 
   return table === "discovery_jobs"
     ? sql`
-          WITH claimable AS (
+          WITH pilot_state AS MATERIALIZED (
+            SELECT status, session_id FROM pilot_control WHERE id = true FOR SHARE
+          ),
+          claimable AS (
             SELECT j.id, (${watchdogRecoveryEligible}) AS watchdog_recovery
             FROM discovery_jobs j
             JOIN campaigns c ON c.id = j.campaign_id
             LEFT JOIN autopilot_settings aps ON aps.workspace_id = c.workspace_id
+            CROSS JOIN pilot_state
             WHERE (c.status = 'active' OR (${scopedDraftCampaign}))
+              AND (
+                pilot_state.status <> 'active'
+                OR (
+                  ${pilotSessionId}::uuid = pilot_state.session_id
+                  AND ${pilotRunKey}::text IS NOT NULL
+                  AND aps.emergency_stopped = false
+                  AND EXISTS (
+                    SELECT 1 FROM pilot_run_permits permit
+                    WHERE permit.run_key = ${pilotRunKey}::text
+                      AND permit.session_id = pilot_state.session_id
+                      AND permit.campaign_id = j.campaign_id
+                      AND permit.discovery_job_id = j.id
+                      AND permit.status IN ('reserved', 'running')
+                      AND (
+                        (permit.run_type = 'recovery' AND j.payload->>'origin' = 'recovery_probe')
+                        OR (permit.run_type = 'scoped_smoke' AND j.payload->>'scopedSmoke' = 'true'
+                          AND j.payload->>'smokeExecutionId' = j.id::text)
+                      )
+                  )
+                )
+              )
               AND (
                 ${requireAutopilot} = false
                 OR (
@@ -697,6 +731,7 @@ export function buildClaimJobsQuery(table: QueueTable, input: ClaimJobsInput, no
             FROM processing_jobs j
             JOIN campaigns c ON c.id = j.campaign_id
             LEFT JOIN autopilot_settings aps ON aps.workspace_id = c.workspace_id
+            CROSS JOIN (SELECT status, session_id FROM pilot_control WHERE id = true FOR SHARE) pilot_state
             WHERE (c.status = 'active' OR (${scopedDraftCampaign}))
               AND (${requireAutopilot} = false OR (c.autopilot_enabled = true AND aps.emergency_stopped = false))
               AND (${inputCampaignId}::uuid IS NULL OR j.campaign_id = ${inputCampaignId}::uuid)
@@ -704,6 +739,26 @@ export function buildClaimJobsQuery(table: QueueTable, input: ClaimJobsInput, no
               AND (${inputCreatedSince}::timestamptz IS NULL OR j.created_at >= ${inputCreatedSince}::timestamptz)
               AND ${rawCandidateIdFilter}
               AND ${jobTypeFilter}
+              AND (
+                pilot_state.status <> 'active'
+                OR (
+                  ${pilotSessionId}::uuid = pilot_state.session_id
+                  AND ${pilotRunKey}::text = j.campaign_id::text
+                  AND aps.emergency_stopped = false
+                  AND EXISTS (
+                    SELECT 1
+                    FROM pilot_run_permits permit
+                    JOIN raw_candidates candidate ON candidate.discovery_job_id = permit.discovery_job_id
+                    WHERE permit.run_key = ${pilotRunKey}::text
+                      AND permit.run_type = 'scoped_smoke'
+                      AND permit.session_id = pilot_state.session_id
+                      AND permit.campaign_id = j.campaign_id
+                      AND permit.status IN ('reserved', 'running', 'completed')
+                      AND candidate.id::text = j.payload->>'rawCandidateId'
+                      AND ${pilotRawCandidateIdFilter}
+                  )
+                )
+              )
               AND j.status IN ('pending', 'processing')
               AND (j.next_attempt_at IS NULL OR j.next_attempt_at <= ${nowIso}::timestamptz)
               AND j.attempt_count < j.max_attempts
@@ -741,17 +796,19 @@ export interface ClaimJobsInput {
   requireAutopilot?: boolean;
   allowWatchdogRecovery?: boolean;
   allowScopedDraftCampaign?: boolean;
+  pilotSessionId?: string;
+  pilotRunKey?: string;
   createdSince?: Date;
   now?: Date;
   leaseMs?: number;
 }
 
 export async function claimDiscoveryJobs<T = Record<string, unknown>>(input: ClaimJobsInput): Promise<JobRecord<T>[]> {
-  return claim<T>("discovery_jobs", input.workerId, input.now ?? new Date(), input.leaseMs ?? JOB_LEASE_MS, input.batchSize, input.campaignId, input.requireAutopilot ?? true, input.allowWatchdogRecovery ?? false, input.jobId, input.allowScopedDraftCampaign ?? false);
+  return claim<T>("discovery_jobs", input.workerId, input.now ?? new Date(), input.leaseMs ?? JOB_LEASE_MS, input.batchSize, input.campaignId, input.requireAutopilot ?? true, input.allowWatchdogRecovery ?? false, input.jobId, input.allowScopedDraftCampaign ?? false, input.pilotSessionId, input.pilotRunKey);
 }
 
 export async function claimProcessingJobs<T = Record<string, unknown>>(input: ClaimJobsInput): Promise<JobRecord<T>[]> {
-  return claim<T>("processing_jobs", input.workerId, input.now ?? new Date(), input.leaseMs ?? JOB_LEASE_MS, input.batchSize, input.campaignId, input.requireAutopilot ?? true, false, input.jobId, input.allowScopedDraftCampaign ?? false);
+  return claim<T>("processing_jobs", input.workerId, input.now ?? new Date(), input.leaseMs ?? JOB_LEASE_MS, input.batchSize, input.campaignId, input.requireAutopilot ?? true, false, input.jobId, input.allowScopedDraftCampaign ?? false, input.pilotSessionId, input.pilotRunKey);
 }
 
 export async function claimNextDiscoveryJob<T = Record<string, unknown>>(
