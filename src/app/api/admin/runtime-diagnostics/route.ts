@@ -9,7 +9,7 @@ import { getApifyDailyEconomicTotals, getSeedEconomicPerformance, listSearchSeed
 import { getSystemHealthDiagnostics } from "@/infrastructure/neon/repositories/health-diagnostics";
 import { getRecoveryProbeDiscoveryJobs, getWatchdogWorkspaceSignals } from "@/infrastructure/neon/repositories/watchdog-signals";
 import { getAutopilotPacingState } from "@/infrastructure/neon/repositories/autopilot";
-import { ApifyClient } from "@/infrastructure/providers/maps/apify-client";
+import { ApifyClient, classifyApifyAccountSnapshotFailure } from "@/infrastructure/providers/maps/apify-client";
 import { getCurrentWorkspaceId, requireCurrentUser, UnauthorizedError } from "@/lib/auth/workspace";
 import { getMapsEnv, getSerperEnv } from "@/lib/config/env";
 import { resolveNeonVar } from "@/lib/config/env-utils";
@@ -169,10 +169,14 @@ export async function GET() {
         timeZone,
       }),
     ]);
+    let apifyAccountSnapshotFailure: ReturnType<typeof classifyApifyAccountSnapshotFailure> | null = null;
     const apifyAccountSpend = mapsEnv.MAPS_PROVIDER === "apify" && mapsEnv.APIFY_API_TOKEN
       ? await new ApifyClient({ apiToken: mapsEnv.APIFY_API_TOKEN })
         .getAccountCostSnapshot(apifyAccountDay.start, apifyAccountDay.end)
-        .catch(() => null)
+        .catch((error: unknown) => {
+          apifyAccountSnapshotFailure = classifyApifyAccountSnapshotFailure(error);
+          return null;
+        })
       : null;
     const watchdogSignals = watchdogRows[0] ?? null;
     const economicCampaigns = campaignRows.filter((campaign) => campaign.engineType === "maps_fast"
@@ -372,6 +376,7 @@ export async function GET() {
       discoveryEconomics: {
         apifyDailyCapUsd: mapsEnv.APIFY_DAILY_COST_LIMIT_USD,
         apifyAccountSnapshotAvailable: apifyAccountSpend !== null,
+        apifyAccountSnapshotFailure,
         apifyRealSpendTodayUsd: apifyAccountSpend?.actualSpendUsd ?? null,
         apifyReservedSpendTodayUsd: apifyAccountSpend?.reservedSpendUsd ?? null,
         apifyCommittedSpendTodayUsd: apifyAccountSpend?.committedSpendUsd ?? null,

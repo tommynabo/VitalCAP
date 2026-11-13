@@ -142,6 +142,52 @@ export class ApifyRequestError extends ProviderFailureError {
   }
 }
 
+export type ApifyAccountSnapshotFailureCategory =
+  | "authentication"
+  | "billing"
+  | "quota"
+  | "api_http_error"
+  | "api_network_error"
+  | "invalid_json"
+  | "invalid_response_schema"
+  | "missing_usage_total_usd"
+  | "missing_inflight_charge_ceiling"
+  | "invalid_usage_window"
+  | "unknown";
+
+export interface ApifyAccountSnapshotFailure {
+  category: ApifyAccountSnapshotFailureCategory;
+  httpStatus: number | null;
+}
+
+export function classifyApifyAccountSnapshotFailure(error: unknown): ApifyAccountSnapshotFailure {
+  if (error instanceof ApifyRequestError) {
+    if (error.status === 401 || (error.status === 403 && error.failureKind !== "billing")) {
+      return { category: "authentication", httpStatus: error.status };
+    }
+    if (error.status === 402 || (error.status === 403 && error.failureKind === "billing")) {
+      return { category: "billing", httpStatus: error.status };
+    }
+    if (error.status === 429) return { category: "quota", httpStatus: error.status };
+    return { category: "api_http_error", httpStatus: error.status };
+  }
+
+  const message = error instanceof Error ? error.message.toLowerCase() : "";
+  if (message.includes("no verifiable charge ceiling")) {
+    return { category: "missing_inflight_charge_ceiling", httpStatus: null };
+  }
+  if (message.includes("account run cost is unavailable")) {
+    return { category: "missing_usage_total_usd", httpStatus: null };
+  }
+  if (message.includes("invalid json")) return { category: "invalid_json", httpStatus: null };
+  if (message.includes("network request failed")) return { category: "api_network_error", httpStatus: null };
+  if (message.includes("spend window is invalid")) return { category: "invalid_usage_window", httpStatus: null };
+  if (/returned (an invalid|incomplete)|returned an invalid|invalid run|invalid total|invalid start time|run list is incomplete/.test(message)) {
+    return { category: "invalid_response_schema", httpStatus: null };
+  }
+  return { category: "unknown", httpStatus: null };
+}
+
 interface ApifyClientOptions {
   apiToken: string;
   /** Injectable for tests — defaults to the global fetch. */
@@ -314,17 +360,21 @@ export class ApifyClient {
         ? listedRun
         : await this.getActorRun(listedRun.id);
       const actual = run.usageTotalUsd;
-      if (typeof actual !== "number" || !Number.isFinite(actual) || actual < 0) {
+      const actualIsMissing = actual === null || actual === undefined;
+      if (actualIsMissing && ApifyClient.TERMINAL_STATUSES.includes(run.status)) {
         throw new ProviderTransientError("Apify account run cost is unavailable; refusing new allocation.");
       }
+      if (!actualIsMissing && (typeof actual !== "number" || !Number.isFinite(actual) || actual < 0)) {
+        throw new ProviderTransientError("Apify account run list returned an invalid usage total.");
+      }
       const startedBeforeWindow = Date.parse(listedRun.startedAt) < start.getTime();
-      if (!startedBeforeWindow) actualSpendUsd += actual;
+      if (!startedBeforeWindow && !actualIsMissing) actualSpendUsd += actual;
       if (!ApifyClient.TERMINAL_STATUSES.includes(run.status)) {
         const ceiling = run.options?.maxTotalChargeUsd;
         if (typeof ceiling !== "number" || !Number.isFinite(ceiling) || ceiling < 0) {
           throw new ProviderTransientError("An in-flight Apify account run has no verifiable charge ceiling; refusing new allocation.");
         }
-        reservedSpendUsd += startedBeforeWindow ? ceiling : Math.max(0, ceiling - actual);
+        reservedSpendUsd += startedBeforeWindow || actualIsMissing ? ceiling : Math.max(0, ceiling - actual);
       }
     }
 
