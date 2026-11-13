@@ -11,6 +11,7 @@
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
+    "test:neon-identity": "vitest run --config vitest.neon-identity.config.ts",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "tsx scripts/migrate.ts",
     "smoke:db": "tsx scripts/smoke/smoke-db.ts",

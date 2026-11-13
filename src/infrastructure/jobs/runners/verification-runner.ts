@@ -11,6 +11,7 @@ import { enqueueVerificationJob } from "@/infrastructure/neon/repositories/verif
 import { actualPriorColdOutreachSql } from "@/infrastructure/neon/repositories/actual-outreach";
 import { upsertCampaignMembership } from "@/infrastructure/neon/repositories/campaigns";
 import { EMAIL_VERIFICATION_PIPELINE_VERSION } from "@/domain/providers/email-verification-idempotency";
+import { getPilotControlState } from "@/infrastructure/neon/repositories/pilot-control";
 import type { VerificationStatus } from "@/domain/contacts/types";
 import { runInstantlyImportTick, type InstantlyImportTickResult } from "@/infrastructure/jobs/runners/instantly-import-runner";
 import {
@@ -730,6 +731,9 @@ export async function runVerificationCronTick(
     onStage?: (stage: VerificationExecutionStage) => void;
   } = {},
 ): Promise<VerificationRunnerResult> {
+  if ((await getPilotControlState()).status === "active") {
+    throw new Error("Verification is blocked while isolated pilot mode is active.");
+  }
   if (options.contactPointIds && options.contactPointIds.length !== 1) {
     throw new Error("Scoped verification requires exactly one contact point.");
   }

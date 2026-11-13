@@ -1,4 +1,5 @@
 import { InstantlyReplyApiError } from "./reply-provider";
+import { assertNotVercelPreview } from "@/lib/security/preview-runtime";
 
 const INSTANTLY_API_BASE_URL = "https://api.instantly.ai/api/v2";
 
@@ -19,6 +20,7 @@ function record(value: unknown): Record<string, unknown> | null {
 
 export class InstantlyInboxProvider {
   constructor(private readonly apiKey: string, private readonly fetchImpl: typeof fetch = fetch) {
+    assertNotVercelPreview("Instantly inbox access");
     if (!apiKey) throw new Error("Instantly API key is not configured.");
   }
 

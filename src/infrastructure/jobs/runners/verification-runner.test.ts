@@ -17,6 +17,7 @@ const mocks = vi.hoisted(() => ({
   runInstantlyImportTick: vi.fn(),
   repairVerifiedAutopilotEmailMetadata: vi.fn(),
   evaluateComplianceForAccount: vi.fn(),
+  getPilotControlState: vi.fn(),
 }));
 
 vi.mock("drizzle-orm", () => ({
@@ -64,6 +65,9 @@ vi.mock("@/lib/config/env", () => ({
 vi.mock("@/infrastructure/neon/repositories/verification-queue", () => ({
   enqueueVerificationJob: mocks.enqueueVerificationJob,
 }));
+vi.mock("@/infrastructure/neon/repositories/pilot-control", () => ({
+  getPilotControlState: mocks.getPilotControlState,
+}));
 vi.mock("@/infrastructure/neon/repositories/actual-outreach", () => ({
   actualPriorColdOutreachSql: vi.fn((scope: { workspaceId: string }) => ({ strings: [`TRUE ${scope.workspaceId}`], values: [] })),
 }));
@@ -97,6 +101,13 @@ function sqlParts(value: unknown): { text: string; values: unknown[] } {
 describe("runVerificationCronTick eligibility recheck", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mocks.getPilotControlState.mockResolvedValue({
+      status: "disabled",
+      sessionId: null,
+      workspaceId: null,
+      enabledAt: null,
+      endedAt: null,
+    });
     mocks.enqueueVerificationJob.mockResolvedValue(true);
     mocks.execute
       .mockResolvedValueOnce({ rows: [] })
@@ -146,6 +157,21 @@ describe("runVerificationCronTick eligibility recheck", () => {
   });
 
   afterEach(() => vi.clearAllMocks());
+
+  it("blocks verification while isolated pilot mode is active", async () => {
+    mocks.getPilotControlState.mockResolvedValueOnce({
+      status: "active",
+      sessionId: "pilot-session",
+      workspaceId: "workspace-1",
+      enabledAt: null,
+      endedAt: null,
+    });
+
+    await expect(runVerificationCronTick()).rejects.toThrow(
+      "Verification is blocked while isolated pilot mode is active.",
+    );
+    expect(mocks.execute).not.toHaveBeenCalled();
+  });
 
   it("claims at most one due failed verification retry per active idempotency key", async () => {
     mocks.execute.mockReset()

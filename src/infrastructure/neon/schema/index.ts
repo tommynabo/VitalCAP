@@ -12,3 +12,4 @@ export * from "./jobs-meta";
 export * from "./website";
 export * from "./intelligence";
 export * from "./compliance";
+export * from "./pilot-control";

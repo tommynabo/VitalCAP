@@ -3,6 +3,8 @@ import { NextResponse, type NextRequest } from "next/server";
 import { getCoreEnv } from "@/lib/config/env";
 import { startCronRun, finishCronRun } from "@/infrastructure/neon/repositories/cron-runs";
 import { logEvent } from "@/lib/observability/structured-logger";
+import { isDeployedVercelPreview } from "@/lib/security/preview-runtime";
+import { getPilotControlState } from "@/infrastructure/neon/repositories/pilot-control";
 
 /**
  * Shared `/api/cron/*` plumbing (Prompt 7 §25): every cron route must (1)
@@ -13,6 +15,7 @@ import { logEvent } from "@/lib/observability/structured-logger";
  * duplicated here (§25).
  */
 export function isAuthorizedCronRequest(request: NextRequest): boolean {
+  if (isDeployedVercelPreview()) return false;
   const env = getCoreEnv();
   if (!env.CRON_SECRET) {
     // env validation already hard-requires CRON_SECRET when APP_ENV === "production" (see lib/config/env.ts),
@@ -39,6 +42,19 @@ export async function runCronRoute(route: string, work: () => Promise<CronWorkRe
   const startedAt = Date.now();
 
   try {
+    const pilot = await getPilotControlState();
+    if (pilot.status === "active") {
+      const result = { itemsProcessed: 0, warnings: ["pilot_mode_active"], metadata: { pilotIsolation: "active" } };
+      await finishCronRun(cronRunId, { status: "completed_with_warnings", itemsProcessed: 0, error: "pilot_mode_active" });
+      logEvent("info", `cron.${route}`, {
+        correlationId,
+        outcome: "completed_with_warnings",
+        durationMs: Date.now() - startedAt,
+        itemsProcessed: 0,
+        ...result.metadata,
+      });
+      return NextResponse.json({ status: "completed_with_warnings", ...result });
+    }
     const result = await work();
     const status = result.warnings && result.warnings.length > 0 ? "completed_with_warnings" : "completed";
     const error = result.warnings && result.warnings.length > 0 ? result.warnings.join("; ") : null;

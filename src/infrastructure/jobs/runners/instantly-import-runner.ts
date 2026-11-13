@@ -29,6 +29,7 @@ import { logEvent } from "@/lib/observability/structured-logger";
 import { isEmailChannelEligible } from "@/services/compliance/email-channel-policy";
 import type { ChannelEligibilityStatus } from "@/domain/contacts/types";
 import { getMultiNicheRolloutEntry } from "@/services/autopilot/multi-niche-rollout";
+import { getPilotControlState } from "@/infrastructure/neon/repositories/pilot-control";
 
 const IMPORT_BATCH_SIZE = 50;
 const MAX_INSTANTLY_WRITE_CONCURRENCY = 2;
@@ -921,6 +922,7 @@ export async function runInstantlyImportTick(options: {
   now?: Date;
 } = {}): Promise<InstantlyImportTickResult> {
   const now = options.now ?? new Date();
+  if ((await getPilotControlState()).status === "active") return emptyImportTickResult("busy");
   const db = getDb();
   const schemaStatus = await db.execute(sql`
     SELECT

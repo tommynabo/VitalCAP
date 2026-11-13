@@ -5,7 +5,7 @@ import { contacts, contactPoints } from "../schema/contacts";
 import type { Account, AccountSource, AccountStatus, BusinessType } from "@/domain/accounts/types";
 import type { Contact, ContactPoint, ContactPointType, VerificationStatus } from "@/domain/contacts/types";
 import type { AccountIdentitySignals } from "@/services/deduplication/account-dedup";
-import { evaluateAccountDedup } from "@/services/deduplication/account-dedup";
+import { businessIdentityDomain, evaluateAccountDedup } from "@/services/deduplication/account-dedup";
 import { deriveEmailChannelEligibility } from "@/services/compliance/email-channel-policy";
 import type { SetterQueueAccount } from "@/services/setter/review-queue";
 import type { AccountListCursor, AccountListRow } from "@/services/accounts/account-list";
@@ -464,10 +464,11 @@ export async function findCandidateAccountMatches(
   incoming: Omit<AccountIdentitySignals, "accountId">,
 ): Promise<AccountIdentitySignals[]> {
   const db = getDb();
+  const identityDomain = businessIdentityDomain(incoming.normalizedDomain);
   const clauses = [];
 
   if (incoming.googlePlaceId) clauses.push(eq(accounts.googlePlaceId, incoming.googlePlaceId));
-  if (incoming.normalizedDomain) clauses.push(eq(accounts.normalizedDomain, incoming.normalizedDomain));
+  if (identityDomain) clauses.push(eq(accounts.normalizedDomain, identityDomain));
   if (incoming.normalizedPhone) clauses.push(eq(accounts.normalizedPhone, incoming.normalizedPhone));
   if (incoming.normalizedName && incoming.postalCode) {
     clauses.push(and(eq(accounts.normalizedName, incoming.normalizedName), eq(accounts.postalCode, incoming.postalCode)));
@@ -495,8 +496,8 @@ export async function findCandidateAccountMatches(
     .from(accounts)
     .where(and(eq(accounts.workspaceId, workspaceId), or(...clauses)))
     .orderBy(sql`CASE
-      WHEN ${incoming.normalizedDomain ?? null}::text IS NOT NULL AND ${accounts.normalizedDomain} = ${incoming.normalizedDomain ?? null} THEN 0
-      WHEN ${incoming.googlePlaceId ?? null}::text IS NOT NULL AND ${accounts.googlePlaceId} = ${incoming.googlePlaceId ?? null} THEN 1
+      WHEN ${incoming.googlePlaceId ?? null}::text IS NOT NULL AND ${accounts.googlePlaceId} = ${incoming.googlePlaceId ?? null} THEN 0
+      WHEN ${identityDomain}::text IS NOT NULL AND ${accounts.normalizedDomain} = ${identityDomain} THEN 1
       WHEN ${incoming.normalizedPhone ?? null}::text IS NOT NULL AND ${accounts.normalizedPhone} = ${incoming.normalizedPhone ?? null} THEN 2
       ELSE 3
     END`)
@@ -549,20 +550,6 @@ export function selectCanonicalAccountMatch(
   incoming: Omit<AccountIdentitySignals, "accountId">,
   candidates: AccountIdentitySignals[],
 ): CanonicalAccountResolution | null {
-  const domainMatches = incoming.normalizedDomain
-    ? candidates.filter((candidate) => candidate.normalizedDomain === incoming.normalizedDomain)
-    : [];
-  if (domainMatches.length === 1) {
-    return {
-      kind: "existingAccount",
-      existingAccountId: domainMatches[0]!.accountId,
-      matchedSignal: "normalized_domain",
-    };
-  }
-  if (domainMatches.length > 1) {
-    return { kind: "needsReview", matchedAccountId: null, matchedSignal: "ambiguous_normalized_domain" };
-  }
-
   const decision = evaluateAccountDedup(incoming, candidates);
   if (decision.action === "merge" && decision.matches[0]) {
     return {
@@ -587,6 +574,7 @@ export function omitIdentityValuesOwnedByOtherAccounts<T extends Partial<InsertA
   candidates: AccountIdentitySignals[],
 ): T {
   const safeFields = { ...fields };
+  if (safeFields.normalizedDomain && !businessIdentityDomain(safeFields.normalizedDomain)) delete safeFields.normalizedDomain;
   for (const field of ["normalizedDomain", "googlePlaceId", "normalizedPhone"] as const) {
     const value = safeFields[field];
     if (value === null || value === undefined) continue;
@@ -631,6 +619,8 @@ export async function resolveCanonicalAccount(
   options: { allowCreate?: boolean } = {},
 ): Promise<CanonicalAccountResolution> {
   if (account.workspaceId !== workspaceId) throw new Error("Canonical account workspace does not match the resolver scope.");
+  const identityDomain = businessIdentityDomain(incoming.normalizedDomain);
+  const accountDomain = businessIdentityDomain(account.normalizedDomain);
   const sqlClient = getNeonSql();
   const transactionResults = await sqlClient.transaction([
     sqlClient`SELECT pg_advisory_xact_lock(hashtextextended(${workspaceId}, 0))`,
@@ -639,20 +629,28 @@ export async function resolveCanonicalAccount(
       SELECT
         a.id,
         CASE
-          WHEN ${incoming.normalizedDomain ?? null}::text IS NOT NULL AND a.normalized_domain = ${incoming.normalizedDomain ?? null} THEN 'normalized_domain'
           WHEN ${incoming.googlePlaceId ?? null}::text IS NOT NULL AND a.google_place_id = ${incoming.googlePlaceId ?? null} THEN 'google_place_id'
+          WHEN ${identityDomain}::text IS NOT NULL AND a.normalized_domain = ${identityDomain}
+            AND ${incoming.googlePlaceId ?? null}::text IS NOT NULL AND a.google_place_id IS NOT NULL
+            AND a.google_place_id <> ${incoming.googlePlaceId ?? null} THEN 'conflicting_normalized_domain'
+          WHEN ${incoming.normalizedPhone ?? null}::text IS NOT NULL AND a.normalized_phone = ${incoming.normalizedPhone ?? null}
+            AND ${incoming.googlePlaceId ?? null}::text IS NOT NULL AND a.google_place_id IS NOT NULL
+            AND a.google_place_id <> ${incoming.googlePlaceId ?? null} THEN 'conflicting_normalized_phone'
           WHEN ${incoming.normalizedPhone ?? null}::text IS NOT NULL AND a.normalized_phone = ${incoming.normalizedPhone ?? null} THEN 'normalized_phone'
+          WHEN ${identityDomain}::text IS NOT NULL AND a.normalized_domain = ${identityDomain} THEN 'normalized_domain'
           WHEN ${incoming.normalizedName}::text IS NOT NULL AND ${incoming.normalizedAddress ?? null}::text IS NOT NULL
             AND a.normalized_name = ${incoming.normalizedName} AND a.normalized_address = ${incoming.normalizedAddress ?? null} THEN 'name_address'
           WHEN ${incoming.normalizedName}::text IS NOT NULL AND ${incoming.postalCode ?? null}::text IS NOT NULL
             AND a.normalized_name = ${incoming.normalizedName} AND a.postal_code = ${incoming.postalCode ?? null} THEN 'name_postal_code'
           ELSE 'name_geo_proximity'
         END AS matched_signal
+        , (${incoming.googlePlaceId ?? null}::text IS NOT NULL AND a.google_place_id IS NOT NULL
+          AND a.google_place_id <> ${incoming.googlePlaceId ?? null}) AS has_place_id_conflict
       FROM accounts a
       WHERE a.workspace_id = ${workspaceId}::uuid
         AND (
           (${incoming.googlePlaceId ?? null}::text IS NOT NULL AND a.google_place_id = ${incoming.googlePlaceId ?? null})
-          OR (${incoming.normalizedDomain ?? null}::text IS NOT NULL AND a.normalized_domain = ${incoming.normalizedDomain ?? null})
+          OR (${identityDomain}::text IS NOT NULL AND a.normalized_domain = ${identityDomain})
           OR (${incoming.normalizedPhone ?? null}::text IS NOT NULL AND a.normalized_phone = ${incoming.normalizedPhone ?? null})
           OR (${incoming.normalizedName}::text IS NOT NULL AND ${incoming.normalizedAddress ?? null}::text IS NOT NULL
             AND a.normalized_name = ${incoming.normalizedName} AND a.normalized_address = ${incoming.normalizedAddress ?? null})
@@ -671,20 +669,63 @@ export async function resolveCanonicalAccount(
             ))) <= 150
           )
         )
+        AND NOT (
+          ${incoming.googlePlaceId ?? null}::text IS NOT NULL
+          AND a.google_place_id IS NOT NULL
+          AND a.google_place_id <> ${incoming.googlePlaceId ?? null}
+          AND (
+            (
+              ${incoming.normalizedAddress ?? null}::text IS NOT NULL
+              AND a.normalized_address IS NOT NULL
+              AND a.normalized_address <> ${incoming.normalizedAddress ?? null}
+              AND ${incoming.postalCode ?? null}::text IS NOT NULL
+              AND a.postal_code IS NOT NULL
+              AND a.postal_code <> ${incoming.postalCode ?? null}
+            )
+            OR (
+              ${incoming.normalizedAddress ?? null}::text IS NOT NULL
+              AND a.normalized_address IS NOT NULL
+              AND a.normalized_address <> ${incoming.normalizedAddress ?? null}
+              AND ${incoming.latitude ?? null}::double precision IS NOT NULL
+              AND ${incoming.longitude ?? null}::double precision IS NOT NULL
+              AND a.latitude IS NOT NULL AND a.longitude IS NOT NULL
+              AND 6371000 * 2 * asin(sqrt(least(1,
+                sin(radians(a.latitude - ${incoming.latitude ?? null}::double precision) / 2)^2
+                + cos(radians(${incoming.latitude ?? null}::double precision)) * cos(radians(a.latitude))
+                * sin(radians(a.longitude - ${incoming.longitude ?? null}::double precision) / 2)^2
+              ))) > 150
+            )
+            OR (
+              ${incoming.postalCode ?? null}::text IS NOT NULL
+              AND a.postal_code IS NOT NULL
+              AND a.postal_code <> ${incoming.postalCode ?? null}
+              AND ${incoming.latitude ?? null}::double precision IS NOT NULL
+              AND ${incoming.longitude ?? null}::double precision IS NOT NULL
+              AND a.latitude IS NOT NULL AND a.longitude IS NOT NULL
+              AND 6371000 * 2 * asin(sqrt(least(1,
+                sin(radians(a.latitude - ${incoming.latitude ?? null}::double precision) / 2)^2
+                + cos(radians(${incoming.latitude ?? null}::double precision)) * cos(radians(a.latitude))
+                * sin(radians(a.longitude - ${incoming.longitude ?? null}::double precision) / 2)^2
+              ))) > 150
+            )
+          )
+        )
     ),
     matched AS MATERIALIZED (
       SELECT
         id,
         matched_signal,
+        has_place_id_conflict,
         count(*) OVER (PARTITION BY matched_signal) AS signal_match_count
       FROM match_candidates
       ORDER BY CASE
-        WHEN matched_signal = 'normalized_domain' THEN 1
-        WHEN matched_signal = 'google_place_id' THEN 2
-        WHEN matched_signal = 'normalized_phone' THEN 3
-        WHEN matched_signal = 'name_address' THEN 4
-        WHEN matched_signal = 'name_postal_code' THEN 5
-        ELSE 6
+        WHEN matched_signal = 'google_place_id' THEN 1
+        WHEN matched_signal IN ('conflicting_normalized_domain', 'conflicting_normalized_phone') THEN 2
+        WHEN matched_signal = 'normalized_domain' THEN 3
+        WHEN matched_signal = 'normalized_phone' THEN 4
+        WHEN matched_signal = 'name_address' THEN 5
+        WHEN matched_signal = 'name_postal_code' THEN 6
+        ELSE 7
       END
       LIMIT 1
     ),
@@ -698,7 +739,18 @@ export async function resolveCanonicalAccount(
       SELECT
         ${account.workspaceId}::uuid, ${account.canonicalName}, ${account.normalizedName}, ${account.businessType}, ${account.countryCode},
         ${account.region}, ${account.province}, ${account.city}, ${account.postalCode}, ${account.addressLine}, ${account.normalizedAddress},
-        ${account.latitude}, ${account.longitude}, ${account.phone}, ${account.normalizedPhone}, ${account.websiteUrl}, ${account.normalizedDomain},
+        ${account.latitude}, ${account.longitude}, ${account.phone},
+        CASE WHEN ${account.normalizedPhone ?? null}::text IS NOT NULL AND EXISTS (
+          SELECT 1 FROM accounts existing
+          WHERE existing.workspace_id = ${workspaceId}::uuid
+            AND existing.normalized_phone = ${account.normalizedPhone ?? null}
+        ) THEN NULL ELSE ${account.normalizedPhone ?? null} END,
+        ${account.websiteUrl},
+        CASE WHEN ${accountDomain}::text IS NOT NULL AND EXISTS (
+          SELECT 1 FROM accounts existing
+          WHERE existing.workspace_id = ${workspaceId}::uuid
+            AND existing.normalized_domain = ${accountDomain}
+        ) THEN NULL ELSE ${accountDomain} END,
         ${account.googlePlaceId}, ${account.mapsUrl}, ${account.rating}, ${account.reviewCount}, ${account.status}
       WHERE NOT EXISTS (SELECT 1 FROM matched)
         AND ${options.allowCreate !== false}
@@ -706,7 +758,7 @@ export async function resolveCanonicalAccount(
       RETURNING id
     )
     SELECT
-      CASE WHEN matched_signal = 'name_geo_proximity' OR signal_match_count > 1 THEN 'needsReview' ELSE 'existingAccount' END AS resolution,
+      CASE WHEN has_place_id_conflict OR matched_signal = 'name_geo_proximity' OR signal_match_count > 1 THEN 'needsReview' ELSE 'existingAccount' END AS resolution,
       id AS account_id,
       matched_signal
     FROM matched

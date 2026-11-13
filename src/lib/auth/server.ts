@@ -1,5 +1,6 @@
 import { createNeonAuth } from "@neondatabase/auth/next/server";
 import { getAuthEnv } from "@/lib/config/auth-env";
+import { assertNotVercelPreview } from "@/lib/security/preview-runtime";
 
 /**
  * Singleton Neon Auth server instance (Better Auth under the hood). Reads
@@ -26,6 +27,12 @@ let cachedAuth: ReturnType<typeof buildAuth> | undefined;
 
 /** Lazily builds/returns the Neon Auth instance. Throws if not configured. */
 export function getAuth() {
+  assertNotVercelPreview("Neon Auth");
   if (!cachedAuth) cachedAuth = buildAuth();
   return cachedAuth;
+}
+
+/** Test-only helper to clear the memoised auth instance. */
+export function resetAuthCacheForTests(): void {
+  cachedAuth = undefined;
 }

@@ -6,7 +6,7 @@ import type { MapsPlaceResult, SerpResult, WebsiteFetcher, EmailVerificationProv
 import { ProviderBudgetExceededError, ProviderFailureError } from "@/domain/providers/errors";
 import { normalizeAddress, normalizeBusinessName, normalizeDomain, normalizePhoneES } from "@/lib/normalization";
 import { evaluateSpainEligibility, type SpainEligibilityVerdict } from "@/lib/geography/spain-eligibility";
-import { evaluateAccountDedup, type AccountIdentitySignals } from "@/services/deduplication/account-dedup";
+import { businessIdentityDomain, evaluateAccountDedup, type AccountIdentitySignals } from "@/services/deduplication/account-dedup";
 import { classifyBusinessType, classifyNicheBusinessType, isAcceptedIcpBusinessType, isAcceptedNicheBusinessType } from "./business-type";
 import type { NicheId } from "./niche-profiles";
 import { extractCandidateEmailsWithDiagnostics } from "@/services/enrichment/email-extraction";
@@ -129,7 +129,8 @@ function identitySignalsFor(payload: CandidateRawPayload): {
 } {
   if (payload.kind === "maps") {
     const place = payload.place;
-    const normalizedDomain = normalizeDomain(place.websiteUrl);
+    const websiteDomain = normalizeDomain(place.websiteUrl);
+    const normalizedDomain = businessIdentityDomain(websiteDomain);
     return {
       incoming: {
         normalizedName: normalizeBusinessName(place.name),
@@ -147,7 +148,7 @@ function identitySignalsFor(payload: CandidateRawPayload): {
         latitude: place.latitude,
         longitude: place.longitude,
         phone: place.phone,
-        websiteDomain: normalizedDomain,
+        websiteDomain,
         province: place.province,
         city: place.city,
       },
@@ -158,14 +159,15 @@ function identitySignalsFor(payload: CandidateRawPayload): {
   }
 
   if (payload.kind === "serp") {
-    const normalizedDomain = normalizeDomain(payload.result.domain);
+    const websiteDomain = normalizeDomain(payload.result.domain);
+    const normalizedDomain = businessIdentityDomain(websiteDomain);
     return {
       incoming: {
         normalizedName: normalizeBusinessName(payload.result.title),
         normalizedDomain,
       },
       spainInput: {
-        websiteDomain: normalizedDomain,
+        websiteDomain,
         province: payload.geography,
       },
       businessNameGuess: payload.result.title,
@@ -174,14 +176,15 @@ function identitySignalsFor(payload: CandidateRawPayload): {
     };
   }
 
-  const normalizedDomain = normalizeDomain(payload.resolvedEmployerDomain);
+  const websiteDomain = normalizeDomain(payload.resolvedEmployerDomain);
+  const normalizedDomain = businessIdentityDomain(websiteDomain);
   return {
     incoming: {
       normalizedName: normalizeBusinessName(payload.profile.title),
       normalizedDomain,
     },
     spainInput: {
-      websiteDomain: normalizedDomain,
+      websiteDomain,
       province: payload.geography,
     },
     businessNameGuess: payload.profile.title,
@@ -217,8 +220,8 @@ export function hasLinkedInEmployerAccount(
   existingAccounts: readonly AccountIdentitySignals[],
 ): boolean {
   if (payload.kind !== "linkedin") return true;
-  const employerDomain = normalizeDomain(payload.resolvedEmployerDomain);
-  return Boolean(employerDomain && existingAccounts.some((account) => account.normalizedDomain === employerDomain));
+  const employerDomain = businessIdentityDomain(payload.resolvedEmployerDomain);
+  return Boolean(employerDomain && existingAccounts.some((account) => businessIdentityDomain(account.normalizedDomain) === employerDomain));
 }
 
 function accountKeyFor(incoming: Omit<AccountIdentitySignals, "accountId">, businessNameGuess: string, geography: string): string {

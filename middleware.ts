@@ -1,6 +1,7 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { isDevSeedMode } from "@/lib/config/env";
 import { getAuthEnv } from "@/lib/config/auth-env";
+import { isDeployedVercelPreview } from "@/lib/security/preview-runtime";
 
 /**
  * Protects every dashboard/admin page behind a Neon Auth session. Skipped
@@ -9,11 +10,17 @@ import { getAuthEnv } from "@/lib/config/auth-env";
  * (`env.ts` already hard-fails `APP_ENV=production` + `DEV_SEED_MODE=true`).
  *
  * `/api/auth/*`, `/api/cron/*`, `/api/webhooks/*` and static assets are
- * intentionally excluded from `matcher` below — cron/webhooks authenticate
- * via `CRON_SECRET`/provider signatures, not a user session.
+ * matched only so Preview can be blocked; outside Preview, API routes continue
+ * to authenticate through their own `CRON_SECRET` or provider signatures.
  */
 export default async function middleware(request: NextRequest) {
   try {
+    if (isDeployedVercelPreview()) {
+      return new NextResponse("Vercel Preview is disabled for this application.", { status: 503 });
+    }
+    if (request.nextUrl.pathname === "/api" || request.nextUrl.pathname.startsWith("/api/")) {
+      return NextResponse.next();
+    }
     if (isDevSeedMode()) return NextResponse.next();
     const env = getAuthEnv();
     if (!env.NEON_AUTH_BASE_URL || !env.NEON_AUTH_COOKIE_SECRET) {
@@ -52,5 +59,6 @@ export const config = {
     "/analytics/:path*",
     "/infrastructure/:path*",
     "/admin/:path*",
+    "/api/:path*",
   ],
 };

@@ -30,6 +30,9 @@ const mocks = vi.hoisted(() => ({
 }));
 
 vi.mock("@/infrastructure/neon/db", () => ({ getDb: () => ({ execute: mocks.execute }) }));
+vi.mock("@/infrastructure/neon/repositories/pilot-control", () => ({
+  getPilotControlState: vi.fn(async () => ({ status: "disabled", sessionId: null, workspaceId: null, enabledAt: null, endedAt: null })),
+}));
 vi.mock("@/infrastructure/neon/repositories/actual-outreach", () => ({
   actualPriorColdOutreachSql: vi.fn(() => ({ strings: ["TRUE"], values: [] })),
   hasActualPriorColdOutreach: mocks.hasActualPriorColdOutreach,
