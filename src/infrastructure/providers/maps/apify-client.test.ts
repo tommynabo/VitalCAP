@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { ApifyClient, classifyApifyRunFailure, reconcileApifyRunCost } from "./apify-client";
+import { ApifyClient, classifyApifyAccountSnapshotFailure, classifyApifyRunFailure, reconcileApifyRunCost } from "./apify-client";
 
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
@@ -144,6 +144,49 @@ describe("ApifyClient", () => {
 
     await expect(client.getAccountCostSnapshot(new Date("2026-10-19T22:00:00.000Z"), new Date("2026-10-20T00:00:00.000Z")))
       .rejects.toThrow(/no verifiable charge ceiling/);
+  });
+
+  it("reserves the full ceiling when an in-flight run has no usage total yet", async () => {
+    const fetchImpl = vi.fn()
+      .mockResolvedValueOnce(jsonResponse({ data: {
+        total: 1,
+        items: [{ id: "active", status: "RUNNING", startedAt: "2026-10-19T23:20:00.000Z", usageTotalUsd: null }],
+      } }))
+      .mockResolvedValueOnce(jsonResponse({ data: { total: 1, items: [
+        { id: "active", status: "RUNNING", startedAt: "2026-10-19T23:20:00.000Z", usageTotalUsd: null },
+      ] } }))
+      .mockResolvedValueOnce(jsonResponse({ data: {
+        id: "active", actId: "actor", status: "RUNNING", defaultDatasetId: null,
+        usageTotalUsd: null, options: { maxTotalChargeUsd: 0.5 },
+        startedAt: "2026-10-19T23:20:00.000Z", finishedAt: null,
+      } }));
+    const client = new ApifyClient({ apiToken: "t", fetchImpl });
+
+    const snapshot = await client.getAccountCostSnapshot(
+      new Date("2026-10-19T22:00:00.000Z"),
+      new Date("2026-10-20T00:00:00.000Z"),
+    );
+
+    expect(snapshot.actualSpendUsd).toBe(0);
+    expect(snapshot.reservedSpendUsd).toBe(0.5);
+    expect(snapshot.committedSpendUsd).toBe(0.5);
+  });
+
+  it("classifies account snapshot failures without exposing provider messages", async () => {
+    const authError = await new ApifyClient({
+      apiToken: "t",
+      fetchImpl: vi.fn().mockResolvedValue(new Response("unauthorized", { status: 401 })),
+    }).getAccountCostSnapshot(new Date("2026-10-19T22:00:00.000Z"), new Date("2026-10-20T00:00:00.000Z")).catch((error) => error);
+
+    expect(classifyApifyAccountSnapshotFailure(authError)).toEqual({ category: "authentication", httpStatus: 401 });
+    expect(classifyApifyAccountSnapshotFailure(new Error("Apify account run cost is unavailable; token=private")))
+      .toEqual({ category: "missing_usage_total_usd", httpStatus: null });
+    expect(classifyApifyAccountSnapshotFailure(new Error("An in-flight Apify account run has no verifiable charge ceiling.")))
+      .toEqual({ category: "missing_inflight_charge_ceiling", httpStatus: null });
+    expect(classifyApifyAccountSnapshotFailure(new Error("Apify account run list returned an invalid response.")))
+      .toEqual({ category: "invalid_response_schema", httpStatus: null });
+    expect(classifyApifyAccountSnapshotFailure(new Error("Apify in-flight account run list is incomplete; refusing new allocation.")))
+      .toEqual({ category: "invalid_response_schema", httpStatus: null });
   });
 
   it("reconciles a final actual run cost against its reservation", () => {

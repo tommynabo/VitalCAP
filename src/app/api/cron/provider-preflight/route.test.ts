@@ -7,6 +7,10 @@ const mocks = vi.hoisted(() => ({
   getDeliveryEnv: vi.fn(),
   getVerificationEnv: vi.fn(),
   leadWriteProof: vi.fn(),
+  pilotState: vi.fn(),
+  startCronRun: vi.fn(),
+  finishCronRun: vi.fn(),
+  logEvent: vi.fn(),
 }));
 
 vi.mock("@/infrastructure/neon/db", () => ({ getNeonSql: () => mocks.sql }));
@@ -15,12 +19,19 @@ vi.mock("@/lib/config/env", () => ({
   getDeliveryEnv: mocks.getDeliveryEnv,
   getVerificationEnv: mocks.getVerificationEnv,
 }));
-vi.mock("../_lib/cron-http", () => ({
+vi.mock("@/infrastructure/neon/repositories/pilot-control", () => ({ getPilotControlState: mocks.pilotState }));
+vi.mock("@/infrastructure/neon/repositories/cron-runs", () => ({
+  startCronRun: mocks.startCronRun,
+  finishCronRun: mocks.finishCronRun,
+}));
+vi.mock("@/lib/observability/structured-logger", () => ({ logEvent: mocks.logEvent }));
+vi.mock("../_lib/cron-http", async (importOriginal) => ({
+  ...await importOriginal<typeof import("../_lib/cron-http")>(),
   isAuthorizedCronRequest: mocks.authorized,
-  unauthorizedCronResponse: () => Response.json({ status: "unauthorized" }, { status: 401 }),
 }));
 
 import { GET } from "./route";
+import { isDeployedVercelPreview } from "@/lib/security/preview-runtime";
 
 const migrationFilenames = [
   "0013_global_deduplication.sql",
@@ -78,6 +89,8 @@ function configureReadyPreflight(
   appliedMigrations: readonly string[] = migrationFilenames,
 ) {
   mocks.authorized.mockReturnValue(true);
+  mocks.pilotState.mockResolvedValue({ status: "disabled" });
+  mocks.startCronRun.mockResolvedValue("cron-run-1");
   mocks.getDatabaseEnv.mockReturnValue({ DATABASE_URL: "postgresql://db.test/vitalcap", DATABASE_URL_UNPOOLED: undefined });
   mocks.getVerificationEnv.mockReturnValue({
     EMAIL_VERIFICATION_PROVIDER: "millionverifier",
@@ -121,6 +134,7 @@ function configureReadyPreflight(
 describe("GET /api/cron/provider-preflight", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
     vi.restoreAllMocks();
   });
 
@@ -130,6 +144,56 @@ describe("GET /api/cron/provider-preflight", () => {
 
     expect(response.status).toBe(401);
     expect(mocks.sql).not.toHaveBeenCalled();
+  });
+
+  it("rejects Preview before touching providers or the database", async () => {
+    vi.stubEnv("VERCEL", "1");
+    vi.stubEnv("VERCEL_ENV", "preview");
+    mocks.authorized.mockImplementation(() => !isDeployedVercelPreview());
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const response = await GET(new Request("https://vitalcap.test/api/cron/provider-preflight") as never);
+
+    expect(response.status).toBe(401);
+    expect(mocks.sql).not.toHaveBeenCalled();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("does not query providers, credits, or the database while pilot control is active", async () => {
+    mocks.authorized.mockReturnValue(true);
+    mocks.pilotState.mockResolvedValue({ status: "active" });
+    mocks.startCronRun.mockResolvedValue("cron-run-1");
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const response = await GET(new Request("https://vitalcap.test/api/cron/provider-preflight") as never);
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ status: "pilot_mode_active" });
+    expect(mocks.getDatabaseEnv).not.toHaveBeenCalled();
+    expect(mocks.getVerificationEnv).not.toHaveBeenCalled();
+    expect(mocks.getDeliveryEnv).not.toHaveBeenCalled();
+    expect(mocks.sql).not.toHaveBeenCalled();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("fails closed without provider activity when pilot state cannot be read", async () => {
+    mocks.authorized.mockReturnValue(true);
+    mocks.pilotState.mockRejectedValue(new Error("pilot control unavailable"));
+    mocks.startCronRun.mockResolvedValue("cron-run-1");
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const response = await GET(new Request("https://vitalcap.test/api/cron/provider-preflight") as never);
+
+    expect(response.status).toBe(500);
+    expect(await response.json()).toMatchObject({ status: "failed" });
+    expect(mocks.getDatabaseEnv).not.toHaveBeenCalled();
+    expect(mocks.getVerificationEnv).not.toHaveBeenCalled();
+    expect(mocks.getDeliveryEnv).not.toHaveBeenCalled();
+    expect(mocks.sql).not.toHaveBeenCalled();
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it("performs non-consuming provider checks and reports migration state without secrets", async () => {

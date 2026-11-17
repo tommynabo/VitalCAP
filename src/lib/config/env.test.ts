@@ -151,4 +151,49 @@ describe("getCoreEnv", () => {
       expect(getCoreEnv().DEV_SEED_MODE).toBe(false);
     });
   });
+
+  it("defaults deployed Preview to real authentication when DEV_SEED_MODE is missing", () => {
+    const names = ["VERCEL", "VERCEL_ENV", "NODE_ENV", "APP_ENV", "DEV_SEED_MODE"];
+    const original = Object.fromEntries(names.map((name) => [name, process.env[name]]));
+    try {
+      process.env.VERCEL = "1";
+      process.env.VERCEL_ENV = "preview";
+      Reflect.set(process.env, "NODE_ENV", "production");
+      delete process.env.APP_ENV;
+      delete process.env.DEV_SEED_MODE;
+      resetServerEnvCacheForTests();
+
+      expect(getCoreEnv().DEV_SEED_MODE).toBe(false);
+    } finally {
+      for (const name of names) {
+        if (original[name] === undefined) delete process.env[name];
+        else process.env[name] = original[name];
+      }
+      resetServerEnvCacheForTests();
+    }
+  });
+
+  it("rejects seed mode and production APP_ENV in deployed Preview", () => {
+    const names = ["VERCEL", "VERCEL_ENV", "NODE_ENV", "APP_ENV", "DEV_SEED_MODE"];
+    const original = Object.fromEntries(names.map((name) => [name, process.env[name]]));
+    try {
+      process.env.VERCEL = "1";
+      process.env.VERCEL_ENV = "preview";
+      Reflect.set(process.env, "NODE_ENV", "production");
+      process.env.DEV_SEED_MODE = "true";
+      resetServerEnvCacheForTests();
+      expect(() => getCoreEnv()).toThrow(/DEV_SEED_MODE=true is forbidden in Vercel Preview/);
+
+      process.env.DEV_SEED_MODE = "false";
+      process.env.APP_ENV = "production";
+      resetServerEnvCacheForTests();
+      expect(() => getCoreEnv()).toThrow(/APP_ENV=production is forbidden in Vercel Preview/);
+    } finally {
+      for (const name of names) {
+        if (original[name] === undefined) delete process.env[name];
+        else process.env[name] = original[name];
+      }
+      resetServerEnvCacheForTests();
+    }
+  });
 });

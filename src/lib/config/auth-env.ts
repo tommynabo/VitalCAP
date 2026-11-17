@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { optionalEnvValue, resolveNeonVar } from "@/lib/config/env-utils";
+import { isDeployedVercelPreview } from "@/lib/security/preview-runtime";
 
 /**
  * Auth-specific environment schema used by the middleware and auth routes.
@@ -10,13 +11,19 @@ import { optionalEnvValue, resolveNeonVar } from "@/lib/config/env-utils";
 const authEnvSchema = z.object({
   APP_ENV: z.enum(["development", "test", "production"]).default("development"),
   VERCEL_ENV: z.enum(["development", "preview", "production"]).optional(),
-  DEV_SEED_MODE: z.string().optional().transform((v) => (v ?? "true").toLowerCase() === "true"),
+  DEV_SEED_MODE: z.string().optional().transform((v) => (v ?? (isDeployedVercelPreview() ? "false" : "true")).toLowerCase() === "true"),
   // Neon Auth variables (injected by Vercel/Neon integration)
   NEON_AUTH_BASE_URL: z.string().optional(),
   NEON_AUTH_COOKIE_SECRET: z.string().optional().refine((s) => !s || s.length >= 32, {
     message: "NEON_AUTH_COOKIE_SECRET must be at least 32 characters in production.",
   }),
 }).superRefine((env, ctx) => {
+  if (isDeployedVercelPreview() && env.DEV_SEED_MODE) {
+    ctx.addIssue({ code: "custom", message: "DEV_SEED_MODE=true is forbidden in Vercel Preview.", path: ["DEV_SEED_MODE"] });
+  }
+  if (isDeployedVercelPreview() && env.APP_ENV === "production") {
+    ctx.addIssue({ code: "custom", message: "APP_ENV=production is forbidden in Vercel Preview.", path: ["APP_ENV"] });
+  }
   if (env.VERCEL_ENV === "production" && optionalEnvValue(process.env.APP_ENV) !== "production") {
     ctx.addIssue({ code: "custom", message: "VERCEL_ENV=production requires APP_ENV=production.", path: ["APP_ENV"] });
   }

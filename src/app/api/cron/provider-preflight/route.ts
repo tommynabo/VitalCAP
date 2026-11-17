@@ -6,7 +6,7 @@ import { getDatabaseEnv, getDeliveryEnv, getVerificationEnv } from "@/lib/config
 import { logEvent } from "@/lib/observability/structured-logger";
 import { ACTUAL_PRIOR_COLD_OUTREACH_STATES } from "@/services/deduplication/outreach-dedup";
 import { EMAIL_CHANNEL_ELIGIBLE_STATUSES } from "@/services/compliance/email-channel-policy";
-import { isAuthorizedCronRequest, unauthorizedCronResponse } from "../_lib/cron-http";
+import { isAuthorizedCronRequest, runCronRoute, unauthorizedCronResponse } from "../_lib/cron-http";
 
 export const dynamic = "force-dynamic";
 
@@ -449,61 +449,73 @@ async function readInstantlyState() {
 export async function GET(request: NextRequest) {
   if (!isAuthorizedCronRequest(request)) return unauthorizedCronResponse();
 
-  const startedAt = Date.now();
-  const [database, millionVerifier, instantly, historicalFunnel] = await Promise.all([
-    readDatabaseState(),
-    readMillionVerifierState(),
-    readInstantlyState(),
-    readHistoricalFunnel(),
-  ]);
-  const schemaReady = database.healthy
-    && database.through0017
-    && database.instantlyTablesExist
-    && database.requiredIndexesPresent;
-  const instantlyLeadImportReady = instantly.configurationReady
-    && schemaReady
-    && instantly.campaignRead === "PASS"
-    && instantly.leadsWrite === "PASS";
+  let responseBody: Record<string, unknown> | undefined;
+  return runCronRoute("provider-preflight", async () => {
+    const [database, millionVerifier, instantly, historicalFunnel] = await Promise.all([
+      readDatabaseState(),
+      readMillionVerifierState(),
+      readInstantlyState(),
+      readHistoricalFunnel(),
+    ]);
+    const schemaReady = database.healthy
+      && database.through0017
+      && database.instantlyTablesExist
+      && database.requiredIndexesPresent;
+    const instantlyLeadImportReady = instantly.configurationReady
+      && schemaReady
+      && instantly.campaignRead === "PASS"
+      && instantly.leadsWrite === "PASS";
     const instantlyWithSchema = { ...instantly, schemaReady, instantlyLeadImportReady };
-  const instantlyTelemetryReady = instantly.telemetryReady;
-  const healthy = instantlyLeadImportReady
-    && millionVerifier.healthy
-    && millionVerifier.creditsAvailable;
+    const instantlyTelemetryReady = instantly.telemetryReady;
+    const healthy = instantlyLeadImportReady
+      && millionVerifier.healthy
+      && millionVerifier.creditsAvailable;
 
-  logEvent("info", "cron.provider-preflight", {
-    correlationId: randomUUID(),
-    outcome: healthy ? "healthy" : "blocked",
-    durationMs: Date.now() - startedAt,
-    databaseConfigured: database.configured,
-    databaseHealthy: database.healthy,
-    through0016: database.through0016,
-    through0017: database.through0017,
-    migration0017Applied: database.migration0017Applied,
-    instantlyTablesExist: database.instantlyTablesExist,
-    requiredIndexesPresent: database.requiredIndexesPresent,
-    databaseErrorCode: database.errorCode,
-    millionVerifierConfigured: millionVerifier.configured,
-    millionVerifierProvider: millionVerifier.provider,
-    millionVerifierHealthy: millionVerifier.healthy,
-    millionVerifierCreditsAvailable: millionVerifier.creditsAvailable,
-    millionVerifierCreditsRemaining: millionVerifier.creditsRemaining,
-    millionVerifierHttpStatus: millionVerifier.httpStatus,
-    millionVerifierErrorCode: millionVerifier.errorCode,
-    instantlyConfigured: instantly.configurationReady,
-    instantlySchemaReady: schemaReady,
-    instantlyCampaignRead: instantly.campaignRead,
-    instantlyLeadsWrite: instantly.leadsWrite,
-    instantlyLeadImportReady,
-    instantlyTelemetryReady,
-    instantlyCampaignAccessible: instantly.campaignAccessible,
-    instantlyCampaignId: instantly.campaignId,
-    instantlyHttpStatus: instantly.httpStatus,
-    instantlyPlanUsage: instantly.planUsage,
-    instantlyErrorCode: instantly.errorCode,
-  });
-
-  return NextResponse.json({ database, millionVerifier, instantly: instantlyWithSchema, instantlyLeadImportReady, instantlyTelemetryReady, historicalFunnel, healthy }, {
-    status: healthy ? 200 : 503,
-    headers: { "Cache-Control": "no-store" },
+    responseBody = { database, millionVerifier, instantly: instantlyWithSchema, instantlyLeadImportReady, instantlyTelemetryReady, historicalFunnel, healthy };
+    return {
+      itemsProcessed: 0,
+      ...(healthy ? {} : { warnings: ["provider_preflight_blocked"] }),
+      metadata: {
+        databaseConfigured: database.configured,
+        databaseHealthy: database.healthy,
+        through0016: database.through0016,
+        through0017: database.through0017,
+        migration0017Applied: database.migration0017Applied,
+        instantlyTablesExist: database.instantlyTablesExist,
+        requiredIndexesPresent: database.requiredIndexesPresent,
+        databaseErrorCode: database.errorCode,
+        millionVerifierConfigured: millionVerifier.configured,
+        millionVerifierProvider: millionVerifier.provider,
+        millionVerifierHealthy: millionVerifier.healthy,
+        millionVerifierCreditsAvailable: millionVerifier.creditsAvailable,
+        millionVerifierCreditsRemaining: millionVerifier.creditsRemaining,
+        millionVerifierHttpStatus: millionVerifier.httpStatus,
+        millionVerifierErrorCode: millionVerifier.errorCode,
+        instantlyConfigured: instantly.configurationReady,
+        instantlySchemaReady: schemaReady,
+        instantlyCampaignRead: instantly.campaignRead,
+        instantlyLeadsWrite: instantly.leadsWrite,
+        instantlyLeadImportReady,
+        instantlyTelemetryReady,
+        instantlyCampaignAccessible: instantly.campaignAccessible,
+        instantlyCampaignId: instantly.campaignId,
+        instantlyHttpStatus: instantly.httpStatus,
+        instantlyPlanUsage: instantly.planUsage,
+        instantlyErrorCode: instantly.errorCode,
+      },
+    };
+  }, {
+    formatResponse: (outcome) => {
+      if (outcome.kind === "pilot_mode_active") {
+        return NextResponse.json({ status: "pilot_mode_active" }, { headers: { "Cache-Control": "no-store" } });
+      }
+      if (outcome.kind === "failed") {
+        return NextResponse.json({ status: "failed", error: "Provider preflight failed." }, { status: 500, headers: { "Cache-Control": "no-store" } });
+      }
+      return NextResponse.json(responseBody, {
+        status: responseBody?.healthy ? 200 : 503,
+        headers: { "Cache-Control": "no-store" },
+      });
+    },
   });
 }

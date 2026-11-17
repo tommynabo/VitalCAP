@@ -84,7 +84,7 @@ describe("job queue SQL builders", () => {
     const whereClause = query.sql.slice(query.sql.indexOf("WHERE"), query.sql.indexOf("ORDER BY"));
 
     expect(whereClause).toMatch(/j\.next_attempt_at IS NULL OR j\.next_attempt_at <= \$\d+::timestamptz/);
-    expect(whereClause).not.toContain("payload->>'origin'");
+    expect(whereClause).toContain("pilot_state.status <> 'active'");
   });
 
   it("prioritizes provider-blocked recovery jobs ahead of normal processing jobs", () => {
@@ -115,6 +115,24 @@ describe("job queue SQL builders", () => {
     expect(query.sql).toContain("j.id =");
     expect(query.params).toContain(campaignId);
     expect(query.params).toContain(jobId);
+  });
+
+  it("requires the exact active pilot permit and preserves emergency-stop precedence", () => {
+    const query = dialect.sqlToQuery(buildClaimJobsQuery("discovery_jobs", {
+      workerId: "pilot-smoke",
+      batchSize: 1,
+      campaignId: "65b9f85d-4c8b-4e52-99fb-217eb3acac1c",
+      jobId: "00000000-0000-0000-0000-000000000005",
+      requireAutopilot: false,
+      allowScopedDraftCampaign: true,
+      pilotSessionId: "00000000-0000-0000-0000-000000000006",
+      pilotRunKey: "65b9f85d-4c8b-4e52-99fb-217eb3acac1c",
+    }, claimTime));
+
+    expect(query.sql).toContain("pilot_state.status <> 'active'");
+    expect(query.sql).toContain("permit.discovery_job_id = j.id");
+    expect(query.sql).toContain("aps.emergency_stopped = false");
+    expect(query.params).toContain("00000000-0000-0000-0000-000000000006");
   });
 
   it("can restrict scoped processing claims to jobs created during the smoke", () => {
@@ -170,14 +188,14 @@ describe("job queue SQL builders", () => {
     const whereClause = query.sql.slice(query.sql.indexOf("WHERE"), query.sql.indexOf("ORDER BY"));
 
     expect(whereClause).toContain("j.attempt_count < j.max_attempts");
-    expect(whereClause).not.toContain("payload->>'origin'");
+    expect(whereClause).toContain("pilot_state.status <> 'active'");
   });
 
   it("leaves normal discovery jobs eligible when no recovery probe is eligible", () => {
     const query = buildDiscoveryClaimQuery();
     const whereClause = query.sql.slice(query.sql.indexOf("WHERE"), query.sql.indexOf("ORDER BY"));
 
-    expect(whereClause).not.toContain("payload->>'origin'");
+    expect(whereClause).toContain("pilot_state.status <> 'active'");
     expect(query.sql).toContain("CASE WHEN j.payload->>'origin' = 'recovery_probe' THEN 0 ELSE 1 END");
   });
 

@@ -1,0 +1,49 @@
+version: 2.1
+
+jobs:
+  checks:
+    docker:
+      - image: cimg/node:20.20.2
+    resource_class: small
+    environment:
+      NEXT_TELEMETRY_DISABLED: "1"
+    steps:
+      - checkout
+      - run:
+          name: Report runtime and checkout
+          command: |
+            printf 'Node: %s\n' "$(node --version)"
+            printf 'npm: %s\n' "$(npm --version)"
+            printf 'Checked out SHA: %s\n' "$(git rev-parse HEAD)"
+      - run:
+          name: Reject production credentials in CI
+          command: |
+            for name in DATABASE_URL DATABASE_URL_UNPOOLED Vitalcap_DATABASE_URL Vitalcap_DATABASE_URL_UNPOOLED CRON_SECRET APIFY_API_TOKEN SERPER_API_KEY MILLIONVERIFIER_API_KEY INSTANTLY_API_KEY INSTANTLY_WEBHOOK_SECRET LLM_PROVIDER_API_KEY CLAUDE_API_KEY CLAUDE_WORKSPACE_ID VERCEL_TOKEN NEON_API_KEY; do
+              if [ -n "${!name:-}" ]; then
+                printf 'A forbidden credential is configured for CI.\n'
+                exit 1
+              fi
+            done
+      - run:
+          name: Install dependencies
+          command: npm ci
+      - run:
+          name: Typecheck
+          command: npm run typecheck
+      - run:
+          name: Lint
+          command: npm run lint
+      - run:
+          name: Standard tests
+          command: npm test
+      - run:
+          name: Production-compatible build
+          command: npm run build
+
+workflows:
+  vitalcap-ci:
+    jobs:
+      - checks:
+          filters:
+            tags:
+              ignore: /.*/

@@ -1,8 +1,12 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { WATCHDOG_QUEUE_PAUSE_REASON } from "@/services/autopilot/watchdog-pause-policy";
 import { canExecuteWatchdogRecoveryJob, getApifyDiscoveryBatchCap, getApifyStartupCostPatch, isAuthorizedScopedProbeExecution, isProviderRunReplayWithoutResults, mergeApifyProviderRunMetadata, resolveScopedColdStartBatches } from "./discovery-runner";
 import type { SearchSeed } from "@/domain/discovery/types";
 import type { SeedEconomicPerformance } from "@/services/discovery/seed-economics";
+
+vi.mock("@/infrastructure/neon/repositories/pilot-control", () => ({
+  getPilotControlState: vi.fn(async () => ({ status: "disabled", sessionId: null, workspaceId: null, enabledAt: null, endedAt: null })),
+}));
 
 describe("watchdog recovery discovery execution", () => {
   const watchdogPausedSettings = {

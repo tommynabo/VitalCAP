@@ -34,10 +34,12 @@ const mocks = vi.hoisted(() => ({
   getSerperEnv: vi.fn(),
   getVerificationEnv: vi.fn(),
   refreshWatchdogPauseForWorkspace: vi.fn(),
+  getPilotControlState: vi.fn(),
 }));
 
 vi.mock("@/infrastructure/neon/repositories/workspace", () => ({ listWorkspaceIds: mocks.listWorkspaceIds }));
 vi.mock("./watchdog-runner", () => ({ refreshWatchdogPauseForWorkspace: mocks.refreshWatchdogPauseForWorkspace }));
+vi.mock("@/infrastructure/neon/repositories/pilot-control", () => ({ getPilotControlState: mocks.getPilotControlState }));
 vi.mock("@/infrastructure/neon/repositories/campaigns", () => ({ listAutopilotEnabledCampaigns: mocks.listAutopilotEnabledCampaigns }));
 vi.mock("@/infrastructure/neon/repositories/autopilot", () => ({
   getAutopilotSettings: mocks.getAutopilotSettings,
@@ -101,6 +103,7 @@ import { MAX_RAW_PER_PLANNING_WINDOW } from "@/services/autopilot/target-planner
 describe("runAutopilotCronTick", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mocks.getPilotControlState.mockResolvedValue({ status: "disabled", sessionId: null, workspaceId: null, enabledAt: null, endedAt: null });
     mocks.listWorkspaceIds.mockResolvedValue(["workspace-1"]);
     mocks.listAutopilotEnabledCampaigns.mockResolvedValue([{
       id: "campaign-1",
@@ -183,6 +186,18 @@ describe("runAutopilotCronTick", () => {
       SERPER_API_KEY: "configured",
       SERPER_DAILY_COST_LIMIT_USD: 10,
     });
+  });
+
+  it("suppresses direct scheduling while an isolated pilot is active", async () => {
+    mocks.getPilotControlState.mockResolvedValue({ status: "active", sessionId: "pilot-1", workspaceId: "workspace-1", enabledAt: null, endedAt: null });
+
+    await expect(runAutopilotCronTick()).resolves.toMatchObject({
+      campaignsTicked: 0,
+      ordersScheduled: 0,
+      pacingStates: [],
+    });
+    expect(mocks.listWorkspaceIds).not.toHaveBeenCalled();
+    expect(mocks.enqueueDiscoveryOrdersWithinDailyRawCap).not.toHaveBeenCalled();
   });
 
   it("does not add discovery work while old due recovery jobs are waiting to drain", async () => {

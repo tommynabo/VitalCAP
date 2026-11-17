@@ -87,6 +87,21 @@ describe("global daily raw request cap SQL", () => {
     expect(query.sql).toMatch(/input\.payload->>'origin' = 'recovery_probe'[\s\S]*OR existing\.status IN \('pending', 'processing'\)/);
   });
 
+  it("supports a one-attempt recovery enqueue through the daily cap", () => {
+    const query = dialect.sqlToQuery(buildEnqueueDiscoveryOrdersWithinDailyRawCapQuery([{
+      campaignId: "campaign-recovery",
+      type: "run_engine_batch",
+      payload: { engineType: "maps_fast", desiredRawCount: 1, origin: "recovery_probe" },
+      idempotencyKey: "recovery-one-attempt",
+      desiredRawCount: 1,
+      maxAttempts: 1,
+    }], 1523, now));
+
+    expect(query.sql).toContain("max_attempts integer");
+    expect(query.sql).toContain("allocated.max_attempts");
+    expect(query.params.some((parameter) => typeof parameter === "string" && parameter.includes('"max_attempts":1'))).toBe(true);
+  });
+
   it("enforces an additional atomic daily cap across the four rollout campaigns", () => {
     const campaignIds = [
       "00000000-0000-0000-0000-000000000001",
@@ -157,6 +172,8 @@ describe("global daily raw request cap SQL", () => {
       expect(queries[0]?.query).toContain("pg_advisory_xact_lock");
       expect(queries[1]?.kind).toBe("query");
       expect(queries[1]?.query).toContain("safety.reservation_cost_usd > 0");
+      expect(queries[1]?.query).toContain("pilot_run_permits permit");
+      expect(queries[1]?.query).toContain("settings.emergency_stopped = false");
       expect(queries[1]?.query).toContain("reconciled_cost_safety.accounted_actual_spend + reconciled_cost_safety.account_reserved_spend");
     }
   });

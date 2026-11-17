@@ -7,6 +7,7 @@ const {
   getRecentProviderUsage,
   getApifyDailyEconomicTotals,
   getApifyAccountCostSnapshot,
+  classifyApifyAccountSnapshotFailure,
   getCurrentWorkspaceId,
   getDb,
   getAutopilotPacingState,
@@ -25,6 +26,7 @@ const {
   getRecentProviderUsage: vi.fn(),
   getApifyDailyEconomicTotals: vi.fn(),
   getApifyAccountCostSnapshot: vi.fn(),
+  classifyApifyAccountSnapshotFailure: vi.fn(),
   getCurrentWorkspaceId: vi.fn(),
   getDb: vi.fn(),
   getAutopilotPacingState: vi.fn(),
@@ -48,6 +50,7 @@ vi.mock("@/infrastructure/neon/repositories/workspace", () => ({ getWorkspaceRol
 vi.mock("@/infrastructure/neon/repositories/provider-runs", () => ({ getApifyRecoverySnapshot, getSerperRecoveryState, getSerperCostDiagnostics, getRecentProviderUsage }));
 vi.mock("@/infrastructure/neon/repositories/discovery", () => ({ getApifyDailyEconomicTotals, getSeedEconomicPerformance, listSearchSeedsForCampaignEngine }));
 vi.mock("@/infrastructure/providers/maps/apify-client", () => ({
+  classifyApifyAccountSnapshotFailure,
   ApifyClient: class {
     getAccountCostSnapshot = getApifyAccountCostSnapshot;
   },
@@ -99,6 +102,7 @@ describe("GET /api/admin/runtime-diagnostics recovery errors", () => {
       runCount: 0,
       runIds: [],
     });
+    classifyApifyAccountSnapshotFailure.mockReturnValue(null);
     getAutopilotPacingState.mockResolvedValue({ instantlyImportedToday: 0, qualifiedToday: 0, validEmailToday: 0 });
     getSeedEconomicPerformance.mockResolvedValue(new Map());
     listSearchSeedsForCampaignEngine.mockResolvedValue([]);
@@ -214,6 +218,7 @@ describe("GET /api/admin/runtime-diagnostics recovery errors", () => {
     expect(body.discoveryEconomics).toMatchObject({
       apifyDailyCapUsd: 15,
       apifyAccountSnapshotAvailable: true,
+      apifyAccountSnapshotFailure: null,
       apifyRealSpendTodayUsd: 0,
       apifyReservedSpendTodayUsd: 0,
       apifyCommittedSpendTodayUsd: 0,
@@ -238,6 +243,23 @@ describe("GET /api/admin/runtime-diagnostics recovery errors", () => {
       recentErrors: 0,
       budgetAllowed: true,
     });
+  });
+
+  it("exposes a sanitized account snapshot failure category", async () => {
+    getApifyAccountCostSnapshot.mockRejectedValue(new Error("private provider response with token=secret"));
+    classifyApifyAccountSnapshotFailure.mockReturnValue({ category: "missing_inflight_charge_ceiling", httpStatus: null });
+
+    const response = await GET();
+    const body = await response.json();
+    const serialized = JSON.stringify(body.discoveryEconomics.apifyAccountSnapshotFailure);
+
+    expect(response.status).toBe(200);
+    expect(body.discoveryEconomics).toMatchObject({
+      apifyAccountSnapshotAvailable: false,
+      apifyAccountSnapshotFailure: { category: "missing_inflight_charge_ceiling", httpStatus: null },
+    });
+    expect(serialized).not.toContain("secret");
+    expect(serialized).not.toContain("private provider response");
   });
 
   it("exposes recovered Apify allocation separately from recent reliability", async () => {

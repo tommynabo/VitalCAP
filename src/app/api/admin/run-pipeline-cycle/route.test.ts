@@ -19,6 +19,7 @@ const mocks = vi.hoisted(() => ({
   enqueueVerificationJobs: vi.fn(),
   runVerificationCronTick: vi.fn(),
   runInstantlyImportTick: vi.fn(),
+  getPilotControlState: vi.fn(),
 }));
 
 vi.mock("@/lib/auth/workspace", () => ({
@@ -26,6 +27,7 @@ vi.mock("@/lib/auth/workspace", () => ({
   requireWorkspaceOwner: mocks.requireWorkspaceOwner,
 }));
 vi.mock("@/infrastructure/neon/db", () => ({ getDb: mocks.getDb }));
+vi.mock("@/infrastructure/neon/repositories/pilot-control", () => ({ getPilotControlState: mocks.getPilotControlState }));
 vi.mock("@/infrastructure/neon/repositories/provider-runs", () => ({ getApifyRecoverySnapshot: mocks.getApifyRecoverySnapshot }));
 vi.mock("@/infrastructure/neon/repositories/productivity-diagnostics", () => ({ getProductivityDiagnostics: mocks.getProductivityDiagnostics }));
 vi.mock("@/infrastructure/neon/repositories/production-capacity-diagnostics", () => ({ getProductionCapacityDiagnostics: mocks.getProductionCapacityDiagnostics }));
@@ -53,6 +55,13 @@ describe("/api/admin/run-pipeline-cycle", () => {
   beforeEach(() => {
     vi.resetAllMocks();
     mocks.requireWorkspaceOwner.mockResolvedValue({ workspaceId: "workspace-1", role: "owner" });
+    mocks.getPilotControlState.mockResolvedValue({
+      status: "disabled",
+      sessionId: null,
+      workspaceId: null,
+      enabledAt: null,
+      endedAt: null,
+    });
     mocks.getApifyRecoverySnapshot.mockResolvedValue({
       recoveryProbeEligible: true,
       recoveryProbeInFlight: false,
@@ -118,6 +127,23 @@ describe("/api/admin/run-pipeline-cycle", () => {
     expect(mocks.runAutopilotCronTick).not.toHaveBeenCalled();
     expect(mocks.runInstantlyImportTick).not.toHaveBeenCalled();
     expect(mocks.refreshWatchdogPauseForWorkspace).not.toHaveBeenCalled();
+  });
+
+  it("blocks the cycle while isolated pilot mode is active", async () => {
+    mocks.getPilotControlState.mockResolvedValueOnce({
+      status: "active",
+      sessionId: "pilot-session",
+      workspaceId: "workspace-1",
+      enabledAt: null,
+      endedAt: null,
+    });
+
+    const response = await POST();
+
+    expect(response.status).toBe(409);
+    expect(mocks.runAutopilotCronTick).not.toHaveBeenCalled();
+    expect(mocks.runDiscoveryCronTick).not.toHaveBeenCalled();
+    expect(mocks.runInstantlyImportTick).not.toHaveBeenCalled();
   });
 
   it("reports the failed stage and logs only approved safe metadata", async () => {

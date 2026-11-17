@@ -1,11 +1,12 @@
 import { z } from "zod";
 import { optionalEnvValue, resolveNeonVar } from "@/lib/config/env-utils";
+import { assertNotVercelPreview, isDeployedVercelPreview } from "@/lib/security/preview-runtime";
 
 // ── Core Env ───────────────────────────────────────────────────────────
 const coreEnvSchema = z.object({
   APP_ENV: z.enum(["development", "test", "production"]).default("development"),
   VERCEL_ENV: z.enum(["development", "preview", "production"]).optional(),
-  DEV_SEED_MODE: z.string().optional().transform((v) => (v ?? "true").toLowerCase() === "true"),
+  DEV_SEED_MODE: z.string().optional().transform((v) => (v ?? (isDeployedVercelPreview() ? "false" : "true")).toLowerCase() === "true"),
   NEXT_PUBLIC_APP_URL: z.string().optional(),
   DEFAULT_DELIVERY_MODE: z.enum(["dry_run", "live"]).default("dry_run"),
   DEFAULT_BOOKING_URL: z.string().optional(),
@@ -17,6 +18,12 @@ const coreEnvSchema = z.object({
    */
   ACTIVATION_MAX_DAILY_RAW_REQUESTS: z.coerce.number().int().min(1).default(1500),
 }).superRefine((env, ctx) => {
+  if (isDeployedVercelPreview() && env.DEV_SEED_MODE) {
+    ctx.addIssue({ code: "custom", message: "DEV_SEED_MODE=true is forbidden in Vercel Preview.", path: ["DEV_SEED_MODE"] });
+  }
+  if (isDeployedVercelPreview() && env.APP_ENV === "production") {
+    ctx.addIssue({ code: "custom", message: "APP_ENV=production is forbidden in Vercel Preview.", path: ["APP_ENV"] });
+  }
   if (env.VERCEL_ENV === "production" && optionalEnvValue(process.env.APP_ENV) !== "production") {
     ctx.addIssue({ code: "custom", message: "VERCEL_ENV=production requires APP_ENV=production.", path: ["APP_ENV"] });
   }
@@ -66,6 +73,7 @@ const databaseEnvSchema = z.object({
 });
 let cachedDbEnv: z.infer<typeof databaseEnvSchema> | null = null;
 export function getDatabaseEnv() {
+  assertNotVercelPreview("Database access");
   if (cachedDbEnv) return cachedDbEnv;
   cachedDbEnv = databaseEnvSchema.parse({
     DATABASE_URL: resolveNeonVar("DATABASE_URL"),

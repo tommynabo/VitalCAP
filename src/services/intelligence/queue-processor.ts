@@ -24,15 +24,22 @@ export class IntelligenceQueueProcessor {
 
     // 1. Lease jobs using CTE
     const leased = await db.execute(sql`
-      WITH available AS (
-        SELECT id FROM intelligence_jobs
+      WITH pilot_state AS MATERIALIZED (
+        SELECT status
+        FROM pilot_control
+        WHERE id = true
+        FOR SHARE
+      ), available AS (
+        SELECT intelligence_jobs.id FROM intelligence_jobs
+        CROSS JOIN pilot_state
         WHERE (locked_at IS NULL OR locked_at < ${lockExpiry.toISOString()})
+          AND pilot_state.status <> 'active'
           AND (next_attempt_at IS NULL OR next_attempt_at <= ${now.toISOString()})
           AND status IN ('pending', 'failed', 'processing', 'budget_paused', 'provider_disabled') -- processing means lock expired
           AND attempt_count < max_attempts
         ORDER BY created_at ASC
         LIMIT ${BATCH_SIZE}
-        FOR UPDATE SKIP LOCKED
+        FOR UPDATE OF intelligence_jobs SKIP LOCKED
       )
       UPDATE intelligence_jobs
       SET locked_at = ${now.toISOString()},

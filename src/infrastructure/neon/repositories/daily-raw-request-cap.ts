@@ -18,11 +18,13 @@ export interface DailyRawRequestCapSnapshot {
 }
 
 export interface DailyRawCapDiscoveryOrder {
+  id?: string;
   campaignId: string;
   type: string;
   payload: Record<string, unknown>;
   idempotencyKey: string;
   desiredRawCount: number;
+  maxAttempts?: number;
 }
 
 export interface ScopedDailyRawCap {
@@ -149,11 +151,13 @@ export function buildEnqueueDiscoveryOrdersWithinDailyRawCapQuery(
     `
     : sql`scoped_daily_commitment AS (SELECT 0::int AS committed_raw_requests)`;
   const inputOrders = orders.map((order, orderIndex) => ({
+    id: order.id ?? null,
     campaign_id: order.campaignId,
     type: order.type,
     payload: order.payload,
     idempotency_key: order.idempotencyKey,
     desired_raw_count: Math.max(0, Math.floor(order.desiredRawCount)),
+    max_attempts: Math.max(1, Math.floor(order.maxAttempts ?? 5)),
     priority: order.payload.origin === "recovery_probe" ? 0 : 1,
     order_index: orderIndex,
   }));
@@ -164,11 +168,13 @@ export function buildEnqueueDiscoveryOrdersWithinDailyRawCapQuery(
     input_orders AS (
       SELECT *
       FROM jsonb_to_recordset(${JSON.stringify(inputOrders)}::jsonb) AS input(
+        id uuid,
         campaign_id uuid,
         type text,
         payload jsonb,
         idempotency_key text,
         desired_raw_count integer,
+        max_attempts integer,
         priority integer,
         order_index integer
       )
@@ -209,10 +215,11 @@ export function buildEnqueueDiscoveryOrdersWithinDailyRawCapQuery(
       CROSS JOIN scoped_daily_commitment
     ),
     inserted_orders AS (
-      INSERT INTO discovery_jobs (campaign_id, type, payload, idempotency_key)
-      SELECT allocated.campaign_id, allocated.type,
+      INSERT INTO discovery_jobs (id, campaign_id, type, payload, idempotency_key, max_attempts)
+      SELECT COALESCE(allocated.id, gen_random_uuid()), allocated.campaign_id, allocated.type,
         jsonb_set(allocated.payload, '{desiredRawCount}', to_jsonb(allocated.reserved_raw_count), true),
-        allocated.idempotency_key
+        allocated.idempotency_key,
+        allocated.max_attempts
       FROM allocated_orders allocated
       WHERE allocated.reserved_raw_count > 0
       ON CONFLICT DO NOTHING

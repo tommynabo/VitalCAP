@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import type { EmailVerificationProvider, MapsPlaceResult, WebsiteFetcher } from "@/domain/providers/types";
 import { createInMemoryVerificationCacheStore } from "@/services/verification/email-verification-cache";
-import { hasLinkedInEmployerAccount, processRawCandidate, type CandidateRawPayload } from "./candidate-processor";
+import { deriveIncomingIdentitySignals, hasLinkedInEmployerAccount, processRawCandidate, type CandidateRawPayload } from "./candidate-processor";
 
 function alwaysValidVerifier(): EmailVerificationProvider {
   return {
@@ -53,6 +53,16 @@ function baseContext(overrides: Partial<Parameters<typeof processRawCandidate>[2
 }
 
 describe("processRawCandidate — maps candidates", () => {
+  it("retains a social website URL but excludes its shared host from identity signals", () => {
+    const payload = mapsPayload({ websiteUrl: "https://m.facebook.com/sanart" });
+
+    expect(deriveIncomingIdentitySignals(payload)).toMatchObject({
+      googlePlaceId: "maps-recovery-test",
+      normalizedDomain: null,
+    });
+    expect(payload.kind === "maps" ? payload.place.websiteUrl : null).toBe("https://m.facebook.com/sanart");
+  });
+
   it("rejects a candidate whose provider country code is not Spain", async () => {
     const payload: CandidateRawPayload = {
       kind: "maps",
@@ -853,6 +863,10 @@ describe("processRawCandidate — linkedin candidates", () => {
     expect(hasLinkedInEmployerAccount(payload, existing)).toBe(true);
     expect(hasLinkedInEmployerAccount(payload, [])).toBe(false);
     expect(hasLinkedInEmployerAccount({ ...payload, resolvedEmployerDomain: null }, existing)).toBe(false);
+    expect(hasLinkedInEmployerAccount(
+      { ...payload, resolvedEmployerDomain: "https://www.facebook.com/farmacia-punal" },
+      [{ ...existing[0]!, normalizedDomain: "facebook.com" }],
+    )).toBe(false);
   });
 
   it("never fabricates a contact when no resolved employer domain is available", async () => {

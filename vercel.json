@@ -13,5 +13,10 @@
     { "path": "/api/cron/provider-preflight", "schedule": "17 6 * * 1" },
     { "path": "/api/cron/intelligence", "schedule": "*/15 * * * *" },
     { "path": "/api/cron/watchdog", "schedule": "*/15 * * * *" }
-  ]
+  ],
+  "git": {
+    "deploymentEnabled": {
+      "fix/canonical-identity-domain-policy": false
+    }
+  }
 }

@@ -28,6 +28,7 @@ import { refreshWatchdogPauseForWorkspace } from "./watchdog-runner";
 import { logEvent } from "@/lib/observability/structured-logger";
 import { getDiscoveryBackpressureMultiplier, getProcessingHealthState } from "@/services/autopilot/watchdog-pause-policy";
 import { computeProviderBudgetPacing, projectEndOfDayImports } from "@/services/autopilot/economic-pacing";
+import { getPilotControlState } from "@/infrastructure/neon/repositories/pilot-control";
 
 export interface AutopilotRunnerResult {
   campaignsTicked: number;
@@ -68,6 +69,17 @@ function engineHealths(maps: ProviderHealthStatus, serp: ProviderHealthStatus): 
 
 /** Schedules a single global target deficit across every eligible engine. */
 export async function runAutopilotCronTick(now: Date = new Date()): Promise<AutopilotRunnerResult> {
+  if ((await getPilotControlState()).status === "active") {
+    return {
+      campaignsTicked: 0,
+      rebalanceDecisionsRecorded: 0,
+      pausedWorkspaces: 0,
+      emergencyStoppedWorkspaces: 0,
+      systemPausedWorkspaces: 0,
+      pacingStates: [],
+      ordersScheduled: 0,
+    };
+  }
   const workspaceIds = await listWorkspaceIds();
   let campaignsTicked = 0;
   let rebalanceDecisionsRecorded = 0;

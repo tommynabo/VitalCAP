@@ -1,4 +1,5 @@
 import type { EmailVerificationCode, EmailVerificationOutcome, EmailVerificationProvider, ProviderUsageStats } from "@/domain/providers/types";
+import { assertNotVercelPreview } from "@/lib/security/preview-runtime";
 
 const MILLIONVERIFIER_BASE_URL = "https://api.millionverifier.com/api/v3/";
 /** Approximate per-email cost; adjust to your actual MillionVerifier plan rate. Not a billed-truth figure. */
@@ -49,6 +50,7 @@ export interface MillionVerifierProviderConfig {
 }
 
 async function verifyOne(email: string, config: MillionVerifierProviderConfig): Promise<EmailVerificationOutcome> {
+  assertNotVercelPreview("MillionVerifier requests");
   const fetchImpl = config.fetchImpl ?? fetch;
   const url = new URL(MILLIONVERIFIER_BASE_URL);
   url.searchParams.set("api", config.apiKey);

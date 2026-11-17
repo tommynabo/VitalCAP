@@ -28,6 +28,7 @@ import {
 import { getApifyRecoverySnapshot, getApifyReservationFailureDetails, getLatestProviderEconomicPacingStates, getProviderRunById, getRecentProviderUsage, getSerperRecoveryState, getTodaySpendUsd, recordProviderRun, reserveApifyProviderRun, updateProviderRun } from "@/infrastructure/neon/repositories/provider-runs";
 import { buildProviderRunIngestionAccounting } from "@/infrastructure/neon/repositories/provider-run-ingestion";
 import { getAutopilotSettings } from "@/infrastructure/neon/repositories/autopilot";
+import { getPilotControlState } from "@/infrastructure/neon/repositories/pilot-control";
 import { getEffectiveAutopilotState } from "@/domain/autopilot/types";
 import { getMultiNicheRolloutEntry } from "@/services/autopilot/multi-niche-rollout";
 import { WATCHDOG_QUEUE_PAUSE_REASON } from "@/services/autopilot/watchdog-pause-policy";
@@ -131,6 +132,8 @@ interface DiscoveryJobPayload {
   reason?: string;
   origin?: "normal" | "rebalance" | "hybrid_fill" | "recovery_probe";
   recoveryCredentialFingerprint?: string;
+  pilotSessionId?: string;
+  pilotRunKey?: string;
   economicPaceState?: EconomicPacingState;
   seedQuery?: string;
   seedGeography?: string;
@@ -748,6 +751,10 @@ async function executeDiscoveryJob(
               productiveSeedCapacityConstrained: economicPlan?.productiveSeedCapacityConstrained ?? false,
             } : {}),
             discoveryJobId: job.id,
+            ...(typeof job.payload.pilotSessionId === "string" && typeof job.payload.pilotRunKey === "string" ? {
+              pilotSessionId: job.payload.pilotSessionId,
+              pilotRunKey: job.payload.pilotRunKey,
+            } : {}),
             query: seed.query,
             normalizedQuery,
             geography: seed.geography,
@@ -943,6 +950,10 @@ async function executeDiscoveryJob(
             geography: seed.geography,
             planningWindow,
             recoveryProbe,
+            ...(job.payload.pilotSessionId && job.payload.pilotRunKey ? {
+              pilotSessionId: job.payload.pilotSessionId,
+              pilotRunKey: job.payload.pilotRunKey,
+            } : {}),
           },
         ),
       });
@@ -1070,6 +1081,8 @@ export interface ScopedDiscoveryExecution {
   allowScopedDraftCampaign: true;
   probeMode?: true;
   smokeExecutionId?: string;
+  pilotSessionId?: string;
+  pilotRunKey?: string;
 }
 
 export function isAuthorizedScopedProbeExecution(
@@ -1104,8 +1117,29 @@ export async function runDiscoveryCronTick(
   now: Date = new Date(),
   scoped?: ScopedDiscoveryExecution,
 ): Promise<DiscoveryRunnerResult> {
+  if ((await getPilotControlState()).status === "active" && !scoped) {
+    return {
+      jobsClaimed: 0,
+      rawCandidatesProduced: 0,
+      rawCandidatesInserted: 0,
+      rawCandidatesDuplicate: 0,
+      providerReservationsCreated: 0,
+      providerReservationsSkipped: 0,
+      providerRunsStarted: 0,
+      providerStartsFailed: 0,
+      providerJobsDeferred: 0,
+      pausedWorkspaces: 0,
+      emergencyStoppedWorkspaces: 0,
+    };
+  }
   const scopedCampaign = scoped ? await getCampaignById(scoped.campaignId) : null;
-  if (scoped && (!scopedCampaign || getMultiNicheRolloutEntry(scoped.campaignId)?.niche !== scopedCampaign.engineConfig?.niche)) {
+  const pilotRecovery = scoped?.pilotRunKey === "recovery" && Boolean(scoped.pilotSessionId);
+  const rolloutEntry = scoped ? getMultiNicheRolloutEntry(scoped.campaignId) : null;
+  if (scoped && (!scopedCampaign
+    || (!rolloutEntry && !pilotRecovery)
+    || (rolloutEntry && rolloutEntry.niche !== scopedCampaign.engineConfig?.niche)
+    || (pilotRecovery && (scopedCampaign.status !== "active"
+      || (scopedCampaign.engineType !== "maps_fast" && scopedCampaign.engineType !== "maps_deep"))))) {
     throw new Error("Scoped discovery campaign is not allowlisted.");
   }
   const workspaceIds = scoped ? [scopedCampaign!.workspaceId] : await listWorkspaceIds();
@@ -1152,6 +1186,8 @@ export async function runDiscoveryCronTick(
       jobId: scoped.jobId,
       requireAutopilot: false,
       allowScopedDraftCampaign: scoped.allowScopedDraftCampaign,
+      pilotSessionId: scoped.pilotSessionId,
+      pilotRunKey: scoped.pilotRunKey,
     } : { allowWatchdogRecovery: true }),
   });
   for (const job of jobs) {

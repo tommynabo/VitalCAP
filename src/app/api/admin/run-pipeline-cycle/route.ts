@@ -6,6 +6,7 @@ import { getDb } from "@/infrastructure/neon/db";
 import { getApifyRecoverySnapshot } from "@/infrastructure/neon/repositories/provider-runs";
 import { getProductivityDiagnostics } from "@/infrastructure/neon/repositories/productivity-diagnostics";
 import { getProductionCapacityDiagnostics } from "@/infrastructure/neon/repositories/production-capacity-diagnostics";
+import { getPilotControlState } from "@/infrastructure/neon/repositories/pilot-control";
 import { getSystemHealthDiagnostics } from "@/infrastructure/neon/repositories/health-diagnostics";
 import { getDeliveryEnv, getMapsEnv, getSerperEnv } from "@/lib/config/env";
 import { getDayBounds } from "@/lib/time/day-bounds";
@@ -122,6 +123,9 @@ export async function POST() {
   let verificationStage: VerificationExecutionStage | null = null;
   try {
     const context = await requireWorkspaceOwner();
+    if ((await getPilotControlState()).status === "active") {
+      return NextResponse.json({ error: "Pipeline cycles are blocked during isolated pilot mode." }, { status: 409 });
+    }
     const workspaceId = context.workspaceId;
     const startedAt = new Date();
     const before = await Promise.all([

@@ -1,6 +1,7 @@
 import { getAuth } from "@/lib/auth/server";
 import { isDevSeedMode } from "@/lib/config/env";
 import { getOrCreateWorkspaceIdForUser, getWorkspaceRole } from "@/infrastructure/neon/repositories/workspace";
+import { assertNotVercelPreview } from "@/lib/security/preview-runtime";
 
 const DEV_SEED_WORKSPACE_ID = "ws_demo";
 
@@ -27,6 +28,7 @@ export interface AuthorizedWorkspaceContext {
 
 /** Throws `UnauthorizedError` if there is no valid Neon Auth session. */
 export async function requireCurrentUser(): Promise<CurrentUser> {
+  assertNotVercelPreview("Authentication session access");
   const { data } = await getAuth().getSession();
   if (!data?.user) throw new UnauthorizedError();
   return { userId: data.user.id, email: data.user.email ?? null, name: data.user.name ?? null };

@@ -5,6 +5,7 @@
  */
 
 import { normalizeDomain } from "@/lib/normalization";
+import { assertNotVercelPreview } from "@/lib/security/preview-runtime";
 
 const BLOCKED_HOSTNAME_SUFFIXES = [".local", ".internal", ".localhost"];
 const BLOCKED_HOSTNAMES = new Set(["localhost", "0.0.0.0", "metadata.google.internal"]);
@@ -96,6 +97,7 @@ function assertPublicUrl(url: URL, allowedDomain?: string): void {
  * implementation, so every hop is re-validated).
  */
 export async function safeFetchPage(rawUrl: string, options: SafeFetchOptions = {}): Promise<{ url: string; status: number; contentType: string | null; body: string }> {
+  assertNotVercelPreview("External website requests");
   const opts = { ...DEFAULT_OPTIONS, ...options };
   const fetchImpl = options.fetchImpl ?? fetch;
 
