@@ -1,16 +1,26 @@
 import { PgDialect } from "drizzle-orm/pg-core";
+import { sql as drizzleSql, type SQL } from "drizzle-orm";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const mocks = vi.hoisted(() => ({ execute: vi.fn() }));
+const mocks = vi.hoisted(() => ({ execute: vi.fn(), transaction: vi.fn() }));
 
-vi.mock("../db", () => ({ getDb: () => ({ execute: mocks.execute }) }));
+vi.mock("../db", () => ({
+  getDb: () => ({ execute: mocks.execute }),
+  getNeonSql: () => Object.assign(
+    (strings: TemplateStringsArray, ...values: unknown[]) => drizzleSql(strings, ...values),
+    { transaction: mocks.transaction },
+  ),
+}));
 
 import { acquirePilotRunPermit, isPilotRunPermitActive, restoreNormalOperation, startIsolatedPilot } from "./pilot-control";
 
 const dialect = new PgDialect();
 
 describe("pilot control repository", () => {
-  beforeEach(() => vi.clearAllMocks());
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.transaction.mockResolvedValue([[], []]);
+  });
 
   it("atomically reserves each unique permit key and audits its actor", async () => {
     mocks.execute.mockResolvedValue({ rows: [{ run_key: "recovery" }] });
@@ -65,17 +75,21 @@ describe("pilot control repository", () => {
   });
 
   it("enables only the exact four Draft/off campaigns without rewriting pending work", async () => {
-    mocks.execute.mockResolvedValue({ rows: [{
+    mocks.transaction.mockResolvedValue([[], [{
       status: "active",
       session_id: "00000000-0000-0000-0000-000000000001",
       workspace_id: "00000000-0000-0000-0000-000000000002",
       enabled_at: null,
       ended_at: null,
-    }] });
+    }]]);
 
     await startIsolatedPilot({ workspaceId: "00000000-0000-0000-0000-000000000002", actorUserId: "admin-1" });
 
-    const query = dialect.sqlToQuery(mocks.execute.mock.calls[0]![0]);
+    expect(mocks.transaction).toHaveBeenCalledOnce();
+    const transaction = mocks.transaction.mock.calls[0]![0] as SQL[];
+    const lockQuery = dialect.sqlToQuery(transaction[0]!);
+    const query = dialect.sqlToQuery(transaction[1]!);
+    expect(lockQuery.sql).toContain("FOR UPDATE");
     expect(query.sql).toContain("(SELECT count FROM valid_campaigns) = 4");
     expect(query.sql).toContain("status = 'draft'");
     expect(query.sql).toContain("autopilot_enabled = false");
@@ -87,5 +101,18 @@ describe("pilot control repository", () => {
       "47fce807-aac6-4a8a-90f9-6ad3bbbf4ca7",
       "53f56788-99d9-4d6a-8c71-ab2ffe075d85",
     ]));
+  });
+
+  it("blocks concurrent pilot activation when Intelligence jobs are already processing", async () => {
+    mocks.transaction.mockResolvedValue([[], []]);
+
+    await expect(startIsolatedPilot({ workspaceId: "00000000-0000-4000-8000-000000000002", actorUserId: "admin-1" }))
+      .rejects.toThrow("Pilot enable blocked");
+
+    const transaction = mocks.transaction.mock.calls[0]![0] as SQL[];
+    const lockQuery = dialect.sqlToQuery(transaction[0]!);
+    const activationQuery = dialect.sqlToQuery(transaction[1]!);
+    expect(lockQuery.sql).toContain("FOR UPDATE");
+    expect(activationQuery.sql).toContain("NOT EXISTS (SELECT 1 FROM intelligence_jobs WHERE status = 'processing')");
   });
 });

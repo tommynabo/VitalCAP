@@ -35,8 +35,21 @@ export interface CronWorkResult {
   metadata?: Record<string, unknown>;
 }
 
+export type CronRouteOutcome =
+  | { kind: "pilot_mode_active" }
+  | { kind: "completed" | "completed_with_warnings"; result: CronWorkResult }
+  | { kind: "failed"; error: unknown };
+
+export interface CronRouteOptions {
+  formatResponse?: (outcome: CronRouteOutcome) => NextResponse;
+}
+
 /** Runs `work`, persisting a `cron_runs` row and structured log line for every outcome (success, warnings, or thrown error). */
-export async function runCronRoute(route: string, work: () => Promise<CronWorkResult>): Promise<NextResponse> {
+export async function runCronRoute(
+  route: string,
+  work: () => Promise<CronWorkResult>,
+  options: CronRouteOptions = {},
+): Promise<NextResponse> {
   const correlationId = randomUUID();
   const cronRunId = await startCronRun(route);
   const startedAt = Date.now();
@@ -53,6 +66,7 @@ export async function runCronRoute(route: string, work: () => Promise<CronWorkRe
         itemsProcessed: 0,
         ...result.metadata,
       });
+      if (options.formatResponse) return options.formatResponse({ kind: "pilot_mode_active" });
       return NextResponse.json({ status: "completed_with_warnings", ...result });
     }
     const result = await work();
@@ -66,11 +80,13 @@ export async function runCronRoute(route: string, work: () => Promise<CronWorkRe
       itemsProcessed: result.itemsProcessed,
       ...(result.metadata ?? {}),
     });
+    if (options.formatResponse) return options.formatResponse({ kind: status, result });
     return NextResponse.json({ status, itemsProcessed: result.itemsProcessed, warnings: result.warnings ?? [], ...(result.metadata ?? {}) });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     await finishCronRun(cronRunId, { status: "failed", itemsProcessed: 0, error: message });
     logEvent("error", `cron.${route}`, { correlationId, outcome: "failed", durationMs: Date.now() - startedAt });
+    if (options.formatResponse) return options.formatResponse({ kind: "failed", error });
     return NextResponse.json({ status: "failed", error: message }, { status: 500 });
   }
 }

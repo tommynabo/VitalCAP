@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { sql } from "drizzle-orm";
 import { MULTI_NICHE_ROLLOUT_CAMPAIGN_IDS } from "@/services/autopilot/multi-niche-rollout";
-import { getDb } from "../db";
+import { getDb, getNeonSql } from "../db";
 
 export type PilotControlStatus = "disabled" | "active" | "completed" | "aborted";
 
@@ -137,13 +137,11 @@ export async function isPilotRunPermitActive(input: {
 export async function startIsolatedPilot(input: { workspaceId: string; actorUserId: string }): Promise<PilotControlState> {
   const sessionId = randomUUID();
   const campaignIds = sql.join(MULTI_NICHE_ROLLOUT_CAMPAIGN_IDS.map((campaignId) => sql`${campaignId}::uuid`), sql`, `);
-  const result = await getDb().execute(sql`
-    WITH singleton_lock AS MATERIALIZED (
-      SELECT id
-      FROM pilot_control
-      WHERE id = true
-      FOR UPDATE
-    ),
+  const sqlClient = getNeonSql();
+  const transactionResults = await sqlClient.transaction([
+    sqlClient`SELECT id FROM pilot_control WHERE id = true FOR UPDATE`,
+    sqlClient`
+    WITH
     valid_campaigns AS MATERIALIZED (
       SELECT COUNT(DISTINCT id)::int AS count
       FROM campaigns
@@ -164,7 +162,6 @@ export async function startIsolatedPilot(input: { workspaceId: string; actorUser
           updated_at = NOW()
       WHERE control.id = true
         AND control.status = 'disabled'
-        AND EXISTS (SELECT 1 FROM singleton_lock)
         AND (SELECT count FROM valid_campaigns) = 4
         AND NOT EXISTS (
           SELECT 1 FROM autopilot_settings
@@ -173,6 +170,7 @@ export async function startIsolatedPilot(input: { workspaceId: string; actorUser
         AND NOT EXISTS (SELECT 1 FROM discovery_jobs WHERE status = 'processing')
         AND NOT EXISTS (SELECT 1 FROM processing_jobs WHERE status = 'processing')
         AND NOT EXISTS (SELECT 1 FROM verification_jobs WHERE status = 'processing')
+        AND NOT EXISTS (SELECT 1 FROM intelligence_jobs WHERE status = 'processing')
         AND NOT EXISTS (SELECT 1 FROM provider_runs WHERE status IN ('starting', 'queued', 'running', 'succeeded', 'ingesting'))
       RETURNING status, session_id, workspace_id, enabled_at, ended_at
     ),
@@ -185,8 +183,9 @@ export async function startIsolatedPilot(input: { workspaceId: string; actorUser
     )
     SELECT updated.status, updated.session_id, updated.workspace_id, updated.enabled_at, updated.ended_at
     FROM updated CROSS JOIN audited
-  `);
-  const row = result.rows[0] as PilotControlRow | undefined;
+  `,
+  ]);
+  const row = transactionResults[1]?.[0] as PilotControlRow | undefined;
   if (!row) throw new Error("Pilot enable blocked: campaign scope, active work, or prior pilot state did not pass preflight.");
   return toState(row);
 }
